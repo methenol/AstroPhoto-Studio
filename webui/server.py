@@ -481,8 +481,25 @@ def _lab(*parts) -> str:
 
 
 def _alive(pid) -> bool:
+    """Whether process ``pid`` is running.  On Windows os.kill(pid, 0) would send it
+    CTRL_C_EVENT (signal 0), so the process's exit code is queried instead."""
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+    except Exception:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
         return True
     except Exception:
         return False
@@ -504,8 +521,11 @@ def _read_status(d: str) -> dict:
 def _spawn(module: str, d: str):
     import subprocess
     out = open(os.path.join(d, "stdout.txt"), "a")
+    # detached from the server: its own session (POSIX) or process group (Windows, so that
+    # "Stop" can send it Ctrl-Break without touching the server)
+    kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     return subprocess.Popen([sys.executable, "-W", "ignore", "-m", module, d], cwd=ROOT, stdout=out,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+                            stderr=subprocess.STDOUT, **kw)
 
 
 def _safe_name(name: str) -> str:
@@ -748,7 +768,8 @@ def lab_stop(sid: str):
     st = _read_status(_study_dir(sid))
     if st.get("state") not in ("starting", "preparing", "running"):
         raise HTTPException(409, "The study is not running")
-    os.kill(int(st["pid"]), signal.SIGTERM)
+    # graceful: the runner cancels the running trial and marks the study stopped
+    os.kill(int(st["pid"]), signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
     return {"ok": True}
 
 

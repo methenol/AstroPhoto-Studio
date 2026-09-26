@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import platform
 import signal
 import sys
 import threading
@@ -91,7 +92,7 @@ def main():
     log_path = os.path.join(study_dir, "log.txt")
     os.makedirs(os.path.join(study_dir, "trials"), exist_ok=True)
     status = {"state": "starting", "pid": os.getpid(), "started": time.time(), "message": "Starting",
-              "trial": None, "host": os.uname().nodename}
+              "trial": None, "host": platform.node()}
     _write_json(status_path, status)
     cancel = threading.Event()
     lock = threading.Lock()
@@ -109,6 +110,8 @@ def main():
         log("Stop requested: cancelling the running trial")
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
+    if hasattr(signal, "SIGBREAK"):          # Windows: the server stops a study with Ctrl-Break
+        signal.signal(signal.SIGBREAK, on_term)
 
     try:
         from ..denoise import pick_device
