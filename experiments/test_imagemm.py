@@ -537,10 +537,55 @@ def test_empirical_psf():
           abs(info["beta"] - 2.8) < 0.3 and np.allclose(sorted([info["alpha1"], info["alpha2"]]), [3.0, 3.4], atol=0.25),
           f"beta {info['beta']:.2f}, alpha {info['alpha1']:.2f}/{info['alpha2']:.2f}, kernel {mdl.shape[0]} px, EE {info['ee_kernel']:.3f}")
 
+def test_empirical_psf_crowded():
+    """empirical_psf in a crowded field like M 27's (median nearest neighbour ~11 px, most
+    stars have a neighbour inside any PSF cut-out): with the neighbours of the reference
+    catalogue masked it must use many stars and still match the true PSF."""
+    import sep
+    from astrophoto.exposures import empirical_psf, moffat_image, star_catalog
+    H = W = 1400
+    true_p = [1.0, 0.0, 0.0, 3.4, 3.0, 0.5, 2.8]
+    half = 13
+    norm = moffat_image([1.0, 0, 0] + true_p[3:], 401).sum()
+    img = RNG.normal(size=(H, W)) * 30.0
+    # M 27's reference coadd: 20258 3-sigma detections on 2160 x 3840 px (2.4e-3 per px^2);
+    # stars from a power-law luminosity function (counts x10^0.35 per magnitude) spanning
+    # 7.5 magnitudes from the faintest detectable up
+    # star count set so that the catalogue matches M 27's reference coadd: 7203 catalogue stars
+    # on 8.3 Mpx (8.7e-4 per px^2), median nearest detected neighbour 11.3 px
+    n_st = int(2.4e-3 * (H - 80) * (W - 80) * 5.0)
+    lf = 0.35 * np.log(10)
+    for _ in range(n_st):
+        x, y = RNG.uniform(40, W - 40, 2)
+        m = np.log1p(RNG.random() * (np.exp(lf * 7.5) - 1)) / lf     # 0 .. 7.5 mag fainter, counts rising
+        f = 10 ** (5.8 - 0.4 * m)                                    # peak ~3e4 down to ~1 sigma
+        ix, iy = int(round(x)), int(round(y))
+        img[iy - 30:iy + 31, ix - 30:ix + 31] += f * moffat_image([1.0, x - ix, y - iy] + true_p[3:], 61) / norm
+    rgb = np.repeat(img[..., None], 3, -1).astype(np.float32)
+    cat = star_catalog(rgb, 1e9, 3.7)
+    d, _ = __import__("scipy.spatial", fromlist=["cKDTree"]).cKDTree(np.stack([cat["all_x"], cat["all_y"]], 1)).query(
+        np.stack([cat["x"], cat["y"]], 1), k=2)
+    psf, n, extra = empirical_psf(img, np.ones((H, W), bool), cat, half, return_error=True, fwhm=3.7)
+    truth = moffat_image(true_p, 2 * half + 1)
+    rr = np.hypot(*np.mgrid[:2 * half + 1, :2 * half + 1] - half)
+    t = np.where(rr <= extra["support"], truth, 0)
+    t /= t.sum()
+    err = np.abs(psf - t).max() / t.max()
+    wing_est, wing_true = psf[rr > 2 * 3.7].sum(), t[rr > 2 * 3.7].sum()
+    check("crowded test field matches M 27 (catalogue density within 25 %, neighbours <= 13 px)",
+          abs(len(cat["x"]) / ((H - 80) * (W - 80)) / 8.7e-4 - 1) < 0.25 and np.median(d[:, 1]) <= 13,
+          f"{len(cat['x']) / ((H - 80) * (W - 80)):.2e} catalogue stars per px^2, median nearest neighbour {np.median(d[:, 1]):.1f} px")
+    check("empirical PSF, crowded field: many PSF stars, shape matches the truth",
+          n >= 30 and err < 0.03 and abs(wing_est - wing_true) < 0.01,
+          f"catalogue {len(cat['x'])} stars (median nearest neighbour {np.median(d[:, 1]):.1f} px), {n} PSF stars, "
+          f"support {extra['support']:.1f} px, wing flux {wing_est:.3f} vs {wing_true:.3f}, max |diff|/peak {err:.3f}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
     ALL = [test_operators, test_operator_vs_conv2d, test_stack_forward, test_true_convolution, test_geometry, test_psf_solver, test_restoration,
-           test_superresolution, test_superresolved_units, test_batched_psf_solver, test_moffat, test_seeing_groups, test_mf_data_term, test_tiling, test_empirical_psf]
+           test_superresolution, test_superresolved_units, test_batched_psf_solver, test_moffat, test_seeing_groups, test_mf_data_term, test_tiling, test_empirical_psf,
+           test_empirical_psf_crowded]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

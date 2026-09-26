@@ -344,50 +344,117 @@ def fourier_shift(img: np.ndarray, dy: float, dx: float) -> np.ndarray:
     return np.fft.irfft2(np.fft.rfft2(img) * np.exp(-2j * np.pi * (ky * dy + kx * dx)), s=(h, w))
 
 
+_PSF_TABLES: dict = {}
+
+
+def _psf_star_table(cat: dict, fwhm: float, half: int) -> list:
+    """PSF-star candidates of a reference catalogue, brightest first: (index, integer centre,
+    neighbour mask of the cut-out).  Depends only on the catalogue, the FWHM and the cut-out
+    size, so it is built once and shared by every exposure and channel."""
+    from scipy.spatial import cKDTree
+    key = (id(cat), len(cat["x"]), round(float(fwhm), 3), int(half))
+    if key in _PSF_TABLES:
+        return _PSF_TABLES[key]
+    rc = max(3.0, 2.0 * fwhm)
+    pad = half + 8
+    yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1]
+    x, y, f = np.asarray(cat["x"], float), np.asarray(cat["y"], float), np.asarray(cat["flux"], float)
+    if "all_x" in cat and len(cat["all_x"]):
+        ax, ay = np.asarray(cat["all_x"], float), np.asarray(cat["all_y"], float)
+        af = np.asarray(cat["all_flux"], float)
+        beta = 2.5
+        alpha = fwhm / (2 * np.sqrt(2 ** (1 / beta) - 1))
+        peak = np.maximum(af, 0) * (beta - 1) / (np.pi * alpha ** 2)
+        thr = 0.5 * float(cat.get("rms", 0.0) or 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_light = np.where(peak > thr, alpha * np.sqrt(np.maximum((peak / max(thr, 1e-30)) ** (1 / beta) - 1, 0)),
+                               0.0)
+        rn = np.maximum(r_light, 3 * np.asarray(cat["all_a"], float))
+        tree = cKDTree(np.stack([ax, ay], 1))
+        reach = pad * np.sqrt(2) + rn.max()
+    else:                                                # no neighbour list: nearest-neighbour distances only
+        tree = None
+    table = []
+    for i in np.argsort(-f):
+        ix, iy = int(round(x[i])), int(round(y[i]))
+        m = np.zeros(yy.shape, bool)
+        if tree is not None:
+            nb = [j for j in tree.query_ball_point([x[i], y[i]], reach) if np.hypot(ax[j] - x[i], ay[j] - y[i]) > 1.0]
+            if nb:
+                d = np.hypot(ax[nb] - x[i], ay[nb] - y[i])
+                if np.any(d <= rc + rn[nb]):             # a neighbour's light reaches the core
+                    continue
+                for j in nb:
+                    m |= np.hypot(yy - (ay[j] - iy), xx - (ax[j] - ix)) <= rn[j]
+        elif "nn" in cat and cat["nn"][i] <= rc + 3 * fwhm:
+            continue
+        table.append((int(i), ix, iy, m))
+    _PSF_TABLES[key] = table
+    return table
+
+
 def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip: float = 3.0,
-                  min_stars: int = 10, return_error: bool = False, nsig: float = 2.0):
+                  min_stars: int = 10, return_error: bool = False, nsig: float = 2.0, fwhm: float | None = None,
+                  max_stars: int = 400):
     """Empirical PSF of one background-subtracted channel.
 
-    Cut-outs of isolated, unsaturated catalogue stars around their reference positions,
-    local residual sky removed (annulus median), shifted onto the pixel grid by an exact
-    Fourier shift and normalised by aperture flux, are combined by a per-pixel sigma-
-    clipped weighted mean.  Weights are flux^2: a flux-normalised cut-out of a sky-limited
-    star has variance sigma_sky^2 / flux^2.
+    Crowded fields (the Milky Way: M 27's median nearest neighbour is ~11 px) have almost no
+    stars without a neighbour inside a PSF cut-out, so neighbours are handled as crowded-field
+    PSF builders do (DAOPHOT; Stetson 1987): every other detection near a star is masked out
+    to the radius where its light falls below half the reference coadd's per-pixel sky noise
+    (from its flux, the FWHM and a Moffat profile with beta = 2.5, heavier-winged than the
+    subs' measured beta ~ 2.8, so the masks err large), and at least 3 isophotal semi-axes;
+    a catalogue star is a PSF star when no mask reaches its core aperture (radius 2 FWHM).
+    Masked pixels get zero weight.
+
+    Each cut-out: local residual sky from the unmasked annulus median, masked pixels zeroed,
+    shifted onto the pixel grid by an exact Fourier shift (the mask is shifted with it), and
+    normalised by its core flux (radius 2 FWHM, unmasked by construction).  The cut-outs are
+    combined by a per-pixel sigma-clipped weighted mean with weights core flux^2 on unmasked
+    pixels (a flux-normalised cut-out of a sky-limited star has variance sigma_sky^2 /
+    flux^2).
 
     The mean is noisy in the far wings, and clipping its negative pixels to zero before
     normalising would add a positive pedestal there (on M 27 subs it put 20-40 % of the
     flux beyond 2 FWHM).  So the kernel is cut at the support radius where the azimuthally
     averaged profile is no longer significant (< ``nsig`` times its standard error), at
     least 2 FWHM; only then are the few remaining negative pixels set to 0 and the kernel
-    normalised.  ``return_error``: also return (unclipped mean, per-pixel standard error,
-    support radius) for model fitting.
+    normalised to unit sum.  ``return_error``: also return (unclipped mean, per-pixel
+    standard error, support radius) for model fitting.
     Returns (PSF of (2 half + 1)^2 pixels with unit sum, number of stars used[, extras])."""
+    fwhm = float(fwhm) if fwhm else half / 3.5
+    rc = max(3.0, 2.0 * fwhm)                            # core aperture (normalisation)
     pad = half + 8
+    yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1]
+    x, y = np.asarray(cat["x"], float), np.asarray(cat["y"], float)
+    core = np.hypot(yy, xx)[8:-8, 8:-8] <= rc
     cuts, wts = [], []
-    c = select(cat, 2 * pad, max_nflux=1e-3)
-    ap = np.hypot(*np.mgrid[-half:half + 1, -half:half + 1]) <= half
-    for x, y in zip(c["x"], c["y"]):
-        ix, iy = int(round(x)), int(round(y))
+    for i, ix, iy, nmask in _psf_star_table(cat, fwhm, half):
+        if len(cuts) >= max_stars:
+            break
         if ix - pad < 0 or iy - pad < 0 or ix + pad + 1 > img.shape[1] or iy + pad + 1 > img.shape[0]:
             continue
-        if not valid[iy - pad:iy + pad + 1, ix - pad:ix + pad + 1].all():
+        m = nmask | ~valid[iy - pad:iy + pad + 1, ix - pad:ix + pad + 1]
+        rr = np.hypot(yy - (y[i] - iy), xx - (x[i] - ix))
+        if m[rr <= rc + 2].any():
+            continue
+        ann = (rr > half + 2) & (rr <= half + 8) & ~m
+        if ann.sum() < 20:
             continue
         cc = img[iy - pad:iy + pad + 1, ix - pad:ix + pad + 1].astype(np.float64)
-        yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1]
-        rr = np.hypot(yy - (y - iy), xx - (x - ix))
-        cc = cc - np.median(cc[(rr > half + 2) & (rr <= half + 8)])          # local residual sky
-        cc = fourier_shift(cc, -(y - iy), -(x - ix))                        # star centre -> pixel centre
-        cc = cc[8:-8, 8:-8]
-        flux = cc[ap].sum()
+        cc = np.where(m, 0.0, cc - np.median(cc[ann]))                       # local residual sky; neighbours out
+        cc = fourier_shift(cc, -(y[i] - iy), -(x[i] - ix))[8:-8, 8:-8]       # star centre -> pixel centre
+        mk = fourier_shift(m.astype(np.float64), -(y[i] - iy), -(x[i] - ix))[8:-8, 8:-8] > 0.02
+        flux = cc[core].sum()
         if flux <= 0:
             continue
         cuts.append(cc / flux)
-        wts.append(flux ** 2)
+        wts.append(np.where(mk, 0.0, flux ** 2))
     if len(cuts) < min_stars:
         return (None, len(cuts), None) if return_error else (None, len(cuts))
     S = np.stack(cuts)
-    w = np.array(wts)[:, None, None] * np.ones_like(S)
-    keep = np.ones_like(S, bool)
+    w = np.stack(wts)
+    keep = w > 0
     for _ in range(10):
         sw = (w * keep).sum(0)
         mu = (S * w * keep).sum(0) / np.maximum(sw, 1e-300)
@@ -395,18 +462,20 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
         var = (w * keep * (S - mu) ** 2).sum(0) / np.maximum(sw, 1e-300)
         neff = sw ** 2 / np.maximum((w ** 2 * keep).sum(0), 1e-300)
         sd = np.sqrt(var * neff / np.maximum(neff - 1, 1))
-        new = np.abs(S - mu) <= clip * np.maximum(sd, 1e-12)
+        new = (w > 0) & (np.abs(S - mu) <= clip * np.maximum(sd, 1e-12))
         if (new == keep).all():
             break
         keep = new
-    se = sd / np.sqrt(np.maximum(neff, 1))
+    se = np.where(neff > 1, sd / np.sqrt(np.maximum(neff, 1)), np.inf)
     # support radius: first 1-px annulus (beyond 2 FWHM) whose mean is not significant
     n = mu.shape[0]
     rr = np.hypot(*np.mgrid[:n, :n] - n // 2)
     fw = 2 * np.sqrt(max((mu * rr ** 2).sum() / max(mu.sum(), 1e-12), 0) / 2) * 1.1774   # 2nd-moment FWHM
     rsup = float(half)
     for k in range(1, half + 1):
-        ring = (rr >= k - 0.5) & (rr < k + 0.5)
+        ring = (rr >= k - 0.5) & (rr < k + 0.5) & np.isfinite(se)
+        if not ring.any():
+            continue
         m_ = mu[ring].mean()
         e_ = np.sqrt((se[ring] ** 2).sum()) / ring.sum()
         if k >= 2 * fw and m_ < nsig * e_:
@@ -416,7 +485,10 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
     psf = np.clip(psf, 0, None)
     psf = (psf / psf.sum()).astype(np.float32)
     if return_error:
-        return psf, len(cuts), {"mean": mu.astype(np.float32), "se": se.astype(np.float32), "support": rsup}
+        tot = max(float(np.clip(np.where(rr <= rsup, mu, 0), 0, None).sum()), 1e-300)
+        se_out = np.where(np.isfinite(se), se, 1e30 * tot)
+        return psf, len(cuts), {"mean": (mu / tot).astype(np.float32), "se": (se_out / tot).astype(np.float32),
+                                "support": rsup}
     return psf, len(cuts)
 
 
@@ -552,7 +624,8 @@ class ExposureSet:
         half = int(math.ceil(3.5 * max(fwhm, self.fwhm_ref)))
         psfs, nst, errs = [], [], []
         for c in range(3):
-            p, ns, pe = empirical_psf(ybs[..., c], hard, self.cat, half, return_error=True)
+            p, ns, pe = empirical_psf(ybs[..., c], hard, self.cat, half, return_error=True,
+                                      fwhm=max(fwhm, self.fwhm_ref))
             psfs.append(p)
             nst.append(ns)
             errs.append(pe)
