@@ -727,11 +727,14 @@ class ExposureSet:
 
     # ------------------------------------------------------------- persistence
     _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask")
+    # bumped whenever the preparation changes what it produces; an older cache is prepared again
+    # (2: crowded-field PSF stars - with 1, most subs of a Milky Way field had no PSF)
+    PREP_VERSION = 2
 
     def save(self, path: str):
         import pickle
         with open(path, "wb") as f:
-            pickle.dump({"names": [info.name for info, _ in self.items],
+            pickle.dump({"names": [info.name for info, _ in self.items], "prep_version": self.PREP_VERSION,
                          **{k: getattr(self, k) for k in self._STATE}}, f)
 
     def load(self, path: str) -> "ExposureSet":
@@ -740,6 +743,8 @@ class ExposureSet:
             st = pickle.load(f)
         if st["names"] != [info.name for info, _ in self.items]:
             raise RuntimeError("the prepared exposures belong to a different frame selection")
+        if st.get("prep_version", 1) != self.PREP_VERSION:
+            raise RuntimeError("the prepared exposures were made by an older version of the preparation")
         for k in self._STATE:
             setattr(self, k, st[k])
         return self

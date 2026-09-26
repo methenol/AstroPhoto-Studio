@@ -28,6 +28,8 @@ DEFAULTS = {
     "white_balance": "stars",   # stars | background | none
     "denoise": 0.95,            # blend with Noise2Noise result (0..1)
     "deconvolution": 0.7,       # 0..1 strength (AI deconvolution blend, or Richardson-Lucy fallback)
+    "restored_resolution": 1.0,  # ImageMM: shown as the sky seen through a Gaussian g_sigma of this
+                                 # sigma (px of the input grid); the paper's sigma = 1 at r = 1
     # non-linear stage
     "palette": "auto",          # auto | natural | hoo | foraxx | hoo_warm
     "oiii_boost": 1.0,

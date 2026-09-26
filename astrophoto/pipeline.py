@@ -6,7 +6,9 @@ interactively without touching the raw frames again.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
+import math
 import json
 import os
 import pickle
@@ -57,7 +59,7 @@ STACK_DEFAULTS = {
 }
 
 LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree",
-               "white_balance", "denoise", "deconvolution"]
+               "white_balance", "denoise", "deconvolution", "restored_resolution"]
 
 
 def restoration_done(session_dir: str) -> bool:
@@ -72,6 +74,18 @@ def restoration_done(session_dir: str) -> bool:
         except Exception:
             return False
     return False
+
+
+def restored_view(latent: np.ndarray, sigma: float, info: dict) -> np.ndarray:
+    """The restoration seen through a Gaussian g_sigma (sigma in pixels of the input grid, so
+    r sigma latent pixels at super-resolution r); a latent that already is the sky through
+    g_sigma0 (Eq. 11) is convolved with the remaining sqrt(sigma^2 - sigma0^2)."""
+    r = int(info.get("r", 1) or 1)
+    s0 = float((info.get("eq11") or {}).get("sigma") or 0.0) / r      # Eq. 11 sigma is in latent pixels
+    s = math.sqrt(max(sigma ** 2 - s0 ** 2, 0.0)) * r
+    if s < 0.05:
+        return latent
+    return np.stack([cv2.GaussianBlur(latent[..., c], (0, 0), s) for c in range(latent.shape[-1])], -1).astype(np.float32)
 
 
 def slugify(path: str) -> str:
@@ -349,6 +363,10 @@ class Session:
                 return es.load(path)
             except Exception:
                 pass
+        # everything cached from earlier prepared exposures (the network's multi-frame targets)
+        # is stale once they are prepared again
+        for f in glob.glob(self._p("imagemm/mf_targets_*.pkl")):
+            os.remove(f)
         es.prepare(progress=progress, cancel=self.cancel_flag.is_set)
         os.makedirs(self._p("imagemm"), exist_ok=True)
         es.save(path)
@@ -453,6 +471,10 @@ class Session:
                                     "coverage": _load_fits(self._p("imagemm_coverage.fits"))}
         return self._restored_cache
 
+    def _restore_info(self) -> dict:
+        p = self._p("restore_meta.json")
+        return json.load(open(p)) if os.path.exists(p) else {}
+
     def _load_stack(self):
         if self._stack_cache is None:
             if not os.path.exists(self._p("stack.fits")):
@@ -484,6 +506,12 @@ class Session:
                 # ImageMM's latent image is already restored (deconvolved, sky noise suppressed):
                 # no denoise blend and no second deconvolution
                 img, cov = rest["image"], rest["coverage"]
+                # ImageMM estimates the sky integrated over each pixel (r = 1, no g_sigma): point
+                # sources are single pixels and the sky noise collapses into isolated speckles, not an
+                # image to look at.  As in the paper (Eq. 11: the latent is the sky seen through g_sigma,
+                # sigma = 1 at r = 1), it is shown through a Gaussian g_sigma; a restoration already
+                # made with Eq. 11 at sigma_0 only gets the remaining sqrt(sigma^2 - sigma_0^2)
+                img = restored_view(img, float(p.get("restored_resolution", 1.0)), self._restore_info())
                 ref = st["stack"]
                 clip_ref = cv2.resize(ref, (img.shape[1], img.shape[0]),
                                       interpolation=cv2.INTER_AREA if ref.shape[1] > img.shape[1] else cv2.INTER_LINEAR)
