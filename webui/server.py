@@ -39,8 +39,8 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 SESSIONS: dict[str, Session] = {}
-JOBS: dict[str, dict] = {}
-JOB_LOCK = threading.Lock()   # one heavy job at a time (memory)
+JOBS: dict[str, dict] = {}   # every job: queued, running, paused and finished (saved in <workdir>/jobs.json)
+JOB_LOCK = threading.Lock()   # held while a job runs (one heavy job at a time: memory)
 PREVIEW_CACHE: dict[str, bytes] = {}
 
 # UI metadata for every processing parameter
@@ -186,22 +186,165 @@ def thumb(folder: str, name: str, size: int = 360):
 
 # ------------------------------------------------------------------ jobs
 
-def _run_job(job_id: str, kind: str, folder: str, params: dict, stack_params: dict, export_opts: dict):
+JOB_KINDS = {"analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore",
+             "all": "Run everything & export", "export": "Export"}
+ACTIVE = ("running", "paused", "queued")
+QUEUE: list[str] = []                     # queued job ids, first to run first
+QUEUE_LOCK = threading.Lock()
+QUEUE_EVENT = threading.Event()
+_WORKER: dict = {}
+_SAVED = {"t": 0.0}
+
+
+def _jobs_file() -> str:
+    return os.path.join(CONFIG["workdir"], "jobs.json")
+
+
+def _save_jobs(force: bool = False):
+    """Persist every job (state, stage history, settings) so a page refresh or a server restart
+    loses nothing; progress updates are throttled to one write every few seconds."""
+    import json as _json
+    now = time.time()
+    if not force and now - _SAVED["t"] < 5:
+        return
+    _SAVED["t"] = now
+    try:
+        os.makedirs(CONFIG["workdir"], exist_ok=True)
+        tmp = _jobs_file() + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(clean_json({"jobs": [dict(j) for j in list(JOBS.values())], "queue": list(QUEUE)}), f)
+        os.replace(tmp, _jobs_file())
+    except Exception:
+        pass
+
+
+def _load_jobs():
+    """Jobs of earlier server runs: finished ones as history; anything that was queued,
+    running or paused when the server stopped is marked interrupted (it can be run again)."""
+    import json as _json
+    if JOBS or not os.path.exists(_jobs_file()):
+        return
+    try:
+        st = _json.load(open(_jobs_file()))
+    except Exception:
+        return
+    for j in st.get("jobs", []):
+        if j.get("state") in ACTIVE:
+            j["state"] = "interrupted"
+            j["message"] = "Interrupted: the server stopped while this job was " + ("waiting" if j.get("started") is None else "running")
+            j["ended"] = j.get("ended") or j.get("updated") or time.time()
+        JOBS[j["id"]] = j
+
+
+def _ensure_worker():
+    if _WORKER.get("t") is None or not _WORKER["t"].is_alive():
+        _WORKER["t"] = threading.Thread(target=_worker_loop, daemon=True)
+        _WORKER["t"].start()
+
+
+def _worker_loop():
+    """Runs queued jobs one at a time, in order (one heavy job at a time: memory)."""
+    while True:
+        QUEUE_EVENT.wait(1.0)
+        with QUEUE_LOCK:
+            job_id = QUEUE.pop(0) if QUEUE else None
+            if not QUEUE:
+                QUEUE_EVENT.clear()
+        if job_id and job_id in JOBS and JOBS[job_id]["state"] == "queued":
+            _run_job(job_id)
+
+
+def _stage_key(msg: str) -> str:
+    """A stage name without its counters: 'ImageMM: cutout 5/84 (...)' -> 'ImageMM: cutout #/#'."""
+    import re
+    return re.sub(r"\d+(\.\d+)?", "#", msg.split(" (")[0]).strip()
+
+
+def _active_seconds(j: dict, now: float | None = None) -> float:
+    if not j.get("started"):
+        return 0.0
+    end = j.get("ended") or now or time.time()
+    paused = j.get("paused_total", 0.0) + ((end - j["pause_started"]) if j.get("pause_started") else 0.0)
+    return max(0.0, end - j["started"] - paused)
+
+
+def _typical_seconds(j: dict) -> tuple[float | None, str | None]:
+    """How long this kind of job took before: on the same dataset, or on another one scaled by
+    the number of subs (the work of every stage grows with it)."""
+    same = [h for h in list(JOBS.values()) if h is not j and h["state"] == "done" and h["kind"] == j["kind"]
+            and h.get("folder") == j.get("folder") and h.get("active_seconds")]
+    if same:
+        h = max(same, key=lambda q: q.get("ended", 0))
+        return h["active_seconds"], "the last run on this dataset"
+    other = [h for h in list(JOBS.values()) if h is not j and h["state"] == "done" and h["kind"] == j["kind"]
+             and h.get("active_seconds") and h.get("n_subs") and j.get("n_subs")]
+    if other:
+        h = max(other, key=lambda q: q.get("ended", 0))
+        return h["active_seconds"] * j["n_subs"] / h["n_subs"], f"a run on another dataset, scaled to {j['n_subs']} subs"
+    return None, None
+
+
+def _job_view(j: dict) -> dict:
+    """A job with its live timings: elapsed and active time, the current stage's ETA from its own
+    rate of progress, and an estimate of the whole job from earlier runs."""
+    now = time.time()
+    v = {k: val for k, val in j.items() if k not in ("params", "stack_params", "export_opts")}
+    v["label"] = JOB_KINDS.get(j["kind"], j["kind"])
+    v["elapsed"] = round(((j.get("ended") or now) - j["started"]) if j.get("started") else 0.0, 1)
+    v["active"] = round(_active_seconds(j, now), 1)
+    if j["state"] in ("running", "paused") and j.get("stage_started"):
+        t_stage = (j.get("pause_started") or now) - j["stage_started"] - j.get("stage_paused", 0.0)
+        p = j.get("progress", 0.0)
+        v["stage_eta"] = round(t_stage * (1 - p) / p, 0) if p > 0.02 and t_stage > 5 else None
+    typ, basis = _typical_seconds(j)
+    if typ is not None and j["state"] in ACTIVE:
+        v["typical_total"] = round(typ, 0)
+        v["typical_basis"] = basis
+        v["total_eta"] = round(max(typ - v["active"], 0), 0)
+    if j["state"] == "queued":
+        with QUEUE_LOCK:
+            pos = QUEUE.index(j["id"]) if j["id"] in QUEUE else None
+        v["position"] = (pos + 1) if pos is not None else None
+        ahead = [JOBS[q] for q in QUEUE[:pos] if q in JOBS] if pos is not None else []
+        running = [r for r in list(JOBS.values()) if r["state"] in ("running", "paused")]
+        v["waiting_on"] = [{"id": r["id"], "label": JOB_KINDS.get(r["kind"], r["kind"]), "dataset": r.get("dataset"),
+                            "state": r["state"]} for r in running + ahead]
+    return v
+
+
+def _run_job(job_id: str):
     job = JOBS[job_id]
+    kind, folder = job["kind"], job["folder"]
+    params, stack_params, export_opts = job.get("params") or {}, job.get("stack_params") or {}, job.get("export_opts") or {}
     s = get_session(folder)
     s.cancel_flag.clear()
+    s.pause_flag.clear()
 
     def progress(i, n, msg):
+        now = time.time()
+        key = _stage_key(msg)
+        if key != job.get("stage_key"):
+            if job.get("stage_key"):
+                job["stages"].append([job["stage_key"], round(now - job["stage_started"] - job.get("stage_paused", 0.0), 1)])
+                job["stages"] = job["stages"][-100:]
+            job["stage_key"], job["stage_started"], job["stage_paused"] = key, now, 0.0
         job["progress"] = i / max(n, 1)
         job["message"] = msg
         job["stage"] = msg
-        if not job["log"] or job["log"][-1][1] != msg.split(" (")[0].rsplit(" ", 1)[0]:
-            job["log"].append([round(time.time() - job["started"], 1), msg.split(" (")[0].rsplit(" ", 1)[0]])
+        job["updated"] = now
+        short = msg.split(" (")[0].rsplit(" ", 1)[0]
+        if not job["log"] or job["log"][-1][1] != short:
+            job["log"].append([round(now - job["started"], 1), short])
             job["log"] = job["log"][-200:]
+        _save_jobs()
+        if s.checkpoint():                       # waits here while paused
+            raise Cancelled()
 
     with JOB_LOCK:
         job["state"] = "running"
         job["started"] = time.time()
+        job["message"] = "Starting"
+        _save_jobs(force=True)
         try:
             if kind == "analyse":
                 s.run_analysis(float(stack_params.get("sensitivity", 1.0)), progress)
@@ -237,8 +380,15 @@ def _run_job(job_id: str, kind: str, folder: str, params: dict, stack_params: di
                 _log_job_error(s, job, kind, stack_params)
         finally:
             job["ended"] = time.time()
+            if job.get("pause_started"):
+                job["paused_total"] = job.get("paused_total", 0.0) + job["ended"] - job.pop("pause_started")
+            if job.get("stage_key"):
+                job["stages"].append([job["stage_key"], round(job["ended"] - job["stage_started"] - job.get("stage_paused", 0.0), 1)])
+            job["active_seconds"] = round(_active_seconds(job), 1)
+            s.pause_flag.clear()
             PREVIEW_CACHE.clear()
             _release_device_memory()
+            _save_jobs(force=True)
 
 
 def _device_state() -> str:
@@ -294,28 +444,75 @@ def _release_device_memory():
 
 @app.post("/api/jobs")
 def start_job(body: dict = Body(...)):
+    """Queue a pipeline job; it runs when every job ahead of it has finished."""
     kind = body["kind"]
-    if kind not in ("analyse", "stack", "denoise", "all", "export"):
+    if kind not in JOB_KINDS:
         raise HTTPException(400, "unknown job kind")
-    if any(j["state"] in ("queued", "running") for j in JOBS.values()):
-        raise HTTPException(409, "Another job is already running")
+    _load_jobs()
+    s = get_session(body["folder"])
     job_id = uuid.uuid4().hex[:10]
-    JOBS[job_id] = {"id": job_id, "kind": kind, "folder": body["folder"], "state": "queued", "progress": 0.0,
-                    "message": "Queued", "log": [], "started": time.time(), "result": None}
-    t = threading.Thread(target=_run_job, args=(job_id, kind, body["folder"], body.get("params") or {},
-                                                body.get("stack_params") or {}, body.get("export") or {}),
-                         daemon=True)
-    t.start()
-    return JOBS[job_id]
+    st = s.status()
+    JOBS[job_id] = {"id": job_id, "kind": kind, "folder": body["folder"], "dataset": st.get("object") or os.path.basename(body["folder"]),
+                    "n_subs": st.get("n_files"), "state": "queued", "progress": 0.0, "message": "Waiting in the queue",
+                    "log": [], "stages": [], "created": time.time(), "started": None, "result": None,
+                    "params": body.get("params") or {}, "stack_params": body.get("stack_params") or {},
+                    "export_opts": body.get("export") or {}}
+    with QUEUE_LOCK:
+        QUEUE.append(job_id)
+        QUEUE_EVENT.set()
+    _ensure_worker()
+    _save_jobs(force=True)
+    return JSONResponse(clean_json(_job_view(JOBS[job_id])))
+
+
+def _external_activity() -> list[dict]:
+    """Experiments studies and synthetic-data generation run as their own processes (sharing the
+    GPU with the queue): the ones running now."""
+    import json as _json
+    out = []
+    root = os.path.join(CONFIG["workdir"], "lab")
+    for sub, kind in (("studies", "Experiment study"), ("synthetic", "Synthetic dataset")):
+        d0 = os.path.join(root, sub)
+        if not os.path.isdir(d0):
+            continue
+        for name in sorted(os.listdir(d0)):
+            d = os.path.join(d0, name)
+            st = _read_status(d)
+            if st.get("state") not in ("starting", "preparing", "running"):
+                continue
+            item = {"kind": kind, "id": name, "state": st.get("state"), "message": st.get("message"),
+                    "started": st.get("started")}
+            try:
+                cfg = _json.load(open(os.path.join(d, "config.json")))
+                item["name"] = cfg.get("name")
+                item["device"] = cfg.get("device")
+                item["n_trials"] = cfg.get("n_trials")
+                item["trial"] = st.get("trial")
+            except Exception:
+                item["name"] = name
+            out.append(item)
+    return out
+
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 50):
+    _load_jobs()
+    order = {"running": 0, "paused": 0, "queued": 1}
+    snap = list(JOBS.values())
+    active = sorted([j for j in snap if j["state"] in ACTIVE],
+                    key=lambda j: (order[j["state"]], QUEUE.index(j["id"]) if j["id"] in QUEUE else -1))
+    done = sorted([j for j in snap if j["state"] not in ACTIVE],
+                  key=lambda j: j.get("ended") or j.get("created") or 0, reverse=True)[:limit]
+    return JSONResponse(clean_json({"active": [_job_view(j) for j in active], "history": [_job_view(j) for j in done],
+                                    "external": _external_activity()}))
 
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
+    _load_jobs()
     if job_id not in JOBS:
         raise HTTPException(404)
-    j = dict(JOBS[job_id])
-    j["elapsed"] = round((j.get("ended") or time.time()) - j["started"], 1)
-    return JSONResponse(clean_json(j))
+    return JSONResponse(clean_json(_job_view(JOBS[job_id])))
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -323,7 +520,63 @@ def cancel_job(job_id: str):
     j = JOBS.get(job_id)
     if not j:
         raise HTTPException(404)
-    get_session(j["folder"]).cancel_flag.set()
+    if j["state"] == "queued":
+        with QUEUE_LOCK:
+            if job_id in QUEUE:
+                QUEUE.remove(job_id)
+        j.update(state="cancelled", message="Removed from the queue", ended=time.time())
+    elif j["state"] in ("running", "paused"):
+        s = get_session(j["folder"])
+        s.cancel_flag.set()
+        s.pause_flag.clear()
+        j["message"] = "Cancelling at the next checkpoint"
+    _save_jobs(force=True)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/pause")
+def pause_job(job_id: str):
+    """Pause a running job: it stops at its next checkpoint (a frame, a sub, an ImageMM iteration)
+    and keeps its memory (and GPU memory) until it is resumed or cancelled."""
+    j = JOBS.get(job_id)
+    if not j or j["state"] != "running":
+        raise HTTPException(409, "Only a running job can be paused")
+    get_session(j["folder"]).pause_flag.set()
+    j["state"] = "paused"
+    j["pause_started"] = time.time()
+    _save_jobs(force=True)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    j = JOBS.get(job_id)
+    if not j or j["state"] != "paused":
+        raise HTTPException(409, "The job is not paused")
+    now = time.time()
+    dt = now - j.pop("pause_started", now)
+    j["paused_total"] = j.get("paused_total", 0.0) + dt
+    j["stage_paused"] = j.get("stage_paused", 0.0) + dt
+    j["state"] = "running"
+    get_session(j["folder"]).pause_flag.clear()
+    _save_jobs(force=True)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/rerun")
+def rerun_job(job_id: str):
+    j = JOBS.get(job_id)
+    if not j:
+        raise HTTPException(404)
+    return start_job({"kind": j["kind"], "folder": j["folder"], "params": j.get("params"),
+                      "stack_params": j.get("stack_params"), "export": j.get("export_opts")})
+
+
+@app.delete("/api/jobs")
+def clear_history():
+    for k in [k for k, j in list(JOBS.items()) if j["state"] not in ACTIVE]:
+        del JOBS[k]
+    _save_jobs(force=True)
     return {"ok": True}
 
 
@@ -809,6 +1062,7 @@ def main():
     a = ap.parse_args()
     CONFIG["images"] = os.path.abspath(a.images)
     CONFIG["workdir"] = os.path.abspath(a.workdir)
+    _load_jobs()
     import uvicorn
     print(f"AstroPhoto Studio {__version__} web UI -> http://{a.host}:{a.port}")
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")

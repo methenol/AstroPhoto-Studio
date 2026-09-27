@@ -461,7 +461,7 @@ class NetworkTask(Task):
         sky = _sky_map(full, int(64 * s))
         mf = None
         if int(p["groups"]):
-            mf = ctx["session"].multiframe_targets(int(p["groups"]), 1.1, "empirical")
+            mf = ctx["session"].multiframe_targets(int(p["groups"]), 1.1, "empirical", device=dev)
             # the targets cover the whole reference (1x) grid: crop them to the training region,
             # whose origin (Y0, X0) is on that grid (the stack crop starts at s Y0, s X0)
             H0, W0 = es.H0, es.W0

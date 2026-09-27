@@ -136,9 +136,11 @@ class Integrator:
         self.local_norm = local_norm and len(self.items) >= 3
         # each in-flight frame holds values+weights at output resolution; keep RAM bounded
         # (values + weights + warp temporaries ~ 2.5x a frame), bounded by a RAM budget
-        frame_gb = self.W * self.H * 3 * 4 * 2 * 2.5 / 2**30
-        budget_gb = float(os.environ.get("ASTROPHOTO_STACK_RAM_GB", 3.0))
-        self.workers = workers or int(max(1, min(6, (os.cpu_count() or 4) // 2, budget_gb // max(frame_gb, 0.05))))
+        # threads (OpenCV warps and NumPy release the interpreter lock): every core but one, as
+        # many frames in flight as fit in half the machine's RAM (ASTROPHOTO_STACK_RAM_GB overrides)
+        from .resources import workers_for
+        frame_bytes = self.W * self.H * 3 * 4 * 2 * 2.5
+        self.workers = workers or workers_for(frame_bytes, "ASTROPHOTO_STACK_RAM_GB")
         self.progress = progress or (lambda *a: None)
         self.cancel = cancel or (lambda: False)
         self.grid = analysis["grid"]

@@ -134,6 +134,25 @@ def poly_terms(x, y, deg=3):
     return np.stack([x ** i * y ** j for i in range(deg + 1) for j in range(deg + 1 - i)], axis=-1)
 
 
+def poly_eval(x, y, deg, *coefs):
+    """poly_terms(x, y, deg) @ c for each coefficient vector c, without building the term
+    matrix (for full-frame coordinate maps it is 10 x the size of the frame): the same terms
+    x^i y^j in the same order, accumulated from precomputed powers."""
+    xp, yp = [np.ones_like(x)], [np.ones_like(y)]
+    for _ in range(deg):
+        xp.append(xp[-1] * x)
+        yp.append(yp[-1] * y)
+    out = [np.zeros_like(x, dtype=np.float64) for _ in coefs]
+    k = 0
+    for i in range(deg + 1):
+        for j in range(deg + 1 - i):
+            t = xp[i] * yp[j]
+            for o, c in zip(out, coefs):
+                o += c[k] * t
+            k += 1
+    return out
+
+
 def fit_distortion(src, ref_stars, M, width, height, deg=3):
     """Fit a polynomial *inverse* mapping reference -> frame pixel coordinates.
 
@@ -225,7 +244,8 @@ def _robust_z(x: np.ndarray) -> np.ndarray:
 def analyse(infos: list[FrameInfo], defects: np.ndarray | None, progress=None,
             workers: int | None = None, sensitivity: float = 1.0) -> dict:
     """Run the full per-frame analysis. ``sensitivity`` >1 rejects more aggressively."""
-    workers = workers or max(1, min(8, (os.cpu_count() or 4) - 2))
+    from .resources import workers_for
+    workers = workers or workers_for(12 * 4.0 * infos[0].width * infos[0].height, "ASTROPHOTO_ANALYSIS_RAM_GB")
     n = len(infos)
     results: list[dict] = [None] * n  # type: ignore
     with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(defects,)) as ex:

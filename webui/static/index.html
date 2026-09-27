@@ -70,7 +70,7 @@
     </section>
 
     <section class="card" id="jobCard" hidden>
-      <h3>Progress <button id="cancelJob" class="btn tiny ghost">Cancel</button></h3>
+      <h3>Progress <span><button id="pauseJob" class="btn tiny ghost" hidden>Pause</button> <button id="cancelJob" class="btn tiny ghost">Cancel</button></span></h3>
       <div class="progress"><div id="progBar"></div></div>
       <div id="progMsg" class="small"></div>
       <div id="progLog" class="log"></div>
@@ -86,6 +86,7 @@
       <button class="tab" data-tab="export">Export</button>
       <button class="tab" data-tab="diag">Diagnostics</button>
       <button class="tab" data-tab="lab">Experiments</button>
+      <button class="tab" data-tab="jobs">Jobs <span id="jobsCount" class="pill" hidden></span></button>
     </nav>
 
     <!-- PROCESS -->
@@ -269,11 +270,21 @@
         </div>
       </div>
     </section>
+
+    <!-- JOBS -->
+    <section class="tabpane" id="tab-jobs">
+      <div class="jobs">
+        <div class="card"><h3>Now <span id="jobsServer" class="muted small"></span></h3><div id="jobsActive"></div></div>
+        <div class="card" id="jobsExternalCard" hidden><h3>Also using this machine</h3><div id="jobsExternal"></div></div>
+        <div class="card"><h3>History <button class="btn tiny ghost" id="jobsClear">Clear history</button></h3><div id="jobsHistory"></div></div>
+      </div>
+    </section>
   </main>
 </div>
 <div id="toast" class="toast" hidden></div>
 <script src="/static/app.js"></script>
 <script src="/static/explore.js"></script>
 <script src="/static/lab.js"></script>
+<script src="/static/jobs.js"></script>
 </body>
 </html>

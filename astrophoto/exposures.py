@@ -40,6 +40,7 @@ holds for the prepared exposure, with f the PSF measured on it:
 from __future__ import annotations
 
 import math
+import time
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,7 +48,7 @@ import cv2
 import numpy as np
 import sep
 
-from .analysis import poly_terms
+from .analysis import poly_eval, poly_terms
 from .frames import cfa_masks, fix_defects, read_raw
 
 
@@ -81,12 +82,11 @@ def source_coords(fr: dict, W0: int, H0: int, xs: np.ndarray, ys: np.ndarray,
     xs = np.asarray(xs, np.float64)
     ys = np.asarray(ys, np.float64)
     if refine is not None:
-        T = poly_terms(xs / W0 * 2 - 1, ys / H0 * 2 - 1, refine["deg"])
-        xs, ys = xs + T @ refine["coefs"][0], ys + T @ refine["coefs"][1]
+        dx, dy = poly_eval(xs / W0 * 2 - 1, ys / H0 * 2 - 1, refine["deg"], refine["coefs"][0], refine["coefs"][1])
+        xs, ys = xs + dx, ys + dy
     dist = fr.get("distortion")
     if dist is not None:
-        T = poly_terms(xs / W0 * 2 - 1, ys / H0 * 2 - 1, dist["deg"])
-        return T @ dist["coefs"][0], T @ dist["coefs"][1]
+        return tuple(poly_eval(xs / W0 * 2 - 1, ys / H0 * 2 - 1, dist["deg"], dist["coefs"][0], dist["coefs"][1]))
     A = np.vstack([np.asarray(fr["transform"], np.float64), [0, 0, 1]])
     Ai = np.linalg.inv(A)[:2]
     return Ai[0, 0] * xs + Ai[0, 1] * ys + Ai[0, 2], Ai[1, 0] * xs + Ai[1, 1] * ys + Ai[1, 2]
@@ -344,17 +344,15 @@ def fourier_shift(img: np.ndarray, dy: float, dx: float) -> np.ndarray:
     return np.fft.irfft2(np.fft.rfft2(img) * np.exp(-2j * np.pi * (ky * dy + kx * dx)), s=(h, w))
 
 
-_PSF_TABLES: dict = {}
-
-
 def _psf_star_table(cat: dict, fwhm: float, half: int) -> list:
     """PSF-star candidates of a reference catalogue, brightest first: (index, integer centre,
     neighbour mask of the cut-out).  Depends only on the catalogue, the FWHM and the cut-out
     size, so it is built once and shared by every exposure and channel."""
     from scipy.spatial import cKDTree
-    key = (id(cat), len(cat["x"]), round(float(fwhm), 3), int(half))
-    if key in _PSF_TABLES:
-        return _PSF_TABLES[key]
+    tables = cat.setdefault("_psf_tables", {})
+    key = (len(cat["x"]), round(float(fwhm), 3), int(half))
+    if key in tables:
+        return tables[key]
     rc = max(3.0, 2.0 * fwhm)
     pad = half + 8
     yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1]
@@ -389,7 +387,7 @@ def _psf_star_table(cat: dict, fwhm: float, half: int) -> list:
         elif "nn" in cat and cat["nn"][i] <= rc + 3 * fwhm:
             continue
         table.append((int(i), ix, iy, m))
-    _PSF_TABLES[key] = table
+    tables[key] = table
     return table
 
 
@@ -423,6 +421,9 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
     standard error, support radius) for model fitting.
     Returns (PSF of (2 half + 1)^2 pixels with unit sum, number of stars used[, extras])."""
     fwhm = float(fwhm) if fwhm else half / 3.5
+    # rounded up to 0.1 px: the neighbour masks and the core are then never smaller than for the
+    # exact FWHM, and the star table is built once per 0.1 px of seeing instead of once per sub
+    fwhm = math.ceil(fwhm * 10 - 1e-9) / 10
     rc = max(3.0, 2.0 * fwhm)                            # core aperture (normalisation)
     pad = half + 8
     yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1]
@@ -545,6 +546,28 @@ def fit_moffat(psf: np.ndarray, err: np.ndarray, ee: float = 0.995, max_half: in
 
 
 # ----------------------------------------------------------------- the exposure set
+_PREP_SET = None
+
+
+def _prep_worker_init(state: bytes):
+    """Worker process of ExposureSet.prepare: the set (reference, catalogue with its PSF-star
+    tables, masks) once.  One thread per process: the processes already use every core, and
+    OpenCV's own thread pool in each of them would oversubscribe the CPU."""
+    import pickle
+    global _PREP_SET
+    cv2.setNumThreads(1)
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    _PREP_SET = pickle.loads(state)
+
+
+def _prep_worker_run(k0: int, k1: int):
+    return _PREP_SET.prepare_run(k0, k1)
+
+
 class ExposureSet:
     """The prepared exposures of one session (see module docstring).
 
@@ -561,7 +584,11 @@ class ExposureSet:
         self.defects = defects if defects is not None else np.zeros((self.H0, self.W0), bool)
         self.sat = float(sat)                     # saturation in bias-subtracted ADU
         self.ref = ref.astype(np.float32)         # reference coadd on the reference (1x) grid
-        self.workers = workers or max(1, min(6, (os.cpu_count() or 4) // 2))
+        # threads for window extraction (I/O, OpenCV and NumPy release the interpreter lock)
+        from .resources import workers_for
+        frame = 4.0 * self.W0 * self.H0
+        self.workers = workers or workers_for(40 * frame, "ASTROPHOTO_PREP_RAM_GB")
+        self._worker_bytes = 30 * frame          # per preparation process: one sub's working arrays (~24 frames) + the shared state (~7)
         fw = np.array([fr["fwhm"] for _, fr in self.items], float)
         self.fwhm_max = float(np.nanmax(fw))
         self.fwhm_med = float(np.nanmedian(fw))
@@ -644,29 +671,75 @@ class ExposureSet:
         n = len(self.items)
         self.params = [None] * n
         acc = {"X": [], "v": [], "n": []}        # photon-transfer bins
-        prev = None
-        with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            futs = [ex.submit(self.prepare_one, k) for k in range(min(n, self.workers))]
+        # Worker processes, each preparing a run of consecutive subs and pairing neighbours itself
+        # (photon transfer), so only the small per-sub parameters and the pair bins travel back:
+        # shipping every prepared frame (~200 MB) to one process for the pairing left the workers
+        # blocked (measured on M 27: 20-60 % CPU each).  Processes, not threads: much of prepare_one
+        # is Python holding the interpreter lock (1 thread 4.2 s per sub, 4 threads 3.5 s, 8 threads
+        # 3.8 s).  Each run also prepares the sub before it, so the pairs are exactly those of a
+        # serial pass, merged in sub order.
+        from concurrent.futures import ProcessPoolExecutor
+        from .resources import workers_for
+        nproc = min(n, workers_for(self._worker_bytes, "ASTROPHOTO_PREP_RAM_GB"))
+        run = int(np.clip(n // max(3 * nproc, 1), 4, 16)) if nproc > 1 else n
+        chunks = [(k0, min(n, k0 + run)) for k0 in range(0, n, run)]
+        if nproc > 1:
+            import pickle
+            keys = set()
+            for _, fr in self.items:          # the PSF-star tables, built once here (as prepare_one keys them)
+                fe = max(float(fr["fwhm"]) if np.isfinite(fr["fwhm"]) else self.fwhm_max, self.fwhm_ref)
+                keys.add((math.ceil(fe * 10 - 1e-9) / 10, int(math.ceil(3.5 * fe))))
+            for fq, half in sorted(keys):
+                _psf_star_table(self.cat, fq, half)
+            ex = ProcessPoolExecutor(max_workers=nproc, initializer=_prep_worker_init,
+                                     initargs=(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL),))
+            submit = lambda c: ex.submit(_prep_worker_run, *c)
+        else:
+            ex = ThreadPoolExecutor(max_workers=1)
+            submit = lambda c: ex.submit(self.prepare_run, *c)
+        with ex:
+            futs = [submit(c) for c in chunks[:2 * max(nproc, 1)]]
             nxt = len(futs)
-            for k in range(n):
+            for ci, (k0, k1) in enumerate(chunks):
                 if cancel and cancel():
+                    for f in futs[ci:]:
+                        if f is not None:
+                            f.cancel()
                     raise RuntimeError("cancelled")
-                p = futs[k].result()
-                futs[k] = None
-                if nxt < n:
-                    futs.append(ex.submit(self.prepare_one, nxt))
+                params, own = futs[ci].result()
+                futs[ci] = None
+                if nxt < len(chunks):
+                    futs.append(submit(chunks[nxt]))
                     nxt += 1
-                if p["_y"] is None:                  # not usable: no photometric scale
-                    prev = None
-                else:
-                    if prev is not None:
-                        self._ptc_pair(prev, p, acc)
-                    prev = {kk: p[kk] for kk in ("_y", "_valid", "_surf", "T")}
-                self.params[k] = {kk: v for kk, v in p.items() if not kk.startswith("_")}
+                self.params[k0:k1] = params
+                for kk in acc:
+                    acc[kk].extend(own[kk])
                 if progress:
-                    progress(k + 1, n, f"ImageMM: preparing exposures {k + 1}/{n}")
+                    progress(k1, n, f"ImageMM: preparing exposures {k1}/{n}")
         self.ptc = self._ptc_fit(acc)
         return self
+
+    def prepare_run(self, k0: int, k1: int):
+        """prepare_one for subs k0 .. k1-1 and the photon-transfer bins of each consecutive usable
+        pair (k-1, k) with k in [k0, k1), as a serial pass forms them.  Returns (their parameters,
+        the bins)."""
+        acc = {"X": [], "v": [], "n": []}
+        prev = None
+        if k0 > 0:
+            q = self.prepare_one(k0 - 1)
+            if q["_y"] is not None:
+                prev = {kk: q[kk] for kk in ("_y", "_valid", "_surf", "T")}
+        params = []
+        for k in range(k0, k1):
+            p = self.prepare_one(k)
+            if p["_y"] is None:                  # not usable: no photometric scale
+                prev = None
+            else:
+                if prev is not None:
+                    self._ptc_pair(prev, p, acc)
+                prev = {kk: p[kk] for kk in ("_y", "_valid", "_surf", "T")}
+            params.append({kk: v for kk, v in p.items() if not kk.startswith("_")})
+        return params, acc
 
     # ------------------------------------------------------------- photon transfer
     def _ptc_pair(self, a: dict, b: dict, acc: dict, nbins: int = 32):
@@ -679,23 +752,27 @@ class ExposureSet:
         ok = a["_valid"] & b["_valid"] & ~self.smask
         for c in range(3):
             Ta, Tb = a["T"][c], b["T"][c]
-            la = self.ref[..., c] + a["_surf"][..., c]
-            lb = self.ref[..., c] + b["_surf"][..., c]
-            d = (a["_y"][..., c] / Ta - a["_surf"][..., c]) - (b["_y"][..., c] / Tb - b["_surf"][..., c])
-            lev = 0.5 * (la + lb)
-            dv, lv = d[ok], lev[ok]
+            la = (self.ref[..., c] + a["_surf"][..., c])[ok]
+            lb = (self.ref[..., c] + b["_surf"][..., c])[ok]
+            dv = ((a["_y"][..., c][ok] / Ta - a["_surf"][..., c][ok]) - (b["_y"][..., c][ok] / Tb - b["_surf"][..., c][ok]))
+            lv = 0.5 * (la + lb)
             edges = np.unique(np.quantile(lv, np.linspace(0, 1, nbins + 1)))
-            idx = np.clip(np.searchsorted(edges, lv, side="right") - 1, 0, len(edges) - 2)
+            # bin j holds edges[j] <= level < edges[j + 1] (the last bin also its upper edge): with the
+            # pixels sorted by level once, every bin is a contiguous slice
+            order = np.argsort(lv, kind="stable")
+            ls = lv[order]
+            bounds = np.searchsorted(ls, edges, side="left")
+            bounds[-1] = len(ls)
             for j in range(len(edges) - 1):
-                s = idx == j
-                if s.sum() < 500:
+                sl = order[bounds[j]:bounds[j + 1]]
+                if len(sl) < 500:
                     continue
-                dd = dv[s]
+                dd = dv[sl]
                 var = (1.4826 * np.median(np.abs(dd - np.median(dd)))) ** 2
-                l_a, l_b = np.median(la[ok][s]), np.median(lb[ok][s])
+                l_a, l_b = np.median(la[sl]), np.median(lb[sl])
                 acc["X"].append((c, 1 / Ta ** 2 + 1 / Tb ** 2, l_a / Ta + l_b / Tb))
                 acc["v"].append(var)
-                acc["n"].append(int(s.sum()))
+                acc["n"].append(int(len(sl)))
 
     @staticmethod
     def _ptc_fit(acc: dict) -> dict:
@@ -734,8 +811,10 @@ class ExposureSet:
     def save(self, path: str):
         import pickle
         with open(path, "wb") as f:
+            state = {k: getattr(self, k) for k in self._STATE}
+            state["cat"] = {k: v for k, v in state["cat"].items() if not k.startswith("_")}   # rebuilt on demand
             pickle.dump({"names": [info.name for info, _ in self.items], "prep_version": self.PREP_VERSION,
-                         **{k: getattr(self, k) for k in self._STATE}}, f)
+                         **state}, f)
 
     def load(self, path: str) -> "ExposureSet":
         import pickle

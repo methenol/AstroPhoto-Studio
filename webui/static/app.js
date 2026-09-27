@@ -141,6 +141,7 @@ async function openDataset(folder) {
     updateSteps(); renderFrames();
     if (r.status.stacked) schedulePreview(0); else showPlaceholder(true);
     refreshExports(); refreshDiag();
+    attachActiveJob();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -207,41 +208,80 @@ async function startJob(kind) {
   if (!S.folder) return toast("Open a dataset first", true);
   try {
     const job = await api("/api/jobs", { method: "POST", body: { kind, folder: S.folder, params: S.params, stack_params: stackParams(), export: exportOpts() } });
-    S.job = job; $("#jobCard").hidden = false; setJobButtons(true);
-    const stepEl = { analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise" }[kind];
-    if (stepEl) $(stepEl).classList.add("running");
+    S.job = job; $("#jobCard").hidden = false;
+    if (job.position > 1 || (job.waiting_on || []).length) toast(`Queued: ${job.label} runs after ${job.waiting_on.length} job(s) ahead of it`);
     pollJob();
   } catch (e) { toast(e.message, true); }
 }
-function setJobButtons(busy) { $$("[data-job], #exportBtn, #exportBtn2").forEach(b => b.disabled = busy); }
+// jobs run one at a time on the server; more can be queued while one runs
+function setJobButtons(busy) { }
+
+function fmtDur(s) {
+  if (s === null || s === undefined || !isFinite(s)) return "–";
+  s = Math.round(s);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), h = Math.floor(m / 60);
+  return h ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${m}m ${String(s % 60).padStart(2, "0")}s`;
+}
+function jobSummary(j) {
+  if (j.state === "queued") {
+    const w = (j.waiting_on || []).map(x => `${x.label} (${x.dataset || ""}${x.state === "paused" ? ", paused" : ""})`);
+    return `Waiting in the queue${j.position ? ` (#${j.position})` : ""}${w.length ? " — after " + w.join(", ") : ""}` +
+      (j.typical_total ? ` · takes ≈ ${fmtDur(j.typical_total)}` : "");
+  }
+  if (j.state === "paused") return `Paused · ${esc(j.message)} · ${fmtDur(j.active)} active (GPU/RAM still held)`;
+  let t = `${esc(j.message)} · ${fmtDur(j.active)}`;
+  if (j.stage_eta !== null && j.stage_eta !== undefined) t += ` · this stage ≈ ${fmtDur(j.stage_eta)} left`;
+  if (j.total_eta !== undefined) t += ` · whole job ≈ ${fmtDur(j.total_eta)} left (from ${j.typical_basis})`;
+  return t;
+}
+
+async function attachActiveJob() {
+  // after a page refresh: pick up this dataset's queued / running / paused job again
+  try {
+    const r = await api("/api/jobs");
+    const mine = r.active.find(j => j.folder === S.folder);
+    if (mine && (!S.job || S.job.id !== mine.id)) { S.job = mine; $("#jobCard").hidden = false; pollJob(); }
+  } catch { }
+}
 
 async function pollJob() {
   if (!S.job) return;
-  const j = await api(`/api/jobs/${S.job.id}`);
+  let j;
+  try { j = await api(`/api/jobs/${S.job.id}`); } catch { setTimeout(pollJob, 2000); return; }
+  if (S.job?.id !== j.id) return;
   $("#progBar").style.width = (j.progress * 100).toFixed(1) + "%";
-  $("#progMsg").textContent = `${j.message} · ${j.elapsed}s`;
-  $("#progLog").innerHTML = j.log.map(([t, m]) => `<div>${t.toFixed(0).padStart(4)}s  ${m}</div>`).join("");
+  $("#progMsg").innerHTML = jobSummary(j);
+  $("#progLog").innerHTML = (j.log || []).map(([t, m]) => `<div>${t.toFixed(0).padStart(4)}s  ${esc(m)}</div>`).join("");
   $("#progLog").scrollTop = 1e9;
-  if (j.state === "running" || j.state === "queued") { setTimeout(pollJob, 700); return; }
-  setJobButtons(false);
+  const pb = $("#pauseJob");
+  pb.hidden = !(j.state === "running" || j.state === "paused");
+  pb.textContent = j.state === "paused" ? "Resume" : "Pause";
+  const stepEl = { analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise" }[j.kind];
   $$(".steps li").forEach(li => li.classList.remove("running"));
+  if (stepEl && (j.state === "running" || j.state === "paused")) $(stepEl).classList.add("running");
+  if (["running", "queued", "paused"].includes(j.state)) { setTimeout(pollJob, j.state === "queued" ? 1500 : 800); return; }
+  $$(".steps li").forEach(li => li.classList.remove("running"));
+  pb.hidden = true;
   S.job = null;
   if (j.state === "done") {
-    toast(`${j.kind} finished in ${j.elapsed}s`);
-    const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
-    S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
-    if (S.status.stacked) schedulePreview(0);
-    if (j.kind === "export" || j.kind === "all") { refreshExports(); switchTab("export"); }
-    refreshDiag();
+    toast(`${j.label} finished in ${fmtDur(j.active)}`);
+    if (j.folder === S.folder) {
+      const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
+      S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
+      if (S.status.stacked) schedulePreview(0);
+      if (j.kind === "export" || j.kind === "all") { refreshExports(); switchTab("export"); }
+      refreshDiag();
+    }
   } else if (j.state === "error") {
     toast(j.message, true); console.error(j.traceback);
     // keep the failure on screen: the stage it reached, the traceback and the device memory
     $("#jobCard").hidden = false;
-    $("#progMsg").innerHTML = `<b style="color:var(--bad)">${esc(j.message)}</b> · ${j.elapsed}s` +
+    $("#progMsg").innerHTML = `<b style="color:var(--bad)">${esc(j.message)}</b> · ${fmtDur(j.active)}` +
       (j.stage ? `<div class="muted small">Last stage: ${esc(j.stage)}</div>` : "") +
       `<details open class="small" style="margin-top:6px"><summary>Traceback (also in job_errors.log in the session folder)</summary>` +
       `<pre class="log" style="max-height:320px;user-select:text">${esc((j.device_state ? j.device_state + "\n\n" : "") + (j.traceback || ""))}</pre></details>`;
-  } else toast("Cancelled");
+  } else toast(j.state === "interrupted" ? "Interrupted" : "Cancelled");
 }
 
 /* ------------------------------------------------------------ preview */
@@ -312,7 +352,14 @@ function bindViewer() {
   const c = $("#canvas");
   c.addEventListener("wheel", e => { e.preventDefault(); const r = c.getBoundingClientRect(); zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - r.left, e.clientY - r.top); }, { passive: false });
   let drag = null;
-  c.addEventListener("mousedown", e => {
+  // pointer events with capture: the browser's own image drag-and-drop never starts (it would
+  // swallow the button release and leave the view stuck in pan mode)
+  $$("img", c).forEach(im => { im.draggable = false; });
+  c.addEventListener("dragstart", e => e.preventDefault());
+  c.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    c.setPointerCapture(e.pointerId);
     const r = c.getBoundingClientRect();
     if (S.view === "split") {
       const ix = (e.clientX - r.left - S.zoom.x) / S.zoom.s;
@@ -320,7 +367,7 @@ function bindViewer() {
     }
     drag = { x: e.clientX, y: e.clientY, zx: S.zoom.x, zy: S.zoom.y }; c.classList.add("dragging");
   });
-  window.addEventListener("mousemove", e => {
+  c.addEventListener("pointermove", e => {
     if (!drag) return;
     if (drag.split) {
       const r = c.getBoundingClientRect();
@@ -328,7 +375,9 @@ function bindViewer() {
     }
     S.zoom.x = drag.zx + e.clientX - drag.x; S.zoom.y = drag.zy + e.clientY - drag.y; applyZoom();
   });
-  window.addEventListener("mouseup", () => { drag = null; c.classList.remove("dragging"); });
+  const end = e => { drag = null; c.classList.remove("dragging"); if (c.hasPointerCapture(e.pointerId)) c.releasePointerCapture(e.pointerId); };
+  c.addEventListener("pointerup", end);
+  c.addEventListener("pointercancel", end);
   c.addEventListener("dblclick", fitView);
   window.addEventListener("resize", fitView);
   $("#zoomFit").onclick = fitView;
@@ -438,6 +487,7 @@ function switchTab(name) {
   if (name === "diag") refreshDiag();
   if (name === "explore") setTimeout(() => Explore.show(), 30);
   if (name === "lab") Lab.show();
+  if (name === "jobs") Jobs.show();
 }
 
 /* ------------------------------------------------------------ bindings */
@@ -449,6 +499,11 @@ function bindUI() {
   };
   $$("[data-job]").forEach(b => b.onclick = () => startJob(b.dataset.job));
   $("#cancelJob").onclick = () => S.job && api(`/api/jobs/${S.job.id}/cancel`, { method: "POST" });
+  $("#pauseJob").onclick = async () => {
+    if (!S.job) return;
+    const paused = $("#pauseJob").textContent === "Resume";
+    try { await api(`/api/jobs/${S.job.id}/${paused ? "resume" : "pause"}`, { method: "POST" }); } catch (e) { toast(e.message, true); }
+  };
   $("#exportBtn").onclick = $("#exportBtn2").onclick = () => startJob("export");
   $("#resetParams").onclick = () => { S.params = currentDefaults(); applyParamsToUI(); saveParams(); schedulePreview(0); };
   $$(".tab").forEach(t => t.onclick = () => switchTab(t.dataset.tab));

@@ -111,7 +111,7 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
     every kernel exactly the iterates of a solve on its own.  Each kernel stops (is frozen)
     when its own mean squared difference falls below rel_tol x mean(f^2).
     Returns (h, per-kernel final mean squared difference)."""
-    device = device or torch.device("cpu")
+    device = device if isinstance(device, torch.device) else pick_device(device or "auto")
     N, n, _ = fs.shape
     m = up * n
     if g is None:
@@ -666,6 +666,12 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     info with the coverage map and per-cutout convergence)."""
     dev = device if isinstance(device, torch.device) else pick_device(device)
     t0 = time.time()
+
+    def _iteration_check(k, crit):
+        # ``cancel`` is the job's checkpoint: it waits while the job is paused, so a pause takes
+        # effect within one iteration instead of after the whole cutout
+        if cancel and cancel():
+            raise RuntimeError("cancelled")
     idx = es.usable()
     K = es.kernels(idx, psf_model)
     kern, eq11 = None, None
@@ -713,7 +719,7 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                 x, info = restore_cutout(es, y0, y1, x0, x1, idx=sub_idx, r=r, kernels=sub_kern, robust=robust,
                                          psf_model=psf_model, n_groups=n_groups, device=dev, delta=delta,
                                          kappa=kappa, epsilon=epsilon, max_iters=max_iters, accelerate=accelerate,
-                                         stop=stop)
+                                         stop=stop, log=_iteration_check)
                 wy = _edge_weights((y1 - y0) * r, overlap * r, y0 > 0, y1 < H0)
                 wx = _edge_weights((x1 - x0) * r, overlap * r, x0 > 0, x1 < W0)
                 wgt = np.outer(wy, wx)[..., None]

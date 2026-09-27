@@ -25,6 +25,7 @@ from PIL import Image
 
 from . import __version__
 from .analysis import analyse, finalize_selection
+from .denoise import pick_device
 from .frames import FrameInfo, build_defect_map, discover, read_raw, superpixel
 from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
 from .stacking import Integrator
@@ -164,6 +165,7 @@ class Session:
         self._lin_cache: tuple[str, np.ndarray, dict] | None = None
         self.lock = threading.RLock()
         self.cancel_flag = threading.Event()
+        self.pause_flag = threading.Event()      # set: long stages wait at their next checkpoint
         self._load_state()
 
     # ------------------------------------------------------------- persistence
@@ -206,6 +208,13 @@ class Session:
             "object": self.infos[0].object if self.infos else None,
             "narrowband": is_narrowband(self.infos[0].filter) if self.infos else None,
         }
+
+    def checkpoint(self) -> bool:
+        """Called by every long stage between units of work (a frame, a sub, an iteration):
+        waits here while the job is paused, and returns True when it has been cancelled."""
+        while self.pause_flag.is_set() and not self.cancel_flag.is_set():
+            time.sleep(0.25)
+        return self.cancel_flag.is_set()
 
     def _check_cancel(self):
         if self.cancel_flag.is_set():
@@ -320,7 +329,7 @@ class Session:
             integ = Integrator(self.infos, self.analysis, self.defects, mode=p["mode"], scale=float(p["scale"]),
                                sigma_low=float(p["sigma_low"]), sigma_high=float(p["sigma_high"]),
                                local_norm=bool(p["local_norm"]), progress=progress,
-                               cancel=self.cancel_flag.is_set)
+                               cancel=self.checkpoint)
             out = integ.run()
             hdr = fits.Header()
             info0 = self.infos[0]
@@ -370,12 +379,12 @@ class Session:
         # is stale once they are prepared again
         for f in glob.glob(self._p("imagemm/mf_targets_*.pkl")):
             os.remove(f)
-        es.prepare(progress=progress, cancel=self.cancel_flag.is_set)
+        es.prepare(progress=progress, cancel=self.checkpoint)
         os.makedirs(self._p("imagemm"), exist_ok=True)
         es.save(path)
         return es
 
-    def multiframe_targets(self, n_groups: int, sigma: float, psf_model: str, progress=None) -> dict:
+    def multiframe_targets(self, n_groups: int, sigma: float, psf_model: str, progress=None, device="auto") -> dict:
         """Targets of the deconvolution network's multi-frame data term: seeing-group coadds of
         the odd subs (for the half-A input, which holds the even subs) and of the even subs
         (for half B), with their PSFs on the stack grid - the group PSF for a 1x stack, the
@@ -395,13 +404,13 @@ class Session:
         sets = []
         for parity in (1, 0):                       # half A = even stacker frames -> odd-sub targets
             idx = [k for k in use if k % 2 == parity]
-            T_ = es.group_coadds(idx, n_groups, psf_model, progress=progress, cancel=self.cancel_flag.is_set)
+            T_ = es.group_coadds(idx, n_groups, psf_model, progress=progress, cancel=self.checkpoint)
             # the network works in the stack's units, sky pedestal included: put the reference
             # sky model the exposures were background-subtracted by back into the targets
             T_["y"] = T_["y"] + es.sky_ref[None]
             T_["sky_included"] = True
             if s > 1:
-                T_["kernels"], _ = superresolved_kernels(T_["kernels"], s, sigma)
+                T_["kernels"], _ = superresolved_kernels(T_["kernels"], s, sigma, device=pick_device(device))
             sets.append(T_)
         mf = {"sets": sets, "s": s, "delta": 2.0}
         with open(cache, "wb") as f:            # imagemm/ is cleared when the session is restacked
@@ -430,7 +439,7 @@ class Session:
                     max_iters=int(p["imagemm_max_iters"]),
                     accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
                     n2n_iters=int(p["denoise_iters"]), device=p["device"], progress=progress,
-                    cancel=self.cancel_flag.is_set)
+                    cancel=self.checkpoint)
                 cov = info.pop("coverage").mean(-1)
                 _save_fits(self._p("imagemm.fits"), lat)
                 _save_fits(self._p("imagemm_coverage.fits"), (cov / max(float(cov.max()), 1e-12)).astype(np.float32))
@@ -441,11 +450,11 @@ class Session:
                 mf = None
                 if method == "network" and int(p.get("network_groups") or 0) > 0:
                     mf = self.multiframe_targets(int(p["network_groups"]), float(p.get("imagemm_sigma") or 0) or 1.1,
-                                                 p["imagemm_psf"], progress)
+                                                 p["imagemm_psf"], progress, device=p["device"])
                 a, b = _load_fits(self._p("half_a.fits")), _load_fits(self._p("half_b.fits"))
                 den, sharp, info = n2n_restore(
                     a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
-                    progress=progress, cancel=self.cancel_flag.is_set, deconvolve=method == "network",
+                    progress=progress, cancel=self.checkpoint, deconvolve=method == "network",
                     sat=self.meta.get("saturation", 63471.0), px_scale=float(self.meta.get("scale", 1.0)),
                     save_path=self._p("restore_nets.pt"), mf=mf)
                 del a, b
