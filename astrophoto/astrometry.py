@@ -120,7 +120,9 @@ def gaia_cone(ra: float, dec: float, radius: float, gmax: float, epoch: float) -
 def simbad_cone(ra: float, dec: float, radius: float) -> list[dict]:
     """Every SIMBAD object within ``radius`` degrees: identifiers, type, V magnitude,
     spectral / morphological type, parallax, redshift and angular size."""
-    q = f"""SELECT b.oid, b.main_id, b.ra, b.dec, b.otype, b.sp_type, b.morph_type, b.plx_value, b.plx_err,
+    # b.oid is only needed for the joins, not returned: it is a 64-bit integer that the VOTable
+    # reader cannot convert on Windows (C long is 32 bits there)
+    q = f"""SELECT b.main_id, b.ra, b.dec, b.otype, b.sp_type, b.morph_type, b.plx_value, b.plx_err,
         b.rvz_redshift, b.rvz_radvel, b.galdim_majaxis, b.galdim_minaxis, b.galdim_angle, b.nbref,
         f.flux AS vmag, i.ids
         FROM basic AS b

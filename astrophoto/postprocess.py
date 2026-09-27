@@ -639,11 +639,32 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
 
 
 def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.ndarray | None = None,
-              noise_ref: float | None = None) -> np.ndarray:
-    """Soft star mask built from photometric star profiles (Gaussian + wings)."""
-    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0)
+              noise_ref: float | None = None, detect_L: np.ndarray | None = None,
+              restored_sigma: float | None = None) -> np.ndarray:
+    """Soft star mask built from photometric star profiles (Gaussian + wings).
+
+    A restoration (ImageMM) is different: its stars are points seen through the display
+    Gaussian g_sigma (``restored_sigma``, in pixels of ``L``), with no wings or halos left
+    (they were deconvolved into the cores), and its sky noise is sparse positive speckle that
+    looks like faint stars.  Stars are then found on ``detect_L``, the coadd the restoration
+    was made from (same grid and scale; honest Gaussian noise, so speckle is never taken for
+    a star), and each mask extends to where the star's Gaussian falls to the noise floor."""
     h, w = L.shape
     mask = np.zeros((h, w), np.float32)
+    if restored_sigma is not None and detect_L is not None:
+        objs, rms, _ = detect_stars_for_mask(detect_L, px_scale, noise_ref or 0.0)
+        if len(objs) == 0:
+            return mask
+        sig = max(float(restored_sigma), 0.5)
+        peak = np.maximum(objs["flux"], 0) / (2 * np.pi * sig ** 2)       # the restoration conserves flux
+        ratio = np.maximum(peak / max(rms, noise_ref or 0.0, 1e-12), 1.01)
+        r = sig * np.sqrt(2 * np.log(ratio)) * 1.35 * grow + 1.0
+        r = np.clip(r, 1.5, 0.02 * max(h, w))
+        for x, y, rr in zip(objs["x"], objs["y"], r):
+            cv2.circle(mask, (int(round(x)), int(round(y))), int(np.ceil(rr)), 1.0, -1, lineType=cv2.LINE_AA)
+        star_mask.last_expanded = 0
+        return np.clip(mask, 0, 1)
+    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0)
     if len(objs) == 0:
         return mask
     sigma = max(fw, 1.0) / 2.3548
@@ -1098,8 +1119,12 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     # --- star separation (in linear space)
     tick("Separating stars")
     nref = p.get("_noise_ref")
-    lin = neutralize_star_halos(lin, min(1.0, 1.6 * float(p["halo_suppress"])), px_scale,
-                                noise_ref=(nref * px_scale) if nref else None)
+    # a restoration (ImageMM) has no star halos: the halo light was deconvolved into the cores
+    restored_sigma = p.get("_restored_sigma")
+    detect_ref = p.get("_detect_ref")
+    if restored_sigma is None:
+        lin = neutralize_star_halos(lin, min(1.0, 1.6 * float(p["halo_suppress"])), px_scale,
+                                    noise_ref=(nref * px_scale) if nref else None)
     if p["star_separation"]:
         key = (lin.shape, float(px_scale), float(lin[::97, ::89].sum()))
         if key in _SEP_CACHE:
@@ -1107,7 +1132,9 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         else:
             L = luminance(lin)
             nref = p.get("_noise_ref")
-            smask = star_mask(L, px_scale, rgb=lin, noise_ref=(nref * px_scale) if nref else None)
+            smask = star_mask(L, px_scale, rgb=lin, noise_ref=(nref * px_scale) if nref else None,
+                              detect_L=luminance(detect_ref) if detect_ref is not None else None,
+                              restored_sigma=(restored_sigma * px_scale) if restored_sigma is not None else None)
             starless = inpaint_stars(lin, smask)
             # linear star layer, soft-thresholded above the noise floor and confined to the mask
             diff = lin - starless

@@ -519,21 +519,38 @@ class Session:
                                          progress=progress, restored=True, clip_ref=clip_ref)
                 info["restoration"] = "ImageMM"
                 info["upscaled"] = img.shape[1] / st["stack"].shape[1]
+                # the coadd on the same grid, cropped and scaled like the output: stars are found on
+                # it (the restoration's sky speckle would pass for faint stars)
+                det = clip_ref
+                if info.get("crop"):
+                    y0, y1, x0, x1 = info["crop"]
+                    det = det[y0:y1, x0:x1]
+                detect = np.ascontiguousarray(det / float(info.get("white_level", self.meta.get("saturation", 63471.0))),
+                                              np.float32)
+                info["restored_sigma"] = float(p.get("restored_resolution", 1.0)) * int(self._restore_info().get("r", 1) or 1)
             else:
+                detect = None
                 den = self._load_denoised()
                 sharp = self._load_sharp() if den is not None else None
                 lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
                                          progress=progress, sharp=sharp)
-            self._lin_cache = (key, lin, info)
+            self._lin_cache = (key, lin, info, detect)
             return lin, info
 
     def render(self, params: dict, max_size: int | None = 1400, progress=None) -> tuple[np.ndarray, dict]:
         lin, info = self.linear(params, progress)
+        detect = self._lin_cache[3] if self._lin_cache and len(self._lin_cache) > 3 else None
         f = 1.0
         if max_size and max(lin.shape[:2]) > max_size:
             f = max_size / max(lin.shape[:2])
-            lin = cv2.resize(lin, (int(lin.shape[1] * f), int(lin.shape[0] * f)), interpolation=cv2.INTER_AREA)
+            size = (int(lin.shape[1] * f), int(lin.shape[0] * f))
+            lin = cv2.resize(lin, size, interpolation=cv2.INTER_AREA)
+            if detect is not None:
+                detect = cv2.resize(detect, size, interpolation=cv2.INTER_AREA)
         params = {**params, "_noise_ref": info.get("noise_ref")}
+        if info.get("restoration") == "ImageMM":
+            params["_restored_sigma"] = info.get("restored_sigma", 1.0)
+            params["_detect_ref"] = detect
         out = nonlinear_stage(lin, params, self.meta.get("filter", ""), px_scale=f, progress=progress)
         return out, info
 
