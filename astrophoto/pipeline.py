@@ -478,8 +478,12 @@ class Session:
         if self._restoration_method() != "imagemm" or not os.path.exists(self._p("imagemm.fits")):
             return None
         if self._restored_cache is None:
-            self._restored_cache = {"image": _load_fits(self._p("imagemm.fits")),
-                                    "coverage": _load_fits(self._p("imagemm_coverage.fits"))}
+            img = _load_fits(self._p("imagemm.fits"))
+            bad = int((~np.isfinite(img)).sum())
+            if bad:
+                raise RuntimeError(f"The ImageMM restoration (imagemm.fits) has {bad} non-finite pixels "
+                                   f"({bad / img.size:.3%}); run Restore again")
+            self._restored_cache = {"image": img, "coverage": _load_fits(self._p("imagemm_coverage.fits"))}
         return self._restored_cache
 
     def _restore_info(self) -> dict:

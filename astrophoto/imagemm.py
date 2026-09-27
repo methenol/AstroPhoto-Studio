@@ -607,6 +607,10 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     k = 3 * s
     fwd = lambda x: np.arcsinh(x / k).astype(np.float32)
     ua, ub = fwd(xa), fwd(xb)
+    # predictions are mapped back with sinh, which overflows float32 beyond ~89: bound them to
+    # the range the data span in this domain (with a margin), beyond which they mean nothing
+    u_lo = float(min(ua.min(), ub.min())) - 1.0
+    u_hi = float(max(ua.max(), ub.max())) + 1.0
     ta = torch.from_numpy(np.ascontiguousarray(np.moveaxis(xa, -1, 0)))
     tb = torch.from_numpy(np.ascontiguousarray(np.moveaxis(xb, -1, 0)))
     tua = torch.from_numpy(np.ascontiguousarray(np.moveaxis(ua, -1, 0)))
@@ -634,9 +638,11 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
         inp, tgt, lin_in = (torch.stack(z).to(device) for z in (inp, tgt, lin_in))
         with _autocast(device):
             u = net(inp)
-        pred = torch.sinh(u.float()) * kt                       # linear prediction
+        pred = torch.sinh(u.float().clamp(u_lo, u_hi)) * kt     # linear prediction
         wgt = 1.0 / (1.0 + (lin_in / kt) ** 2)                   # depends on the input only
         loss = (wgt * (pred - tgt) ** 2).mean()
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"ImageMM Noise2Noise pass: the training loss is not finite at step {it}")
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -646,7 +652,11 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
             progress(it + 1, iters, f"ImageMM Noise2Noise pass {it + 1}/{iters} ({time.time() - t0:.0f}s)")
     net.eval()
     tta = 8 if device.type != "cpu" else 2
-    out = 0.5 * (np.sinh(infer(net, ua, tta=tta)) * k + np.sinh(infer(net, ub, tta=tta)) * k)
+    back = lambda u: np.sinh(np.clip(u, u_lo, u_hi)) * k
+    out = 0.5 * (back(infer(net, ua, tta=tta)) + back(infer(net, ub, tta=tta)))
+    bad = int((~np.isfinite(out)).sum())
+    if bad:
+        raise RuntimeError(f"ImageMM Noise2Noise pass: {bad} non-finite pixels in the output")
     return out.astype(np.float32), {"noise_scale": s.tolist(), "iters": iters}
 
 
@@ -765,6 +775,9 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         torch.mps.empty_cache()
     elif dev.type == "cuda":
         torch.cuda.empty_cache()
+    bad = int((~np.isfinite(out)).sum())
+    if bad:                       # never save (and later render) a restoration with NaN / inf pixels
+        raise RuntimeError(f"ImageMM restoration: {bad} non-finite pixels ({bad / out.size:.2%}) in the result")
     return out, {"method": "ImageMM (arXiv:2501.03002), Algorithm " + ("2" if kern is not None else ("3" if robust else "1")),
                  "robust": robust, "delta": delta, "kappa": kappa, "epsilon": epsilon, "stop": stop, "r": r, "eq11": eq11,
                  "psf_model": psf_model, "n_groups": n_groups, "accelerate": accelerate, "n2n": n2n_info,
