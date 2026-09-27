@@ -41,7 +41,10 @@ STACK_DEFAULTS = {
     "deconv_method": "imagemm",  # imagemm | network | none  (best on held-out subs: experiments/README.md)
     # ImageMM (arXiv:2501.03002) on the individual subs, see astrophoto/imagemm.py
     "imagemm_r": 1,          # super-resolution factor r (Algorithm 2 for r > 1)
-    "imagemm_sigma": 0.0,    # g_sigma of Eq. 11 in latent pixels; 0 = none for r = 1, 1.1 for r > 1
+    "imagemm_sigma": 0.0,    # g_sigma of Eq. 11 in latent pixels; 0 = the paper's value (1 at r = 1, 1.1 at r = 2).
+                             # A latent without g_sigma (the sky at unlimited resolution) violates the
+                             # sampling theorem and rings: holes around stars on bright backgrounds
+                             # (Magain, Courbin & Sohy 1998); the paper avoids it with Eq. 11
     "imagemm_robust": True,  # Algorithm 3 (Huber, delta = 2) instead of the L2 loss
     "imagemm_delta": 2.0,    # Huber threshold delta of Algorithm 3 (the paper: 2)
     "imagemm_kappa": 2.0,    # clipping of the multiplicative update, kappa (the paper: 2)
@@ -417,7 +420,8 @@ class Session:
             if method == "imagemm":
                 from . import imagemm
                 es = self.exposure_set(progress)
-                sigma = float(p.get("imagemm_sigma") or 0) or None
+                r_ = int(p["imagemm_r"])
+                sigma = float(p.get("imagemm_sigma") or 0) or (1.1 if r_ > 1 else 1.0)
                 lat, info = imagemm.restore(
                     es, r=int(p["imagemm_r"]), sigma=sigma, psf_model=p["imagemm_psf"],
                     n_groups=int(p["imagemm_groups"]), robust=bool(p["imagemm_robust"]),

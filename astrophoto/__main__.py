@@ -51,7 +51,7 @@ def main(argv=None):
                    help="restoration: N2N deconvolution network, ImageMM (arXiv:2501.03002) on the subs, or none")
     r.add_argument("--imagemm-r", type=int, default=STACK_DEFAULTS["imagemm_r"], help="ImageMM super-resolution factor")
     r.add_argument("--imagemm-sigma", type=float, default=STACK_DEFAULTS["imagemm_sigma"],
-                   help="g_sigma of Eq. 11 in latent pixels (0: none for r=1, 1.1 for r>1)")
+                   help="g_sigma of Eq. 11 in latent pixels (0: the paper's value, 1 for r=1 and 1.1 for r=2)")
     r.add_argument("--imagemm-l2", action="store_true", help="L2 loss (Algorithm 1/2) instead of Huber (Algorithm 3)")
     r.add_argument("--imagemm-delta", type=float, default=STACK_DEFAULTS["imagemm_delta"],
                    help="Huber threshold delta (Algorithm 3)")

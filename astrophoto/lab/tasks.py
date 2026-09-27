@@ -188,7 +188,7 @@ class ImageMMTask(Task):
          "default": 1000, "tune": False, "pipeline": "imagemm_max_iters"},
         {"name": "r", "label": "Super-resolution r", "type": "categorical", "choices": [1, 2], "default": 1,
          "tune": False, "pipeline": "imagemm_r"},
-        {"name": "sigma", "label": "g_σ of Eq. 11 (0 = none at r = 1, 1.1 at r = 2)", "type": "float", "low": 0.0,
+        {"name": "sigma", "label": "g_σ of Eq. 11 (0 = the paper's: 1 at r = 1, 1.1 at r = 2)", "type": "float", "low": 0.0,
          "high": 1.6, "default": 0.0, "tune": False, "pipeline": "imagemm_sigma"},
     ]
     metrics = {
@@ -247,7 +247,7 @@ class ImageMMTask(Task):
         from .. import imagemm as M
         es, window, dev = ctx["es"], ctx["window"], ctx["device"]
         r = int(p["r"])
-        sigma = float(p["sigma"]) if float(p["sigma"]) > 0 else (1.1 if r > 1 else None)
+        sigma = float(p["sigma"]) if float(p["sigma"]) > 0 else (1.1 if r > 1 else 1.0)
         # the held-out subs are always predicted through their measured (empirical) PSFs, the
         # same yardstick for every trial whatever PSF model the trial restores with
         kern = None

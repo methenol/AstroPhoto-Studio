@@ -243,6 +243,17 @@ PSFs (see below).
   field at 2× would take days, so it is an option.
 * **Moffat PSFs, seeing groups, Noise2Noise pass and the network's multi-frame loss: off.**
   None of them is better. Groups remain a speed option.
+* **Target resolution g_σ: the paper's (σ = 1 at 1×, 1.1 at 2×).** An earlier default
+  was σ = 0: the sky at unlimited resolution. The held-out score cannot see what that does.
+  It violates the sampling theorem, and the restoration rings (Magain, Courbin & Sohy 1998,
+  ApJ 494, 472). Measured on 8 stars on M 27's nebula in a 260-sub restoration, viewed
+  through g_1:
+  * the ring 3–7 px out lies below the local nebula for half of them (median −10%), while
+    in the stack it is +19%;
+  * the deepest pixel within 12 px is 88% below the local nebula: a hole.
+
+  After processing these showed as black discs around stars on bright backgrounds (the
+  M 31 disc). Eq. 11 with g_σ is how the paper avoids this.
 
 The networks were trained with the benchmark window (plus 64 px) excluded from every
 patch, including the multi-frame targets. They predict the window from half A only, and are
