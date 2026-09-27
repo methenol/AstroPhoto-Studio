@@ -179,6 +179,20 @@ function applyExperiment(id) {
 }
 document.addEventListener("change", e => { if (e.target.id === "sp-experiment") applyExperiment(e.target.value); });
 
+function resetStackParams() {
+  // every option back to the pipeline's STACK_DEFAULTS (served by /api/system)
+  const D = S.system.stack_defaults;
+  for (const [k, v] of Object.entries(D)) {
+    const el = $("#sp-" + k); if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!v;
+    else el.value = String(v);
+    if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
+  }
+  $("#sp-experiment").value = ""; $("#sp-experiment-info").textContent = "";
+  $("#sp-deconv_method").dispatchEvent(new Event("change", { bubbles: true }));
+  toast("Integration & compute options reset to defaults");
+}
+
 /* ------------------------------------------------------------ jobs */
 // ImageMM options only matter for the ImageMM restoration
 document.addEventListener("change", e => {
@@ -524,6 +538,7 @@ function bindUI() {
   bindViewer();
   loadExperimentChoices();
   $(".sidebar details.adv").addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
+  $("#spReset").onclick = resetStackParams;
 }
 
 init().catch(e => toast(e.message, true));

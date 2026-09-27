@@ -37,6 +37,7 @@
 
       <details class="adv">
         <summary>Integration &amp; compute options</summary>
+        <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn tiny ghost" id="spReset" title="Set every option below back to the pipeline's defaults">Reset to defaults</button></div>
         <label title="Apply the pipeline settings of an experiment's best trial (Experiments tab). Single objective: the trial with the best value; two objectives: the Pareto-optimal trial that is best on the first. Every setting the trial ran with is applied, tuned or held fixed.">From experiment <select id="sp-experiment"><option value="">—</option></select></label>
         <div id="sp-experiment-info" class="muted small"></div>
         <label>Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
