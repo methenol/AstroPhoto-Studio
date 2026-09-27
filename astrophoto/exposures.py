@@ -42,7 +42,7 @@ from __future__ import annotations
 import math
 import time
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import cv2
 import numpy as np
@@ -547,14 +547,16 @@ def fit_moffat(psf: np.ndarray, err: np.ndarray, ee: float = 0.995, max_half: in
 
 # ----------------------------------------------------------------- the exposure set
 _PREP_SET = None
+_PREP_COUNTER = None
 
 
-def _prep_worker_init(state: bytes):
+def _prep_worker_init(state: bytes, counter=None):
     """Worker process of ExposureSet.prepare: the set (reference, catalogue with its PSF-star
     tables, masks) once.  One thread per process: the processes already use every core, and
     OpenCV's own thread pool in each of them would oversubscribe the CPU."""
     import pickle
-    global _PREP_SET
+    global _PREP_SET, _PREP_COUNTER
+    _PREP_COUNTER = counter
     cv2.setNumThreads(1)
     try:
         import torch
@@ -565,7 +567,11 @@ def _prep_worker_init(state: bytes):
 
 
 def _prep_worker_run(k0: int, k1: int):
-    return _PREP_SET.prepare_run(k0, k1)
+    def tick():
+        if _PREP_COUNTER is not None:
+            with _PREP_COUNTER.get_lock():
+                _PREP_COUNTER.value += 1
+    return _PREP_SET.prepare_run(k0, k1, tick=tick)
 
 
 class ExposureSet:
@@ -663,6 +669,8 @@ class ExposureSet:
     # ------------------------------------------------------------- the pass
     def prepare(self, progress=None, cancel=None):
         from .postprocess import background_model
+        say = (lambda msg: progress(0, len(self.items), msg)) if progress else (lambda msg: None)
+        say("ImageMM: reference sky model and star catalogue")
         self.sky_ref, self.sky_info = background_model(self.ref, "poly", 2)
         ref_bs = self.ref - self.sky_ref
         self.fwhm_ref = self.fwhm_med
@@ -689,14 +697,21 @@ class ExposureSet:
             for _, fr in self.items:          # the PSF-star tables, built once here (as prepare_one keys them)
                 fe = max(float(fr["fwhm"]) if np.isfinite(fr["fwhm"]) else self.fwhm_max, self.fwhm_ref)
                 keys.add((math.ceil(fe * 10 - 1e-9) / 10, int(math.ceil(3.5 * fe))))
-            for fq, half in sorted(keys):
+            for i, (fq, half) in enumerate(sorted(keys)):
+                say(f"ImageMM: PSF-star table {i + 1}/{len(keys)} (FWHM {fq:.1f} px)")
                 _psf_star_table(self.cat, fq, half)
-            ex = ProcessPoolExecutor(max_workers=nproc, initializer=_prep_worker_init,
-                                     initargs=(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL),))
+            say(f"ImageMM: starting {nproc} worker processes")
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            counter = ctx.Value("i", 0)            # subs prepared so far, over all workers
+            ex = ProcessPoolExecutor(max_workers=nproc, mp_context=ctx, initializer=_prep_worker_init,
+                                     initargs=(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL), counter))
             submit = lambda c: ex.submit(_prep_worker_run, *c)
         else:
+            import threading as _th
+            counter = type("C", (), {"value": 0, "get_lock": lambda self_: _th.Lock()})()
             ex = ThreadPoolExecutor(max_workers=1)
-            submit = lambda c: ex.submit(self.prepare_run, *c)
+            submit = lambda c: ex.submit(self.prepare_run, *c, tick=lambda: setattr(counter, "value", counter.value + 1))
         with ex:
             futs = [submit(c) for c in chunks[:2 * max(nproc, 1)]]
             nxt = len(futs)
@@ -706,7 +721,21 @@ class ExposureSet:
                         if f is not None:
                             f.cancel()
                     raise RuntimeError("cancelled")
-                params, own = futs[ci].result()
+                # report every sub as the workers finish it (runs return whole), and honour a pause
+                # or cancel while waiting
+                while True:
+                    try:
+                        params, own = futs[ci].result(timeout=1.0)
+                        break
+                    except TimeoutError:
+                        if cancel and cancel():
+                            for f in futs[ci:]:
+                                if f is not None:
+                                    f.cancel()
+                            raise RuntimeError("cancelled")
+                        if progress:
+                            done = min(counter.value, n)
+                            progress(done, n, f"ImageMM: preparing exposures {done}/{n}")
                 futs[ci] = None
                 if nxt < len(chunks):
                     futs.append(submit(chunks[nxt]))
@@ -719,7 +748,7 @@ class ExposureSet:
         self.ptc = self._ptc_fit(acc)
         return self
 
-    def prepare_run(self, k0: int, k1: int):
+    def prepare_run(self, k0: int, k1: int, tick=None):
         """prepare_one for subs k0 .. k1-1 and the photon-transfer bins of each consecutive usable
         pair (k-1, k) with k in [k0, k1), as a serial pass forms them.  Returns (their parameters,
         the bins)."""
@@ -732,6 +761,8 @@ class ExposureSet:
         params = []
         for k in range(k0, k1):
             p = self.prepare_one(k)
+            if tick:
+                tick()
             if p["_y"] is None:                  # not usable: no photometric scale
                 prev = None
             else:
