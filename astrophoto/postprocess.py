@@ -1176,7 +1176,14 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         yv = ghs_fast(np.clip((grid - bp) / (1 - bp), 0, 1), D, b, sp)
         x0 = float(grid[min(np.searchsorted(yv, knee), len(grid) - 1)])
         sig_b = max(4.0, 0.008 * max(Lsl.shape))
-        B = cv2.GaussianBlur(Lsl, (0, 0), sig_b)
+        # the brightness of *extended* structure only: stars (whatever is left of them in the starless
+        # layer, or all of them without star separation) are removed by a morphological opening
+        # first.  Otherwise a star's core drives the compression of its surroundings: a deconvolved
+        # or restored star, its light packed into a few pixels, darkens a disc ~2 sig_b across
+        k_open = max(5, int(round(1.5 * sig_b)) | 1)
+        opened = cv2.morphologyEx(np.ascontiguousarray(Lsl, np.float32), cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open)))
+        B = cv2.GaussianBlur(opened, (0, 0), sig_b)
         g = np.power(1 + np.maximum(B / max(x0, 1e-9) - 1, 0), -hdr).astype(np.float32)[..., None]
         if (g < 0.999).any():
             starless = starless * g + bp * (1 - g)
