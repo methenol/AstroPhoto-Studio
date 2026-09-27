@@ -103,8 +103,17 @@ def refine_psf(f: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None
 
 
 def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, lr: float = 1e-3,
-                max_iters: int = 200_000, rel_tol: float = 1e-8, device=None) -> tuple[np.ndarray, np.ndarray]:
+                max_iters: int = 200_000, rel_tol: float = 1e-8, device=None, nonneg: bool = True,
+                stall: float = 1e-2, stall_window: int = 1000) -> tuple[np.ndarray, np.ndarray]:
     """Eq. 11 (see ``refine_psf``) for many target PSFs at once: fs (N, d', d') -> h (N, r d', r d').
+
+    ``nonneg``: h >= 0 (projected Adam: negative entries set to 0 after every step).  h is a PSF,
+    and the multiplicative MM update (Eqs. 7-9) is derived for non-negative kernels.  Without the
+    constraint, at r = 1 Adam's per-parameter steps drive the directions g_sigma barely constrains
+    and leave h oscillating: 24-59 % negative flux even for smooth Moffat PSFs whose exact
+    minimiser has 0.2-3 % (experiments/README.md), and ImageMM then ran to its iteration cap.
+    ``stall``: a kernel also stops when its loss fell by less than this fraction over the last
+    ``stall_window`` iterations (at r = 1 the rel_tol target is usually out of reach).
 
     The N problems are independent: each kernel's gradient comes only from its own loss and
     Adam's update is per parameter, so solving them together (one grouped convolution) gives
@@ -124,6 +133,10 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
     opt = torch.optim.Adam([z], lr=lr)
     target = rel_tol * (ft ** 2).mean(dim=(1, 2))
     active = torch.ones(N, dtype=torch.bool, device=device)
+    if nonneg:
+        with torch.no_grad():
+            z.clamp_(min=0)
+    best_prev = torch.full((N,), float("inf"), device=device)
 
     # every kernel correlates the same g_sigma: unfold its m x m patches once (im2col, as conv2d
     # evaluates a convolution) and apply all N flipped kernels as one matrix product
@@ -137,6 +150,10 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
         per = ((ft - model(z)) ** 2).mean(dim=(1, 2))
         with torch.no_grad():
             active &= per >= target
+            if it % stall_window == 0:
+                if it > 0:
+                    active &= per < (1 - stall) * best_prev      # still improving
+                best_prev = per.detach().clone()
         if not bool(active.any()):
             break
         opt.zero_grad()
@@ -145,6 +162,8 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
         saved = z.detach()[~active].clone()
         opt.step()
         with torch.no_grad():
+            if nonneg:
+                z.clamp_(min=0)
             z[~active] = saved
     with torch.no_grad():
         final = ((ft - model(z)) ** 2).mean(dim=(1, 2))

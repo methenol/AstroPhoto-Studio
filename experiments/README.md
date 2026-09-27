@@ -243,14 +243,38 @@ PSFs (see below).
   field at 2× would take days, so it is an option.
 * **Moffat PSFs, seeing groups, Noise2Noise pass and the network's multi-frame loss: off.**
   None of them is better. Groups remain a speed option.
-* **Target resolution g_σ: none at 1×, the paper's σ = 1.1 at 2×.** The paper also uses
-  Eq. 11 at 1× with σ = 1 (its Fig. 5), for smooth PSFEx models. With measured PSFs
-  (cut at their support radius), Eq. 11 at 1× is an ill-conditioned deconvolution by g_1.
-  On synthetic subs its kernels carry 31–62% negative flux when solved with Adam to the
-  paper's accuracy (2 × 10⁻⁴ of the mean square). With the default tolerance Adam never gets
-  there: relative error 3 × 10⁻³ after 1000 iterations, 3 × 10⁻⁴ after 20 000. ImageMM's
-  multiplicative update assumes non-negative kernels; with these it did not converge in
-  1000 iterations, where the same window at σ = 0 converged in about 130.
+* **Target resolution g_σ: the paper's (σ = 1 at 1×, its Fig. 5; 1.1 at 2×), with h ≥ 0 in
+  Eq. 11.** Solved unconstrained, as the paper states, the r = 1 kernels had 30–75% negative
+  flux, and ImageMM ran to its iteration cap with them: the multiplicative update (Eqs. 7–9)
+  assumes non-negative kernels. The cause was isolated on four synthetic subs and real M 27
+  subs by solving Eq. 11 (Adam, stopped at the paper's accuracy of 2 × 10⁻⁴ of the mean
+  square) from different PSFs. Negative flux:
+
+  | PSF solved from | Adam | exact minimiser, at 2 × 10⁻⁴ |
+  |---|---|---|
+  | the true PSF (generator) | 32–53% | 1–16% |
+  | the Moffat fit | 24–59% | 0.2–44% |
+  | measured, synthetic or real, cut or not | 48–76% | 66–95% |
+
+  Two sources, neither the synthetic data:
+  * Measured PSFs carry pixel noise that no h * g₁ can represent. The r = 1 operator has
+    conditioning 1.8 × 10⁻⁴, so even the exact solution oscillates. The paper used smooth
+    PSFEx models, where this does not arise.
+  * Adam's per-parameter steps also drive the directions g₁ barely constrains.
+
+  With the constraint h ≥ 0 (projected Adam) and a stall stop (less than 1% gain over 1000
+  iterations), a 128 px synthetic window with 20 subs converges (77 iterations; at σ = 0,
+  46). Against the true sky seen through g₁:
+
+  | | nrmse | faint-emission nrmse | SSIM | PSNR |
+  |---|---|---|---|---|
+  | σ = 1, measured PSFs | 0.147 | 0.849 | 0.860 | 50.8 dB |
+  | σ = 0, then viewed through g₁ | 0.172 | 0.705 | 0.908 | 49.4 dB |
+  | σ = 1, Moffat fits (753 s for Eq. 11) | 0.238 | 0.774 | 0.886 | 46.8 dB |
+
+  σ = 1 with measured PSFs has the lower overall error, but σ = 0 is better on faint
+  extended emission and SSIM. This is one window; the Experiments tab can settle it on
+  larger synthetic sets.
 * **Rings around stars.** The dark discs around bright stars in processed images came from
   the HDR step, not the restoration. HDR's large-scale brightness map included the stars,
   and a deconvolved star (light packed into a few pixels) darkened a disc about two blur
