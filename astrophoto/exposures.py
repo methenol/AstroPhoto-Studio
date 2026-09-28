@@ -429,7 +429,7 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
     yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1]
     x, y = np.asarray(cat["x"], float), np.asarray(cat["y"], float)
     core = np.hypot(yy, xx)[8:-8, 8:-8] <= rc
-    cuts, wts = [], []
+    cuts, wts, noises = [], [], []
     for i, ix, iy, nmask in _psf_star_table(cat, fwhm, half):
         if len(cuts) >= max_stars:
             break
@@ -443,7 +443,9 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
         if ann.sum() < 20:
             continue
         cc = img[iy - pad:iy + pad + 1, ix - pad:ix + pad + 1].astype(np.float64)
-        cc = np.where(m, 0.0, cc - np.median(cc[ann]))                       # local residual sky; neighbours out
+        bg = np.median(cc[ann])
+        noise = 1.4826 * np.median(np.abs(cc[ann] - bg))                      # this cut-out's pixel noise
+        cc = np.where(m, 0.0, cc - bg)                                        # local residual sky; neighbours out
         cc = fourier_shift(cc, -(y[i] - iy), -(x[i] - ix))[8:-8, 8:-8]       # star centre -> pixel centre
         mk = fourier_shift(m.astype(np.float64), -(y[i] - iy), -(x[i] - ix))[8:-8, 8:-8] > 0.02
         flux = cc[core].sum()
@@ -451,10 +453,37 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
             continue
         cuts.append(cc / flux)
         wts.append(np.where(mk, 0.0, flux ** 2))
+        noises.append(noise / flux)                                          # in units of the normalised cut-out
     if len(cuts) < min_stars:
         return (None, len(cuts), None) if return_error else (None, len(cuts))
     S = np.stack(cuts)
     w = np.stack(wts)
+    # Every cut-out must show the same PSF before the flux^2-weighted mean: the weights are the
+    # inverse variances *of a point source's* estimate of the PSF, and a bright non-point source (a
+    # galaxy or cluster core, a blend) gets a large weight while its profile is not the PSF.  On
+    # M 31 one such cut-out carried 24 % of the weight (its core 4.5x less concentrated than the
+    # median cut-out's, its wings 50x stronger) and the PSF wings came out ~16x too strong, so the
+    # restoration zeroed a disc around every star to compensate; the per-pixel sigma clipping could
+    # not catch it, being centred on the weighted mean it dominated.
+    # Test: the concentration c (mean of the normalised cut-out within 1.5 px of the centre) is the
+    # same for every point source up to noise.  Each cut-out is compared with the median against
+    # its own uncertainty: its noise (background noise / flux, over the central pixels) combined
+    # with the genuine star-to-star spread, measured on the brightest fifth (where noise is
+    # negligible).  Beyond 4 of those it is not the PSF.  (A single spread over all cut-outs
+    # would be set by the faint, noisy ones and let a bright extended source through.)
+    R0 = np.hypot(*np.mgrid[:S.shape[1], :S.shape[2]] - S.shape[1] // 2)
+    centre = R0 < 1.5
+    c = np.array([q[centre].mean() for q in S])
+    c_med = float(np.median(c))
+    e_noise = np.asarray(noises) / np.sqrt(centre.sum())
+    fl = np.array([1 / max(e, 1e-30) for e in noises])                     # ~ flux / noise
+    bright = fl >= np.percentile(fl, 80)
+    s_int = 1.4826 * float(np.median(np.abs(c[bright] - np.median(c[bright])))) if bright.sum() >= 5 else 0.0
+    point = np.abs(c - c_med) <= 4 * np.sqrt(e_noise ** 2 + s_int ** 2)
+    if point.sum() < min_stars:
+        return (None, int(point.sum()), None) if return_error else (None, int(point.sum()))
+    S, w = S[point], w[point]
+    cuts = [q for q, ok in zip(cuts, point) if ok]
     keep = w > 0
     for _ in range(10):
         sw = (w * keep).sum(0)
@@ -836,8 +865,9 @@ class ExposureSet:
     # ------------------------------------------------------------- persistence
     _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask")
     # bumped whenever the preparation changes what it produces; an older cache is prepared again
-    # (2: crowded-field PSF stars - with 1, most subs of a Milky Way field had no PSF)
-    PREP_VERSION = 2
+    # (2: crowded-field PSF stars - with 1, most subs of a Milky Way field had no PSF;
+    #  3: PSF cut-outs must agree with each other - with 2, bright non-point sources set the wings)
+    PREP_VERSION = 3
 
     def save(self, path: str):
         import pickle
