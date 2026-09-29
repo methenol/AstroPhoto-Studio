@@ -1010,11 +1010,34 @@ def ghs_fast(x: np.ndarray, D: float, b: float, SP: float) -> np.ndarray:
     return lut_sqrt(x, lut).astype(np.float32)
 
 
-def solve_stretch(L: np.ndarray, target: float, b: float) -> tuple[float, float, float]:
-    """Find black point and GHS strength D so the background median lands on ``target``."""
+_PROXY_SIZE = 1400
+
+
+def _stretch_proxy(L: np.ndarray, size: int | None = None) -> np.ndarray:
+    """The image the stretch is solved on: area-averaged to at most ``size`` px (the fast
+    preview's scale) whatever the render resolution.  The black point and strength come from
+    the median and MAD of the pixels, and per-pixel noise depends on the pixel scale - on a
+    restoration, whose sky is pixel-scale speckle, the full-resolution render got a lower black
+    point and a lifted, grainy, washed-out background compared with the "Detailed" preview
+    (NGC 6960).  Solved at one scale, every render size gets the same curve."""
+    h, w = L.shape[:2]
+    f = (size or _PROXY_SIZE) / max(h, w)
+    if f >= 1:
+        return L
+    return cv2.resize(np.ascontiguousarray(L, np.float32), (max(1, int(round(w * f))), max(1, int(round(h * f)))),
+                      interpolation=cv2.INTER_AREA)
+
+
+def solve_stretch(L: np.ndarray, target: float, b: float, noise_floor: float = 0.0) -> tuple[float, float, float]:
+    """Find black point and GHS strength D so the background median lands on ``target``.
+    ``noise_floor``: the data's real per-pixel noise at this scale; the background's own MAD is
+    never taken below it.  A restoration's sky is exactly 0 over much of the field (ImageMM drives
+    it there, and at the paper's g_sigma the display adds no blur), so its MAD can be 0: the black
+    point then sat on the sky itself and the strength ran away (NGC 6960: D = 6.7e5 against 300,
+    a grey, speckled, washed-out full-resolution render)."""
     sample = L[::4, ::4].ravel()
     med = float(np.median(sample))
-    sig = mad_sigma(sample)
+    sig = max(mad_sigma(sample), float(noise_floor))
     bp = max(0.0, med - 2.8 * sig)
     x = np.clip((sample - bp) / (1 - bp), 0, 1)
     sp = float(np.median(x))
@@ -1335,7 +1358,11 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         unit = nref if nref else max(mad_sigma(Lsl[::4, ::4]), 1e-9)
         structure = float((np.percentile(sm, 90) - np.percentile(sm, 10)) / max(unit, 1e-12))
         target = target * (0.55 + 0.45 * np.clip((structure - 0.5) / 1.0, 0, 1))
-    bp, D, sp = solve_stretch(Lsl, target, b)
+    # the stretch is solved at one fixed scale (_stretch_proxy), with the data's real noise at that
+    # scale as the floor of the background's (the coadd's per-pixel noise, averaged down with it)
+    f_proxy = min(1.0, _PROXY_SIZE / max(Lsl.shape[:2]))
+    nfloor = float(p.get("_noise_ref") or 0.0) * px_scale * f_proxy
+    bp, D, sp = solve_stretch(_stretch_proxy(Lsl), target, b, nfloor)
     # HDR: compress large-scale brightness above a knee (linear, multiplicative, so local
     # detail and colour ratios survive) – keeps bright compact objects (planetary
     # nebulae, galaxy cores, M42-type cores) from burning out.
@@ -1370,7 +1397,7 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         ha, oiii = extract_ha_oiii(starless, unmix=bool(p["oiii_unmix"]), boost=float(p["oiii_boost"]), neutral=halo_w,
                                    params=hp)
         # identical stretch for both lines preserves their relative signal/noise
-        bpn, Dn, spn = solve_stretch(ha, target, b)
+        bpn, Dn, spn = solve_stretch(_stretch_proxy(ha), target, b, nfloor)
         ha_s = ghs_fast(np.clip((ha - bpn) / (1 - bpn), 0, 1), Dn, b, spn)
         o_s = ghs_fast(np.clip((oiii - bpn) / (1 - bpn), 0, 1), Dn, b, spn)
         pal = palette_compose(ha_s, o_s, palette)
