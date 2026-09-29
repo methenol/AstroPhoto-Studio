@@ -210,32 +210,6 @@ when blending.
     (centroids within 10⁻⁶ px).
   * **Check:** with the true sky, the data term equals the noise level (0.97–1.01).
 
-**Audit on real data (IC 405, NGC 6960, M 76; 2026-09-29).** Full-field ImageMM runs came out as
-a speckled mess with values up to 4.5·10⁶ (the stack peaks at 6.3·10⁴), cyan donut stars, dark
-discs around stars, a thin landscape crop of a portrait field, and on NGC 6960 no result at all.
-Each cause was isolated on real cutouts and synthetic data (`test_imagemm.py`, `test_postprocess.py`):
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| NGC 6960 fails ("photon-transfer calibration impossible"); 21 of 160 IC 405 subs unusable | photometric scale required ≥ 3 stars at SNR ≥ 50 *each*; the OIII-only blue channel of a 60 s LP sub has almost none | weighted least-squares slope f_sub = T·f_ref over all isolated stars with reference SNR ≥ 10 (unbiased; the old per-star ratio ran 2–3% high); combined SNR ≥ 50. All 122 / 160 subs usable |
-| dark rings / discs around stars (M 31: hundreds of black discs) | (1) **one PSF per sub for the whole field**, while the Seestar's star FWHM changes by ~40% from centre to edge (IC 405: 4.2 → 5.8 px; PSF peak 0.020 → 0.051): too broad at the centre (data core z = +52, wings −11σ at 3–5 px, latent zeroed there); (2) **a wing pedestal**: a 60 s sub measures its PSF wings with a per-pixel error (3·10⁻⁴) above the wing itself, and clipping that noise at 0 left ~6% of the flux in a shelf out to the support radius (a bright star: model 41 vs data 3 at 12 px) | field-dependent PSFs (`empirical_psf_field`: each PSF pixel a quadratic in field position, PSFEx-style, evaluated on a ~900 px node grid and interpolated per cutout), with the high-SNR wings of the reference coadd's own field PSF (`hybrid_psf`); synthetic check: global PSF 30–43% off at the edges, field model 3–5%; per-sub wing flux 4× the truth, hybrid within 1.3% |
-| remaining 1–2% rings 3–4 px round every star (r = 1) | Algorithm 3 with the measured PSFs on a pixel latent: a star between pixel centres can only be split over whole pixels, the model is broader than the star, the fit empties a ring | the paper's Eq. 11 at r = 1 (σ = 1) is the default again: the latent is the sky through g₁, band-limited, and the ring is gone (star profile − background at 3 px: −11.6 → +40.9); it also converges in half the iterations |
-| runs of 2 iterations; others stop at 23 iterations far from the fixed point | Eq. C15 averages u′ₖ/u′ₖ₋₁: pixels clamped at κ twice in a row give exactly 1, ratios above and below 1 cancel | new default stop `flux`: Σ|xₖ − xₖ₋₁| / Σxₖ over m̃ < 10⁻⁴ (accelerated: within 2.5% rms of the fixed point in faint nebulosity); C15 remains selectable |
-| acceleration never converging on faint cutouts | Biggs–Andrews extrapolation jitters noise-dominated pixels | adaptive restart when the objective rises (O'Donoghue & Candès 2015); synthetic sky-dominated cutout: converged in 498 iterations, 4.8% from the fixed point (C15: 38%) |
-| values of 10⁵–10⁶ over the whole nebula with the Noise2Noise pass | its noise scale came from pixels "above the median", but ImageMM's sky is ~0 on more than half the latent: s ≈ 6·10⁻⁵ instead of ~300, the loss weights silenced every source pixel and the network output hit its clamp | scale from pixels where *both* restorations carry signal (IC 405: 272–402) |
-| cyan donut on saturated stars (AE Aur: R core 120 vs G 3352, B 16461) | saturated cores are masked in every sub; the latent there has no data | `saturated_fill`: compact low-coverage cores (< 0.5, ramp to 0.97) take the coadd's profile |
-| thin landscape crop of a portrait field | crop computed on ImageMM's coverage, which is ~0 on every saturated star | crop on the stack footprint |
-| grey Ha nebula in restorations (R/G 1.32 vs the coadd's 1.68) | the Ha-leakage estimate (5th percentile of OIII/Ha) is 0 on a restoration's sparse speckle | leakage and OIII gain measured on the white-balanced coadd |
-| 3–6 h per restoration | every cutout re-read all subs (0.4 s each) and Eq. 11 (Adam) took minutes | raw-frame cache in RAM, FISTA solver for Eq. 11 (7–25× faster), Eq. 11 at r = 1 halves the iterations: ~27 s per 384 px cutout of 160 subs on an M-series Studio |
-
-Colour (display stage, `test_postprocess.py`): the green/teal halo round bright stars in dual-band
-data is a real scattered-light halo, 20–25% stronger in G and B, that (a) was neutralised only
-out to a reach computed from the star's FWHM (2 px after deconvolution → 20 px, the halo extends
-to ~80 px) and (b) was re-coloured by the palette's OIII gain (up to 2×). The reach is now
-measured from each star's ring-median profile, only the halo's colour is removed (knots and
-neighbours inside the rings keep theirs), stars on extended objects are left alone, and the
-palette keeps neutralised halos out of the OIII gain and unmixing.
-
 **Held-out benchmark** (`bench_imagemm.py`). Each method restores from the even subs of a
 512² M 27 window; every odd sub is then predicted through its own PSF. The table reports
 the excess of (y − DHx̂)²/v over 1, which is 0 for a perfect restoration. The other columns

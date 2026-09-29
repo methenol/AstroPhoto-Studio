@@ -670,46 +670,69 @@ def empirical_psf_field(img: np.ndarray, valid: np.ndarray, cat: dict, half: int
             "support": rsup, "deg": deg, "n_stars": int(N), "psf": _finish_psf(mu_bar, rsup)}
 
 
-def hybrid_psf(sub: dict, ref: dict, fwhm: float, r1: float = 1.5, r2: float = 2.5) -> dict:
-    """Per-exposure PSF field with the wings of the deep reference coadd.
+def hybrid_psf(sub: dict, ref: dict, fwhm: float, r_fit: float = 2.5,
+               scales: np.ndarray = np.round(np.arange(0.60, 1.80001, 0.02), 2)) -> dict:
+    """Per-exposure PSF field: the deep reference coadd's field PSF, radially scaled to the
+    exposure's seeing.
 
-    A 60 s sub measures its PSF wings with a per-pixel standard error (~3e-4 of the flux on
-    IC 405) above the wing itself beyond ~1.5 FWHM (1e-4 at 8 px, 6e-5 at 10 px); cutting the
-    kernel at its support and setting its negative pixels to 0 then left a shelf of 1-2e-4 of
-    the flux per pixel out to the support radius - ~6 % of the flux in the wings where the
-    stars have ~2 %.  ImageMM cannot put negative flux on the sky, so it cancelled the excess
-    by emptying the sky around every bright star: the dark rings.
+    A single sub cannot measure its own PSF shape: its per-pixel noise is comparable to the PSF
+    beyond ~1 FWHM, and a kernel must be non-negative, so the noise clipped at 0 inflates the
+    profile.  On M 31's 10 s subs the sub kernels averaged 0.6-0.7x the coadd PSF's peak and 2-5x
+    its value at 5-10 px; on IC 405's 60 s subs the wings alone were ~6 % of the flux too strong.
+    ImageMM, which cannot put negative flux on the sky, then emptied a moat round every star
+    (the dark rings, 2 % of a star's peak at 3-9 px on M 31, deepest in R and B).
 
-    The reference coadd averages every sub, so its wings are measured ~sqrt(n) times better.
-    Each node kernel keeps the exposure's own model inside r1 FWHM (seeing and field
-    aberrations, measured at high SNR there), takes the coadd's model beyond r2 FWHM, scaled
-    to the exposure by the inverse-variance weighted least-squares amplitude over the r1 .. r2
-    annulus, and blends the two linearly in radius in between.  The support radius is the
-    coadd's; the result is then cut, clipped at 0 and normalised as ``empirical_psf``.
-    Returns ``sub`` with "nodes", "mean" and "psf" replaced."""
-    ms, mr = sub["mean"], ref["mean"]                     # (ny, nx, n, n), unclipped
-    n, nr = ms.shape[-1], mr.shape[-1]
-    if nr < n:
-        p = (n - nr) // 2
-        mr = np.pad(mr, ((0, 0), (0, 0), (p, p), (p, p)))
-    elif nr > n:
-        p = (nr - n) // 2
-        mr = mr[..., p:p + n, p:p + n]
-    rr = np.hypot(*np.mgrid[:n, :n] - n // 2)
-    a1, a2 = r1 * fwhm, r2 * fwhm
-    ann = (rr >= a1) & (rr <= a2)
-    w = 1.0 / np.maximum(sub["se"][ann], 1e-30) ** 2
-    num = (ms[..., ann] * mr[..., ann] * w).sum(-1)
-    den = (mr[..., ann] ** 2 * w).sum(-1)
-    amp = np.where(den > 0, num / np.maximum(den, 1e-300), 1.0)[..., None, None]
-    b = np.clip((rr - a1) / max(a2 - a1, 1e-6), 0, 1)
-    mu = ms * (1 - b) + amp * mr * b
-    rsup = min(float(ref["support"]), n // 2)
-    inside = rr <= rsup
-    tot = np.maximum(np.clip(np.where(inside, mu, 0), 0, None).sum((-2, -1)), 1e-300)[..., None, None]
+    The coadd averages every sub, so its shape - core, field-dependent aberrations and wings - is
+    measured ~sqrt(n) times better.  What differs between subs is mainly the seeing, a single
+    number: at every node and channel the exposure's kernel is the coadd's, radially scaled by s
+    (K_s(x) = K(x / s) / s^2, renormalised), with s and an amplitude fitted by weighted least
+    squares to the exposure's own unclipped mean profile inside ``r_fit`` FWHM (its noise is
+    zero-mean there, so the fit is unbiased; no clipping is involved) - one s per exposure and
+    channel, the median over the nodes.
+    Returns ``sub`` with "nodes", "mean", "psf" replaced and "scale" (ny, nx) added."""
+    Kr = ref["nodes"]                                     # (ny, nx, nr, nr), clipped, unit sum
+    ms, se = sub["mean"], sub["se"]                       # (ny, nx, n, n) unclipped; (n, n)
+    ny, nx, n, _ = ms.shape
+    nr = Kr.shape[-1]
+    N = max(n, int(np.ceil(nr * scales.max())) | 1)
+    pad = lambda z, m: np.pad(z, [(0, 0)] * (z.ndim - 2) + [((N - m) // 2, (N - m) // 2)] * 2)
+    Kr, ms = pad(Kr, nr), pad(ms, n)
+    se = np.pad(se, (N - n) // 2, constant_values=1e30)
+    c = N // 2
+    Ks = np.empty((len(scales), ny, nx, N, N), np.float32)
+    for q, sc in enumerate(scales):
+        M_ = np.float32([[1 / sc, 0, c - c / sc], [0, 1 / sc, c - c / sc]])       # dst x <- src c + (x - c) / s
+        for i in range(ny):
+            for j in range(nx):
+                k = cv2.warpAffine(Kr[i, j].astype(np.float32), M_, (N, N), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+                k = np.clip(k, 0, None)
+                Ks[q, i, j] = k / max(float(k.sum()), 1e-30)
+    rr = np.hypot(*np.mgrid[:N, :N] - c)
+    fit = (rr <= r_fit * fwhm) & (se < 1e29)
+    w = 1.0 / np.maximum(se[fit], 1e-30) ** 2
+    A = Ks[..., fit]                                      # (S, ny, nx, P)
+    m = ms[..., fit][None]                                # (1, ny, nx, P)
+    amp = (w * A * m).sum(-1) / np.maximum((w * A * A).sum(-1), 1e-300)
+    chi = (w * (m - amp[..., None] * A) ** 2).sum(-1)    # (S, ny, nx)
+    best = np.argmin(chi, 0)                              # per node
+    # the seeing is one number per exposure (the field dependence is already in the coadd's PSF);
+    # single nodes fit badly where the exposure has few PSF stars - on a galaxy disc, the sub's own
+    # field model is an extrapolation and its fit ran to the bounds (M 31: 20 % of the nodes) - so
+    # the scale is the median of the node fits that stay inside the range, used at every node
+    inner = (best > 0) & (best < len(scales) - 1)
+    q = int(np.round(np.median(best[inner]))) if inner.any() else int(np.argmin(np.abs(scales - 1.0)))
+    best = np.full_like(best, q)
+    K = np.take_along_axis(Ks, best[None, ..., None, None], 0)[0]
+    # only as large as the scaled support (the range of s left room for up to 1.8 x): the cost of
+    # the restoration grows with the square of the kernel size
+    h_ = min(c, int(np.ceil(float(ref["support"]) * scales[q])) + 1)
+    K = K[..., c - h_:c + h_ + 1, c - h_:c + h_ + 1]
+    K = K / np.maximum(K.sum((-2, -1), keepdims=True), 1e-30)
+    se = se[c - h_:c + h_ + 1, c - h_:c + h_ + 1]
     out = dict(sub)
-    out.update({"nodes": _finish_psf(mu, rsup), "mean": (mu / tot).astype(np.float32), "support": rsup,
-                "psf": _finish_psf(mu.mean((0, 1)), rsup), "wing_amp": amp[..., 0, 0].astype(np.float32)})
+    out.update({"nodes": K.astype(np.float32), "mean": K.astype(np.float32), "psf": K.mean((0, 1)).astype(np.float32),
+                "scale": scales[best].astype(np.float32), "support": float(ref["support"]),
+                "se": np.where(se < 1e29, se, 1e30).astype(np.float32)})
     return out
 
 
@@ -1109,7 +1132,8 @@ class ExposureSet:
     #  3: PSF cut-outs must agree with each other - with 2, bright non-point sources set the wings)
     #  4: field-dependent PSFs (empirical_psf_field) with the coadd's wings (hybrid_psf), least-squares
     #     photometric scales)
-    PREP_VERSION = 4
+    #  7: per-exposure PSFs = the coadd's field PSF scaled to the exposure's seeing (hybrid_psf)
+    PREP_VERSION = 7
 
     def save(self, path: str):
         import pickle

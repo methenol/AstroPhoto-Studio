@@ -471,56 +471,6 @@ def deconvolve(img: np.ndarray, strength: float, sat: float, noise_ref: float | 
     return out.astype(np.float32), {"psf_fwhm": fw, "iterations": iters}
 
 
-def restored_star_floor(img: np.ndarray, detect: np.ndarray, fwhm: float, nsig: float = 1.0) -> np.ndarray:
-    """A restoration may concentrate a star's halo light into its core, but it must not leave a
-    moat darker than the local sky around the star (the network path's ``deconv_floor`` rule).
-    ImageMM leaves a faint one around bright stars - 0.1-0.2 % of the peak at 1-2 FWHM, where
-    its PSF model is a little stronger than the star's own wings - invisible in the linear data
-    but a dark ring after a strong stretch of a smooth (Noise2Noise) restoration.
-
-    Around every star of the coadd ``detect`` (same grid, 20-sigma detections), in the annulus
-    from 1 to 3.5 FWHM, pixels are raised to at least the local sky (a median over ~8 FWHM of
-    ``img`` with the stars' cores excluded) minus ``nsig`` x the local pixel noise.  A speckled
-    restoration, whose noise is large, is barely touched; the stars' cores never are.
-    img, detect: (H, W, C) linear; ``fwhm`` in pixels of that grid."""
-    from scipy.ndimage import median_filter
-    h, w, C = img.shape
-    L = np.ascontiguousarray(luminance(detect), np.float32)
-    bkg = sep.Background(L, bw=64, bh=64)
-    try:
-        objs = _extract(L - bkg.back(), 20.0, bkg.globalrms, minarea=5)
-    except Exception:
-        return img
-    if len(objs) == 0:
-        return img
-    ring = np.zeros((h, w), np.uint8)
-    core = np.zeros((h, w), np.uint8)
-    r_in, r_out = max(1, int(round(fwhm))), max(2, int(round(3.5 * fwhm)))
-    for x, y in zip(objs["x"], objs["y"]):
-        c = (int(round(x)), int(round(y)))
-        cv2.circle(ring, c, r_out, 1, -1)
-        cv2.circle(core, c, r_in, 1, -1)
-    ring &= (1 - core)
-    if not ring.any():
-        return img
-    # local sky: median over ~8 FWHM with the star discs excluded (a down-sampled grid, as deconv_floor)
-    f = max(1, int(round(fwhm / 2)))
-    k = max(5, int(round(8 * fwhm / f)) | 1)
-    excl = cv2.dilate(core, np.ones((3, 3), np.uint8), iterations=max(1, r_out - r_in)) > 0
-    out = img.copy()
-    for c in range(C):
-        ch = np.where(excl, np.nan, img[..., c]).astype(np.float32)
-        small = ch[::f, ::f]
-        # NaN-aware median via filling the excluded pixels with the median of their surroundings
-        fill = np.where(np.isnan(small), np.nanmedian(small), small)
-        sky = median_filter(fill, size=k, mode="reflect")
-        sky = cv2.resize(sky.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-        resid = (img[..., c] - sky)[~excl][::7]
-        sig = 1.4826 * float(np.median(np.abs(resid - np.median(resid)))) if resid.size else 0.0
-        out[..., c] = np.where(ring > 0, np.maximum(img[..., c], sky - nsig * sig), img[..., c])
-    return out.astype(np.float32)
-
-
 def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.ndarray | None,
                  params: dict, sat: float, progress=None, sharp: np.ndarray | None = None,
                  restored: bool = False, clip_ref: np.ndarray | None = None) -> tuple[np.ndarray, dict]:

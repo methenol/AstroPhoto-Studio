@@ -70,33 +70,6 @@ def test_halo_neutral():
           f"OIII / Ha excess in the halo {ox / hx:.3f} (without the protection {ox0 / hx:.3f})")
 
 
-def test_star_floor():
-    """restored_star_floor: a moat round a star in a smooth restoration is lifted to the local
-    sky; the star's core and the sky away from stars are not touched."""
-    from astrophoto.postprocess import restored_star_floor
-    rs = np.random.default_rng(1)
-    H = W = 400
-    yy, xx = np.mgrid[:H, :W].astype(np.float64)
-    sky = 50.0
-    img = np.full((H, W, 3), sky) + rs.normal(size=(H, W, 3)) * 0.5            # smooth (N2N-like) restoration
-    det = np.full((H, W, 3), 2000.0) + rs.normal(size=(H, W, 3)) * 30.0        # its coadd, with sky
-    stars = [(100, 100), (250, 300), (320, 80)]
-    fw = 4.5
-    for y, x in stars:
-        r = np.hypot(yy - y, xx - x)
-        img += (5e4 * np.exp(-r ** 2 / (2 * 1.1 ** 2)) - 6.0 * np.exp(-((r - 7) / 2.0) ** 2))[..., None]   # core + moat
-        det += (3e4 * np.exp(-r ** 2 / (2 * (fw / 2.3548) ** 2)))[..., None]
-    img = img.astype(np.float32)
-    out = restored_star_floor(img, det.astype(np.float32), fw)
-    r0 = np.hypot(yy - 100, xx - 100)
-    moat = (r0 > 6) & (r0 < 8)
-    far = np.min([np.hypot(yy - y, xx - x) for y, x in stars], 0) > 30
-    check("star floor: moat lifted to the sky", np.median(out[moat]) > sky - 1.0 > np.median(img[moat]),
-          f"moat median {np.median(img[moat]):.2f} -> {np.median(out[moat]):.2f} (sky {sky})")
-    check("star floor: star cores and open sky untouched",
-          np.abs(out - img)[r0 < 3].max() == 0 and np.abs(out - img)[far].max() == 0)
-
-
 def test_stretch_scale():
     """A restoration's sky is exactly the pedestal over much of the field (MAD 0): the stretch
     must stay sane there, and a full-resolution render must get the same curve as a downsampled
@@ -124,7 +97,7 @@ def test_stretch_scale():
 
 if __name__ == "__main__":
     t0 = time.time()
-    ALL = [test_halo_neutral, test_star_floor, test_stretch_scale]
+    ALL = [test_halo_neutral, test_stretch_scale]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

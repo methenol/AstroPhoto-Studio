@@ -27,7 +27,7 @@ from . import __version__
 from .analysis import analyse, finalize_selection
 from .denoise import pick_device
 from .frames import FrameInfo, build_defect_map, discover, read_raw, superpixel
-from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage, restored_star_floor
+from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
 from .stacking import Integrator
 
 STACK_DEFAULTS = {
@@ -542,10 +542,6 @@ class Session:
                 ref = st["stack"]
                 clip_ref = cv2.resize(ref, (img.shape[1], img.shape[0]),
                                       interpolation=cv2.INTER_AREA if ref.shape[1] > img.shape[1] else cv2.INTER_LINEAR)
-                # no moat darker than the local sky around stars (restored_star_floor)
-                rinfo = self._restore_info()
-                fw = float(rinfo.get("fwhm") or ((rinfo.get("psf_size") or 29) - 1) / 7)
-                img = restored_star_floor(img, clip_ref, fw)
                 lin, info = linear_stage(img, cov, None, p, self.meta.get("saturation", 63471.0),
                                          progress=progress, restored=True, clip_ref=clip_ref)
                 info["restoration"] = "ImageMM"

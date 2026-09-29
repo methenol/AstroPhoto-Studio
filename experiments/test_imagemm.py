@@ -595,6 +595,8 @@ def test_field_psf():
         t = moffat_image(p, n)
         t /= t.sum()
         k_h = interp_nodes(hyb["nodes"], nodes, y, x)
+        o_ = (k_h.shape[-1] - n) // 2
+        k_h = k_h[o_:o_ + n, o_:o_ + n] if o_ > 0 else k_h
         k_s = interp_nodes(f_sub["nodes"], nodes, y, x)
         err = lambda k: float(np.abs(k - t).max() / t.max())
         wing = lambda k: float(k[rr > 2 * 4.5].sum())
