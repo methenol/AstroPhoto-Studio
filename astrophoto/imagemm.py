@@ -51,8 +51,10 @@ Optional, not part of the paper, each implemented to its own reference:
 from __future__ import annotations
 
 import math
+import os
 import time
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -82,15 +84,15 @@ def gaussian_psf_mc(sigma: float, size: int, n_samples: int = 200_000_000, seed:
     return (g / g.sum()).astype(np.float32)
 
 
-def refine_psf(f: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, lr: float = 1e-3,
-               max_iters: int = 200_000, rel_tol: float = 1e-8, device=None) -> tuple[np.ndarray, float]:
+def refine_psf(f: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, rel_tol: float = 1e-6,
+               device=None) -> tuple[np.ndarray, float]:
     """Super-resolved PSF h of Eq. 11 (Algorithm 2, line 6):
 
         h = argmin_{h in R^{r d'}} (1/d') sum_i (f_i - (D(h * g_sigma))_i)^2
 
     f: target PSF (d' x d', d' odd); h: r d' x r d'; g_sigma: (2 r d' - 1) x (2 r d' - 1);
     "h * g_sigma" is the valid convolution, of r d' x r d' pixels, and D is r x r average
-    pooling.  Unconstrained, solved with Adam from f subdivided into r x r replicas.
+    pooling.  Solved from f subdivided into r x r replicas (``refine_psfs``).
 
     Eq. 11 has r^2 d'^2 unknowns for d'^2 equations, so its minimisers form an affine
     space, and once the loss is ~0 Adam's normalised steps keep moving h along it.  The
@@ -98,13 +100,89 @@ def refine_psf(f: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None
     x mean(f^2) (the paper reports 3.9e-8 for its HSC PSFs, ~2e-4 relative), which leaves h
     at the minimiser reached from the smooth initial guess.
     Returns (h, final mean squared difference)."""
-    h, mse = refine_psfs(f[None], up, sigma, g=g, lr=lr, max_iters=max_iters, rel_tol=rel_tol, device=device)
+    h, mse = refine_psfs(f[None], up, sigma, g=g, device=device, rel_tol=rel_tol)
     return h[0], float(mse[0])
 
 
-def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, lr: float = 1e-3,
-                max_iters: int = 200_000, rel_tol: float = 1e-8, device=None, nonneg: bool = True,
-                stall: float = 1e-2, stall_window: int = 1000) -> tuple[np.ndarray, np.ndarray]:
+def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, device=None,
+                rel_tol: float = 1e-6, method: str = "fista", max_iters: int = 20_000, nonneg: bool = True,
+                stall: float = 1e-2, stall_window: int = 500, chunk: int = 4096, **adam_kw) -> tuple[np.ndarray, np.ndarray]:
+    """Eq. 11 (see ``refine_psf``) for many target PSFs at once: fs (N, d', d') -> h (N, r d', r d').
+
+    ``method`` "fista" (default): Eq. 11 is a linear least-squares problem, solved by projected
+    accelerated gradient (FISTA, Beck & Teboulle 2009) with the exact step 1/L, L = ||A||^2 <=
+    1/r^2 for A h = D(h * g_sigma) (D averages r x r, and convolution with a unit-sum non-negative
+    kernel has norm <= 1); the convolution runs through FFTs.  From the same initial guess (f
+    subdivided into r x r replicas / r^2) and with the same stopping rule it reaches the same
+    fit as Adam, 7-25x faster (IC 405: 300 kernels in 2.3 s vs 59 s at r = 1, 36 s vs 250 s at
+    r = 2), which matters once the PSFs vary over the field (a kernel per exposure, channel and
+    node of the field grid: ~10^4).  "adam": the paper's optimiser (``_refine_psfs_adam``).
+
+    ``nonneg``: h >= 0 (projection after every step).  Each kernel stops when its mean squared
+    difference is below ``rel_tol`` x mean(f^2) (1e-6: 0.1 % rms, below the PSFs' own
+    measurement error; the paper reports 3.9e-8 absolute, ~2e-4 relative, for its HSC PSFs), or
+    when it fell by less than ``stall`` over ``stall_window`` iterations.
+    Returns (h, per-kernel final mean squared difference)."""
+    if method == "adam":
+        return _refine_psfs_adam(fs, up, sigma, g=g, device=device, rel_tol=rel_tol, nonneg=nonneg, **adam_kw)
+    device = device if isinstance(device, torch.device) else pick_device(device or "auto")
+    N, n, _ = fs.shape
+    m = up * n
+    if g is None:
+        g = gaussian_psf_mc(sigma, 2 * m - 1)
+    Pf = 1 << (3 * m - 3).bit_length()                    # >= full linear convolution size 3m - 2
+    G = torch.fft.rfft2(torch.from_numpy(np.ascontiguousarray(g, np.float32)).to(device), s=(Pf, Pf))
+    L = 1.0 / (up * up)
+    outs, mses = [], []
+    for a in range(0, N, chunk):
+        ft = torch.from_numpy(np.ascontiguousarray(fs[a:a + chunk], np.float32)).to(device)
+        B = ft.shape[0]
+        scale = ft.abs().amax(dim=(1, 2)).view(B, 1, 1).clamp_min(1e-30)
+        f = ft / scale
+
+        def A(h):                       # D(h * g_sigma), the valid part (output j at full index j + m - 1)
+            full = torch.fft.irfft2(torch.fft.rfft2(h, s=(Pf, Pf)) * G, s=(Pf, Pf))
+            return pool(full[:, None, m - 1:2 * m - 1, m - 1:2 * m - 1], up)[:, 0]
+
+        def AT(z):                      # its adjoint: D^T (replicas / r^2), then correlation with g_sigma
+            zu = unpool(z[:, None], up)[:, 0] / (up * up)
+            pad = torch.zeros(B, Pf, Pf, device=device)
+            pad[:, m - 1:2 * m - 1, m - 1:2 * m - 1] = zu
+            return torch.fft.irfft2(torch.fft.rfft2(pad) * G.conj(), s=(Pf, Pf))[:, :m, :m]
+
+        h = unpool(f[:, None], up)[:, 0] / (up * up)
+        if nonneg:
+            h = h.clamp_min(0)
+        yk, hp, t = h.clone(), h.clone(), 1.0
+        target = rel_tol * (f ** 2).mean(dim=(1, 2))
+        active = torch.ones(B, dtype=torch.bool, device=device)
+        best_prev = torch.full((B,), float("inf"), device=device)
+        for it in range(max_iters):
+            hn = yk - AT(A(yk) - f) / L
+            if nonneg:
+                hn = hn.clamp_min(0)
+            hn = torch.where(active[:, None, None], hn, hp)      # a stopped kernel stays where it is
+            tn = (1 + math.sqrt(1 + 4 * t * t)) / 2
+            yk = hn + ((t - 1) / tn) * (hn - hp)
+            hp, t = hn, tn
+            if it % 50 == 0:
+                mse = ((A(hp) - f) ** 2).mean(dim=(1, 2))
+                active &= mse >= target
+                if it % stall_window == 0:
+                    if it > 0:
+                        active &= mse < (1 - stall) * best_prev
+                    best_prev = mse.clone()
+                if not bool(active.any()):
+                    break
+        mse = ((A(hp) - f) ** 2).mean(dim=(1, 2)) * scale.view(B) ** 2
+        outs.append((hp * scale).cpu().numpy().astype(np.float32))
+        mses.append(mse.cpu().numpy())
+    return np.concatenate(outs), np.concatenate(mses)
+
+
+def _refine_psfs_adam(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, lr: float = 1e-3,
+                      max_iters: int = 200_000, rel_tol: float = 1e-8, device=None, nonneg: bool = True,
+                      stall: float = 1e-2, stall_window: int = 1000) -> tuple[np.ndarray, np.ndarray]:
     """Eq. 11 (see ``refine_psf``) for many target PSFs at once: fs (N, d', d') -> h (N, r d', r d').
 
     ``nonneg``: h >= 0 (projected Adam: negative entries set to 0 after every step).  h is a PSF,
@@ -319,12 +397,21 @@ class BiggsAndrews:
         g_k = x_{k+1} - y_k
         alpha_k = sum(g_{k-1} g_{k-2}) / sum(g_{k-2} g_{k-2}),   0 <= alpha_k < 1
 
-    The extrapolated point is kept strictly positive (the MM update needs x > 0)."""
+    The extrapolated point is kept strictly positive (the MM update needs x > 0).
+    ``restart`` drops the history (the next step is a plain MM step), for mm_restore's
+    adaptive restart when the objective increases (O'Donoghue & Candes 2015): without it the
+    extrapolation keeps jittering noise-dominated pixels and a sky-dominated cutout never
+    satisfies the stopping rule."""
 
     def __init__(self, floor: float):
         self.floor = floor
         self.x_prev = self.g1 = self.g2 = None
         self.alpha = 0.0
+        self.restarts = 0
+
+    def restart(self):
+        self.x_prev = self.g1 = self.g2 = None
+        self.restarts += 1
 
     def extrapolate(self, x: torch.Tensor) -> torch.Tensor:
         self.alpha = 0.0
@@ -344,7 +431,7 @@ class BiggsAndrews:
 def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: torch.Tensor,
                x0: torch.Tensor, r: int = 1, kappa: float = 2.0, robust: bool = True, delta: float = 2.0,
                max_iters: int = 1000, epsilon: float = 1e-6, mu: float = 0.1, chunk: int | None = None,
-               accelerate: bool = False, stop: str = "c15", log=None) -> tuple[torch.Tensor, dict]:
+               accelerate: bool = False, stop: str = "c15", min_iters: int = 0, log=None) -> tuple[torch.Tensor, dict]:
     """Algorithms 1-3 on one cutout.
 
     y, var, mask: (n, C, d, d) exposures y(t), variances v(t), masks m(t) in {0, 1};
@@ -378,7 +465,7 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         for a, b in ops.ranges():
             num += ops.adjoint_sum(W_(a, b) * y[a:b], a, b)
     acc = BiggsAndrews(float(x0.min())) if accelerate else None
-    if accelerate:
+    if accelerate and stop != "flux":
         # extrapolated steps bring the mean of u'_k / u'_{k-1} to 1 about 100x sooner relative
         # to the true convergence (measured against a 20000-iteration run, experiments/
         # diag_accel.py): at epsilon / 100 the accelerated result is closer to the fixed point
@@ -386,39 +473,62 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         epsilon = epsilon / 100
     x = x0.clone()
     u_prev, hist, converged, k = None, [], False, 0
+    loss_prev, losses = float("inf"), []
     for k in range(1, max_iters + 1):
         xe = acc.extrapolate(x) if acc is not None else x
         if robust:
             num = torch.zeros_like(x0)
         den = torch.zeros_like(x0)
+        loss = 0.0                     # float64 accumulation of float32 chunk sums (MPS has no float64)
         for a, b in ops.ranges():
             fx = ops.forward(xe, a, b)
             Wk = W_(a, b)
+            z = (y[a:b] - fx) / var[a:b].clamp_min(1e-30).sqrt()
+            za = z.abs()
+            # the objective at xe (Eq. 5 / Eq. 14): sum over valid pixels of rho(z)
+            rho = torch.where(za <= delta, 0.5 * z * z, delta * (za - 0.5 * delta)) if robust else 0.5 * z * z
+            loss += float((rho * (mask[a:b] > 0)).sum())
             if robust:                 # Eq. 17: W_rho = m / v * psi(r),  r = (y - D H x) / sigma  (Eq. 13)
-                Wk = Wk * huber_psi((y[a:b] - fx) / var[a:b].clamp_min(1e-30).sqrt(), delta)
+                Wk = Wk * huber_psi(z, delta)
                 num += ops.adjoint_sum(Wk * y[a:b], a, b)
             den += ops.adjoint_sum(Wk * fx, a, b)
-            del fx, Wk
+            del fx, Wk, z, za, rho
+        losses.append(loss)
+        # (a rise above float32 summation noise, ~1e-7 relative)
+        if acc is not None and loss > loss_prev * (1 + 1e-6) and acc.alpha > 0:
+            # the extrapolated point made the objective worse: take a plain MM step from x instead
+            # (MM never increases it) and start the extrapolation history afresh
+            acc.restart()
+            loss_prev = float("inf")
+            continue
+        loss_prev = loss
         u = torch.where(den > 0, num / den.clamp_min(1e-30), torch.ones_like(den))      # Eq. 8 / 16
         u = u.clamp(1.0 / kappa, kappa)                                                 # Eq. 9
         x_new = xe * u                                                                  # Eq. 7
         if acc is not None:
             acc.update(x, xe, x_new)
-        x = x_new
-        if u_prev is not None:
+        if stop == "flux":
+            # flux-weighted relative change of the image, sum |x_k - x_{k-1}| / sum x_k over m~
+            crit = float((m_eff * (x_new - x).abs()).sum()) / max(float((m_eff * x_new).sum()), 1e-30)
+        elif u_prev is not None:
             xi = u / u_prev
             if stop == "c15":
                 crit = abs(float((m_eff * xi).sum()) / max(M_eff, 1.0) - 1.0)            # Eq. C15
             else:
                 crit = float((m_eff * (xi - 1).abs()).sum()) / max(M_eff, 1.0)
+        else:
+            crit = None
+        x = x_new
+        if crit is not None:
             hist.append(crit)
             if log:
                 log(k, crit)
-            if crit < epsilon:
+            if crit < epsilon and k >= min_iters:
                 converged = True
                 break
         u_prev = u
-    return x, {"iterations": k, "converged": converged, "criterion": hist, "effective_mask": m_eff,
+    return x, {"iterations": k, "converged": converged, "criterion": hist, "loss": losses,
+               "restarts": acc.restarts if acc is not None else 0, "effective_mask": m_eff,
                "coverage": frac / n, "chunk": chunk}
 
 
@@ -503,9 +613,10 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     device = device or pick_device()
     idx = es.usable() if idx is None else idx
     Y, V, Mk = es.windows(idx, y0, y1, x0, x1)
-    k = es.kernels(idx, psf_model) if kernels is None else kernels
+    at = ((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2)                # the PSFs where the cutout is
+    k = es.kernels(idx, psf_model, at=at) if kernels is None else kernels
     if n_groups:
-        groups = seeing_groups(es.kernels(idx, psf_model), n_groups)
+        groups = seeing_groups(es.kernels(idx, psf_model, at=at), n_groups)
         Y, V, Mk, k = coadd_groups(Y, V, Mk, k, groups)
     yt, vt, mt = (torch.from_numpy(z).to(device) for z in (Y, V, Mk))
     kt = torch.from_numpy(k).to(device)
@@ -576,6 +687,53 @@ def stack_forward(x: torch.Tensor, kernels: torch.Tensor, s: int) -> tuple[torch
     return out.view(B, G, C, n, n), e0
 
 
+# ----------------------------------------------------------------- saturated stars
+def saturated_fill(x: np.ndarray, cov: np.ndarray, ref: np.ndarray, fwhm: float, lo: float = 0.5,
+                   hi: float = 0.97) -> tuple[np.ndarray, int]:
+    """Give saturated stars the coadd's profile.
+
+    A saturated star's core is masked in every exposure (with the demosaic and Lanczos supports
+    around it), so the latent there has no data: ImageMM leaves a hole, widest in the channel that
+    saturates most - on IC 405's AE Aur the red core came out at 120 against 3352 / 16461 in green /
+    blue, a cyan donut.  No restoration can recover it, so, as the network path does, those stars
+    get the (background-subtracted) coadd ``ref`` instead: with c the restoration's coverage (the
+    PSF-weighted fraction of valid measurements per latent pixel, lowest channel), weight 1 where
+    c <= ``lo`` and ramping to 0 at c = ``hi``, applied within 3 FWHM of a compact low-coverage core
+    (not one touching the border - the frames' footprint - nor larger than ~64 x 64 FWHM^2 / 16,
+    which would be an obstructed part of the field rather than a star).
+    x, ref: (H, W, C) on the same grid; cov (H, W, C); ``fwhm`` in pixels of that grid.
+    Returns (x with the stars filled, number of stars filled)."""
+    c = cov.min(-1)
+    core = (c < lo).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+    H, W = c.shape
+    keep = np.zeros(n, bool)
+    lim = (16 * fwhm) ** 2
+    for i in range(1, n):
+        x0, y0, w, h, area = stats[i]
+        keep[i] = area <= lim and x0 > 0 and y0 > 0 and x0 + w < W and y0 + h < H
+    if not keep.any():
+        return x, 0
+    near = keep[lab].astype(np.uint8)
+    R = int(math.ceil(3 * fwhm))
+    near = cv2.dilate(near, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * R + 1, 2 * R + 1)))
+    w = np.clip((hi - c) / (hi - lo), 0, 1) * near
+    w = np.maximum(w, cv2.GaussianBlur(w.astype(np.float32), (0, 0), max(fwhm / 3, 0.5)) * near)[..., None]
+    return (x * (1 - w) + ref * w).astype(np.float32), int(keep.sum())
+
+
+def reference_on_latent(es, r: int, region: tuple[int, int, int, int]) -> np.ndarray:
+    """The background-subtracted reference coadd on the latent grid of ``region`` (latent sample j
+    at reference coordinate region origin + j / r; Lanczos resampling for r > 1)."""
+    y0, y1, x0, x1 = region
+    ref = (es.ref - es.sky_ref)[y0:y1, x0:x1].astype(np.float32)
+    if r == 1:
+        return ref
+    M_ = np.float32([[1.0 / r, 0, 0], [0, 1.0 / r, 0]])            # dst(j) = src(j / r)
+    return cv2.warpAffine(ref, M_, ((x1 - x0) * r, (y1 - y0) * r), flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REFLECT)
+
+
 # ----------------------------------------------------------------- Noise2Noise pass
 def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128, batch: int = 16,
              device=None, progress=None, cancel=None, seed: int = 0) -> tuple[np.ndarray, dict]:
@@ -588,8 +746,12 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     biased for faint signal), and the weights w depend only on the input, so they change
     which errors dominate training but not the minimiser.  The network sees the inputs
     through u = asinh(x / (3 s)) and predicts in that domain, mapped back to linear values
-    for the loss.  s: robust noise scale of (x_A - x_B)/sqrt 2 over pixels that carry signal
-    (ImageMM's sky is ~0, so a scale over all pixels would vanish).
+    for the loss.  s: robust noise scale of (x_A - x_B)/sqrt 2 over the pixels where *both*
+    restorations carry signal (min(x_A, x_B) above 1e-3 of the 99th percentile).  ImageMM
+    drives the sky to ~0 - on IC 405 more than half of all latent pixels - so any scale that
+    includes the sky (the former "above the median" selection) collapses to ~1e-4 of the real
+    noise; the loss weights 1 / (1 + (x/k)^2) then silenced every source pixel and the network
+    returned values at the clamp (~2e6 over the whole nebula).
     Returns (1/2 (f(x_A) + f(x_B)), info)."""
     from .denoise import UNet, _autocast, infer
     device = device or pick_device()
@@ -600,9 +762,14 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     for c in range(C):
         a, b = xa[..., c], xb[..., c]
         sig = 0.5 * (a + b)
-        on = sig > np.percentile(sig, 50)
-        d = (a - b)[on]
+        thr = 1e-3 * float(np.percentile(sig, 99))
+        on = np.minimum(a, b) > thr
+        if on.sum() < 1000:                    # almost empty channel: every pixel with any signal
+            on = sig > thr
+        d = (a - b)[on] if on.any() else (a - b).ravel()
         s[c] = 1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2)
+        if not s[c] > 0:
+            s[c] = float(np.std(a - b)) / np.sqrt(2)
     s = np.maximum(s, 1e-12)
     k = 3 * s
     fwd = lambda x: np.arcsinh(x / k).astype(np.float32)
@@ -663,23 +830,57 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
 # ----------------------------------------------------------------- full restoration
 def superresolved_kernels(K: np.ndarray, r: int, sigma: float, device=None, progress=None):
     """Eq. 11 for every exposure and channel: (n, C, d', d') -> (n, C, r d', r d'), divided by r^2.
+    Also accepts field-grid node kernels (n, C, ny, nx, d', d').
 
     With D the r x r *average*, D(h * g_sigma) = f makes h sum to r^2, and the latent x of
     D(h * x) is in flux per latent pixel (1/r^2 of the exposures' surface brightness).  The
     kernels h / r^2 describe exactly the same model for r^2 x, so with them the latent is in
     the exposures' (and the stack's) surface-brightness units - which the initial guess, the
     stack-grid forward model of the network and the pipeline all assume."""
-    n, C, d, _ = K.shape
+    lead, d = K.shape[:-2], K.shape[-1]
+    N = int(np.prod(lead))
     if progress:
-        progress(0, 1, f"ImageMM: solving Eq. 11 for {n * C} PSFs (r = {r}, sigma = {sigma})")
-    h, mse = refine_psfs(K.reshape(n * C, d, d), r, sigma, device=device)
-    return h.reshape(n, C, r * d, r * d) / r ** 2, mse
+        progress(0, 1, f"ImageMM: solving Eq. 11 for {N} PSFs (r = {r}, sigma = {sigma})")
+    h, mse = refine_psfs(K.reshape(N, d, d), r, sigma, device=device)
+    return h.reshape(*lead, r * d, r * d) / r ** 2, mse
+
+
+def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: str, device=None, progress=None,
+                  cache: str | None = None) -> tuple[np.ndarray, dict | None]:
+    """Latent-grid kernels of the exposures ``idx`` at the nodes of the field PSF grid
+    ``es.nodes``: (n, C, ny, nx, k, k) - the measured PSFs f(t), or with r > 1 or a sigma the
+    Eq. 11 kernels h(t) solved at every node.  Kernels for a cutout are interpolated
+    bilinearly between the nodes (exposures.interp_nodes).  ``cache``: file for the Eq. 11
+    solution (it takes minutes), reused while the exposures, r, sigma and the model match."""
+    K = es.node_kernels(idx, psf_model)
+    if not (r > 1 or sigma is not None):
+        return K, None
+    sigma = 1.1 if sigma is None else sigma
+    import hashlib
+    import pickle
+    key = hashlib.sha1(np.ascontiguousarray(K).tobytes() + f"{r}|{sigma}".encode()).hexdigest()
+    if cache and os.path.exists(cache):
+        try:
+            with open(cache, "rb") as f:
+                c = pickle.load(f)
+            if c.get("key") == key:
+                return c["kernels"], c["eq11"]
+        except Exception:
+            pass
+    kern, mse = superresolved_kernels(K, r, sigma, device=device, progress=progress)
+    eq11 = {"sigma": sigma, "mse_max": float(mse.max()), "mse_median": float(np.median(mse))}
+    if cache:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(cache, "wb") as f:
+            pickle.dump({"key": key, "kernels": kern, "eq11": eq11}, f, protocol=4)
+    return kern, eq11
 
 
 def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empirical", n_groups: int = 0,
             robust: bool = True, delta: float = 2.0, kappa: float = 2.0, epsilon: float = 1e-6,
             max_iters: int = 1000, accelerate: bool = False, stop: str = "c15", tile: int = 384, device: str = "auto",
-            n2n: bool = False, n2n_iters: int = 2000, progress=None, cancel=None) -> tuple[np.ndarray, dict]:
+            n2n: bool = False, n2n_iters: int = 2000, min_iters: int = 0, kernel_cache: str | None = None,
+            region: tuple[int, int, int, int] | None = None, progress=None, cancel=None) -> tuple[np.ndarray, dict]:
     """ImageMM over the whole field of the prepared exposures ``es`` (exposures.ExposureSet).
 
     r = 1 and sigma None: Algorithm 1 (robust=False) / 3 (robust=True) with the measured
@@ -691,8 +892,10 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     widths and are blended with feathered weights.
     ``n2n``: restore the even and the odd subs separately (disjoint data, independent noise)
     and combine them with ``n2n_pass`` instead of restoring all subs at once.
-    Returns (latent image on the r x finer grid - sample j at reference coordinate j / r -,
-    info with the coverage map and per-cutout convergence)."""
+    ``region``: (y0, y1, x0, x1) of the reference grid to restore instead of the whole field
+    (previews, experiments); the result then covers that window only.
+    Returns (latent image on the r x finer grid - sample j at reference coordinate j / r
+    (relative to the region's origin) -, info with the coverage map and per-cutout convergence)."""
     dev = device if isinstance(device, torch.device) else pick_device(device)
     t0 = time.time()
 
@@ -701,15 +904,15 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         # effect within one iteration instead of after the whole cutout
         if cancel and cancel():
             raise RuntimeError("cancelled")
+    from .exposures import interp_nodes
     idx = es.usable()
-    K = es.kernels(idx, psf_model)
-    kern, eq11 = None, None
-    if r > 1 or sigma is not None:
-        sigma = 1.1 if sigma is None else sigma
-        kern, mse = superresolved_kernels(K, r, sigma, device=dev, progress=progress)
-        eq11 = {"sigma": sigma, "mse_max": float(mse.max()), "mse_median": float(np.median(mse))}
-    ks = (kern if kern is not None else K).shape[-1]
-    H0, W0 = es.H0, es.W0
+    # the PSF of each exposure where a cutout is: field-grid node kernels, interpolated per cutout
+    kern, eq11 = field_kernels(es, idx, r, sigma, psf_model, device=dev, progress=progress, cache=kernel_cache)
+    ks = kern.shape[-1]
+    RY0, RY1, RX0, RX1 = region if region is not None else (0, es.H0, 0, es.W0)
+    RY0, RX0 = max(0, int(RY0)), max(0, int(RX0))
+    RY1, RX1 = min(es.H0, int(RY1)), min(es.W0, int(RX1))
+    H0, W0 = RY1 - RY0, RX1 - RX0
     overlap = int(max(64, 2 * math.ceil(ks / r)))
     tile = max(tile, 3 * overlap)
     # the exposures of a cutout (y, v, mask) must fit on the device next to at least one
@@ -737,7 +940,6 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     ntot = len(ys) * len(xs) * len(sets)
     for part, sel in enumerate(sets):
         sub_idx = [idx[i] for i in sel]
-        sub_kern = kern[sel] if kern is not None else None
         out = np.zeros((H0 * r, W0 * r, 3), np.float32)
         acc = np.zeros((H0 * r, W0 * r, 1), np.float32)
         for y0 in ys:
@@ -745,10 +947,12 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                 if cancel and cancel():
                     raise RuntimeError("cancelled")
                 y1, x1 = min(y0 + tile, H0), min(x0 + tile, W0)
-                x, info = restore_cutout(es, y0, y1, x0, x1, idx=sub_idx, r=r, kernels=sub_kern, robust=robust,
+                sub_kern = interp_nodes(kern[sel], es.nodes, RY0 + (y0 + y1 - 1) / 2,
+                                        RX0 + (x0 + x1 - 1) / 2).astype(np.float32)
+                x, info = restore_cutout(es, RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1, idx=sub_idx, r=r, kernels=sub_kern, robust=robust,
                                          psf_model=psf_model, n_groups=n_groups, device=dev, delta=delta,
                                          kappa=kappa, epsilon=epsilon, max_iters=max_iters, accelerate=accelerate,
-                                         stop=stop, log=_iteration_check)
+                                         stop=stop, min_iters=min_iters, log=_iteration_check)
                 wy = _edge_weights((y1 - y0) * r, overlap * r, y0 > 0, y1 < H0)
                 wx = _edge_weights((x1 - x0) * r, overlap * r, x0 > 0, x1 < W0)
                 wgt = np.outer(wy, wx)[..., None]
@@ -756,7 +960,7 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                 out[sl] += x * wgt
                 cov[sl] += info["coverage"] * wgt / len(sets)
                 acc[sl] += wgt
-                tiles.append({"set": part, "window": [y0, y1, x0, x1], "iterations": info["iterations"],
+                tiles.append({"set": part, "window": [RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1], "iterations": info["iterations"],
                               "converged": info["converged"]})
                 if progress:
                     done = len(tiles)
@@ -766,6 +970,14 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         if part == 0:
             acc0 = acc
     cov /= np.maximum(acc0, 1e-12)
+    # saturated stars: no data in their cores, the coadd's profile instead (saturated_fill)
+    n_sat = 0
+    if hasattr(es, "ref") and hasattr(es, "sky_ref"):
+        ref_lat = reference_on_latent(es, r, (RY0, RY1, RX0, RX1))
+        fw = float(getattr(es, "fwhm_ref", 4.0)) * r
+        for i in range(len(outs)):
+            outs[i], n_sat = saturated_fill(outs[i], cov, ref_lat, fw)
+        del ref_lat
     n2n_info = None
     if n2n:
         out, n2n_info = n2n_pass(outs[0], outs[1], iters=n2n_iters, device=dev, progress=progress, cancel=cancel)
@@ -778,8 +990,9 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     bad = int((~np.isfinite(out)).sum())
     if bad:                       # never save (and later render) a restoration with NaN / inf pixels
         raise RuntimeError(f"ImageMM restoration: {bad} non-finite pixels ({bad / out.size:.2%}) in the result")
-    return out, {"method": "ImageMM (arXiv:2501.03002), Algorithm " + ("2" if kern is not None else ("3" if robust else "1")),
+    return out, {"method": "ImageMM (arXiv:2501.03002), Algorithm " + ("2" if eq11 is not None else ("3" if robust else "1")),
                  "robust": robust, "delta": delta, "kappa": kappa, "epsilon": epsilon, "stop": stop, "r": r, "eq11": eq11,
                  "psf_model": psf_model, "n_groups": n_groups, "accelerate": accelerate, "n2n": n2n_info,
-                 "n_exposures": len(idx), "psf_size": ks, "tiles": tiles, "coverage": cov,
+                 "n_exposures": len(idx), "psf_size": ks, "tiles": tiles, "coverage": cov, "saturated_stars": n_sat,
+                 "fwhm": float(getattr(es, "fwhm_ref", (ks / r - 1) / 7)) * r,      # seeing FWHM, latent pixels
                  "seconds": round(time.time() - t0, 1)}

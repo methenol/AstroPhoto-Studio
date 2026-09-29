@@ -180,12 +180,12 @@ class ImageMMTask(Task):
          "default": 0, "tune": True, "pipeline": "imagemm_groups"},
         {"name": "accelerate", "label": "Biggs–Andrews acceleration", "type": "bool", "default": True, "tune": True,
          "pipeline": "imagemm_accelerate"},
-        {"name": "stop", "label": "Stopping rule", "type": "categorical", "choices": ["c15", "elementwise"],
-         "default": "c15", "tune": False, "pipeline": "imagemm_stop"},
+        {"name": "stop", "label": "Stopping rule", "type": "categorical", "choices": ["flux", "c15", "elementwise"],
+         "default": "flux", "tune": False, "pipeline": "imagemm_stop"},
         {"name": "epsilon", "label": "Tolerance ε", "type": "float", "low": 1e-8, "high": 1e-3, "log": True,
-         "default": 1e-6, "tune": False, "pipeline": "imagemm_epsilon"},
+         "default": 1e-4, "tune": False, "pipeline": "imagemm_epsilon"},
         {"name": "max_iters", "label": "Max iterations", "type": "int", "low": 50, "high": 5000, "log": True,
-         "default": 1000, "tune": False, "pipeline": "imagemm_max_iters"},
+         "default": 2000, "tune": False, "pipeline": "imagemm_max_iters"},
         {"name": "r", "label": "Super-resolution r", "type": "categorical", "choices": [1, 2], "default": 1,
          "tune": False, "pipeline": "imagemm_r"},
         {"name": "sigma", "label": "g_σ of Eq. 11 (0 = the paper's: 1 at r = 1, 1.1 at r = 2)", "type": "float", "low": 0.0,
@@ -251,10 +251,12 @@ class ImageMMTask(Task):
         # the held-out subs are always predicted through their measured (empirical) PSFs, the
         # same yardstick for every trial whatever PSF model the trial restores with
         kern = None
-        kb = es.kernels(ctx["idx_b"], "empirical")
+        y0, y1, x0, x1 = window
+        at = ((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2)             # the field-dependent PSFs at the window
+        kb = es.kernels(ctx["idx_b"], "empirical", at=at)
         if r > 1 or sigma:
             log(f"Eq. 11 kernels (r = {r}, σ = {sigma})")
-            kern, _ = M.superresolved_kernels(es.kernels(ctx["idx_a"], p["psf_model"]), r, sigma, device=dev)
+            kern, _ = M.superresolved_kernels(es.kernels(ctx["idx_a"], p["psf_model"], at=at), r, sigma, device=dev)
             kb, _ = M.superresolved_kernels(kb, r, sigma, device=dev)
         n_groups = min(int(p["n_groups"]), len(ctx["idx_a"]))
         def it_log(k, c):
@@ -435,7 +437,7 @@ class NetworkTask(Task):
         return ctx
 
     def run(self, ctx, p, log, cancel):
-        from ..denoise import _batch_and_tile, _sky_map, channel_psfs, infer, train_n2n, train_n2n_deconv
+        from ..denoise import _batch_and_tile, _sky_map, channel_psf_field, infer, train_n2n, train_n2n_deconv
         dev, es, s = ctx["device"], ctx["es"], ctx["sc"]
         y0, y1, x0, x1 = ctx["window"]
         Y0, X0 = ctx["off"]
@@ -451,7 +453,7 @@ class NetworkTask(Task):
         da, db = infer(net, ctx["ga"], tile=tile, tta=8), infer(net, ctx["gb"], tile=tile, tta=8)
         stab = ctx["stab"]
         den = stab.inv(0.5 * (da + db))
-        psfs = channel_psfs(den, ctx["sat"])
+        psfs = channel_psf_field(den, ctx["sat"], spacing=900.0 * s)
         if psfs is None:
             raise RuntimeError("not enough isolated stars to measure the PSF")
         var = cv2.GaussianBlur(0.5 * (a - b) ** 2, (0, 0), 10 * s)
@@ -487,7 +489,7 @@ class NetworkTask(Task):
             x = x.reshape((y1 - y0), s, (x1 - x0), s, 3).mean((1, 3))
         x = x - es.sky_ref[y0:y1, x0:x1]
         dt = time.time() - t
-        kb = es.kernels(ctx["idx_b"], "empirical")
+        kb = es.kernels(ctx["idx_b"], "empirical", at=((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2))
         ch = MX.heldout_chi2(es, ctx["idx_b"], x, 1, kb, ctx["window"], ctx["smask"], dev)
         out = {"heldout_src": _mean(ch["src"]), "heldout_sky": _mean(ch["sky"]), "heldout_src_rgb": ch["src"],
                "heldout_sky_rgb": ch["sky"], "seconds": dt}

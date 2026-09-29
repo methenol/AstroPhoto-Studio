@@ -58,8 +58,9 @@ def main(argv=None):
     r.add_argument("--imagemm-kappa", type=float, default=STACK_DEFAULTS["imagemm_kappa"],
                    help="clipping of the multiplicative update")
     r.add_argument("--imagemm-epsilon", type=float, default=STACK_DEFAULTS["imagemm_epsilon"], help="stopping tolerance")
-    r.add_argument("--imagemm-stop", default=STACK_DEFAULTS["imagemm_stop"], choices=["c15", "elementwise"],
-                   help="stopping rule: Eq. C15 (the paper) or elementwise mean |u'_k/u'_k-1 - 1|")
+    r.add_argument("--imagemm-stop", default=STACK_DEFAULTS["imagemm_stop"], choices=["flux", "c15", "elementwise"],
+                   help="stopping rule: flux-weighted relative change of the image (default, epsilon ~1e-4), "
+                        "Eq. C15 (the paper, epsilon 1e-4 ... 1e-6) or elementwise mean |u'_k/u'_k-1 - 1|")
     r.add_argument("--imagemm-max-iters", type=int, default=STACK_DEFAULTS["imagemm_max_iters"])
     r.add_argument("--imagemm-psf", default=STACK_DEFAULTS["imagemm_psf"], choices=["empirical", "moffat"])
     r.add_argument("--imagemm-groups", type=int, default=STACK_DEFAULTS["imagemm_groups"],

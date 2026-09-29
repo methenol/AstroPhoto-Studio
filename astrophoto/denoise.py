@@ -293,6 +293,38 @@ def channel_psfs(img: np.ndarray, sat: float, max_half: int = 20) -> np.ndarray 
     return np.stack([np.pad(p, (n - p.shape[0]) // 2) for p in psfs]).astype(np.float32)
 
 
+def channel_psf_field(img: np.ndarray, sat: float, max_half: int = 20, spacing: float = 900.0) -> dict | None:
+    """Per-channel empirical PSFs over the field: ``channel_psfs`` in overlapping windows (twice
+    the node spacing) around the nodes of a grid at most ``spacing`` px apart (exposures.psf_nodes),
+    the whole-image PSF where a window has too few stars.  The Seestar's star FWHM changes by ~40 %
+    from the centre to the edge of the field; with one PSF for the whole image the deconvolution
+    network was trained to over-deconvolve the (sharper) centre - tiny stars with dark outlines on
+    M 76 - and under-deconvolve the edges.
+    Returns {"kernels": (C, ny, nx, k, k) - symmetrised, unit sum -, "nodes": (rows, cols)} or None."""
+    from .exposures import psf_nodes
+    glob = channel_psfs(img, sat, max_half)
+    if glob is None:
+        return None
+    H, W = img.shape[:2]
+    ys, xs = psf_nodes(H, W, spacing)
+    sy, sx = (ys[1] - ys[0]) if len(ys) > 1 else H, (xs[1] - xs[0]) if len(xs) > 1 else W
+    per = [[None] * len(xs) for _ in ys]
+    for i, y in enumerate(ys):
+        for j, x in enumerate(xs):
+            y0, y1 = int(max(0, y - sy)), int(min(H, y + sy + 1))
+            x0, x1 = int(max(0, x - sx)), int(min(W, x + sx + 1))
+            per[i][j] = channel_psfs(img[y0:y1, x0:x1], sat, max_half)
+    k = max([glob.shape[1]] + [q.shape[1] for row in per for q in row if q is not None])
+    C = img.shape[2]
+    K = np.zeros((C, len(ys), len(xs), k, k), np.float32)
+    for i in range(len(ys)):
+        for j in range(len(xs)):
+            q = per[i][j] if per[i][j] is not None else glob
+            o = (k - q.shape[1]) // 2
+            K[:, i, j, o:o + q.shape[1], o:o + q.shape[1]] = q
+    return {"kernels": K, "nodes": (ys, xs), "n_fallback": int(sum(q is None for row in per for q in row))}
+
+
 def _sky_map(img: np.ndarray, box: int) -> np.ndarray:
     import sep
     return np.stack([sep.Background(np.ascontiguousarray(img[..., c], np.float32), bw=box, bh=box).back()
@@ -389,9 +421,19 @@ def train_n2n_deconv(net: nn.Module, da: np.ndarray, db: np.ndarray, a: np.ndarr
     tda, tdb, ta, tb = T(da), T(db), T(a), T(b)
     tw = T(weight[..., None] / var)
     tsky, tsig = T(sky), T(np.sqrt(var / 2))
-    nc = psfs.shape[0]
-    kt = torch.from_numpy(psfs[:, None].copy()).to(device)
-    r = psfs.shape[1] // 2
+    # psfs: (C, k, k), or a field {"kernels": (C, ny, nx, k, k), "nodes"} (channel_psf_field): each
+    # patch is then blurred with the PSF where it lies (bilinear between the nodes, at its centre)
+    field = psfs if isinstance(psfs, dict) else None
+    if field is not None:
+        from .exposures import interp_nodes
+        Kf = field["kernels"]
+        nc, r = Kf.shape[0], Kf.shape[-1] // 2
+        kernel_at = lambda y, x: torch.from_numpy(np.ascontiguousarray(interp_nodes(Kf, field["nodes"], y, x),
+                                                                       np.float32))
+    else:
+        nc = psfs.shape[0]
+        kt = torch.from_numpy(psfs[:, None].copy()).to(device)
+        r = psfs.shape[1] // 2
     if mf is not None:
         s_ = int(mf["s"])
         patch -= patch % s_
@@ -440,18 +482,27 @@ def train_n2n_deconv(net: nn.Module, da: np.ndarray, db: np.ndarray, a: np.ndarr
             chi2 = data / count.clamp_min(1.0)
         else:
             parts = [[] for _ in range(5)]
+            kers = []
             for (y, x), s in zip(pick, rng.random(batch) < 0.5):
                 sl = (slice(None), slice(y, y + patch), slice(x, x + patch))
                 src = (tdb, ta) if s else (tda, tb)
                 rot = int(rng.integers(0, 4))            # the PSF is 4-fold symmetrised: rotations are exact
                 for lst, z in zip(parts, (src[0][sl], src[1][sl], tw[sl], tsky[sl], tsig[sl])):
                     lst.append(torch.rot90(z, rot, (1, 2)))
+                if field is not None:
+                    kers.append(kernel_at(y + patch / 2, x + patch / 2))
             inp, tgt, wt, skyp, sigp = (torch.stack(z).to(device) for z in parts)
             with _autocast(device):
                 g = net(inp)
             g = g.float()
             x = inv(g)
-            kx = F.conv2d(F.pad(x, (r, r, r, r), mode="reflect"), kt, groups=nc)
+            xp = F.pad(x, (r, r, r, r), mode="reflect")
+            if field is not None:                        # one kernel per sample and channel: grouped conv
+                B_ = xp.shape[0]
+                kw = torch.stack(kers).to(device).reshape(B_ * nc, 1, 2 * r + 1, 2 * r + 1)
+                kx = F.conv2d(xp.reshape(1, B_ * nc, *xp.shape[-2:]), kw, groups=B_ * nc).reshape(B_, nc, *x.shape[-2:])
+            else:
+                kx = F.conv2d(xp, kt, groups=nc)
             sl = (slice(None), slice(None), slice(r, -r), slice(r, -r))
             chi2 = ((kx - tgt) ** 2 * wt)[sl].mean() / (wt[sl] > 0).float().mean().clamp_min(1e-3)
         if mf is not None:
@@ -536,11 +587,13 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
     del keep
     sharp = psfs = dnet = None
     if deconvolve:
-        psfs = channel_psfs(den, sat)
+        psfs = channel_psf_field(den, sat, spacing=900.0 * px_scale)
         if psfs is None:
             info["deconvolution"] = "skipped: not enough isolated stars to measure the PSF"
         else:
-            info["psf_size"] = int(psfs.shape[1])
+            ksize = int(psfs["kernels"].shape[-1])
+            info["psf_size"] = ksize
+            info["psf_field"] = {"nodes": [len(psfs["nodes"][0]), len(psfs["nodes"][1])], "fallback": psfs["n_fallback"]}
             var = cv2.GaussianBlur(0.5 * (half_a - half_b) ** 2, (0, 0), 10 * px_scale)
             var = np.maximum(var, np.percentile(var[::4, ::4], 1, axis=(0, 1)) * 0.5).astype(np.float32)
             unsat = (full.max(-1) < 0.5 * sat).astype(np.uint8)
@@ -557,10 +610,10 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
             del da, db, sky
             if progress:
                 progress(0, 1, "Deconvolving")
-            ov = int(min(tile // 3, max(128, 4 * psfs.shape[1])))
+            ov = int(min(tile // 3, max(128, 4 * ksize)))
             sharp = stab.inv(infer(dnet, g_den, tile=max(tile, 3 * ov), overlap=ov, tta=tta))
             del var
-            sharp = finish_sharp(sharp, den, full, sat, psfs.shape[1])
+            sharp = finish_sharp(sharp, den, full, sat, ksize)
     if save_path:
         torch.save({"denoiser": net.state_dict(), "deconv": dnet.state_dict() if dnet is not None else None,
                     "stab": {"sigma": stab.sigma, "bg": stab.bg, "k": stab.k},

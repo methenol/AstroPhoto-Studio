@@ -27,7 +27,7 @@ from . import __version__
 from .analysis import analyse, finalize_selection
 from .denoise import pick_device
 from .frames import FrameInfo, build_defect_map, discover, read_raw, superpixel
-from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
+from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage, restored_star_floor
 from .stacking import Integrator
 
 STACK_DEFAULTS = {
@@ -47,9 +47,12 @@ STACK_DEFAULTS = {
     "imagemm_robust": True,  # Algorithm 3 (Huber, delta = 2) instead of the L2 loss
     "imagemm_delta": 2.0,    # Huber threshold delta of Algorithm 3 (the paper: 2)
     "imagemm_kappa": 2.0,    # clipping of the multiplicative update, kappa (the paper: 2)
-    "imagemm_epsilon": 1e-6,  # stopping tolerance (the paper uses 1e-4 ... 1e-6)
-    "imagemm_stop": "c15",   # c15 (Eq. C15, the paper) | elementwise (mean |u'_k/u'_k-1 - 1|)
-    "imagemm_max_iters": 1000,
+    "imagemm_epsilon": 1e-4,  # stopping tolerance: flux rule ~1e-4; Eq. C15 (the paper) 1e-4 ... 1e-6
+    "imagemm_stop": "flux",  # flux (sum |x_k - x_k-1| / sum x_k) | c15 (Eq. C15, the paper) | elementwise
+                             # (mean |u'_k/u'_k-1 - 1|).  C15 stops far from the fixed point on sky-dominated
+                             # cutouts (pixels clamped at kappa in two successive iterations have a ratio of
+                             # exactly 1, and ratios above and below 1 cancel): 2 - 23 iterations on IC 405
+    "imagemm_max_iters": 2000,
     "imagemm_psf": "empirical",  # empirical | moffat
     "imagemm_groups": 0,     # 0 = every exposure (the paper); N = N seeing-group coadds
     "imagemm_accelerate": True,  # Biggs & Andrews extrapolation (not in the paper): the converged
@@ -428,15 +431,21 @@ class Session:
                 from . import imagemm
                 es = self.exposure_set(progress)
                 r_ = int(p["imagemm_r"])
+                # the paper's g_sigma (Eq. 11): 1 at r = 1, 1.1 at r = 2.  At r = 1 the latent is then the
+                # sky seen through a 1 px Gaussian - band-limited, so a star between pixel centres is
+                # represented exactly; with the measured PSFs directly (no Eq. 11) the latent can only
+                # split such a star over whole pixels, the model comes out broader than the star, and the
+                # fit pulls light out of a ring 3-4 px around every star (IC 405: -1 % of the peak)
                 sigma = float(p.get("imagemm_sigma") or 0) or (1.1 if r_ > 1 else 1.0)
                 lat, info = imagemm.restore(
                     es, r=int(p["imagemm_r"]), sigma=sigma, psf_model=p["imagemm_psf"],
                     n_groups=int(p["imagemm_groups"]), robust=bool(p["imagemm_robust"]),
                     delta=float(p.get("imagemm_delta", 2.0)), kappa=float(p.get("imagemm_kappa", 2.0)),
-                    epsilon=float(p["imagemm_epsilon"]), stop=p.get("imagemm_stop", "c15"),
+                    epsilon=float(p["imagemm_epsilon"]), stop=p.get("imagemm_stop", "flux"),
                     max_iters=int(p["imagemm_max_iters"]),
                     accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
                     n2n_iters=int(p["denoise_iters"]), device=p["device"], progress=progress,
+                    kernel_cache=self._p(f"imagemm/kernels_r{r_}_s{sigma}_{p['imagemm_psf']}.pkl"),
                     cancel=self.checkpoint)
                 cov = info.pop("coverage").mean(-1)
                 _save_fits(self._p("imagemm.fits"), lat)
@@ -520,16 +529,23 @@ class Session:
             if rest is not None:
                 # ImageMM's latent image is already restored (deconvolved, sky noise suppressed):
                 # no denoise blend and no second deconvolution
-                img, cov = rest["image"], rest["coverage"]
-                # ImageMM estimates the sky integrated over each pixel (r = 1, no g_sigma): point
-                # sources are single pixels and the sky noise collapses into isolated speckles, not an
-                # image to look at.  As in the paper (Eq. 11: the latent is the sky seen through g_sigma,
-                # sigma = 1 at r = 1), it is shown through a Gaussian g_sigma; a restoration already
-                # made with Eq. 11 at sigma_0 only gets the remaining sqrt(sigma^2 - sigma_0^2)
+                img = rest["image"]
+                # crop on the frames' footprint (the stack's coverage): the restoration's own map is
+                # the fraction of subs with valid data, which is ~0 on every saturated star (masked
+                # in all subs), and the largest rectangle avoiding those holes is a thin band of the
+                # field (IC 405: rows 1248-3168 of 7680)
+                cov = _resize_to(st["coverage"], img.shape[:2])
+                # the restoration is shown as the sky seen through a Gaussian g_sigma (the paper's Eq. 11,
+                # sigma = 1 at r = 1); one already made with Eq. 11 at sigma_0 only gets the remaining
+                # sqrt(sigma^2 - sigma_0^2) (none at the default resolution)
                 img = restored_view(img, float(p.get("restored_resolution", 1.0)), self._restore_info())
                 ref = st["stack"]
                 clip_ref = cv2.resize(ref, (img.shape[1], img.shape[0]),
                                       interpolation=cv2.INTER_AREA if ref.shape[1] > img.shape[1] else cv2.INTER_LINEAR)
+                # no moat darker than the local sky around stars (restored_star_floor)
+                rinfo = self._restore_info()
+                fw = float(rinfo.get("fwhm") or ((rinfo.get("psf_size") or 29) - 1) / 7)
+                img = restored_star_floor(img, clip_ref, fw)
                 lin, info = linear_stage(img, cov, None, p, self.meta.get("saturation", 63471.0),
                                          progress=progress, restored=True, clip_ref=clip_ref)
                 info["restoration"] = "ImageMM"
@@ -540,7 +556,9 @@ class Session:
                 if info.get("crop"):
                     y0, y1, x0, x1 = info["crop"]
                     det = det[y0:y1, x0:x1]
-                detect = np.ascontiguousarray(det / float(info.get("white_level", self.meta.get("saturation", 63471.0))),
+                # (white-balanced like the output: the palette measures the Ha leakage on it)
+                detect = np.ascontiguousarray(det * np.asarray(info.get("wb_gains", [1, 1, 1]), np.float32)
+                                              / float(info.get("white_level", self.meta.get("saturation", 63471.0))),
                                               np.float32)
                 info["restored_sigma"] = float(p.get("restored_resolution", 1.0)) * int(self._restore_info().get("r", 1) or 1)
             else:

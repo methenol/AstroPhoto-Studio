@@ -1,0 +1,106 @@
+"""Checks of the display stage (astrophoto/postprocess.py) on synthetic images.
+
+    python experiments/test_postprocess.py
+"""
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from astrophoto.postprocess import extract_ha_oiii, luminance, neutralize_star_halos  # noqa: E402
+
+FAILS = []
+
+
+def check(name, ok, detail=""):
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    if not ok:
+        FAILS.append(name)
+
+
+def halo_scene(H=1800, W=1800, seed=0):
+    """A bright star whose halo (r^-3, out to ~100 px) is 25 % stronger in G and B than in R -
+    the dual-band filter halo of the Seestar - with a red knot inside the halo, faint stars and
+    sky noise, as a linear, background-neutralised image (0..1)."""
+    rs = np.random.default_rng(seed)
+    yy, xx = np.mgrid[:H, :W].astype(np.float64)
+    img = np.full((H, W, 3), 2e-4) + rs.normal(size=(H, W, 3)) * 3e-5
+    cy, cx = H / 2, W / 2
+    r = np.hypot(yy - cy, xx - cx)
+    core = 0.9 * np.exp(-r ** 2 / (2 * 1.8 ** 2))
+    halo = 2e-2 * (1 + (r / 6.0) ** 2) ** -1.5
+    for c, k in enumerate((1.0, 1.25, 1.25)):
+        img[..., c] += core + k * halo
+    for _ in range(1200):                                          # field stars
+        y, x = rs.uniform(20, H - 20, 2)
+        f = 10 ** rs.uniform(-3.5, -1.5)
+        img += (f * np.exp(-((yy - y) ** 2 + (xx - x) ** 2) / (2 * 1.8 ** 2)))[..., None]
+    knot = 3e-3 * np.exp(-((yy - cy - 45) ** 2 + (xx - cx) ** 2) / (2 * 3.0 ** 2))
+    img[..., 0] += knot                                             # an Ha knot inside the halo
+    return img.astype(np.float32), (cy, cx), (cy + 45, cx), halo
+
+
+def test_halo_neutral():
+    img, (cy, cx), (ky, kx), halo = halo_scene()
+    out, W = neutralize_star_halos(img, 0.96, noise_ref=3e-5)
+    H, Wd = img.shape[:2]
+    yy, xx = np.mgrid[:H, :Wd]
+    r = np.hypot(yy - cy, xx - cx)
+    # the visible halo: its excess at least twice the pixel noise (12 - 40 px)
+    ring = (r > 12) & (r < 40) & (np.hypot(yy - ky, xx - kx) > 12)
+    col = lambda z: np.median(z[ring] - np.median(z[r > 500], 0), 0)
+    before, after = col(img), col(out)
+    gb_r = lambda c: (0.5 * (c[1] + c[2])) / c[0]
+    knot = np.hypot(yy - ky, xx - kx) < 3
+    kb = (img[knot][:, 0] - img[knot][:, 1]).mean()
+    ka = (out[knot][:, 0] - out[knot][:, 1]).mean()
+    check("halo colour neutralised out to the halo's measured reach",
+          abs(gb_r(after) - 1) < 0.03 and abs(gb_r(before) - 1.25) < 0.05,
+          f"(G+B)/2 / R in the halo 12-40 px: before {gb_r(before):.3f}, after {gb_r(after):.3f}")
+    check("a red knot inside the halo keeps its colour", ka > 0.9 * kb, f"R - G at the knot: before {kb:.2e}, after {ka:.2e}")
+    ha, oiii = extract_ha_oiii(out, unmix=True, neutral=W)
+    ring2 = ring & (r < 40)
+    hx = np.median(ha[ring2]) - np.median(ha[r > 500])
+    ox = np.median(oiii[ring2]) - np.median(oiii[r > 500])
+    ha0, o0 = extract_ha_oiii(out, unmix=True)
+    ox0 = np.median(o0[ring2]) - np.median(o0[r > 500])
+    check("palette: the neutral halo stays neutral (no OIII gain / unmixing on it)", abs(ox / hx - 1) < 0.1,
+          f"OIII / Ha excess in the halo {ox / hx:.3f} (without the protection {ox0 / hx:.3f})")
+
+
+def test_star_floor():
+    """restored_star_floor: a moat round a star in a smooth restoration is lifted to the local
+    sky; the star's core and the sky away from stars are not touched."""
+    from astrophoto.postprocess import restored_star_floor
+    rs = np.random.default_rng(1)
+    H = W = 400
+    yy, xx = np.mgrid[:H, :W].astype(np.float64)
+    sky = 50.0
+    img = np.full((H, W, 3), sky) + rs.normal(size=(H, W, 3)) * 0.5            # smooth (N2N-like) restoration
+    det = np.full((H, W, 3), 2000.0) + rs.normal(size=(H, W, 3)) * 30.0        # its coadd, with sky
+    stars = [(100, 100), (250, 300), (320, 80)]
+    fw = 4.5
+    for y, x in stars:
+        r = np.hypot(yy - y, xx - x)
+        img += (5e4 * np.exp(-r ** 2 / (2 * 1.1 ** 2)) - 6.0 * np.exp(-((r - 7) / 2.0) ** 2))[..., None]   # core + moat
+        det += (3e4 * np.exp(-r ** 2 / (2 * (fw / 2.3548) ** 2)))[..., None]
+    img = img.astype(np.float32)
+    out = restored_star_floor(img, det.astype(np.float32), fw)
+    r0 = np.hypot(yy - 100, xx - 100)
+    moat = (r0 > 6) & (r0 < 8)
+    far = np.min([np.hypot(yy - y, xx - x) for y, x in stars], 0) > 30
+    check("star floor: moat lifted to the sky", np.median(out[moat]) > sky - 1.0 > np.median(img[moat]),
+          f"moat median {np.median(img[moat]):.2f} -> {np.median(out[moat]):.2f} (sky {sky})")
+    check("star floor: star cores and open sky untouched",
+          np.abs(out - img)[r0 < 3].max() == 0 and np.abs(out - img)[far].max() == 0)
+
+
+if __name__ == "__main__":
+    t0 = time.time()
+    ALL = [test_halo_neutral, test_star_floor]
+    chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
+    for f in chosen:
+        f()
+    print(f"\n{len(FAILS)} failed: {FAILS}  ({time.time() - t0:.0f}s)")

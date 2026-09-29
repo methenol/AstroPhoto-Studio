@@ -373,11 +373,19 @@ def estimate_psf(L: np.ndarray, sat: float, max_stars: int = 150, max_half: int 
     xy = np.stack([objs["x"], objs["y"]], 1)
     from scipy.spatial import cKDTree
     d, _ = cKDTree(xy).query(xy, k=2)
-    good &= d[:, 1] > 3 * half
-    idx = np.nonzero(good)[0]
+    h, w = L.shape
+    inside = ((objs["x"] >= half + 2) & (objs["y"] >= half + 2) & (objs["x"] < w - half - 3) & (objs["y"] < h - half - 3))
+    # isolation: no other 10-sigma detection within 3 cut-out half-widths; in crowded (Milky Way)
+    # fields, and on the crops the experiment lab trains on, that can leave fewer than the 5 stars
+    # needed, so it is relaxed step by step - the per-pixel median of the cut-outs rejects a
+    # neighbour that appears in a minority of them
+    for iso in (3.0, 2.0, 1.5):
+        ok = good & inside & (d[:, 1] > iso * half)
+        if ok.sum() >= 15:
+            break
+    idx = np.nonzero(ok)[0]
     idx = idx[np.argsort(-objs["peak"][idx])][:max_stars]
     cuts = []
-    h, w = L.shape
     for i in idx:
         x, y = objs["x"][i], objs["y"][i]
         xi, yi = int(round(x)), int(round(y))
@@ -458,6 +466,56 @@ def deconvolve(img: np.ndarray, strength: float, sat: float, noise_ref: float | 
     ratio = np.clip(ratio, 0.2, 5)
     out = img * ratio[..., None]
     return out.astype(np.float32), {"psf_fwhm": fw, "iterations": iters}
+
+
+def restored_star_floor(img: np.ndarray, detect: np.ndarray, fwhm: float, nsig: float = 1.0) -> np.ndarray:
+    """A restoration may concentrate a star's halo light into its core, but it must not leave a
+    moat darker than the local sky around the star (the network path's ``deconv_floor`` rule).
+    ImageMM leaves a faint one around bright stars - 0.1-0.2 % of the peak at 1-2 FWHM, where
+    its PSF model is a little stronger than the star's own wings - invisible in the linear data
+    but a dark ring after a strong stretch of a smooth (Noise2Noise) restoration.
+
+    Around every star of the coadd ``detect`` (same grid, 20-sigma detections), in the annulus
+    from 1 to 3.5 FWHM, pixels are raised to at least the local sky (a median over ~8 FWHM of
+    ``img`` with the stars' cores excluded) minus ``nsig`` x the local pixel noise.  A speckled
+    restoration, whose noise is large, is barely touched; the stars' cores never are.
+    img, detect: (H, W, C) linear; ``fwhm`` in pixels of that grid."""
+    from scipy.ndimage import median_filter
+    h, w, C = img.shape
+    L = np.ascontiguousarray(luminance(detect), np.float32)
+    bkg = sep.Background(L, bw=64, bh=64)
+    try:
+        objs = _extract(L - bkg.back(), 20.0, bkg.globalrms, minarea=5)
+    except Exception:
+        return img
+    if len(objs) == 0:
+        return img
+    ring = np.zeros((h, w), np.uint8)
+    core = np.zeros((h, w), np.uint8)
+    r_in, r_out = max(1, int(round(fwhm))), max(2, int(round(3.5 * fwhm)))
+    for x, y in zip(objs["x"], objs["y"]):
+        c = (int(round(x)), int(round(y)))
+        cv2.circle(ring, c, r_out, 1, -1)
+        cv2.circle(core, c, r_in, 1, -1)
+    ring &= (1 - core)
+    if not ring.any():
+        return img
+    # local sky: median over ~8 FWHM with the star discs excluded (a down-sampled grid, as deconv_floor)
+    f = max(1, int(round(fwhm / 2)))
+    k = max(5, int(round(8 * fwhm / f)) | 1)
+    excl = cv2.dilate(core, np.ones((3, 3), np.uint8), iterations=max(1, r_out - r_in)) > 0
+    out = img.copy()
+    for c in range(C):
+        ch = np.where(excl, np.nan, img[..., c]).astype(np.float32)
+        small = ch[::f, ::f]
+        # NaN-aware median via filling the excluded pixels with the median of their surroundings
+        fill = np.where(np.isnan(small), np.nanmedian(small), small)
+        sky = median_filter(fill, size=k, mode="reflect")
+        sky = cv2.resize(sky.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        resid = (img[..., c] - sky)[~excl][::7]
+        sig = 1.4826 * float(np.median(np.abs(resid - np.median(resid)))) if resid.size else 0.0
+        out[..., c] = np.where(ring > 0, np.maximum(img[..., c], sky - nsig * sig), img[..., c])
+    return out.astype(np.float32)
 
 
 def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.ndarray | None,
@@ -635,7 +693,29 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
         sat_star[i] = probe < len(prof) and prof[probe] < 0.12 * pk
     star &= (conc < 3.0) | sat_star
     star &= ~(sat_peak & ~sat_star & ~((fw < 3.0 * fw_med) & (conc < 3.0)))
-    return objs[star], rms, fw_med
+    found = objs[star]
+    # stars on bright extended light (a planetary nebula's lobes, a galaxy disc): the mesh background
+    # cannot follow structure of a few tens of pixels, so such a star merges with the object into one
+    # extended source and is rejected - it then stays in the starless layer, where the chroma noise
+    # reduction spreads its neutral colour into a grey disc over the nebula (M 76).  A white top-hat
+    # (the image minus its opening by a disc a few FWHM across) keeps only structure smaller than a
+    # star: compact, round, significant peaks there that are not already stars are added.
+    k = max(5, int(round(3 * fw_med)) | 1)
+    th = Lc - cv2.morphologyEx(Lc, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    try:
+        extra = _extract(np.ascontiguousarray(th), 8.0, rms, minarea=3, deblend_cont=0.002)
+    except Exception:
+        extra = []
+    if len(extra):
+        fe = 2 * sep.flux_radius(th, extra["x"], extra["y"], 6 * extra["a"], 0.5, subpix=5)[0]
+        ok = (fe < 1.6 * fw_med) & (extra["a"] / np.maximum(extra["b"], 1e-3) < 1.6) & (extra["flag"] == 0)
+        if len(found) and ok.any():
+            from scipy.spatial import cKDTree
+            d, _ = cKDTree(np.stack([found["x"], found["y"]], 1)).query(np.stack([extra["x"], extra["y"]], 1))
+            ok &= d > 1.5 * fw_med
+        if ok.any():
+            found = np.concatenate([found, extra[ok]])
+    return found, rms, fw_med
 
 
 def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.ndarray | None = None,
@@ -744,32 +824,82 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
     return np.clip(mask, 0, 1)
 
 
-def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.0,
-                          noise_ref: float | None = None) -> np.ndarray:
-    """Remove coloured (blue/violet/cyan) halos around bright stars, in linear data.
+def _halo_radius(L: np.ndarray, x: float, y: float, r_min: float, r_max: int, nsig: float = 3.0,
+                 floor: float = 0.0) -> float:
+    """Radius where a star's halo meets the local background: the ring *medians* of ``L``
+    (robust to the other stars in a ring) minus the median of the outer annulus [0.8, 1] r_max,
+    first below the larger of ``nsig`` x the standard error of a ring median and ``floor`` (light
+    below it is invisible: on denoised data the ring medians are so precise that a halo falling
+    as r^-3 stays "significant" out to any radius), beyond ``r_min``.  Returns r_max when the
+    halo never meets the background (an extended object)."""
+    from scipy import ndimage
+    h, w = L.shape
+    xi, yi = int(round(x)), int(round(y))
+    y0, y1, x0, x1 = max(0, yi - r_max), min(h, yi + r_max + 1), max(0, xi - r_max), min(w, xi + r_max + 1)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    rad = np.hypot(xx - x, yy - y).astype(np.int32)
+    cut = L[y0:y1, x0:x1]
+    ok = rad < r_max
+    outer = cut[ok & (rad >= int(0.8 * r_max))]
+    if outer.size < 50:
+        return float(r_max)
+    bg = float(np.median(outer))
+    sig = 1.4826 * float(np.median(np.abs(outer - bg))) + 1e-12
+    idx = np.arange(int(np.ceil(r_min)), int(0.8 * r_max))
+    if not len(idx):
+        return float(r_max)
+    med = ndimage.median(cut, labels=np.where(ok, rad, -1), index=idx)
+    cnt = np.bincount(rad[ok], minlength=r_max)[idx]
+    se = 1.2533 * sig / np.sqrt(np.maximum(cnt, 1))        # standard error of a median
+    below = np.nonzero(np.asarray(med) - bg < np.maximum(nsig * se, floor))[0]
+    return float(idx[below[0]]) if len(below) else float(r_max)
 
-    Small refractors focus blue/violet (and the OIII band) slightly differently,
-    so bright stars get coloured rings/halos.  Around each bright star, the halo
-    light *in excess of the local background* is desaturated towards neutral,
-    ramping in outside the star's core so the core keeps its true colour.
-    Works regardless of which layer the halo later ends up in.
-    """
+
+def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.0,
+                          noise_ref: float | None = None, detect_L: np.ndarray | None = None,
+                          core_sigma: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Remove coloured (blue/violet/cyan/green) halos around bright stars, in linear data.
+
+    Small refractors focus blue/violet (and the OIII band) slightly differently, and dual-band
+    filters scatter a wide halo mostly into the OIII (green and blue) pixels, so bright stars
+    get coloured rings/halos.  Around each bright star, the halo light *in excess of the local
+    background* is desaturated towards neutral, ramping in outside the star's core so the
+    core keeps its true colour.  Works regardless of which layer the halo later ends up in.
+
+    The halo's reach is measured on the star's own radial profile (``_halo_radius``).  It used
+    to be a formula of the star's FWHM, which after a deconvolution or restoration is a
+    fraction of the optical halo's size: on M 76 (Seestar, LP filter) the brightest field star
+    measured FWHM 2.0 px, reach 20 px, while its teal halo (G and B 20 % above R) extends to
+    ~80 px.  ``detect_L``: the image to find stars on (for a restoration, the coadd it was made
+    from - its speckle would pass for stars); ``core_sigma``: Gaussian sigma of a restoration's
+    star cores (the core radius is then set from it).
+    Returns (corrected image, halo weight map in [0, 1]: how far each pixel was neutralised -
+    the palette uses it to keep the halo neutral, see ``extract_ha_oiii``)."""
+    W = np.zeros(lin.shape[:2], np.float32)
     if strength <= 0:
-        return lin
+        return lin, W
     L = luminance(lin)
-    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0)
+    objs, rms, fw = detect_stars_for_mask(detect_L if detect_L is not None else L, px_scale, noise_ref or 0.0)
     if len(objs) == 0:
-        return lin
+        return lin, W
     h, w = L.shape
     ratio = objs["peak"] / max(rms, 1e-12)
     sel = np.nonzero(ratio >= max(np.percentile(ratio, 97), 100))[0]
     sel = sel[np.argsort(-objs["flux"][sel])][:300]
     out = lin.copy()
-    r_core = max(1.5, 1.2 * fw)
+    r_core = max(1.5, 1.2 * fw) if core_sigma is None else max(1.5, 2.5 * float(core_sigma))
+    r_cap = int(np.clip(0.06 * max(h, w), 40, 400))
     for i in sel:
         x, y = float(objs["x"][i]), float(objs["y"][i])
-        # halo reach grows with brightness (log), bounded by the frame size
-        Rh = float(np.clip(fw * (2.5 + 2.2 * np.log10(ratio[i])), 12, 0.035 * max(h, w)))
+        # measured reach, never below the former brightness-based estimate
+        Rf = float(np.clip(fw * (2.5 + 2.2 * np.log10(ratio[i])), 12, 0.035 * max(h, w)))
+        hr = _halo_radius(L, x, y, 2 * r_core, r_cap, floor=0.5 * (noise_ref or 0.0))
+        if hr >= int(0.8 * r_cap) - 1:
+            # the profile never meets the background: the star sits on an extended object (a nebula,
+            # a galaxy, a planetary nebula), whose own light the ring medians measure - neutralising
+            # it greyed a disc of the object around every star on it (M 76's lobes)
+            continue
+        Rh = max(Rf, 1.1 * hr)
         R = int(np.ceil(Rh * 1.35))
         xi, yi = int(round(x)), int(round(y))
         y0, y1, x0, x1 = max(0, yi - R), min(h, yi + R + 1), max(0, xi - R), min(w, xi + R + 1)
@@ -782,14 +912,23 @@ def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.
         if ring_out.sum() < 20:
             continue
         bg = np.median(patch[ring_out], axis=0)
-        d = patch - bg
-        dm = luminance(d)[..., None]  # luminance-weighted: neutralising never brightens
-        wgt = np.clip((rad - r_core) / r_core, 0, 1) * np.clip((R - rad) / (R - Rh), 0, 1)
-        wgt = (strength * wgt)[..., None]
-        # only touch pixels that actually carry excess (halo) light
-        wgt = wgt * (dm > 0)
-        out[y0:y1, x0:x1] = bg + dm + (d - dm) * (1 - wgt)
-    return out.astype(np.float32)
+        wgt = np.clip((rad - r_core) / r_core, 0, 1) * np.clip((R - rad) / max(R - Rh, 1e-6), 0, 1)
+        wgt = strength * wgt
+        W[y0:y1, x0:x1] = np.maximum(W[y0:y1, x0:x1], wgt)
+        # the halo is the star's azimuthally symmetric light: per channel, the ring medians minus the
+        # local background (robust to the stars, knots and nebula texture inside the rings).  Only
+        # its colour - each channel's departure from the halo's luminance - is removed, so everything
+        # else in the rings (a red Ha knot, a neighbouring star) keeps its own colour.
+        ri = rad.astype(np.int32)
+        lab_ = np.where(ri < R, ri, -1)
+        from scipy import ndimage
+        prof = np.stack([np.asarray(ndimage.median(patch[..., c], labels=lab_, index=np.arange(R))) - bg[c]
+                         for c in range(patch.shape[-1])], -1)                      # (R, C)
+        prof = np.maximum(prof, 0)
+        pl = luminance(prof[None])[0][:, None]
+        excess = (prof - pl)[np.minimum(ri, R - 1)]                                   # colour of the halo
+        out[y0:y1, x0:x1] = patch - wgt[..., None] * excess
+    return out.astype(np.float32), W
 
 
 def pushpull_fill(img: np.ndarray, weight: np.ndarray) -> np.ndarray:
@@ -929,20 +1068,14 @@ def palette_compose(ha: np.ndarray, oiii: np.ndarray, palette: str) -> np.ndarra
     return np.stack([ha, oiii, oiii], -1)  # HOO
 
 
-def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0):
-    """Split dual-band OSC data into Ha (red pixels) and OIII (green+blue pixels).
-
-    Colour filters on a Bayer sensor are not perfectly selective: green/blue
-    pixels also record some Ha (and broadband starlight/continuum).  With
-    ``unmix`` the leakage coefficient k is estimated from the data as the
-    *lower envelope* of OIII/Ha over high-SNR Ha pixels (regions that are
-    pure Ha constrain k), and k*Ha is subtracted.  OIII is then linearly
-    fitted to Ha's signal scale so both lines use one stretch.
-    """
+def ha_oiii_params(lin: np.ndarray, unmix: bool = True) -> tuple[float, float]:
+    """The two data-derived constants of ``extract_ha_oiii``: the Ha leakage into the OIII
+    pixels, k (0 without ``unmix``), and the gain that fits OIII's signal scale to Ha's."""
     ha = lin[..., 0].astype(np.float32)
     oiii = (0.5 * (lin[..., 1] + lin[..., 2])).astype(np.float32)
     hb, ob = np.median(ha[::4, ::4]), np.median(oiii[::4, ::4])
     hs = mad_sigma(ha[::4, ::4] - cv2.GaussianBlur(ha, (0, 0), 2)[::4, ::4])
+    k = 0.0
     if unmix:
         hsm = cv2.GaussianBlur(ha, (0, 0), 3) - hb
         osm = cv2.GaussianBlur(oiii, (0, 0), 3) - ob
@@ -950,8 +1083,7 @@ def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0):
         if sel.sum() > 500:
             ratio = osm[::2, ::2][sel] / hsm[::2, ::2][sel]
             # sensor leakage is a small physical constant: the lower envelope overestimates
-            # it where genuine Ha-only emission is bright (e.g. M27's "ears"), so cap it,
-            # and never let the correction remove more than 70% of the OIII signal
+            # it where genuine Ha-only emission is bright (e.g. M27's "ears"), so cap it
             k = float(np.clip(np.percentile(ratio, 5), 0, 0.3))
             unmixed = oiii - k * (ha - hb)
             oiii = np.maximum(unmixed, ob + 0.3 * (oiii - ob))
@@ -959,8 +1091,44 @@ def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0):
     # linear fit of OIII signal scale to Ha (robust upper-range statistics)
     hr = np.percentile(ha[::4, ::4], 99.0) - hb
     orr = np.percentile(oiii[::4, ::4], 99.0) - ob
-    gain = float(np.clip(hr / max(orr, 1e-6), 1.0, 2.0)) * boost
-    oiii = hb + (oiii - ob) * gain
+    return k, float(np.clip(hr / max(orr, 1e-6), 1.0, 2.0))
+
+
+def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0, neutral: np.ndarray | None = None,
+                    params: tuple[float, float] | None = None):
+    """Split dual-band OSC data into Ha (red pixels) and OIII (green+blue pixels).
+
+    Colour filters on a Bayer sensor are not perfectly selective: green/blue
+    pixels also record some Ha (and broadband starlight/continuum).  With
+    ``unmix`` the leakage coefficient k is estimated from the data as the
+    *lower envelope* of OIII/Ha over high-SNR Ha pixels (regions that are
+    pure Ha constrain k), and k*Ha is subtracted (never more than 70 % of the OIII
+    signal).  OIII is then linearly fitted to Ha's signal scale so both lines use one
+    stretch.
+
+    ``params``: (k, gain) measured elsewhere (``ha_oiii_params``).  A restoration must use the
+    coadd's: its OIII is sparse non-negative speckle, often exactly 0, so the 5th percentile of
+    OIII / Ha - the leakage - comes out 0, the Ha leakage stays in the OIII pixels and the Ha
+    nebula renders grey (IC 405: output R/G 1.32 against the coadd's 1.68).
+
+    ``neutral`` (H, W) in [0, 1]: light that must stay neutral (star halos, made neutral by
+    ``neutralize_star_halos``) is exempt from the unmixing and the OIII gain in proportion:
+    either would turn it red or teal again - the OIII gain (up to 2x) is what painted the
+    halos of bright stars teal / green in the HOO and Foraxx palettes.
+    """
+    k, gain = params if params is not None else ha_oiii_params(lin, unmix)
+    if not unmix:
+        k = 0.0
+    ha = lin[..., 0].astype(np.float32)
+    oiii = (0.5 * (lin[..., 1] + lin[..., 2])).astype(np.float32)
+    hb, ob = np.median(ha[::4, ::4]), np.median(oiii[::4, ::4])
+    if k > 0:
+        unmixed = oiii - k * (ha - hb) * (1 if neutral is None else (1 - neutral))
+        oiii = np.maximum(unmixed, ob + 0.3 * (oiii - ob))
+        ob = np.median(oiii[::4, ::4])
+    gain = gain * boost
+    g = gain if neutral is None else 1 + (gain - 1) * (1 - neutral)
+    oiii = hb + (oiii - ob) * g
     return ha, oiii.astype(np.float32)
 
 
@@ -1122,9 +1290,11 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     # a restoration (ImageMM) has no star halos: the halo light was deconvolved into the cores
     restored_sigma = p.get("_restored_sigma")
     detect_ref = p.get("_detect_ref")
-    if restored_sigma is None:
-        lin = neutralize_star_halos(lin, min(1.0, 1.6 * float(p["halo_suppress"])), px_scale,
-                                    noise_ref=(nref * px_scale) if nref else None)
+    # (a restoration's stars are points, but the far halo - beyond its PSF kernels - is still there)
+    lin, halo_w = neutralize_star_halos(lin, min(1.0, 1.6 * float(p["halo_suppress"])), px_scale,
+                                        noise_ref=(nref * px_scale) if nref else None,
+                                        detect_L=luminance(detect_ref) if detect_ref is not None else None,
+                                        core_sigma=(restored_sigma * px_scale) if restored_sigma is not None else None)
     if p["star_separation"]:
         key = (lin.shape, float(px_scale), float(lin[::97, ::89].sum()))
         if key in _SEP_CACHE:
@@ -1195,7 +1365,10 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
 
     tick("Palette")
     if palette in ("hoo", "foraxx", "hoo_warm"):
-        ha, oiii = extract_ha_oiii(starless, unmix=bool(p["oiii_unmix"]), boost=float(p["oiii_boost"]))
+        # a restoration's own statistics are speckle: the leakage and the OIII scale come from its coadd
+        hp = ha_oiii_params(detect_ref, bool(p["oiii_unmix"])) if detect_ref is not None else None
+        ha, oiii = extract_ha_oiii(starless, unmix=bool(p["oiii_unmix"]), boost=float(p["oiii_boost"]), neutral=halo_w,
+                                   params=hp)
         # identical stretch for both lines preserves their relative signal/noise
         bpn, Dn, spn = solve_stretch(ha, target, b)
         ha_s = ghs_fast(np.clip((ha - bpn) / (1 - bpn), 0, 1), Dn, b, spn)
@@ -1250,20 +1423,27 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
             er = cv2.erode(stars, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
             # shrink: erosion blended where the star layer is faint (halo), keep cores
             stars = stars * (1 - red) + er * red
+        # how far into its star's halo each pixel is: 0 at the core peak, -> 1 in the faint wings.
+        # Each pixel is compared with the core peak of *its own* star (connected component of the
+        # star mask), so ring-shaped chromatic halos are caught too
+        sl_ = luminance(stars)
+        n_lab, labels = cv2.connectedComponents((smask > 0.3).astype(np.uint8), connectivity=8)
+        comp_max = np.zeros(n_lab, np.float32)
+        np.maximum.at(comp_max, labels.ravel(), sl_.ravel())
+        peak = comp_max[labels]
+        k = max(5, int(round(15 * px_scale)) | 1)
+        peak = np.where(labels > 0, peak, maximum_filter(sl_, size=k))
+        halo = np.clip(1 - sl_ / np.maximum(peak, 1e-6), 0, 1)[..., None]
+        # the colour star light is desaturated *towards*: neutral at the core, the colour of the
+        # nebula underneath in the wings.  Desaturating the wings to grey painted a grey disc round
+        # every star on coloured nebulosity (M 76's lobes); on dark sky the two are the same
+        bg_rgb = cv2.GaussianBlur(sl_s, (0, 0), max(1.0, 2.0 * px_scale))
+        bgc = np.clip(bg_rgb / np.maximum(luminance(bg_rgb)[..., None], 1e-4), 0, 3)
+        tint = 1 + (bgc - 1) * halo                          # multiplies the luminance
         # halo suppression: pixels far below their star's local peak are halo – dim and
         # desaturate them (tames the OIII/blue bloat typical of small refractors)
         hs = float(p["halo_suppress"])
         if hs > 0:
-            sl_ = luminance(stars)
-            # each pixel is compared with the core peak of *its own* star (connected
-            # component of the star mask), so ring-shaped chromatic halos are caught too
-            n_lab, labels = cv2.connectedComponents((smask > 0.3).astype(np.uint8), connectivity=8)
-            comp_max = np.zeros(n_lab, np.float32)
-            np.maximum.at(comp_max, labels.ravel(), sl_.ravel())
-            peak = comp_max[labels]
-            k = max(5, int(round(15 * px_scale)) | 1)
-            peak = np.where(labels > 0, peak, maximum_filter(sl_, size=k))
-            halo = np.clip(1 - sl_ / np.maximum(peak, 1e-6), 0, 1)[..., None]
             ls = sl_[..., None]
             # chromatic halo removal: refractors focus blue/violet differently, leaving
             # blue/purple rings. Pull blue down to the brighter of red/green, weighted
@@ -1274,8 +1454,8 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
             # purple (red+blue without green) -> neutral
             stars[..., 0] = stars[..., 0] - hw * np.maximum(stars[..., 0] - np.maximum(stars[..., 1], stars[..., 2]), 0) * 0.5
             sl_ = luminance(stars)
-            ls = sl_[..., None]
-            stars = ls + (stars - ls) * (1 - hs * halo)
+            tgt = sl_[..., None] * tint
+            stars = tgt + (stars - tgt) * (1 - hs * halo)
             stars = stars * (1 - 0.6 * hs * halo ** 1.5)
         stars = stars * float(p["star_intensity"])
         if abs(p["star_saturation"] - 1) > 1e-3:
@@ -1284,8 +1464,8 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         if palette in ("hoo", "foraxx", "hoo_warm"):
             # dual-band star colours are unnatural (magenta); tame the green/magenta axis
             stars = scnr(stars, 0.5)
-            ls = luminance(stars)[..., None]
-            stars = np.clip(ls + (stars - ls) * 0.5, 0, 1)
+            tgt = luminance(stars)[..., None] * tint
+            stars = np.clip(tgt + (stars - tgt) * 0.5, 0, 1)
         out = 1 - (1 - sl_s) * (1 - stars)  # screen blend
     else:
         out = sl_s
