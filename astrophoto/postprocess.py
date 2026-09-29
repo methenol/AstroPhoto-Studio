@@ -28,8 +28,11 @@ DEFAULTS = {
     "white_balance": "stars",   # stars | background | none
     "denoise": 0.95,            # blend with Noise2Noise result (0..1)
     "deconvolution": 0.7,       # 0..1 strength (AI deconvolution blend, or Richardson-Lucy fallback)
-    "restored_resolution": 1.0,  # ImageMM: shown as the sky seen through a Gaussian g_sigma of this
-                                 # sigma (px of the input grid); the paper's sigma = 1 at r = 1
+    "restored_resolution": 1.25,  # ImageMM: shown as the sky seen through a Gaussian g_sigma of this
+                                  # sigma (px of the input grid).  The restoration already is the sky
+                                  # through the paper's g_1 (Eq. 11); structure finer than that is its
+                                  # speckle, whose zero pixels showed as dark pits at full resolution
+                                  # (1.25: 0.75 px more, 2133 -> 420 pits on NGC 6960, stars still sharp)
     # non-linear stage
     "palette": "auto",          # auto | natural | hoo | foraxx | hoo_warm
     "oiii_boost": 1.0,
