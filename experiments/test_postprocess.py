@@ -97,9 +97,34 @@ def test_star_floor():
           np.abs(out - img)[r0 < 3].max() == 0 and np.abs(out - img)[far].max() == 0)
 
 
+def test_stretch_scale():
+    """A restoration's sky is exactly the pedestal over much of the field (MAD 0): the stretch
+    must stay sane there, and a full-resolution render must get the same curve as a downsampled
+    preview (NGC 6960: D = 6.7e5 at full resolution against 300 in the preview)."""
+    import cv2
+    import astrophoto.postprocess as P
+    rs = np.random.default_rng(3)
+    H, W = 2400, 1600
+    ped, noise = 3e-3, 1e-3                                    # pedestal = 3 x the coadd's noise
+    L = np.full((H, W), ped, np.float32)
+    sp = rs.random((H, W)) < 0.15                              # sparse positive speckle
+    L[sp] += rs.exponential(2e-3, sp.sum()).astype(np.float32)
+    yy, xx = np.mgrid[:H, :W]
+    L += (0.02 * np.exp(-((xx - 800) ** 2) / (2 * 150 ** 2))).astype(np.float32)   # a nebula band
+    res = []
+    for f in (1.0, 0.625):
+        Lf = L if f == 1 else cv2.resize(L, (int(W * f), int(H * f)), interpolation=cv2.INTER_AREA)
+        fp = min(1.0, P._PROXY_SIZE / max(Lf.shape))
+        res.append(P.solve_stretch(P._stretch_proxy(Lf), 0.12, 2.0, noise * f * fp))
+    (bp1, D1, _), (bp2, D2, _) = res
+    check("stretch: sane on an exactly flat restored sky, same curve at full and preview scale",
+          D1 < 5e3 and abs(np.log(D1 / D2)) < 0.15 and abs(bp1 - bp2) < 0.1 * noise,
+          f"full: bp {bp1:.5f} D {D1:.1f}; preview: bp {bp2:.5f} D {D2:.1f}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
-    ALL = [test_halo_neutral, test_star_floor]
+    ALL = [test_halo_neutral, test_star_floor, test_stretch_scale]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

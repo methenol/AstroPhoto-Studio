@@ -925,8 +925,14 @@ def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.
         prof = np.stack([np.asarray(ndimage.median(patch[..., c], labels=lab_, index=np.arange(R))) - bg[c]
                          for c in range(patch.shape[-1])], -1)                      # (R, C)
         prof = np.maximum(prof, 0)
-        pl = luminance(prof[None])[0][:, None]
-        excess = (prof - pl)[np.minimum(ri, R - 1)]                                   # colour of the halo
+        # the halos to fix carry *extra* green / blue light (a dual-band filter's OIII scatter, a
+        # refractor's blue focus): remove the G and B excess over R, nothing else.  Pulling every
+        # channel to the halo's luminance also "neutralised" red light - a red nebula or the reddish
+        # sky under a wide profile - by adding G and B: a grey disc ~140 px across round NGC 6960's
+        # brightest star at full resolution, where the profile reaches 6 % of the frame
+        ex = np.zeros_like(prof)
+        ex[:, 1:] = np.maximum(prof[:, 1:] - prof[:, :1], 0)
+        excess = ex[np.minimum(ri, R - 1)]                                           # colour of the halo
         out[y0:y1, x0:x1] = patch - wgt[..., None] * excess
     return out.astype(np.float32), W
 
@@ -1174,7 +1180,7 @@ def chroma_denoise(rgb: np.ndarray, amount: float, px_scale: float) -> np.ndarra
     return oklab_to_rgb(_chroma_denoise_lab(rgb_to_oklab(rgb), amount, px_scale))
 
 
-def _luminance_denoise_lab(lab: np.ndarray, amount: float) -> np.ndarray:
+def _luminance_denoise_lab(lab: np.ndarray, amount: float, floors: np.ndarray | None = None) -> np.ndarray:
     """Noise-adaptive starlet shrinkage of OKLab lightness after the stretch.
 
     Per-scale noise is estimated robustly (MAD) on the faintest pixels, where
@@ -1193,6 +1199,8 @@ def _luminance_denoise_lab(lab: np.ndarray, amount: float) -> np.ndarray:
     out = res.copy()
     for j, d in enumerate(det):
         sig = mad_sigma(d[::2, ::2][faint])
+        if floors is not None:                 # the data's real noise at this scale (see nonlinear_stage)
+            sig = max(sig, float(floors[j]))
         t = k[j] * sig * w
         out += np.sign(d) * np.maximum(np.abs(d) - t, 0)
     lab[..., 0] = np.clip(out, 0, 1)
@@ -1331,8 +1339,10 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
             starless = inpaint_stars(lin, smask)
             # linear star layer, soft-thresholded above the noise floor and confined to the mask
             diff = lin - starless
-            nsig = np.array([mad_sigma((lin[..., c] - cv2.GaussianBlur(lin[..., c], (0, 0), 1.5))[::3, ::3])
-                             for c in range(3)], np.float32)
+            # (never below the data's real noise: a restoration's sky is exactly flat, its MAD 0, and at
+            # full resolution every speckle then passed into the star layer)
+            nsig = np.array([max(mad_sigma((lin[..., c] - cv2.GaussianBlur(lin[..., c], (0, 0), 1.5))[::3, ::3]),
+                                 float(nref or 0.0) * px_scale * 0.5) for c in range(3)], np.float32)
             soft = cv2.GaussianBlur(smask, (0, 0), 1.0)[..., None]
             stars_lin = np.maximum(diff - 2.5 * nsig, 0) * soft
             if len(_SEP_CACHE) >= 3:
@@ -1415,7 +1425,18 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     tick("Local contrast")
     # the whole finishing chain runs in a single OKLab session (one conversion each way)
     lab = rgb_to_oklab(sl_s)
-    lab = _luminance_denoise_lab(lab, float(p["luminance_denoise"]))
+    # noise floors of the starlet scales after the stretch: Gaussian noise of the data's real per-pixel
+    # level (the coadd's, at this scale) on the background, put through the same stretch.  A
+    # restoration's sky is exactly flat over much of the field, so the shrinkage measured 0 noise
+    # there at full resolution and left all the speckle in
+    floors = None
+    if nref:
+        rs_ = np.random.default_rng(0)
+        bgl = float(np.median(Lsl[::4, ::4]))
+        patch = np.clip(bgl + rs_.normal(size=(256, 256)).astype(np.float32) * float(nref) * px_scale, 0, 1)
+        pl_ = rgb_to_oklab(np.repeat(apply_stretch(patch[..., None].repeat(3, -1), bp, D, b, sp, cp)[..., :1], 3, -1))[..., 0]
+        floors = np.array([mad_sigma(dd) for dd in atrous(pl_, 4)[0]])
+    lab = _luminance_denoise_lab(lab, float(p["luminance_denoise"]), floors)
     lab = _local_contrast_lab(lab, float(p["local_contrast"]), px_scale)
     tick("Colour")
     lab = _chroma_denoise_lab(lab, float(p["chroma_denoise"]), px_scale)
