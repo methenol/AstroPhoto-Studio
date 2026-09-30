@@ -81,13 +81,24 @@ def restoration_done(session_dir: str) -> bool:
     return False
 
 
-def restored_view(latent: np.ndarray, sigma: float, info: dict) -> np.ndarray:
-    """The restoration seen through a Gaussian g_sigma (sigma in pixels of the input grid, so
-    r sigma latent pixels at super-resolution r); a latent that already is the sky through
-    g_sigma0 (Eq. 11) is convolved with the remaining sqrt(sigma^2 - sigma0^2)."""
-    r = int(info.get("r", 1) or 1)
-    s0 = float((info.get("eq11") or {}).get("sigma") or 0.0) / r      # Eq. 11 sigma is in latent pixels
-    s = math.sqrt(max(sigma ** 2 - s0 ** 2, 0.0)) * r
+def restored_view(latent: np.ndarray, factor: float, info: dict) -> np.ndarray:
+    """The restoration seen through a Gaussian g_sigma, sigma = ``factor`` x the Eq. 11 sigma_0 (the
+    latent already is the sky through g_sigma_0, so it is convolved with the remaining
+    sqrt(sigma^2 - sigma_0^2)).  Relative to sigma_0 because what the extra blur is for - the
+    latent's pixel-scale speckle - lives on the latent grid: at r = 2 an input-pixel sigma of
+    1.25 blurred 2.2 latent px and gave the super-resolution back."""
+    return restored_view_sigma(latent, restored_sigma(factor, info), info)
+
+
+def restored_sigma(factor: float, info: dict) -> float:
+    """sigma of ``restored_view`` in latent pixels."""
+    s0 = float((info.get("eq11") or {}).get("sigma") or 0.0)
+    return float(factor) * (s0 if s0 > 0 else 1.0)
+
+
+def restored_view_sigma(latent: np.ndarray, sigma: float, info: dict) -> np.ndarray:
+    s0 = float((info.get("eq11") or {}).get("sigma") or 0.0)            # latent pixels
+    s = math.sqrt(max(sigma ** 2 - s0 ** 2, 0.0))
     if s < 0.05:
         return latent
     return np.stack([cv2.GaussianBlur(latent[..., c], (0, 0), s) for c in range(latent.shape[-1])], -1).astype(np.float32)
@@ -448,7 +459,12 @@ class Session:
                     kernel_cache=self._p(f"imagemm/kernels_r{r_}_s{sigma}_{p['imagemm_psf']}.pkl"),
                     cancel=self.checkpoint)
                 cov = info.pop("coverage").mean(-1)
+                resid = info.pop("residual", None)
                 _save_fits(self._p("imagemm.fits"), lat)
+                if resid is not None:
+                    _save_fits(self._p("imagemm_residual.fits"), resid)
+                elif os.path.exists(self._p("imagemm_residual.fits")):
+                    os.remove(self._p("imagemm_residual.fits"))
                 _save_fits(self._p("imagemm_coverage.fits"), (cov / max(float(cov.max()), 1e-12)).astype(np.float32))
                 info["ptc"] = {k: np.asarray(v).tolist() for k, v in es.ptc.items()}
                 self._restored_cache = None
@@ -492,7 +508,13 @@ class Session:
             if bad:
                 raise RuntimeError(f"The ImageMM restoration (imagemm.fits) has {bad} non-finite pixels "
                                    f"({bad / img.size:.3%}); run Restore again")
-            self._restored_cache = {"image": img, "coverage": _load_fits(self._p("imagemm_coverage.fits"))}
+            res = None
+            if os.path.exists(self._p("imagemm_residual.fits")):
+                res = _load_fits(self._p("imagemm_residual.fits"))
+                if res.shape != img.shape or not np.isfinite(res).all():
+                    res = None
+            self._restored_cache = {"image": img, "coverage": _load_fits(self._p("imagemm_coverage.fits")),
+                                    "residual": res}
         return self._restored_cache
 
     def _restore_info(self) -> dict:
@@ -539,6 +561,9 @@ class Session:
                 # sigma = 1 at r = 1); one already made with Eq. 11 at sigma_0 only gets the remaining
                 # sqrt(sigma^2 - sigma_0^2) (none at the default resolution)
                 img = restored_view(img, float(p.get("restored_resolution", 1.0)), self._restore_info())
+                resid = rest.get("residual")
+                if resid is not None:        # the output's noise realisation (N2N pass), seen the same way
+                    resid = restored_view(resid, float(p.get("restored_resolution", 1.0)), self._restore_info())
                 ref = st["stack"]
                 clip_ref = cv2.resize(ref, (img.shape[1], img.shape[0]),
                                       interpolation=cv2.INTER_AREA if ref.shape[1] > img.shape[1] else cv2.INTER_LINEAR)
@@ -556,19 +581,26 @@ class Session:
                 detect = np.ascontiguousarray(det * np.asarray(info.get("wb_gains", [1, 1, 1]), np.float32)
                                               / float(info.get("white_level", self.meta.get("saturation", 63471.0))),
                                               np.float32)
-                info["restored_sigma"] = float(p.get("restored_resolution", 1.0)) * int(self._restore_info().get("r", 1) or 1)
+                info["restored_sigma"] = restored_sigma(float(p.get("restored_resolution", 1.0)), self._restore_info())
+                if resid is not None:        # cropped, white-balanced and normalised like the output
+                    if info.get("crop"):
+                        y0, y1, x0, x1 = info["crop"]
+                        resid = resid[y0:y1, x0:x1]
+                    resid = np.ascontiguousarray(resid * np.asarray(info.get("wb_gains", [1, 1, 1]), np.float32)
+                                                 / float(info["white_level"]), np.float32)
             else:
-                detect = None
+                detect = resid = None
                 den = self._load_denoised()
                 sharp = self._load_sharp() if den is not None else None
                 lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
                                          progress=progress, sharp=sharp)
-            self._lin_cache = (key, lin, info, detect)
+            self._lin_cache = (key, lin, info, detect, resid)
             return lin, info
 
     def render(self, params: dict, max_size: int | None = 1400, progress=None) -> tuple[np.ndarray, dict]:
         lin, info = self.linear(params, progress)
         detect = self._lin_cache[3] if self._lin_cache and len(self._lin_cache) > 3 else None
+        resid = self._lin_cache[4] if self._lin_cache and len(self._lin_cache) > 4 else None
         f = 1.0
         if max_size and max(lin.shape[:2]) > max_size:
             f = max_size / max(lin.shape[:2])
@@ -576,10 +608,13 @@ class Session:
             lin = cv2.resize(lin, size, interpolation=cv2.INTER_AREA)
             if detect is not None:
                 detect = cv2.resize(detect, size, interpolation=cv2.INTER_AREA)
+            if resid is not None:            # averaged down with the image, its noise with it
+                resid = cv2.resize(resid, size, interpolation=cv2.INTER_AREA)
         params = {**params, "_noise_ref": info.get("noise_ref")}
         if info.get("restoration") == "ImageMM":
             params["_restored_sigma"] = info.get("restored_sigma", 1.0)
             params["_detect_ref"] = detect
+            params["_noise_resid"] = resid
         out = nonlinear_stage(lin, params, self.meta.get("filter", ""), px_scale=f, progress=progress)
         return out, info
 

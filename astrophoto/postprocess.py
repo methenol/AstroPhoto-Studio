@@ -28,11 +28,11 @@ DEFAULTS = {
     "white_balance": "stars",   # stars | background | none
     "denoise": 0.95,            # blend with Noise2Noise result (0..1)
     "deconvolution": 0.7,       # 0..1 strength (AI deconvolution blend, or Richardson-Lucy fallback)
-    "restored_resolution": 1.25,  # ImageMM: shown as the sky seen through a Gaussian g_sigma of this
-                                  # sigma (px of the input grid).  The restoration already is the sky
-                                  # through the paper's g_1 (Eq. 11); structure finer than that is its
-                                  # speckle, whose zero pixels showed as dark pits at full resolution
-                                  # (1.25: 0.75 px more, 2133 -> 420 pits on NGC 6960, stars still sharp)
+    "restored_resolution": 1.25,  # ImageMM: shown as the sky seen through a Gaussian g_sigma, sigma this
+                                  # factor x the Eq. 11 sigma_0 (the restoration already is the sky through
+                                  # g_sigma_0).  Finer than that is the latent's speckle, whose zero pixels
+                                  # showed as dark pits at full resolution (1.25: 2133 -> 420 pits on
+                                  # NGC 6960 at r = 1, stars still sharp)
     # non-linear stage
     "palette": "auto",          # auto | natural | hoo | foraxx | hoo_warm
     "oiii_boost": 1.0,
@@ -1133,12 +1133,18 @@ def chroma_denoise(rgb: np.ndarray, amount: float, px_scale: float) -> np.ndarra
     return oklab_to_rgb(_chroma_denoise_lab(rgb_to_oklab(rgb), amount, px_scale))
 
 
-def _luminance_denoise_lab(lab: np.ndarray, amount: float, floors: np.ndarray | None = None) -> np.ndarray:
+def _luminance_denoise_lab(lab: np.ndarray, amount: float, floors: np.ndarray | None = None,
+                           noise_L: np.ndarray | None = None) -> np.ndarray:
     """Noise-adaptive starlet shrinkage of OKLab lightness after the stretch.
 
     Per-scale noise is estimated robustly (MAD) on the faintest pixels, where
     the stretch amplifies noise most; thresholds fade out in bright regions so
     that high-SNR detail is untouched.
+    ``noise_L``: the lightness of a realisation of the image's own noise (same shape, through the
+    same stretch); its per-scale MAD on those pixels is then the noise, as it is.  The image's own
+    statistics cannot tell noise from signal on a restoration: its fine scales are the restored
+    detail, far below the coadd's noise (NGC 6960: MAD 1.2 against 17.7 at the first scale), and
+    shrinking at either level erased it.
     """
     if amount <= 0:
         return lab
@@ -1149,10 +1155,14 @@ def _luminance_denoise_lab(lab: np.ndarray, amount: float, floors: np.ndarray | 
     faint = Lb[::2, ::2] < np.percentile(Lb[::2, ::2], 40)
     w = 1 - 0.75 * smoothstep(bg, bg + 0.35, Lb)  # 1 in background, 0.25 in bright areas
     k = np.array([2.2, 1.6, 1.0, 0.5]) * amount
+    ndet = atrous(noise_L, 4)[0] if noise_L is not None else None
     out = res.copy()
     for j, d in enumerate(det):
-        sig = mad_sigma(d[::2, ::2][faint])
-        if floors is not None:                 # the data's real noise at this scale (see nonlinear_stage)
+        if ndet is not None:
+            sig = mad_sigma(ndet[j][::2, ::2][faint])
+        else:
+            sig = mad_sigma(d[::2, ::2][faint])
+        if ndet is None and floors is not None:   # the data's real noise at this scale (see nonlinear_stage)
             sig = max(sig, float(floors[j]))
         t = k[j] * sig * w
         out += np.sign(d) * np.maximum(np.abs(d) - t, 0)
@@ -1382,14 +1392,20 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     # level (the coadd's, at this scale) on the background, put through the same stretch.  A
     # restoration's sky is exactly flat over much of the field, so the shrinkage measured 0 noise
     # there at full resolution and left all the speckle in
-    floors = None
-    if nref:
+    # With a restoration's own noise realisation (the N2N pass's residual, same grid) that goes through
+    # the stretch instead: the coadd's noise is not the restoration's
+    floors, noise_L = None, None
+    resid = p.get("_noise_resid")
+    bgl = float(np.median(Lsl[::4, ::4]))
+    if resid is not None and resid.shape[:2] == lab.shape[:2] and float(p["luminance_denoise"]) > 0:
+        nl = np.clip(bgl + luminance(resid), 0, 1)
+        noise_L = rgb_to_oklab(np.repeat(apply_stretch(nl[..., None].repeat(3, -1), bp, D, b, sp, cp)[..., :1], 3, -1))[..., 0]
+    elif nref:
         rs_ = np.random.default_rng(0)
-        bgl = float(np.median(Lsl[::4, ::4]))
         patch = np.clip(bgl + rs_.normal(size=(256, 256)).astype(np.float32) * float(nref) * px_scale, 0, 1)
         pl_ = rgb_to_oklab(np.repeat(apply_stretch(patch[..., None].repeat(3, -1), bp, D, b, sp, cp)[..., :1], 3, -1))[..., 0]
         floors = np.array([mad_sigma(dd) for dd in atrous(pl_, 4)[0]])
-    lab = _luminance_denoise_lab(lab, float(p["luminance_denoise"]), floors)
+    lab = _luminance_denoise_lab(lab, float(p["luminance_denoise"]), floors, noise_L)
     lab = _local_contrast_lab(lab, float(p["local_contrast"]), px_scale)
     tick("Colour")
     lab = _chroma_denoise_lab(lab, float(p["chroma_denoise"]), px_scale)

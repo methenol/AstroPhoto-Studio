@@ -95,9 +95,50 @@ def test_stretch_scale():
           f"full: bp {bp1:.5f} D {D1:.1f}; preview: bp {bp2:.5f} D {D2:.1f}")
 
 
+def test_restored_denoise():
+    """The display's starlet shrinkage on a restoration: with the restoration's own noise
+    realisation (the N2N residual) it removes that noise and keeps restored detail far below the
+    coadd's per-pixel noise, which the coadd-calibrated shrinkage erased."""
+    import astrophoto.postprocess as P
+    rs = np.random.default_rng(5)
+    H = W = 512
+    yy, xx = np.mgrid[:H, :W]
+    # fine filaments: amplitude 1/4 of the coadd noise, width ~1.5 px, on a faint nebula
+    fil = np.zeros((H, W), np.float32)
+    for _ in range(40):
+        y, x, t = rs.uniform(0, H), rs.uniform(0, W), rs.uniform(0, np.pi)
+        d = np.abs((yy - y) * np.cos(t) - (xx - x) * np.sin(t))
+        fil += np.exp(-d ** 2 / (2 * 1.5 ** 2)) * (np.hypot(yy - y, xx - x) < 60)
+    nref, rnoise = 4e-3, 1.5e-4                    # coadd per-pixel noise; the restoration's residual noise
+    sig = 2e-3 + 0.25 * nref * np.minimum(fil, 1)
+    img = sig + rs.normal(size=(H, W)) * rnoise
+    resid = (rs.normal(size=(H, W)) * rnoise).astype(np.float32)
+    bp, D, b, sp, cp = 1e-3, 300.0, 2.0, 0.0, 0.7
+    st = lambda z: P.rgb_to_oklab(P.apply_stretch(np.repeat(z[..., None], 3, -1).astype(np.float32), bp, D, b, sp, cp))
+    lab = st(img)
+    truth = st(sig)[..., 0]
+    bgl = float(np.median(img))
+    noise_L = P.rgb_to_oklab(P.apply_stretch(np.repeat(np.clip(bgl + resid, 0, 1)[..., None], 3, -1), bp, D, b, sp, cp))[..., 0]
+    rsn = np.random.default_rng(0)
+    patch = np.clip(bgl + rsn.normal(size=(256, 256)).astype(np.float32) * nref, 0, 1)
+    pl_ = P.rgb_to_oklab(np.repeat(P.apply_stretch(patch[..., None].repeat(3, -1), bp, D, b, sp, cp)[..., :1], 3, -1))[..., 0]
+    floors = np.array([P.mad_sigma(dd) for dd in P.atrous(pl_, 4)[0]])
+    new = P._luminance_denoise_lab(lab.copy(), 0.8, None, noise_L)[..., 0]
+    old = P._luminance_denoise_lab(lab.copy(), 0.8, floors)[..., 0]
+    fine = lambda z: sum(P.atrous(z, 2)[0])                 # scales 1-2 (~1-4 px)
+    kept = lambda z: float(np.sum(fine(z) * fine(truth)) / np.sum(fine(truth) ** 2))
+    err = lambda z: float(np.sqrt(np.mean((z - truth) ** 2)))
+    check("restored display denoise: fine detail below the coadd noise survives",
+          kept(new) > 3 * kept(old) and err(new) < 0.8 * err(old),
+          f"fine-scale detail kept: {kept(new):.2f} (coadd-calibrated: {kept(old):.2f}); rms error vs truth "
+          f"{err(new):.2e} (coadd-calibrated: {err(old):.2e})")
+    check("restored display denoise: the residual noise is still reduced", err(new) < 0.9 * err(lab[..., 0]),
+          f"rms error vs truth: input {err(lab[..., 0]):.2e}, output {err(new):.2e}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
-    ALL = [test_halo_neutral, test_stretch_scale]
+    ALL = [test_halo_neutral, test_stretch_scale, test_restored_denoise]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

@@ -752,7 +752,7 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     includes the sky (the former "above the median" selection) collapses to ~1e-4 of the real
     noise; the loss weights 1 / (1 + (x/k)^2) then silenced every source pixel and the network
     returned values at the clamp (~2e6 over the whole nebula).
-    Returns (1/2 (f(x_A) + f(x_B)), info)."""
+    Returns (1/2 (f(x_A) + f(x_B)), info with "residual" 1/2 (f(x_A) - f(x_B)))."""
     from .denoise import UNet, _autocast, infer
     device = device or pick_device()
     rng = np.random.default_rng(seed)
@@ -820,11 +820,16 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     net.eval()
     tta = 8 if device.type != "cpu" else 2
     back = lambda u: np.sinh(np.clip(u, u_lo, u_hi)) * k
-    out = 0.5 * (back(infer(net, ua, tta=tta)) + back(infer(net, ub, tta=tta)))
+    fa, fb = back(infer(net, ua, tta=tta)), back(infer(net, ub, tta=tta))
+    out = 0.5 * (fa + fb)
     bad = int((~np.isfinite(out)).sum())
     if bad:
         raise RuntimeError(f"ImageMM Noise2Noise pass: {bad} non-finite pixels in the output")
-    return out.astype(np.float32), {"noise_scale": s.tolist(), "iters": iters}
+    # the output's own noise: f(x_A) and f(x_B) err independently (disjoint subs), so 1/2 (f(x_A) - f(x_B))
+    # has the variance of 1/2 (f(x_A) + f(x_B))'s error, and its structure (correlated, after the
+    # deconvolution and the network).  The display's denoising is calibrated on it (postprocess).
+    resid = (0.5 * (fa - fb)).astype(np.float32)
+    return out.astype(np.float32), {"noise_scale": s.tolist(), "iters": iters, "residual": resid}
 
 
 # ----------------------------------------------------------------- full restoration
@@ -895,7 +900,8 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     ``region``: (y0, y1, x0, x1) of the reference grid to restore instead of the whole field
     (previews, experiments); the result then covers that window only.
     Returns (latent image on the r x finer grid - sample j at reference coordinate j / r
-    (relative to the region's origin) -, info with the coverage map and per-cutout convergence)."""
+    (relative to the region's origin) -, info with the coverage map, per-cutout convergence and,
+    with ``n2n``, the output's noise realisation "residual" (n2n_pass))."""
     dev = device if isinstance(device, torch.device) else pick_device(device)
     t0 = time.time()
 
@@ -978,9 +984,10 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         for i in range(len(outs)):
             outs[i], n_sat = saturated_fill(outs[i], cov, ref_lat, fw)
         del ref_lat
-    n2n_info = None
+    n2n_info, resid = None, None
     if n2n:
         out, n2n_info = n2n_pass(outs[0], outs[1], iters=n2n_iters, device=dev, progress=progress, cancel=cancel)
+        resid = n2n_info.pop("residual")
     else:
         out = outs[0]
     if dev.type == "mps":
@@ -993,6 +1000,7 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     return out, {"method": "ImageMM (arXiv:2501.03002), Algorithm " + ("2" if eq11 is not None else ("3" if robust else "1")),
                  "robust": robust, "delta": delta, "kappa": kappa, "epsilon": epsilon, "stop": stop, "r": r, "eq11": eq11,
                  "psf_model": psf_model, "n_groups": n_groups, "accelerate": accelerate, "n2n": n2n_info,
-                 "n_exposures": len(idx), "psf_size": ks, "tiles": tiles, "coverage": cov, "saturated_stars": n_sat,
+                 "n_exposures": len(idx), "psf_size": ks, "tiles": tiles, "coverage": cov, "residual": resid,
+                 "saturated_stars": n_sat,
                  "fwhm": float(getattr(es, "fwhm_ref", (ks / r - 1) / 7)) * r,      # seeing FWHM, latent pixels
                  "seconds": round(time.time() - t0, 1)}
