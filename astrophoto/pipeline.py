@@ -25,7 +25,6 @@ from PIL import Image
 
 from . import __version__
 from .analysis import analyse, finalize_selection
-from .denoise import pick_device
 from .frames import FrameInfo, build_defect_map, discover, read_raw, superpixel
 from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
 from .stacking import Integrator
@@ -402,6 +401,7 @@ class Session:
         (for half B), with their PSFs on the stack grid - the group PSF for a 1x stack, the
         Eq. 11 kernels (r = scale, g_sigma) for an integer drizzle scale."""
         import pickle
+        from .denoise import pick_device
         from .imagemm import superresolved_kernels
         cache = self._p(f"imagemm/mf_targets_g{n_groups}_s{sigma:g}_{psf_model}_sky.pkl")
         if os.path.exists(cache):

@@ -42,6 +42,7 @@ from __future__ import annotations
 import math
 import time
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import cv2
@@ -819,17 +820,20 @@ _PREP_COUNTER = None
 def _prep_worker_init(state: bytes, counter=None):
     """Worker process of ExposureSet.prepare: the set (reference, catalogue with its PSF-star
     tables, masks) once.  One thread per process: the processes already use every core, and
-    OpenCV's own thread pool in each of them would oversubscribe the CPU."""
+    OpenCV's own thread pool in each of them would oversubscribe the CPU.  The worker keeps only
+    the sub it is preparing in its raw-frame cache (prepare_one registers it up to four times):
+    a worker visits each sub once, and one cache of 35 % of the RAM per worker ran a 32 GB
+    machine out of memory."""
     import pickle
+    from .resources import exit_with_parent
     global _PREP_SET, _PREP_COUNTER
+    exit_with_parent()
     _PREP_COUNTER = counter
     cv2.setNumThreads(1)
-    try:
-        import torch
-        torch.set_num_threads(1)
-    except Exception:
-        pass
+    if "torch" in sys.modules:           # the preparation never uses torch: importing it costs ~450 MB
+        sys.modules["torch"].set_num_threads(1)
     _PREP_SET = pickle.loads(state)
+    _PREP_SET._raw_cache_frames = 1
 
 
 def _prep_worker_run(k0: int, k1: int):
@@ -860,7 +864,10 @@ class ExposureSet:
         from .resources import workers_for
         frame = 4.0 * self.W0 * self.H0
         self.workers = workers or workers_for(40 * frame, "ASTROPHOTO_PREP_RAM_GB")
-        self._worker_bytes = 30 * frame          # per preparation process: one sub's working arrays (~24 frames) + the shared state (~7)
+        # per preparation process: one sub's working arrays, the shared state (reference, its sky
+        # model and the catalogue, ~9 frames, held twice: unpickled and as the pool's initargs) and
+        # the libraries.  Measured on M 31 (3840x2160): 2.1 GB peak = 63 frames.
+        self._worker_bytes = 64 * frame
         fw = np.array([fr["fwhm"] for _, fr in self.items], float)
         self.fwhm_max = float(np.nanmax(fw))
         self.fwhm_med = float(np.nanmedian(fw))
@@ -888,6 +895,9 @@ class ExposureSet:
         raw = read_raw(info.path, info.bias)
         sat = raw >= 0.95 * self.sat
         raw = fix_defects(raw, self.defects)
+        limit = self.__dict__.get("_raw_cache_frames")      # a preparation worker: the current sub only
+        if limit is not None and len(cache) >= limit:
+            cache.clear()
         need = raw.size * 5                                  # float32 frame + saturation mask
         if self._raw_cache_used() + need <= _raw_cache_budget():
             cache[info.path] = (raw.astype(np.float32, copy=True), sat)

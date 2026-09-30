@@ -34,9 +34,11 @@ _DEFECTS = None
 
 
 def _init_worker(defects):
+    from .resources import exit_with_parent
     global _DEFECTS
     _DEFECTS = defects
     cv2.setNumThreads(1)
+    exit_with_parent()
 
 
 def measure_stars(lum: np.ndarray, thresh: float = 5.0):

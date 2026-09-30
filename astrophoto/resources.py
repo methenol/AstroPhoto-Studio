@@ -46,3 +46,20 @@ def workers_for(per_worker_bytes: float, env: str, fraction: float = 0.5, reserv
     fit in the memory budget."""
     by_ram = int(ram_budget_bytes(env, fraction) // max(per_worker_bytes, 1))
     return max(1, min(cpu_cores() - reserve_cores, by_ram))
+
+
+def exit_with_parent():
+    """In a worker process: exit as soon as the parent does.  A pool whose parent is killed (the
+    out-of-memory killer) otherwise lives on: its workers block for ever writing results to a pipe
+    nobody reads (their siblings hold its other end), keeping every byte they hold."""
+    import multiprocessing as mp
+    import threading
+    from multiprocessing.connection import wait
+    parent = mp.parent_process()
+    if parent is None:
+        return
+
+    def watch():
+        wait([parent.sentinel])
+        os._exit(1)
+    threading.Thread(target=watch, name="exit-with-parent", daemon=True).start()

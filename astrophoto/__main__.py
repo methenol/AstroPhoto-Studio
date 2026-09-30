@@ -100,8 +100,8 @@ def main(argv=None):
         print(f"{len(acc)}/{len(table)} frames accepted")
         for f in table:
             if not f["accepted"] or f["obstructed"] > 0:
-                print(f"  {f['name']}: {'REJECT' if not f['accepted'] else 'partial'} "
-                      f"{'; '.join(f['reasons']) or f'{f['obstructed'] * 100:.0f}% masked'}")
+                why = "; ".join(f["reasons"]) or f"{f['obstructed'] * 100:.0f}% masked"
+                print(f"  {f['name']}: {'REJECT' if not f['accepted'] else 'partial'} {why}")
         return
 
     proc = {}
