@@ -150,6 +150,7 @@ function updateSteps() {
   $("#step-analyse").classList.toggle("done", !!st.analysed);
   $("#step-stack").classList.toggle("done", !!st.stacked);
   $("#step-denoise").classList.toggle("done", !!st.denoised);
+  $("#step-starnet").classList.toggle("done", !!st.star_remover);
 }
 
 /* ------------------------------------------------------------ settings from an experiment */
@@ -271,7 +272,7 @@ async function pollJob() {
   const pb = $("#pauseJob");
   pb.hidden = !(j.state === "running" || j.state === "paused");
   pb.textContent = j.state === "paused" ? "Resume" : "Pause";
-  const stepEl = { analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise" }[j.kind];
+  const stepEl = { analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet" }[j.kind];
   $$(".steps li").forEach(li => li.classList.remove("running"));
   if (stepEl && (j.state === "running" || j.state === "paused")) $(stepEl).classList.add("running");
   if (["running", "queued", "paused"].includes(j.state)) { setTimeout(pollJob, j.state === "queued" ? 1500 : 800); return; }

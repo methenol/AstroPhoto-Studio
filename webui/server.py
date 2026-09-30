@@ -50,10 +50,14 @@ PARAM_SPEC = [
     {"group": "Linear", "key": "background", "label": "Gradient removal", "type": "bool"},
     {"group": "Linear", "key": "bg_method", "label": "Gradient model", "type": "select", "options": ["auto", "poly", "rbf"]},
     {"group": "Linear", "key": "bg_degree", "label": "Polynomial degree", "type": "range", "min": 1, "max": 4, "step": 1},
-    {"group": "Linear", "key": "white_balance", "label": "White balance", "type": "select", "options": ["stars", "background", "none"]},
+    {"group": "Linear", "key": "white_balance", "label": "Colour calibration (auto: spectrophotometric, Gaia)", "type": "select", "options": ["auto", "stars", "background", "none"]},
+    {"group": "Linear", "key": "spcc_sensor", "label": "Colour calibration: camera sensor", "type": "select", "options": ["auto"]},
+    {"group": "Linear", "key": "spcc_filter", "label": "Colour calibration: filter", "type": "select", "options": ["auto"]},
+    {"group": "Linear", "key": "spcc_white_ref", "label": "Colour calibration: white reference", "type": "select", "options": ["average_spiral_galaxy", "g2v"]},
     {"group": "Linear", "key": "denoise", "label": "AI denoise (Noise2Noise)", "type": "range", "min": 0, "max": 1, "step": 0.05},
     {"group": "Linear", "key": "deconvolution", "label": "Deconvolution (AI network / ImageMM, or Richardson-Lucy)", "type": "range", "min": 0, "max": 1, "step": 0.05},
     {"group": "Linear", "key": "restored_resolution", "label": "ImageMM: restored image resolution (× Eq. 11 σ)", "type": "range", "min": 1, "max": 3, "step": 0.05},
+    {"group": "Stretch", "key": "stretch_method", "label": "Stretch algorithm", "type": "select", "options": ["ghs", "asinh", "mtf", "log"]},
     {"group": "Stretch", "key": "stretch", "label": "Stretch (background level)", "type": "range", "min": 0.04, "max": 0.35, "step": 0.01},
     {"group": "Stretch", "key": "auto_stretch", "label": "Adapt stretch to target size", "type": "bool"},
     {"group": "Stretch", "key": "hdr", "label": "HDR (protect bright cores)", "type": "range", "min": 0, "max": 1.5, "step": 0.05},
@@ -67,7 +71,8 @@ PARAM_SPEC = [
     {"group": "Colour", "key": "chroma_denoise", "label": "Colour noise reduction", "type": "range", "min": 0, "max": 1, "step": 0.05},
     {"group": "Colour", "key": "scnr", "label": "SCNR (remove green cast)", "type": "range", "min": 0, "max": 1, "step": 0.05},
     {"group": "Stars", "key": "star_separation", "label": "Process stars separately", "type": "bool"},
-    {"group": "Stars", "key": "star_reduction", "label": "Star reduction", "type": "range", "min": 0, "max": 1, "step": 0.05},
+    {"group": "Stars", "key": "star_removal", "label": "Star removal (auto: AI once trained)", "type": "select", "options": ["auto", "ai", "classic"]},
+    {"group": "Stars", "key": "star_reduction", "label": "Star reduction (1 = starless)", "type": "range", "min": 0, "max": 1, "step": 0.05},
     {"group": "Stars", "key": "star_intensity", "label": "Star brightness", "type": "range", "min": 0, "max": 1.5, "step": 0.05},
     {"group": "Stars", "key": "star_saturation", "label": "Star colour", "type": "range", "min": 0, "max": 2.5, "step": 0.05},
     {"group": "Stars", "key": "star_color_preservation", "label": "Star colour intensity (stretch)", "type": "range", "min": 0, "max": 1, "step": 0.05},
@@ -116,7 +121,16 @@ def system():
     except Exception as e:  # torch missing
         dev = {"default": "cpu", "gpus": [], "error": str(e)}
     return {"version": __version__, "devices": dev, "defaults": DEFAULTS, "stack_defaults": STACK_DEFAULTS,
-            "param_spec": PARAM_SPEC, "presets": PRESETS, "images_root": CONFIG["images"]}
+            "param_spec": _param_spec(), "presets": PRESETS, "images_root": CONFIG["images"]}
+
+
+def _param_spec() -> list[dict]:
+    """PARAM_SPEC with the sensors and filters of the SPCC database (cached index; offline: auto only)."""
+    from astrophoto import spcc
+    cache = os.path.join(CONFIG["workdir"], "spcc_db")
+    lists = {"spcc_sensor": spcc.list_curves("osc_sensors", cache), "spcc_filter": spcc.list_curves("osc_filters", cache)}
+    return [{**p, "options": ["auto"] + [n for n in lists[p["key"]] if n != "README"]} if p["key"] in lists else p
+            for p in PARAM_SPEC]
 
 
 @app.get("/api/datasets")
@@ -186,7 +200,7 @@ def thumb(folder: str, name: str, size: int = 360):
 
 # ------------------------------------------------------------------ jobs
 
-JOB_KINDS = {"analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore",
+JOB_KINDS = {"analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore", "starnet": "Train star remover",
              "all": "Run everything & export", "export": "Export"}
 ACTIVE = ("running", "paused", "queued")
 QUEUE: list[str] = []                     # queued job ids, first to run first
@@ -351,14 +365,20 @@ def _run_job(job_id: str):
                 job["result"] = {"n": len(s.infos)}
             elif kind == "stack":
                 job["result"] = s.run_stack(stack_params, progress)
+                s.plate_solve(progress)              # catalogue stars for the colour calibration
             elif kind == "denoise":
                 s.run_denoise(stack_params, progress)
                 job["result"] = {"ok": True}
+            elif kind == "starnet":
+                job["result"] = s.train_star_remover(params, stack_params, progress)
             elif kind == "all":
                 sp = {**STACK_DEFAULTS, **stack_params}
                 s.run_analysis(sp["sensitivity"], progress)
                 s.run_stack(sp, progress)
+                s.plate_solve(progress)
                 s.run_denoise(sp, progress)
+                if sp["star_remover"]:
+                    s.train_star_remover(params, sp, progress)
                 job["result"] = s.export(params, progress=progress, **export_opts)
             elif kind == "export":
                 job["result"] = s.export(params, progress=progress, **export_opts)

@@ -57,13 +57,16 @@ STACK_DEFAULTS = {
     "imagemm_accelerate": True,  # Biggs & Andrews extrapolation (not in the paper): the converged
                                  # result in half the time of the plain run
     "imagemm_n2n": False,    # ImageMM on even / odd subs + Noise2Noise pass
+    "star_remover": True,    # train the AI star remover (starnet.py) after the restoration
+    "star_remover_iters": 3000,
     "network_groups": 0,     # > 0: the network's data term is ImageMM's multi-frame likelihood over
                              # this many seeing-group coadds of the other half's subs
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
 
 LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree",
-               "white_balance", "denoise", "deconvolution", "restored_resolution"]
+               "white_balance", "spcc_sensor", "spcc_filter", "spcc_white_ref", "denoise", "deconvolution",
+               "restored_resolution"]
 
 
 def restoration_done(session_dir: str) -> bool:
@@ -174,6 +177,7 @@ class Session:
         self._sharp_cache: np.ndarray | None = None
         self._restored_cache: dict | None = None
         self._lin_cache: tuple[str, np.ndarray, dict] | None = None
+        self._starless_cache: tuple[str, np.ndarray] | None = None
         self.lock = threading.RLock()
         self.cancel_flag = threading.Event()
         self.pause_flag = threading.Event()      # set: long stages wait at their next checkpoint
@@ -214,6 +218,7 @@ class Session:
             "stacked": os.path.exists(self._p("stack.fits")),
             "denoised": restoration_done(self.dir),
             "deconvolved": os.path.exists(self._p("sharp.fits")) or os.path.exists(self._p("imagemm.fits")),
+            "star_remover": self.star_remover_ready(),
             "stack_meta": clean_json(self.meta),
             "filter": self.infos[0].filter if self.infos else None,
             "object": self.infos[0].object if self.infos else None,
@@ -360,7 +365,7 @@ class Session:
                     "shape": list(out["stack"].shape)}
             json.dump(meta, open(self._p("stack_meta.json"), "w"), indent=1, default=_json_default)
             for f in ("denoised.fits", "sharp.fits", "restore_meta.json", "restore_nets.pt", "imagemm.fits",
-                      "imagemm_coverage.fits"):
+                      "imagemm_coverage.fits", "starnet.pt", "starnet.json", "starless_ml.npz"):
                 if os.path.exists(self._p(f)):
                     os.remove(self._p(f))
             self._stack_cache = {"stack": out["stack"], "coverage": out["coverage"]}
@@ -542,7 +547,9 @@ class Session:
     # ------------------------------------------------------------- stage 3
     def linear(self, params: dict, progress=None):
         p = {**DEFAULTS, **(params or {})}
-        key = json.dumps({k: p[k] for k in LINEAR_KEYS}, sort_keys=True) + self.meta.get("created", "")
+        sol = self._p("explore/solution.json")
+        key = (json.dumps({k: p[k] for k in LINEAR_KEYS}, sort_keys=True) + self.meta.get("created", "") +
+               (str(os.path.getmtime(sol)) if p["white_balance"] == "auto" and os.path.exists(sol) else ""))
         with self.lock:
             if self._lin_cache and self._lin_cache[0] == key:
                 return self._lin_cache[1], self._lin_cache[2]
@@ -568,7 +575,8 @@ class Session:
                 clip_ref = cv2.resize(ref, (img.shape[1], img.shape[0]),
                                       interpolation=cv2.INTER_AREA if ref.shape[1] > img.shape[1] else cv2.INTER_LINEAR)
                 lin, info = linear_stage(img, cov, None, p, self.meta.get("saturation", 63471.0),
-                                         progress=progress, restored=True, clip_ref=clip_ref)
+                                         progress=progress, restored=True, clip_ref=clip_ref,
+                                         ref_stars=self._ref_stars(p, img.shape[1] / ref.shape[1]))
                 info["restoration"] = "ImageMM"
                 info["upscaled"] = img.shape[1] / st["stack"].shape[1]
                 # the coadd on the same grid, cropped and scaled like the output: stars are found on
@@ -593,24 +601,128 @@ class Session:
                 den = self._load_denoised()
                 sharp = self._load_sharp() if den is not None else None
                 lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
-                                         progress=progress, sharp=sharp)
+                                         progress=progress, sharp=sharp, ref_stars=self._ref_stars(p))
             self._lin_cache = (key, lin, info, detect, resid)
             return lin, info
+
+    def _ref_stars(self, p: dict, up: float = 1.0) -> dict | None:
+        """Catalogue stars for the spectrophotometric white balance (spcc.py), in pixels of an image
+        ``up`` x the stack's resolution, or {"error": why not}; None unless it is "auto"."""
+        if p.get("white_balance") != "auto":
+            return None
+        from .spcc import reference_stars
+        try:
+            r = reference_stars(self, p)
+        except Exception as e:
+            return {"error": f"photometric calibration unavailable: {e}"}
+        if r is None:
+            return {"error": "the stack is not plate-solved yet (Explore tab; done automatically after stacking "
+                             "when online)"}
+        if abs(up - 1) > 1e-6:
+            r = {**r, "x": (r["x"] + 0.5) * up - 0.5, "y": (r["y"] + 0.5) * up - 0.5}
+        return r
+
+    def plate_solve(self, progress=None) -> dict | None:
+        """Solve the stack against Gaia (astrometry.py) unless it already is; best effort (needs a
+        connection and RA/Dec in the headers): None when it cannot."""
+        from .astrometry import load_solution, solve_session
+        try:
+            return load_solution(self) or solve_session(self, progress=progress)
+        except Cancelled:
+            raise
+        except Exception as e:
+            if progress:
+                progress(1, 1, f"Plate solving skipped ({type(e).__name__}: {str(e)[:80]})")
+            return None
+
+    # ------------------------------------------------------------- AI star remover
+    def _star_source(self) -> str:
+        """What a star remover is trained for: the current restoration (or stack)."""
+        return str(self._restore_info().get("created") or self.meta.get("created", ""))
+
+    def star_remover_ready(self) -> bool:
+        """A star remover has been trained on the current restoration (a restack or a new
+        restoration makes the old one stale)."""
+        p = self._p("starnet.json")
+        if not (os.path.exists(p) and os.path.exists(self._p("starnet.pt"))):
+            return False
+        try:
+            return json.load(open(p)).get("source") == self._star_source()
+        except Exception:
+            return False
+
+    def train_star_remover(self, params: dict | None = None, stack_params: dict | None = None, progress=None):
+        """Train the AI star remover (starnet.py) on this dataset's full-resolution linear image."""
+        from . import starnet
+        from .postprocess import classic_star_separation
+        sp = {**STACK_DEFAULTS, **(stack_params or {})}
+        with self.lock:
+            lin, info = self.linear(params or {}, progress)
+            detect = self._lin_cache[3]
+            if progress:
+                progress(0, 1, "Classic star separation (training backgrounds)")
+            _, starless = classic_star_separation(
+                lin, 1.0, noise_ref=info.get("noise_ref"),
+                detect_L=luminance(detect) if detect is not None else None,
+                restored_sigma=info.get("restored_sigma") if info.get("restoration") == "ImageMM" else None)
+            net, meta = starnet.train(lin, starless, noise=float(info.get("noise_ref") or 0.0),
+                                      iters=int(sp["star_remover_iters"]), device=sp["device"],
+                                      progress=progress, cancel=self.checkpoint)
+            meta["source"] = self._star_source()
+            meta["created"] = datetime.now().isoformat(timespec="seconds")
+            starnet.save(self._p("starnet.pt"), net, meta)
+            self._starless_cache = None
+            if os.path.exists(self._p("starless_ml.npz")):
+                os.remove(self._p("starless_ml.npz"))
+            return meta
+
+    def ml_starless(self, lin: np.ndarray, progress=None) -> np.ndarray:
+        """The AI star remover's starless version of the current full-resolution linear image
+        (cached in memory and on disk, keyed by the linear parameters and the model)."""
+        from . import starnet
+        key = self._lin_cache[0] + str(os.path.getmtime(self._p("starnet.pt")))
+        if self._starless_cache and self._starless_cache[0] == key:
+            return self._starless_cache[1]
+        path = self._p("starless_ml.npz")
+        out = None
+        if os.path.exists(path):
+            try:
+                z = np.load(path)
+                if str(z["key"]) == key and z["img"].shape == lin.shape:
+                    out = z["img"].astype(np.float32)
+            except Exception:
+                out = None
+        if out is None:
+            net, meta = starnet.load(self._p("starnet.pt"))
+            out = starnet.remove_stars(net, meta, lin, progress=progress)
+            del net
+            np.savez(path, key=key, img=out.astype(np.float16))
+        self._starless_cache = (key, out)
+        return out
 
     def render(self, params: dict, max_size: int | None = 1400, progress=None) -> tuple[np.ndarray, dict]:
         lin, info = self.linear(params, progress)
         detect = self._lin_cache[3] if self._lin_cache and len(self._lin_cache) > 3 else None
         resid = self._lin_cache[4] if self._lin_cache and len(self._lin_cache) > 4 else None
+        starless = None
+        if params.get("star_removal", DEFAULTS["star_removal"]) != "classic" and params.get("star_separation", True):
+            if self.star_remover_ready():
+                starless = self.ml_starless(lin, progress)
+                info = {**info, "star_removal": "AI star remover"}
+            else:
+                info = {**info, "star_removal": "classic (train the AI star remover to use it)"}
         f = 1.0
         if max_size and max(lin.shape[:2]) > max_size:
             f = max_size / max(lin.shape[:2])
             size = (int(lin.shape[1] * f), int(lin.shape[0] * f))
             lin = cv2.resize(lin, size, interpolation=cv2.INTER_AREA)
+            if starless is not None:
+                starless = cv2.resize(starless, size, interpolation=cv2.INTER_AREA)
             if detect is not None:
                 detect = cv2.resize(detect, size, interpolation=cv2.INTER_AREA)
             if resid is not None:            # averaged down with the image, its noise with it
                 resid = cv2.resize(resid, size, interpolation=cv2.INTER_AREA)
-        params = {**params, "_noise_ref": info.get("noise_ref")}
+        params = {**params, "_noise_ref": info.get("noise_ref"), "_starless": starless}
         if info.get("restoration") == "ImageMM":
             params["_restored_sigma"] = info.get("restored_sigma", 1.0)
             params["_detect_ref"] = detect
@@ -672,8 +784,11 @@ class Session:
         sp = {**STACK_DEFAULTS, **(stack_params or {})}
         self.run_analysis(sp["sensitivity"], progress)
         self.run_stack(sp, progress)
+        self.plate_solve(progress)                     # catalogue stars for the colour calibration
         if float((proc_params or {}).get("denoise", DEFAULTS["denoise"])) > 0:
             self.run_denoise(sp, progress)
+        if sp["star_remover"]:
+            self.train_star_remover(proc_params, sp, progress)
         files = self.export(proc_params or {}, progress=progress, **export_kw)
         files["seconds"] = round(time.time() - t0, 1)
         return files

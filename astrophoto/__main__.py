@@ -71,6 +71,9 @@ def main(argv=None):
                    help="ImageMM on the even and on the odd subs, combined by a Noise2Noise pass")
     r.add_argument("--network-groups", type=int, default=STACK_DEFAULTS["network_groups"],
                    help="deconvolution network: ImageMM multi-frame likelihood over N seeing groups (0 = off)")
+    r.add_argument("--no-star-remover", action="store_true",
+                   help="skip training the AI star remover (star separation then uses the classic mask + inpainting)")
+    r.add_argument("--star-remover-iters", type=int, default=STACK_DEFAULTS["star_remover_iters"])
     r.add_argument("--quality", type=int, default=95)
     r.add_argument("--upscale", type=float, default=1.0)
     r.add_argument("--params", help="JSON file or string with processing parameters")
@@ -124,7 +127,8 @@ def main(argv=None):
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
              "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
-             "network_groups": args.network_groups}
+             "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
+             "star_remover_iters": args.star_remover_iters}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)
     print(json.dumps(files, indent=2))
 

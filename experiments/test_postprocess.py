@@ -136,9 +136,117 @@ def test_restored_denoise():
           f"rms error vs truth: input {err(lab[..., 0]):.2e}, output {err(new):.2e}")
 
 
+def test_stretch_methods():
+    """Every stretch algorithm is a monotone curve through (0, 0) and (1, 1), and the solver puts
+    the background on the target level whichever is chosen."""
+    import astrophoto.postprocess as P
+    rs = np.random.default_rng(7)
+    L = (2e-3 + rs.normal(size=(800, 800)) * 2e-4).astype(np.float32)
+    L[300:500, 300:500] += 0.02                                          # some signal
+    for m in P.STRETCH_METHODS:
+        bp, D, sp = P.solve_stretch(L, 0.15, 2.0, method=m)
+        x = np.linspace(0, 1, 1001)
+        y = P.tone(x, D, 2.0, sp, m)
+        bgv = float(np.median(P.tone_fast(np.clip((L - bp) / (1 - bp), 0, 1), D, 2.0, sp, m)))
+        check(f"stretch {m}: monotone 0->0, 1->1, background on target",
+              np.all(np.diff(y) >= -1e-6) and abs(y[0]) < 1e-5 and abs(y[-1] - 1) < 1e-4 and abs(bgv - 0.15) < 0.01,
+              f"D {D:.3g}, background {bgv:.3f}")
+
+
+def test_spcc_detection():
+    """Sensor and filter detection are generic: from the camera name, a camera model number that
+    differs from the sensor's, the sensor geometry, and the FILTER header - never one camera."""
+    from astrophoto.spcc import detect_filter, detect_sensor
+    avail = ["Sony_IMX585", "Sony_IMX571", "Sony_IMX462", "Sony_IMX662", "Sony_IMX294", "ZWO_Seestar_S50",
+             "ZWO_Seestar_S30", "Canon_EOS600D"]
+    cases = [("ZWO ASI585MC", 3840, 2160, 2.9, "Sony_IMX585"), ("ZWO ASI2600MC Pro", 6248, 4176, 3.76, "Sony_IMX571"),
+             ("Seestar S50", 1080, 1920, 2.9, "ZWO_Seestar_S50"), ("Seestar S30", 1080, 1920, 2.9, "ZWO_Seestar_S30"),
+             ("Seestar S50", 2160, 3840, 2.9, "Sony_IMX585"), ("", 4144, 2822, 4.63, "Sony_IMX294"),
+             ("Canon EOS 600D", 5184, 3456, 4.3, "Canon_EOS600D"), ("", 1920, 1080, 2.9, None),
+             ("Mystery cam", 1000, 1000, 5.0, None)]
+    for inst, w, h, px, want in cases:
+        got, how = detect_sensor(inst, w, h, px, avail)
+        check(f"SPCC sensor: {inst or 'no name'} {w}x{h} {px} um -> {want}", got == want, f"got {got} ({how})")
+    favail = ["UV-IR-Block", "ZWO_Seestar_LP", "OPTOLONG_L-PRO_Light_Pollution", "No_filter", "Baader_UHC-S"]
+    for f, inst, want in [("IRCUT", "Seestar S50", "UV-IR-Block"), ("LP", "Seestar S50", "ZWO_Seestar_LP"),
+                          ("L-Pro", "ZWO ASI585MC", "OPTOLONG_L-PRO_Light_Pollution"), ("", "ZWO ASI585MC", "UV-IR-Block"),
+                          ("UHC-S", "", "Baader_UHC-S")]:
+        got, how = detect_filter(f, inst, favail)
+        check(f"SPCC filter: {f or 'none'} ({inst or 'no camera'}) -> {want}", got == want, f"got {got} ({how})")
+
+
+def test_spcc_physics():
+    """CCM89 extinction: A_V at V (550 nm) is 1 and A_B / A_V ~ 1.32; reddening makes a star redder
+    through any R/G/B response."""
+    from astrophoto import spcc
+    a = spcc.ccm89(np.array([550.0, 440.0]))
+    check("SPCC: CCM89 extinction law", abs(a[0] - 1) < 0.02 and abs(a[1] - 1.32) < 0.04, f"A550 {a[0]:.3f}, A440 {a[1]:.3f}")
+    resp = np.stack([np.exp(-((spcc.WL - c) / 40) ** 2) for c in (610, 530, 460)])
+    flat = np.ones_like(spcc.WL)
+    c0 = spcc._counts(flat, resp)
+    c1 = spcc._counts(flat * 10 ** (-0.4 * 2.0 * spcc.ccm89(spcc.WL)), resp)
+    check("SPCC: reddening raises R/G and lowers B/G", (c1[0] / c1[1]) > (c0[0] / c0[1]) and (c1[2] / c1[1]) < (c0[2] / c0[1]))
+
+
+def test_photometric_gains():
+    """Stars with known predicted colours seen through unknown channel gains: the photometric
+    calibration recovers the gains (the inverse of the camera's) to 1 %, though the stars' colours
+    differ widely from white and from each other."""
+    from astrophoto.spcc import photometric_gains
+    rs = np.random.default_rng(11)
+    H, W, N = 1500, 1500, 400
+    x, y = rs.uniform(40, W - 40, N), rs.uniform(40, H - 40, N)
+    g = rs.uniform(9, 14, N)
+    expected = np.stack([10 ** rs.normal(0.1, 0.12, N), np.ones(N), 10 ** rs.normal(-0.15, 0.15, N)], 1)  # reddish field
+    cam = np.array([0.55, 1.0, 0.8])                          # the camera's response relative to the calibrated colours
+    img = np.full((H, W, 3), 1e-3, np.float32) + rs.normal(size=(H, W, 3)).astype(np.float32) * 1e-5
+    yy, xx = np.mgrid[-12:13, -12:13]
+    psf = np.exp(-(xx ** 2 + yy ** 2) / (2 * 1.6 ** 2))
+    psf /= psf.sum()
+    for i in range(N):
+        f = 10 ** (-0.4 * (g[i] - 9)) * 0.5
+        xi, yi = int(x[i]), int(y[i])
+        for c in range(3):
+            img[yi - 12:yi + 13, xi - 12:xi + 13, c] += (f * expected[i, c] * cam[c] * psf).astype(np.float32)
+    stars = {"x": np.floor(x), "y": np.floor(y), "g": g, "expected": expected}
+    gains, info = photometric_gains(img, stars, np.zeros((H, W), bool), noise=1e-5)
+    want = 1 / cam
+    check("SPCC: gains recovered from catalogue colours", gains is not None and np.allclose(gains, want, rtol=0.01),
+          f"gains {None if gains is None else np.round(gains, 4)}, want {np.round(want, 4)}; {info}")
+
+
+def test_star_reduction_starless():
+    """With a starless image given (the AI star remover's), star reduction 1 renders it without
+    the stars, 0 keeps every star, and the sky away from stars is the same either way."""
+    import astrophoto.postprocess as P
+    rs = np.random.default_rng(13)
+    H = W = 600
+    yy, xx = np.mgrid[:H, :W]
+    bg = np.full((H, W, 3), 2e-3, np.float32) + rs.normal(size=(H, W, 3)).astype(np.float32) * 1e-4
+    bg[..., 0] += (0.01 * np.exp(-((xx - 300) ** 2 + (yy - 300) ** 2) / (2 * 120 ** 2))).astype(np.float32)
+    stars = np.zeros_like(bg)
+    pos = rs.uniform(30, W - 30, (60, 2))
+    for x, y in pos:
+        stars += (rs.uniform(0.01, 0.3) * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 1.5 ** 2)))[..., None].astype(np.float32)
+    lin = bg + stars
+    base = {"_noise_ref": 1e-4, "_starless": bg, "sharpen": 0, "local_contrast": 0}
+    out1 = P.nonlinear_stage(lin, {**base, "star_reduction": 1.0})
+    out0 = P.nonlinear_stage(lin, {**base, "star_reduction": 0.0})
+    ref = P.nonlinear_stage(bg, {**base, "star_reduction": 1.0})
+    at = lambda im: np.mean([P.luminance(im)[int(y), int(x)] for x, y in pos])
+    far = np.ones((H, W), bool)
+    for x, y in pos:
+        far &= np.hypot(xx - x, yy - y) > 10
+    check("star reduction 1 = starless, 0 = every star",
+          abs(at(out1) - at(ref)) < 0.02 and at(out0) > at(out1) + 0.2 and
+          np.abs(P.luminance(out1)[far] - P.luminance(out0)[far]).mean() < 2e-3,
+          f"at the stars: r=1 {at(out1):.3f} (starless {at(ref):.3f}), r=0 {at(out0):.3f}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
-    ALL = [test_halo_neutral, test_stretch_scale, test_restored_denoise]
+    ALL = [test_halo_neutral, test_stretch_scale, test_restored_denoise, test_stretch_methods, test_spcc_detection,
+           test_spcc_physics, test_photometric_gains, test_star_reduction_starless]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

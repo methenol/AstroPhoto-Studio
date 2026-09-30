@@ -67,12 +67,12 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 | **AI denoise** | **Noise2Noise**: a U-Net is trained *on your own data* to map half-stack A to half-stack B. Because the noise in the two is independent, the network learns the expected clean signal for this exact sensor, sky and integration. It uses no pretrained weights, so it can't invent detail from other people's images. Training runs in a variance-stabilised (asinh) domain, inference averages 8 rotations/flips (self-ensemble), and bright star cores are handed back unchanged. |
 | **Gradient removal** | Tile samples with stars masked. An iterative *lower-envelope* surface fit (polynomial or thin-plate RBF) rejects samples sitting on nebulosity or galaxies. When nebulosity dominates the field, the model order is reduced automatically. |
 | **Crop** | Largest fully covered rectangle, found by an aspect-ratio search on the coverage map and centred on the deepest part of the stack. The minimum coverage is adjustable. |
-| **Colour** | Background neutralisation and star-based white balance: aperture photometry of isolated, unsaturated stars, with the aperture sized to the *widest* colour channel. When AI deconvolution is available, the stars are measured on the deconvolved image, where each channel's halo light is back in the core. Refractors spread blue light into a wider halo, and small apertures miss it; that used to over-boost blue and gave galaxies a pink or magenta cast. Pixels clipped in any channel are rendered neutral, because white-balance gains would otherwise turn saturated cores blue or purple. |
+| **Colour** | Background neutralisation, then **spectrophotometric colour calibration** (SPCC, as in Siril). Once the stack is plate-solved (done automatically after stacking when online), every Gaia DR3 star in the field gets a predicted colour *in your camera*: a Pickles library spectrum for its Gaia temperature, reddened by its own Gaia extinction (CCM89), integrated through your sensor's R/G/B response and your filter's transmission. The per-channel gains are the robust fit of the measured star colours to those predictions, relative to a white reference (average spiral galaxy, or G2V). Sensor and filter come from the FITS headers (camera name, model number, sensor geometry, `FILTER`), or you pick them from Siril's database. Without a plate solution it falls back to star-based white balance (the average star is white). Aperture photometry uses isolated, unsaturated stars, with the aperture sized to the *widest* colour channel. Pixels clipped in any channel are rendered neutral. |
 | **AI deconvolution** (option) | A second network is trained on the same half-stack pairs to *undo the blur*. This is a Noise2Noise adaptation of ZS-DeconvNet. The network takes the denoised half A. Its output, blurred by **PSFs measured from your own stars (one per colour channel)**, must predict the raw half B (χ² with the measured per-pixel noise). The only way to lower that loss is to recover the true, sharper sky. A Hessian penalty and a physical **sky-floor prior** (no flux below the local sky) prevent the dark rings and noise that classic deconvolution produces. In held-out tests on M 27, IC 5070 and M 31, star FWHM fell by 2–2.5× with no ringing, against 1.1× for the old masked Richardson–Lucy (see `experiments/README.md`). Saturated stars are handed back to the denoised image. Richardson–Lucy with TV regularisation remains as the fallback when too few stars are available. |
 | **Restoration: ImageMM** (default) | **ImageMM** (Sukurdeep et al. 2025, arXiv:2501.03002), as published. One non-negative, background-subtracted sky image is fitted to **every individual sub at once**. Each sub has its own PSF measured from its stars, photon-transfer variances and masks. The fit uses majorization-minimization, with Huber-robust weights (removes satellite trails) and the paper's update clipping and stopping rule. Biggs–Andrews acceleration is on, which gives the converged result in half the time. The sky background is driven to zero instead of being denoised. The subs are prepared by linear demosaicing and star-refined registration (RMS at the centroid-noise level), with per-colour photometric scales and background models. On held-out subs of M 27 it beats both the stack and the deconvolution networks in every channel, and sky noise falls by three orders of magnitude (`experiments/README.md`). Options: 2× super-resolution (the paper's Algorithm 2), Moffat PSFs, seeing groups, a Noise2Noise pass. The first run prepares the subs once (about 30 min for 270 subs); the full-field restoration time is measured below. |
-| **Star separation** | Stars are detected on a background mesh scaled to the PSF, so stars on galaxy discs separate cleanly. A concentration index keeps galaxy nuclei, M32/M110-type companions and nebula knots out of the star layer. Mask radii come from each star's measured per-channel radial profile, and push-pull inpainting with matched grain fills the gaps. |
+| **Star separation** | An **AI star remover trained on your own image** (like StarNet, with no pretrained weights). Its training pairs are made from the dataset: the classic starless image as the background, plus stars rendered with the image's own measured star profile per colour channel (halo and any dark ring included), star colours and brightnesses, up to saturated cores. The network then removes the real stars, including faint ones below the detection limit and stars on nebulosity, where inpainting smears. **Star reduction** at 1 gives the fully starless image. Until the remover is trained, the classic method is used: stars detected on a background mesh scaled to the PSF, with a concentration index that keeps galaxy nuclei and nebula knots out of the star layer, and push-pull inpainting with matched grain. |
 | **Star colour & halos** | Refractors bring blue/violet (and the OIII band) to a slightly different focus, so bright stars get coloured rings. Halo light above the local background is desaturated in linear data. The star layer uses a luminance-only stretch, true linear star colour and an "unscreen" recombination, which gives white cores with no coloured blooming, dark donuts or tints over bright backgrounds. |
-| **Stretch** | **Generalized Hyperbolic Stretch**. Its strength is solved automatically so that the starless background lands on a target level. It is colour-preserving, with luminance-preserving gamut mapping so that saturated highlights never darken. |
+| **Stretch** | Four algorithms, as in Siril: **Generalized Hyperbolic Stretch** (default), **arcsinh**, **histogram transformation** (midtones transfer function, as in an autostretch) and **logarithmic**. For each one the strength is solved automatically so that the starless background lands on a target level. The stretch is colour-preserving, with luminance-preserving gamut mapping so that saturated highlights never darken. |
 | **Narrowband (LP filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. |
 | **Finishing** | Post-stretch starlet shrinkage on luminance, OKLab chroma noise reduction, wavelet local contrast, perceptual (OKLab) vibrance with background protection, SCNR, curves and masked sharpening. |
 
@@ -93,6 +93,45 @@ Costs: about 4× the stacking time and 4× larger stack and export files. It nee
 fill the finer grid evenly. Stacking parallelism is limited automatically to fit about 3 GB of RAM;
 raise it with `ASTROPHOTO_STACK_RAM_GB=6` on bigger machines. The export **Upscale** option is only
 interpolation. Use Super-resolution for real detail.
+
+## Colour calibration from the stars' physics
+
+With **Colour calibration: auto** (the default), the pipeline does not assume that the average
+star is white. It predicts each catalogue star's colour through your own camera and filter, then
+solves the gains that make the image agree with those predictions:
+
+- **Stars**: every Gaia DR3 star in the plate-solved field that has a GSP-Phot temperature. Each
+  star gets a Pickles (1998) spectrum, dwarf or giant from its absolute magnitude, reddened by its
+  own extinction A_G with the Cardelli, Clayton & Mathis (1989) law.
+- **Camera and filter**: quantum-efficiency and transmission curves from
+  [Siril's SPCC database](https://gitlab.com/free-astro/siril-spcc-database) (GPL-3.0). They are
+  downloaded on first use to `output/spcc_db/` and are not bundled with this project.
+  - The sensor is detected from the `INSTRUME` header (camera name or model number, e.g. ASI2600
+    → IMX571) or from the sensor geometry (width × height × pixel size).
+  - The filter is detected from `FILTER`.
+  - When detection is ambiguous or unknown, pick the sensor or filter in *Linear → Colour
+    calibration*. The pipeline then falls back to star-based white balance and says why.
+- **Fit**: aperture photometry of the isolated, unsaturated stars, and a sigma-clipped median of
+  predicted ÷ measured colour.
+  - The processing info reports the number of stars used, the scatter, and the sensor and filter
+    chosen.
+  - On M 31 (Seestar, IMX585, IRCUT): 792 stars, 0.09 mag scatter.
+
+Siril predicts star colours from each star's Gaia XP spectrum. The Gaia archive serves those
+spectra one star at a time (minutes for a few hundred stars), while temperature and extinction
+come with the catalogue query that plate solving already makes.
+
+## AI star remover
+
+**Train AI star remover** (Pipeline panel, and part of *Run everything*) takes about 2–3 minutes
+on an Apple-silicon GPU. It trains a U-Net to remove stars from this dataset (details in the
+*Star separation* row above). Once it is trained, *Star removal: auto* uses it for star
+separation. The **Star reduction** slider then works in two ranges:
+
+- up to 0.5 it shrinks the stars;
+- from 0.5 to 1 it also fades them out, and 1 is the starless image.
+
+A new restack or restoration makes the trained remover stale, and it has to be trained again.
 
 ## Explore: what else is in your image
 

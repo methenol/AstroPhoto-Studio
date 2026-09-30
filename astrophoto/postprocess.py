@@ -25,7 +25,10 @@ DEFAULTS = {
     "background": True,
     "bg_method": "auto",        # auto | poly | rbf
     "bg_degree": 2,
-    "white_balance": "stars",   # stars | background | none
+    "white_balance": "auto",    # auto (spectrophotometric, Gaia) | stars | background | none
+    "spcc_sensor": "auto",      # camera sensor curve (Siril SPCC database) - auto: from the FITS headers
+    "spcc_filter": "auto",      # filter curve - auto: from the FILTER header
+    "spcc_white_ref": "average_spiral_galaxy",  # white reference: average_spiral_galaxy | g2v
     "denoise": 0.95,            # blend with Noise2Noise result (0..1)
     "deconvolution": 0.7,       # 0..1 strength (AI deconvolution blend, or Richardson-Lucy fallback)
     "restored_resolution": 1.25,  # ImageMM: shown as the sky seen through a Gaussian g_sigma, sigma this
@@ -37,12 +40,14 @@ DEFAULTS = {
     "palette": "auto",          # auto | natural | hoo | foraxx | hoo_warm
     "oiii_boost": 1.0,
     "synthetic_luminance": 0.8, # narrowband: lightness from all-channel stretch (0..1)
+    "stretch_method": "ghs",    # ghs | asinh | mtf (histogram transformation) | log - see STRETCH_METHODS
     "stretch": 0.16,            # target background brightness (0..1)
     "auto_stretch": True,       # scale the stretch by how much of the frame holds signal
     "hdr": 0.6,                 # compress bright large-scale structures (0..1)
     "contrast": 2.0,            # GHS local-intensity b (focus of contrast)
     "color_preservation": 0.7,  # 0 = per-channel stretch, 1 = luminance-ratio
     "star_separation": True,
+    "star_removal": "auto",     # auto (the AI star remover once trained, else classic) | ai | classic
     "star_reduction": 0.35,
     "star_intensity": 0.9,
     "star_saturation": 1.0,
@@ -473,7 +478,8 @@ def deconvolve(img: np.ndarray, strength: float, sat: float, noise_ref: float | 
 
 def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.ndarray | None,
                  params: dict, sat: float, progress=None, sharp: np.ndarray | None = None,
-                 restored: bool = False, clip_ref: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+                 restored: bool = False, clip_ref: np.ndarray | None = None,
+                 ref_stars: dict | None = None) -> tuple[np.ndarray, dict]:
     """``sharp``: output of the self-supervised deconvolution network (denoise.n2n_restore).
     When present, "deconvolution" blends towards it; otherwise Richardson-Lucy is used.
 
@@ -481,7 +487,10 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     blend and no further deconvolution; ``clip_ref`` is then the original coadd on the same
     grid, which tells where the data were saturated (a restored star core may legitimately
     exceed the sensor's white level), and the output is normalised by the larger of the
-    white level and the image maximum so restored cores are not clipped."""
+    white level and the image maximum so restored cores are not clipped.
+
+    ``ref_stars``: catalogue stars for the spectrophotometric white balance ("auto"; spcc.py),
+    positions in ``stack`` pixels, or {"error": why there are none}."""
     p = {**DEFAULTS, **(params or {})}
     info = {}
     img = stack
@@ -529,8 +538,17 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     img += ped
     if progress:
         progress(2, 4, "Colour calibration")
+    # clipped highlights carry no colour information (see below); also kept out of the photometry
+    clip_src = clip_ref if (restored and clip_ref is not None) else stack
+    if info.get("crop"):
+        y0, y1, x0, x1 = info["crop"]
+        clip_src = clip_src[y0:y1, x0:x1]
+    clipped = (clip_src.max(-1) >= 0.80 * sat).astype(np.float32)
     gains = np.ones(3, np.float32)
-    if p["white_balance"] == "stars":
+    wb = p["white_balance"]
+    cal = {"method": wb}
+    calibrated = False
+    if wb in ("auto", "stars"):
         wb_src = img
         if sharp is not None and denoised is not None:
             # measure star colours on the fully deconvolved image: each channel's halo
@@ -541,26 +559,38 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
                 y0, y1, x0, x1 = info["crop"]
                 extra = extra[y0:y1, x0:x1]
             wb_src = img + extra
-        fl = measure_star_colors(wb_src, sat, noise_floor=noise_ref if restored else 0.0)
+        if wb == "auto":
+            # spectrophotometric: catalogue stars' predicted colours in this camera (spcc.py)
+            g_ = None
+            if ref_stars and ref_stars.get("x") is not None:
+                from .spcc import photometric_gains
+                y0, _, x0, _ = info.get("crop") or [0, 0, 0, 0]
+                st_ = {**ref_stars, "x": np.asarray(ref_stars["x"]) - x0, "y": np.asarray(ref_stars["y"]) - y0}
+                g_, cinfo = photometric_gains(wb_src, st_, clipped > 0, noise=noise_ref)
+                cal.update(cinfo)
+                cal.update({k: v for k, v in (ref_stars.get("meta") or {}).items() if k != "db_offline"})
+            else:
+                cal["note"] = (ref_stars or {}).get("error") or \
+                    "the stack is not plate-solved (Explore tab): no catalogue colours"
+            if g_ is not None:
+                gains, calibrated = g_, True
+                cal["method"] = "spectrophotometric (Gaia DR3)"
+            else:
+                cal["method"] = "stars (average star = white): photometric calibration unavailable"
+        if not calibrated:
+            fl = measure_star_colors(wb_src, sat, noise_floor=noise_ref if restored else 0.0)
+            if fl is not None and len(fl) >= 10:
+                rg = np.median(fl[:, 0] / fl[:, 1])
+                bg_ = np.median(fl[:, 2] / fl[:, 1])
+                gains = np.array([1 / rg, 1.0, 1 / bg_], np.float32)
+                gains = np.clip(gains, 0.25, 4)
         del wb_src
-        if fl is not None and len(fl) >= 10:
-            rg = np.median(fl[:, 0] / fl[:, 1])
-            bg_ = np.median(fl[:, 2] / fl[:, 1])
-            gains = np.array([1 / rg, 1.0, 1 / bg_], np.float32)
-            gains = np.clip(gains, 0.25, 4)
-    elif p["white_balance"] == "background":
-        gains = np.ones(3, np.float32)
     if (gains != 1).any():
         img = (img - ped) * gains + ped
     info["wb_gains"] = gains.tolist()
-    # clipped highlights carry no colour information: once white balance scales the
-    # channels differently they turn blue/purple/cyan ("coloured blooming").
-    # Render every pixel that was clipped in ANY channel neutral (max channel).
-    clip_src = clip_ref if (restored and clip_ref is not None) else stack
-    if info.get("crop"):
-        y0, y1, x0, x1 = info["crop"]
-        clip_src = clip_src[y0:y1, x0:x1]
-    clipped = (clip_src.max(-1) >= 0.80 * sat).astype(np.float32)
+    info["color_calibration"] = cal
+    # Once white balance scales the channels differently, clipped pixels turn blue/purple/cyan
+    # ("coloured blooming"): render every pixel that was clipped in ANY channel neutral (max channel).
     info["clipped_pixels"] = int(clipped.sum())
     if clipped.any():
         soft = cv2.GaussianBlur(cv2.dilate(clipped, np.ones((5, 5), np.uint8)), (0, 0), 2.0)
@@ -931,6 +961,15 @@ def inpaint_stars(img: np.ndarray, mask: np.ndarray, seed: int = 0) -> np.ndarra
     return (img * (1 - soft) + fill * soft).astype(np.float32)
 
 
+def classic_star_separation(lin: np.ndarray, px_scale: float = 1.0, noise_ref: float | None = None,
+                            detect_L: np.ndarray | None = None, restored_sigma: float | None = None):
+    """Star removal without the network: photometric star mask (``star_mask``) and push-pull
+    inpainting.  Arguments at the scale of ``lin``.  Returns (mask, starless)."""
+    smask = star_mask(luminance(lin), px_scale, rgb=lin, noise_ref=noise_ref, detect_L=detect_L,
+                      restored_sigma=restored_sigma)
+    return smask, inpaint_stars(lin, smask)
+
+
 def ghs(x: np.ndarray, D: float, b: float, SP: float) -> np.ndarray:
     """Generalized Hyperbolic Stretch (Payne & Cranfield 2021) with symmetry point SP."""
     def T0(u):
@@ -969,6 +1008,42 @@ def ghs_fast(x: np.ndarray, D: float, b: float, SP: float) -> np.ndarray:
     return lut_sqrt(x, lut).astype(np.float32)
 
 
+# Stretch algorithms (as in Siril, https://siril.readthedocs.io/en/stable/processing/stretching.html).
+# Each is a one-parameter family in its strength D >= 0 (D = 0: identity), so one solver finds the
+# D that puts the background on the target level whatever the curve:
+#   ghs    Generalized Hyperbolic Stretch (Payne & Cranfield 2021): b ("contrast") sets where the
+#          contrast is focused, the symmetry point SP sits on the background
+#   asinh  arcsinh(D x) / arcsinh(D): logarithmic in the highlights, linear in the shadows -
+#          keeps star colour and bright cores well
+#   mtf    histogram transformation / autostretch: the midtones transfer function with midtone
+#          balance m = 0.5 / (1 + D) (PixInsight's STF, Siril's histogram tool)
+#   log    log(1 + D x) / log(1 + D): the classic logarithmic stretch
+STRETCH_METHODS = ("ghs", "asinh", "mtf", "log")
+
+
+def tone(x: np.ndarray, D: float, b: float, SP: float, method: str = "ghs") -> np.ndarray:
+    """The stretch curve of ``method`` with strength ``D`` (x, output in 0..1)."""
+    if method == "ghs":
+        return ghs(x, D, b, SP)
+    x = np.clip(np.asarray(x, np.float64), 0, 1)
+    if D < 1e-9:
+        return x.astype(np.float32)
+    if method == "asinh":
+        return (np.arcsinh(D * x) / np.arcsinh(D)).astype(np.float32)
+    if method == "log":
+        return (np.log1p(D * x) / np.log1p(D)).astype(np.float32)
+    if method == "mtf":
+        m = 0.5 / (1.0 + D)
+        return (((m - 1) * x) / ((2 * m - 1) * x - m)).astype(np.float32)
+    raise ValueError(f"unknown stretch method {method!r}")
+
+
+def tone_fast(x: np.ndarray, D: float, b: float, SP: float, method: str = "ghs") -> np.ndarray:
+    """``tone`` via a lookup table on the sqrt grid (see ghs_fast)."""
+    lut = tone(_U ** 2, D, b, SP, method).astype(np.float32)
+    return lut_sqrt(x, lut).astype(np.float32)
+
+
 _PROXY_SIZE = 1400
 
 
@@ -987,7 +1062,8 @@ def _stretch_proxy(L: np.ndarray, size: int | None = None) -> np.ndarray:
                       interpolation=cv2.INTER_AREA)
 
 
-def solve_stretch(L: np.ndarray, target: float, b: float, noise_floor: float = 0.0) -> tuple[float, float, float]:
+def solve_stretch(L: np.ndarray, target: float, b: float, noise_floor: float = 0.0,
+                  method: str = "ghs") -> tuple[float, float, float]:
     """Find black point and GHS strength D so the background median lands on ``target``.
     ``noise_floor``: the data's real per-pixel noise at this scale; the background's own MAD is
     never taken below it.  A restoration's sky is exactly 0 over much of the field (ImageMM drives
@@ -1003,7 +1079,7 @@ def solve_stretch(L: np.ndarray, target: float, b: float, noise_floor: float = 0
     lo, hi = 0.0, 18.0  # log(D) search
     for _ in range(40):
         mid = (lo + hi) / 2
-        v = float(np.median(ghs(x, np.exp(mid) - 1, b, sp)))
+        v = float(np.median(tone(x, np.exp(mid) - 1, b, sp, method)))
         if v < target:
             lo = mid
         else:
@@ -1011,13 +1087,13 @@ def solve_stretch(L: np.ndarray, target: float, b: float, noise_floor: float = 0
     return bp, float(np.exp((lo + hi) / 2) - 1), sp
 
 
-def apply_stretch(img: np.ndarray, bp, D, b, sp, color_preservation: float) -> np.ndarray:
+def apply_stretch(img: np.ndarray, bp, D, b, sp, color_preservation: float, method: str = "ghs") -> np.ndarray:
     x = np.clip((img - bp) / (1 - bp), 0, 1)
-    per = ghs_fast(x, D, b, sp)
+    per = tone_fast(x, D, b, sp, method)
     if color_preservation <= 0:
         return per
     L = luminance(x)
-    Ls = ghs_fast(L, D, b, sp)
+    Ls = tone_fast(L, D, b, sp, method)
     ratio = Ls / np.maximum(L, 1e-6)
     cp = x * ratio[..., None]
     # luminance-preserving gamut mapping: when a channel exceeds 1, desaturate towards
@@ -1030,9 +1106,9 @@ def apply_stretch(img: np.ndarray, bp, D, b, sp, color_preservation: float) -> n
     return (color_preservation * cp + (1 - color_preservation) * per).astype(np.float32)
 
 
-def stretch_mono(ch: np.ndarray, target: float, b: float) -> np.ndarray:
-    bp, D, sp = solve_stretch(ch, target, b)
-    return ghs(np.clip((ch - bp) / (1 - bp), 0, 1), D, b, sp)
+def stretch_mono(ch: np.ndarray, target: float, b: float, method: str = "ghs") -> np.ndarray:
+    bp, D, sp = solve_stretch(ch, target, b, method=method)
+    return tone(np.clip((ch - bp) / (1 - bp), 0, 1), D, b, sp, method)
 
 
 def palette_compose(ha: np.ndarray, oiii: np.ndarray, palette: str) -> np.ndarray:
@@ -1289,25 +1365,39 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
                                         noise_ref=(nref * px_scale) if nref else None,
                                         detect_L=luminance(detect_ref) if detect_ref is not None else None,
                                         core_sigma=(restored_sigma * px_scale) if restored_sigma is not None else None)
+    ml_starless = p.get("_starless")          # the AI star remover's starless image (starnet.py), same grid
+    if ml_starless is not None and ml_starless.shape != lin.shape:
+        ml_starless = None
     if p["star_separation"]:
-        key = (lin.shape, float(px_scale), float(lin[::97, ::89].sum()))
+        key = (lin.shape, float(px_scale), float(lin[::97, ::89].sum()),
+               None if ml_starless is None else float(ml_starless[::97, ::89].sum()))
         if key in _SEP_CACHE:
             smask, starless, stars_lin = _SEP_CACHE[key]
         else:
-            L = luminance(lin)
             nref = p.get("_noise_ref")
-            smask = star_mask(L, px_scale, rgb=lin, noise_ref=(nref * px_scale) if nref else None,
-                              detect_L=luminance(detect_ref) if detect_ref is not None else None,
-                              restored_sigma=(restored_sigma * px_scale) if restored_sigma is not None else None)
-            starless = inpaint_stars(lin, smask)
-            # linear star layer, soft-thresholded above the noise floor and confined to the mask
-            diff = lin - starless
             # (never below the data's real noise: a restoration's sky is exactly flat, its MAD 0, and at
             # full resolution every speckle then passed into the star layer)
             nsig = np.array([max(mad_sigma((lin[..., c] - cv2.GaussianBlur(lin[..., c], (0, 0), 1.5))[::3, ::3]),
                                  float(nref or 0.0) * px_scale * 0.5) for c in range(3)], np.float32)
-            soft = cv2.GaussianBlur(smask, (0, 0), 1.0)[..., None]
-            stars_lin = np.maximum(diff - 2.5 * nsig, 0) * soft
+            if ml_starless is not None:
+                # the network removed stars *and* their halos (and any dark ring round them) and kept the
+                # sky's own noise and texture, so the star layer is simply the difference: no threshold
+                # (which clipped the faint wings), and the mask is wherever that layer rises above the noise
+                starless = ml_starless
+                stars_lin = np.maximum(lin - starless, 0)
+                sl = luminance(stars_lin)
+                smask = cv2.dilate((sl > 0.5 * float(nsig.mean())).astype(np.uint8),
+                                   cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))).astype(np.float32)
+                smask = cv2.morphologyEx(smask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+            else:
+                smask, starless = classic_star_separation(
+                    lin, px_scale, noise_ref=(nref * px_scale) if nref else None,
+                    detect_L=luminance(detect_ref) if detect_ref is not None else None,
+                    restored_sigma=(restored_sigma * px_scale) if restored_sigma is not None else None)
+                # linear star layer, soft-thresholded above the noise floor and confined to the mask
+                diff = lin - starless
+                soft = cv2.GaussianBlur(smask, (0, 0), 1.0)[..., None]
+                stars_lin = np.maximum(diff - 2.5 * nsig, 0) * soft
             if len(_SEP_CACHE) >= 3:
                 _SEP_CACHE.pop(next(iter(_SEP_CACHE)))
             _SEP_CACHE[key] = (smask, starless, stars_lin)
@@ -1335,7 +1425,8 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     # scale as the floor of the background's (the coadd's per-pixel noise, averaged down with it)
     f_proxy = min(1.0, _PROXY_SIZE / max(Lsl.shape[:2]))
     nfloor = float(p.get("_noise_ref") or 0.0) * px_scale * f_proxy
-    bp, D, sp = solve_stretch(_stretch_proxy(Lsl), target, b, nfloor)
+    sm = p.get("stretch_method", "ghs")
+    bp, D, sp = solve_stretch(_stretch_proxy(Lsl), target, b, nfloor, sm)
     # HDR: compress large-scale brightness above a knee (linear, multiplicative, so local
     # detail and colour ratios survive) – keeps bright compact objects (planetary
     # nebulae, galaxy cores, M42-type cores) from burning out.
@@ -1343,7 +1434,7 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     if hdr > 0:
         grid = np.linspace(0, 1, 4097, dtype=np.float32) ** 3
         knee = 0.6
-        yv = ghs_fast(np.clip((grid - bp) / (1 - bp), 0, 1), D, b, sp)
+        yv = tone_fast(np.clip((grid - bp) / (1 - bp), 0, 1), D, b, sp, sm)
         x0 = float(grid[min(np.searchsorted(yv, knee), len(grid) - 1)])
         sig_b = max(4.0, 0.008 * max(Lsl.shape))
         # the brightness of *extended* structure only: stars (whatever is left of them in the starless
@@ -1361,7 +1452,7 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
                 stars_lin = stars_lin * g
             Lsl = luminance(starless)
     cp = float(p["color_preservation"])
-    sl_s = apply_stretch(starless, bp, D, b, sp, cp)
+    sl_s = apply_stretch(starless, bp, D, b, sp, cp, sm)
 
     tick("Palette")
     if palette in ("hoo", "foraxx", "hoo_warm"):
@@ -1370,9 +1461,9 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         ha, oiii = extract_ha_oiii(starless, unmix=bool(p["oiii_unmix"]), boost=float(p["oiii_boost"]), neutral=halo_w,
                                    params=hp)
         # identical stretch for both lines preserves their relative signal/noise
-        bpn, Dn, spn = solve_stretch(_stretch_proxy(ha), target, b, nfloor)
-        ha_s = ghs_fast(np.clip((ha - bpn) / (1 - bpn), 0, 1), Dn, b, spn)
-        o_s = ghs_fast(np.clip((oiii - bpn) / (1 - bpn), 0, 1), Dn, b, spn)
+        bpn, Dn, spn = solve_stretch(_stretch_proxy(ha), target, b, nfloor, sm)
+        ha_s = tone_fast(np.clip((ha - bpn) / (1 - bpn), 0, 1), Dn, b, spn, sm)
+        o_s = tone_fast(np.clip((oiii - bpn) / (1 - bpn), 0, 1), Dn, b, spn, sm)
         pal = palette_compose(ha_s, o_s, palette)
         # LRGB-style: palette provides chrominance, the stretched all-channel image
         # provides lightness (synthetic luminance = best SNR, perceptually balanced)
@@ -1399,11 +1490,11 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     bgl = float(np.median(Lsl[::4, ::4]))
     if resid is not None and resid.shape[:2] == lab.shape[:2] and float(p["luminance_denoise"]) > 0:
         nl = np.clip(bgl + luminance(resid), 0, 1)
-        noise_L = rgb_to_oklab(np.repeat(apply_stretch(nl[..., None].repeat(3, -1), bp, D, b, sp, cp)[..., :1], 3, -1))[..., 0]
+        noise_L = rgb_to_oklab(np.repeat(apply_stretch(nl[..., None].repeat(3, -1), bp, D, b, sp, cp, sm)[..., :1], 3, -1))[..., 0]
     elif nref:
         rs_ = np.random.default_rng(0)
         patch = np.clip(bgl + rs_.normal(size=(256, 256)).astype(np.float32) * float(nref) * px_scale, 0, 1)
-        pl_ = rgb_to_oklab(np.repeat(apply_stretch(patch[..., None].repeat(3, -1), bp, D, b, sp, cp)[..., :1], 3, -1))[..., 0]
+        pl_ = rgb_to_oklab(np.repeat(apply_stretch(patch[..., None].repeat(3, -1), bp, D, b, sp, cp, sm)[..., :1], 3, -1))[..., 0]
         floors = np.array([mad_sigma(dd) for dd in atrous(pl_, 4)[0]])
     lab = _luminance_denoise_lab(lab, float(p["luminance_denoise"]), floors, noise_L)
     lab = _local_contrast_lab(lab, float(p["local_contrast"]), px_scale)
@@ -1427,7 +1518,7 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         Ls0 = luminance(np.clip((starless - bp) / (1 - bp), 0, None))
         Ls1 = luminance(np.clip((starless + stars_lin - bp) / (1 - bp), 0, None))
         # "unscreen": the star layer that screen-blending reconstructs exactly
-        T0, T1 = ghs_fast(Ls0, D, b, sp), ghs_fast(Ls1, D, b, sp)
+        T0, T1 = tone_fast(Ls0, D, b, sp, sm), tone_fast(Ls1, D, b, sp, sm)
         dL = np.clip(1 - (1 - T1) / np.maximum(1 - T0, 1e-4), 0, 1)[..., None]
         sl_lum = luminance(stars_lin)[..., None]
         chroma = stars_lin / np.maximum(sl_lum, 1e-9)
@@ -1474,7 +1565,9 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
             tgt = sl_[..., None] * tint
             stars = tgt + (stars - tgt) * (1 - hs * halo)
             stars = stars * (1 - 0.6 * hs * halo ** 1.5)
-        stars = stars * float(p["star_intensity"])
+        # star reduction beyond 0.5 also fades the star layer out: 1 = the starless image (with the AI
+        # star remover a clean one; with the classic separation, the inpainted one)
+        stars = stars * float(p["star_intensity"]) * (1.0 - float(smoothstep(0.5, 1.0, red)))
         if abs(p["star_saturation"] - 1) > 1e-3:
             ls = luminance(stars)[..., None]
             stars = np.clip(ls + (stars - ls) * float(p["star_saturation"]), 0, 1)

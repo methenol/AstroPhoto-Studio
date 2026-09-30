@@ -33,6 +33,7 @@ class FrameInfo:
     dec: float | None
     focallen: float
     pixsize: float
+    instrument: str = ""   # INSTRUME: camera model (the sensor's spectral response for colour calibration)
 
     def to_dict(self):
         return asdict(self)
@@ -65,6 +66,7 @@ def read_info(path: str) -> FrameInfo:
         dec=float(h["DEC"]) if "DEC" in h else None,
         focallen=float(h.get("FOCALLEN", 250) or 250),
         pixsize=float(h.get("XPIXSZ", 2.9) or 2.9),
+        instrument=str(h.get("INSTRUME", "") or "").strip(),
     )
 
 

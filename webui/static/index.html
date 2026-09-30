@@ -32,6 +32,7 @@
         <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, clouds, obstructions, ML anomalies</small></div><button class="btn small" data-job="analyse">Run</button></li>
         <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>local normalisation, sigma-clip, drizzle</small></div><button class="btn small" data-job="stack">Run</button></li>
         <li id="step-denoise"><span class="dot"></span><div><b>Restore</b><small>ImageMM on every sub (first run also prepares the subs, ~30 min), or the Noise2Noise networks</small></div><button class="btn small" data-job="denoise">Run</button></li>
+        <li id="step-starnet"><span class="dot"></span><div><b>Train AI star remover</b><small>learns this image's stars (its own PSF, colours and brightnesses) to separate them cleanly; the Star reduction slider then goes all the way to starless</small></div><button class="btn small" data-job="starnet">Run</button></li>
       </ol>
       <button class="btn primary wide" data-job="all">▶ Run everything &amp; export</button>
 
