@@ -34,13 +34,15 @@ class Profile:
     sensor: str | None = None         # Siril SPCC database sensor name
     aperture: float | None = None     # mm
     dwarf: bool = False               # DWARFLAB file layout (CALI_FRAME, shotsInfo.json, file names)
+    bit_depth: int | None = None      # ADC bits when the FITS data is not scaled to 16 bits
 
 
 PROFILES = {
-    # telephoto: Sony IMX678 (3840x2160, 2.0 um, RGGB), 35 mm f/4.3; 2x2 binning gives 1920x1080 at 4 um
-    "dwarf3": Profile("dwarf3", "DWARF 3", 150.0, 2.0, "RGGB", "Sony_IMX678", 35.0, dwarf=True),
+    # telephoto: Sony IMX678 (3840x2160, 2.0 um, RGGB), 35 mm f/4.3; 2x2 binning gives 1920x1080 at 4 um.
+    # Its subs and CALI_FRAME masters hold the 12-bit ADC values unscaled (0..4095; black level ~200)
+    "dwarf3": Profile("dwarf3", "DWARF 3", 150.0, 2.0, "RGGB", "Sony_IMX678", 35.0, dwarf=True, bit_depth=12),
     # the wide-angle camera (cam_1) has other optics: only its calibration layout is known here
-    "dwarf3_wide": Profile("dwarf3_wide", "DWARF 3 wide-angle", dwarf=True),
+    "dwarf3_wide": Profile("dwarf3_wide", "DWARF 3 wide-angle", dwarf=True, bit_depth=12),
     "dwarf_mini": Profile("dwarf_mini", "DWARF mini", 150.0, 2.9, None, "Sony_IMX662", 30.0, dwarf=True),
     "dwarf2": Profile("dwarf2", "DWARF II", 100.0, 1.45, None, "Sony_IMX415", 24.0, dwarf=True),
     "seestar_s50": Profile("seestar_s50", "ZWO Seestar S50", 250.0, 2.9, "GRBG", None, 50.0),
@@ -117,11 +119,12 @@ def parse_dwarf_name(path: str) -> dict:
 
 
 def coord(v, hours: bool) -> float | None:
-    """A coordinate in degrees from a number (degrees) or a sexagesimal string."""
+    """A coordinate in degrees from a number or a sexagesimal string, either in hours (``hours``)
+    or in degrees."""
     if v is None or v == "":
         return None
     try:
-        return float(v)
+        return float(v) * (15.0 if hours else 1.0)
     except (TypeError, ValueError):
         pass
     try:
@@ -166,7 +169,7 @@ def shots_info(folder: str) -> dict:
         out["temp"] = sum(temps) / len(temps)
         out["temp_range"] = [min(temps), max(temps)]
     ra, dec = get("ra", "ra_deg", "radeg", "rightascension"), get("dec", "dec_deg", "decdeg", "declination")
-    out["ra"] = coord(ra, hours=isinstance(ra, str))       # a sexagesimal RA string is in hours
+    out["ra"] = coord(ra, hours=True)          # DWARF 3: "RA": 20.98 for 314.7 deg - hours, as numbers too
     out["dec"] = coord(dec, hours=False)
     for key in ("shotstaken", "shotsstacked"):
         if key in low:

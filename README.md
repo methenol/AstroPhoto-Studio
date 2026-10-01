@@ -84,14 +84,14 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 ## Supported telescopes and cameras
 
 Any one-shot-colour (Bayer) camera that writes 2-D FITS light frames works. The headers used
-are `BAYERPAT`, `EXPTIME`, `GAIN`, `FILTER`, `DATE-OBS`, `BIAS`, `CCD-TEMP`, `FOCALLEN`, `XPIXSZ`,
+are `BAYERPAT`, `EXPTIME`, `GAIN`, `FILTER`, `DATE-OBS`, `BIAS`, `CCD-TEMP` (or `DET-TEMP`), `FOCALLEN`, `XPIXSZ`,
 `XBINNING`, `INSTRUME`, `TELESCOP`, `RA`/`DEC` (or `OBJCTRA`/`OBJCTDEC`) and `IMAGETYP`.
 Smart telescopes leave some of these out, so a profile of the telescope (`astrophoto/instruments.py`)
 fills the gaps. A header value always wins over the profile.
 
 | Telescope | Recognised from | Profile fills in |
 |---|---|---|
-| **DWARFLAB DWARF 3** (telephoto) | `TELESCOP`/`INSTRUME` (`DWARFIII`, `DWARF 3`), or the DWARF file layout | Sony IMX678, RGGB, 150 mm, 2.0 µm × binning (1920×1080 subs are 2×2 binned), and exposure / gain / filter / temperature / time from the file name. Target and RA/Dec come from `shotsInfo.json`. |
+| **DWARFLAB DWARF 3** (telephoto) | `TELESCOP`/`INSTRUME` `DWARF 3` (or the DWARF file layout) | 12-bit data → 16-bit ADU, Sony IMX678 sensor curve. Where a header is missing: RGGB, 150 mm, 2.0 µm × binning, and exposure / gain / filter / temperature / time from the file name, target and RA/Dec from `shotsInfo.json` |
 | DWARF mini, DWARF II | headers or file layout | sensor (IMX662 / IMX415), focal length, pixel size |
 | **ZWO Seestar** S50 / S30 | `INSTRUME`/`TELESCOP` | GRBG, focal length, pixel size (black level from its `BIAS` header) |
 | Astronomy cameras (ZWO, QHY, Player One, Touptek, …) | `INSTRUME` | nothing: their capture software writes full headers |
@@ -102,46 +102,73 @@ the telescope that was recognised, and `python -m astrophoto calibration DIR` pr
 ### DWARF 3
 
 Copy the DWARF's `Astronomy` folder from the telescope (USB or the app's file access), or
-at least the session folder together with `CALI_FRAME`:
+at least the session folders together with `CALI_FRAME`. The DWARF writes `CALI_FRAME`
+beside the session folders, and it is found there (or in any parent up to three levels up):
 
 ```
-Astronomy/
+Dwarf/
 ├── CALI_FRAME/                        factory + your own masters, found automatically
 │   ├── bias/cam_0/bias_gain_2_bin_1.fits
-│   ├── dark/cam_0/dark_exp_15.000000_gain_60_bin_1_38C_stack_10.fits
-│   └── flat/cam_0/flat_gain_2_bin_1_ir_1.fits          ir: 0 VIS, 1 Astro, 2 Duo-Band
-└── DWARF_RAW_TELE_M 31_EXP_15_GAIN_60_2025-10-01-21-30-00-100/   ← open this folder
+│   ├── dark/cam_0/dark_exp_15.000000_gain_60_bin_1_27C_stack_3.fits
+│   ├── flat/cam_0/flat_gain_2_bin_1_ir_2.fits          ir: 0 VIS, 1 Astro, 2 Duo-Band
+│   └── …/cam_1/…                                      the wide-angle camera's
+└── DWARF_RAW_TELE_C 20_EXP_15_GAIN_60_2026-09-30-21-03-44-039/   ← open this folder
     ├── shotsInfo.json
-    ├── M 31_15s60_Astro_20251001-213012345_31C.fits
-    ├── failed_M 31_15s60_Astro_20251001-213530123_31C.fits
-    └── stacked-….fits / .jpg / .png                     the DWARF's own stack: ignored
+    ├── C 20_15s60_Duo-Band_20260930-210453262_35C.fits
+    ├── failed_C 20_15s60_Duo-Band_20260930-210438244_35C.fits
+    ├── Thumbnail/, img_*.png/.tif, stacked*.jpg/.png    previews: ignored
+    └── stacked-16_C 20_….fits                          the DWARF's own RGB stack: ignored
 ```
+
+What a DWARF 3 sub is (checked on real C 20 data):
+
+- 3840×2160 uint16, RGGB, and full headers: `TELESCOP`/`INSTRUME` `DWARF 3`, `FILTER`, `EXPTIME`,
+  `GAIN`, `XPIXSZ` 2.0, `FOCALLEN` 150, `DET-TEMP` (sensor temperature), `RA`/`DEC` in degrees,
+  `DATE-OBS`. The profile and the file name only fill in what a header leaves out.
+- **12-bit values, unscaled** (0…4095, black level ≈ 200), in the subs and in the masters alike.
+  Both are read ×16 as 16-bit ADU, so saturation and every threshold mean what they do for a
+  16-bit camera. If a sub ever holds values above 4095 (a firmware that scales to 16 bits), the
+  scaling turns itself off.
+- `shotsInfo.json` gives the RA in hours (`"RA": 20.98` for 314.7°); it is only a fallback.
+- The Duo-Band sky of a 15 s sub is only a few ADU above black, with about twice that in read
+  noise. Calibrated subs are therefore **not clipped at 0**: clipping the noise below black would
+  add a bias as large as the faint signal.
 
 What the pipeline takes from the DWARF:
 
 - **Factory and user masters** (`CALI_FRAME`). It picks the telephoto camera's (`cam_0`) dark
-  with the same exposure, gain and binning, at the nearest sensor temperature. The flat is
-  the one for the filter the subs were shot with (`ir_1` Astro, `ir_2` Duo-Band), and its
-  pedestal is removed with the bias. The wide-angle camera's masters (`cam_1`) are only used
-  for wide-angle sessions.
-- **Temperature-matched darks without a matching temperature.** The DWARF's sensor is uncooled.
-  Its temperature is in every sub's file name and drifts by 10 °C or more in a night, and dark
-  current doubles about every 6 °C. So the dark's thermal signal (dark − bias) is scaled
-  for each sub, from how much its hot pixels stand above their neighbours
-  (the same idea as Siril's dark optimisation). The processing info reports the scale range.
-- **`failed_` subs**, which the DWARF's live stack rejected, are not dropped unseen. They are
-  graded like every other sub, so a frame with a passing cloud can still give its clean
-  tiles. The frames table notes them, and you can override them in the Frames tab.
+  with the same exposure, gain and binning, at the nearest sensor temperature. The flat is the one
+  for the subs' filter (`ir_0` VIS, `ir_1` Astro, `ir_2` Duo-Band). The DWARF stores its flats
+  with the pedestal still in them, and the bias removes it. The bias is taken at gain 2 while
+  lights and darks are at gain 60, and their pedestals differ by about 2 ADU. So the bias is
+  levelled to the dark's pedestal before the dark's thermal signal is scaled. The wide-angle
+  camera's masters (`cam_1`) are only used for wide-angle sessions.
+- **Darks fitted to each sub's temperature.** The sensor is uncooled: C 20 ran at 35–42 °C
+  against darks at 27 °C. The dark's thermal signal (dark − bias) is scaled for each sub, by how
+  much its hot pixels stand above their neighbours (the idea of Siril's dark optimisation). The
+  fit is a robust L1 fit. A least-squares fit is ruled by the few hundred hottest pixels, which
+  grow faster with temperature than the rest. On C 20 the fitted scale rises steadily from
+  ×1.29 at 35 °C to ×1.50 at 41 °C. It leaves 5–18 % less hot-pixel residual than plain dark
+  subtraction, and more the warmer the sub.
+- **Flats checked against the sky.** The factory flats are nearly flat (1–2 % centre to corner).
+  Each session compares the large-scale unevenness of its sky with and without the flat (on
+  C 20: 11.4 → 10.9 ADU). A flat that makes the sky less even is not used, and the reason is
+  reported.
+- **`failed_` subs**, which the DWARF's live stack rejected, usually because of cloud, are not
+  dropped unseen. They are graded like every other sub, so a frame with a passing cloud can
+  still give its clean tiles. The frames table notes them, and you can override them in the
+  Frames tab.
 - **Colour calibration** uses the IMX678 sensor curve. The Siril SPCC database has no DWARF 3
   filter curves: `Astro` and `VIS` are taken as UV/IR cuts, and `Duo-Band` uses DWARFLAB's
   DWARF mini dual-band curve, the closest one available. You can pick others in
   *Linear → Colour calibration*.
 - `Duo-Band` subs get the Ha/OIII workflow; `Astro` and `VIS` subs get natural-colour RGB.
 
-If `CALI_FRAME` lives elsewhere, pass it with `--calib /path/to/CALI_FRAME` (CLI and web
-server) or `ASTROPHOTO_CALIB=/path/to/CALI_FRAME`. To record darks for your own exposure,
-gain and temperature, use the DWARF app's dark library. The masters it stacks land in
-`CALI_FRAME` and are picked up automatically.
+If `CALI_FRAME` lives elsewhere, set it in the web UI's *Calibration* panel (*Library folder*),
+or pass `--calib /path/to/CALI_FRAME` (CLI and web server) or `ASTROPHOTO_CALIB=/path/to/CALI_FRAME`.
+To record darks for your own exposure, gain and temperature, use the DWARF app's dark library.
+The masters it stacks land in `CALI_FRAME` and are picked up automatically. A dark close to the
+lights' temperature still gives the best result.
 
 ## Calibration frames
 
@@ -152,7 +179,8 @@ Masters are looked for in these places:
 2. `darks/`, `flats/`, `biases/` (also `dark`, `flat`, `bias`, `offsets`) folders in the session folder
    or beside it (the Siril `lights/ darks/ flats/ biases/` layout)
 3. calibration frames (`IMAGETYP` Dark / Flat / Bias) among the lights
-4. `--calib DIR` / `ASTROPHOTO_CALIB` (several folders separated by `:`; `off` disables calibration)
+4. the dataset's *Library folder* in the web UI, `--calib DIR` or `ASTROPHOTO_CALIB` (several folders
+   separated by `:`; `ASTROPHOTO_CALIB=off` disables calibration everywhere)
 
 Individual frames are median-combined into a master once and cached in the session's
 `calib/` folder. Frames that already are masters (`STACKCNT` > 1, `stack_N` or `master` in
@@ -165,15 +193,33 @@ is then:
 - **Dark**: same gain and exposure, nearest temperature, then the largest stack. A dark of
   another exposure is used only with a bias, scaled by the exposure ratio and then refined per sub.
 - **Flat**: the lights' filter. A flat stored with its pedestal still in it is detected and
-  the bias removed.
-- **Bias**: the nearest gain.
+  the bias removed. The flat is dropped if it makes the sky less even.
+- **Bias**: the nearest gain, levelled to the dark's pedestal when their gains differ.
 
 Each sub is then calibrated as `(light − bias − k·(dark − bias)) / flat`, where `k` is fitted
-per sub when a bias is available. Without a bias, it is `(light − dark) / flat`. Saturated
-pixels stay saturated after the flat division. The web UI's dataset panel shows which
-masters are used; hover over it for the files, the fitted thermal scale and any warnings.
-The stack's FITS header records it too (`CALIBRAT`). Checks on a synthetic DWARF drive:
-`python experiments/test_calibration.py`.
+per sub when a bias is available. Without a bias, it is `(light − dark) / flat`. The flat is
+normalised in each CFA site, and saturated pixels stay saturated after the flat division.
+
+### In the web UI
+
+**Calibrate** is the first step of the *Pipeline* card. *Analyse frames* and *Run everything*
+calibrate first as well, as their first progress stage. The *Calibration* panel under the
+steps shows what `python -m astrophoto calibration DIR` prints:
+
+- the telescope profile (sensor, Bayer pattern, bit depth, optics) and the lights' exposure,
+  gain, filter and temperature range
+- the dark, bias and flat in use, the fitted thermal-scale range, the flat check, the pedestal, and notes
+
+Its settings are kept per dataset:
+
+- **Use calibration masters** on or off
+- an extra **Library folder**
+- **Dark / Flat / Bias**: *Auto*, *None*, or any master that fits the lights
+
+*Save & calibrate* applies the settings. If the masters in use change, the frame analysis is
+dropped, so *Analyse frames* measures the subs again with the new calibration. The dataset panel
+shows a one-line summary (hover over it for the files), and the stack's FITS header records it
+too (`CALIBRAT`). Checks on a synthetic DWARF drive: `python experiments/test_calibration.py`.
 
 ## Super-resolution
 

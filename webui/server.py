@@ -139,7 +139,8 @@ def datasets(root: str | None = None):
     out = []
     if not os.path.isdir(root):
         return {"root": root, "datasets": []}
-    candidates = [root] + sorted(d for d in glob.glob(os.path.join(root, "**"), recursive=True) if os.path.isdir(d))
+    candidates = [root] + sorted(d for d in glob.glob(os.path.join(root, "**"), recursive=True)
+                                 if os.path.isdir(d) and os.path.abspath(d) != root)
     for d in candidates:
         # calibration libraries are not datasets (DWARF CALI_FRAME / DWARF_DARK, darks/ flats/ biases/)
         parts = {p.lower() for p in os.path.relpath(d, root).replace("\\", "/").split("/")}
@@ -195,6 +196,23 @@ def sensitivity(body: dict = Body(...)):
     return {"frames": s.reselect(float(body["sensitivity"]))}
 
 
+@app.get("/api/calibration")
+def calibration_get(folder: str):
+    """The calibration panel: telescope profile, masters chosen and available, fitted dark scale,
+    flat check, notes (what ``python -m astrophoto calibration`` prints)."""
+    s = get_session(folder)
+    return clean_json({**s.calibration_info(), "status": s.status()})
+
+
+@app.post("/api/calibration")
+def calibration_set(body: dict = Body(...)):
+    """Save this dataset's calibration settings (enabled, library folder, dark / flat / bias:
+    auto | none | a master's path).  Run the Calibrate step (or Analyse) to apply them."""
+    s = get_session(body["folder"])
+    prefs = s.set_calib_prefs(body.get("prefs") or {})
+    return {"prefs": prefs}
+
+
 @app.get("/api/thumb")
 def thumb(folder: str, name: str, size: int = 360):
     s = get_session(folder)
@@ -205,7 +223,7 @@ def thumb(folder: str, name: str, size: int = 360):
 
 # ------------------------------------------------------------------ jobs
 
-JOB_KINDS = {"analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore", "starnet": "Train star remover",
+JOB_KINDS = {"calibrate": "Calibrate", "analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore", "starnet": "Train star remover",
              "all": "Run everything & export", "export": "Export"}
 ACTIVE = ("running", "paused", "queued")
 QUEUE: list[str] = []                     # queued job ids, first to run first
@@ -365,7 +383,9 @@ def _run_job(job_id: str):
         job["message"] = "Starting"
         _save_jobs(force=True)
         try:
-            if kind == "analyse":
+            if kind == "calibrate":
+                job["result"] = s.run_calibration(progress)
+            elif kind == "analyse":
                 s.run_analysis(float(stack_params.get("sensitivity", 1.0)), progress)
                 job["result"] = {"n": len(s.infos)}
             elif kind == "stack":

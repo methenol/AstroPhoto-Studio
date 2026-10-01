@@ -262,3 +262,9 @@ details.adv label input[type=number] { width: 90px; }
 .state.paused { background: #2a3350; color: var(--accent2); }
 .state.queued { background: #273048; color: var(--text); }
 .state.cancelled, .state.interrupted { background: #2b2b33; color: var(--muted); }
+
+.calib-info { margin: 8px 0 4px; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
+.calib-info span { color: var(--muted); }
+.calib-info b { color: var(--text); font-weight: 500; word-break: break-word; }
+.calib-info .note { grid-column: 1 / -1; color: var(--warn); }
+details.adv label input[type=text] { width: 160px; }

@@ -40,6 +40,7 @@ class FrameInfo:
     camera_slot: str | None = None   # DWARF calibration camera (cam_0 telephoto / cam_1 wide-angle)
     device_rejected: bool = False    # the telescope's own live stack rejected this sub (DWARF "failed_")
     calib: dict | None = field(default=None, repr=False)   # calibration masters (calibration.py)
+    adu_scale: float = 1.0           # raw values x this = 16-bit ADU (DWARF 3: 12-bit data, x16)
 
     def to_dict(self):
         return asdict(self)
@@ -74,6 +75,9 @@ def read_info(path: str) -> FrameInfo:
     def pick(*vals, default=None):
         return next((v for v in vals if v not in (None, "")), default)
     width, height = int(h["NAXIS1"]), int(h["NAXIS2"])
+    # data written at the ADC's bit depth (DWARF 3: 0..4095) is scaled to 16 bits, so the white
+    # level, the saturation tests and every ADU threshold mean the same as for a 16-bit camera
+    scale = float(2 ** (16 - prof.bit_depth)) if prof.bit_depth and int(h.get("BITPIX", 16)) == 16 else 1.0
     binning = int(num("XBINNING", fallback=0) or si.get("binning") or 0)
     if not binning:
         # a DWARF 3 telephoto sub at 1920x1080 is binned 2x2 from its 3840x2160 sensor
@@ -95,11 +99,12 @@ def read_info(path: str) -> FrameInfo:
         filter=str(filt),
         exptime=float(pick(num("EXPTIME", "EXPOSURE"), fn.get("exptime"), si.get("exptime"), default=0.0)),
         gain=float(pick(num("GAIN"), fn.get("gain"), si.get("gain"), default=0.0)),
-        temp=float(pick(num("CCD-TEMP", "SENSTEMP"), fn.get("temp"), si.get("temp"), default=float("nan"))),
+        temp=float(pick(num("CCD-TEMP", "DET-TEMP", "SENSTEMP"), fn.get("temp"), si.get("temp"),
+                        default=float("nan"))),
         date_obs=date_obs,
         timestamp=_parse_time(date_obs),
         bayer=str(h.get("BAYERPAT", "") or "").strip() or prof.bayer or instruments.GENERIC.bayer,
-        bias=float(h.get("BIAS", 0) or 0),
+        bias=float(h.get("BIAS", 0) or 0) * scale,
         width=width,
         height=height,
         ra=ra if ra is not None else si.get("ra"),
@@ -112,6 +117,7 @@ def read_info(path: str) -> FrameInfo:
         sensor=prof.sensor or "",
         camera_slot=instruments.camera_slot(prof),
         device_rejected=bool(fn.get("failed")),
+        adu_scale=scale,
     )
 
 
@@ -141,31 +147,52 @@ def discover(folder: str) -> list[FrameInfo]:
     for fi in infos:
         groups.setdefault((fi.filter, fi.width, fi.height, fi.bayer), []).append(fi)
     best = max(groups.values(), key=lambda g: sum(f.exptime for f in g))
+    _check_adu_scale(best)
     return sorted(best, key=lambda f: f.timestamp or 0)
 
 
-def load_raw_adu(path: str) -> np.ndarray:
-    """A raw CFA frame as float32 ADU, nothing removed."""
-    return fits.getdata(path).astype(np.float32)
+def _check_adu_scale(infos: list[FrameInfo]):
+    """A profile's bit depth is only trusted while the data agrees: a sub with values beyond it
+    (a firmware that scales to 16 bits) turns the scaling off for the whole session."""
+    scale = infos[0].adu_scale
+    if scale == 1.0:
+        return
+    for info in infos[:: max(1, len(infos) // 3)][:3]:
+        if float(fits.getdata(info.path).max()) > 65535.0 / scale:
+            for i in infos:
+                i.bias /= i.adu_scale
+                i.adu_scale = 1.0
+            return
 
 
-def read_raw(path: str, bias: float, calib: dict | None = None) -> np.ndarray:
+def load_raw_adu(path: str, scale: float = 1.0) -> np.ndarray:
+    """A raw CFA frame as float32 16-bit ADU (``scale``: FrameInfo.adu_scale), nothing removed."""
+    data = fits.getdata(path).astype(np.float32)
+    if scale != 1.0:
+        data *= scale
+    return data
+
+
+def read_raw(path: str, bias: float, calib: dict | None = None, scale: float = 1.0) -> np.ndarray:
     """Read a raw CFA frame as float32 with the black level removed: by the calibration
     masters (bias, dark, flat; calibration.py) when the session has them, else by the
-    header's BIAS."""
-    data = load_raw_adu(path)
+    header's BIAS (clipped at 0, as always).
+
+    A calibrated frame is not clipped: a DWARF 3's Duo-Band sky is a few ADU above black with
+    ~10x that in read noise, and clipping the negative half of the noise would add a bias of
+    the same size as the faint signal.  Everything downstream is linear in the data."""
+    data = load_raw_adu(path, scale)
     if calib:
         from .calibration import apply
-        data = apply(data, calib)
-    else:
-        data -= bias
+        return apply(data, calib)
+    data -= bias
     np.maximum(data, 0, out=data)
     return data
 
 
 def read_frame(info: FrameInfo) -> np.ndarray:
     """``read_raw`` of a sub with its session's calibration."""
-    return read_raw(info.path, info.bias, getattr(info, "calib", None))
+    return read_raw(info.path, info.bias, getattr(info, "calib", None), getattr(info, "adu_scale", 1.0))
 
 
 # --------------------------------------------------------------------------- CFA
@@ -227,8 +254,15 @@ def _opencv_bayer_code(pattern: str) -> int:
 def demosaic(raw: np.ndarray, pattern: str) -> np.ndarray:
     """Edge-aware demosaic of a (bias-subtracted, float) CFA frame -> RGB float32."""
     code = _opencv_bayer_code(pattern.upper())
-    u16 = np.clip(raw, 0, 65535).astype(np.uint16)
-    return cv2.cvtColor(u16, code).astype(np.float32)
+    # OpenCV's edge-aware demosaic takes integers: offset so calibrated noise below black survives
+    # (the interpolation is affine, so the offset comes back out exactly)
+    off = float(max(0.0, -float(raw.min()))) if raw.size else 0.0
+    off = np.ceil(off)
+    u16 = np.clip(np.round(raw + off), 0, 65535).astype(np.uint16)
+    rgb = cv2.cvtColor(u16, code).astype(np.float32)
+    if off:
+        rgb -= off
+    return rgb
 
 
 # ------------------------------------------------------------------- cosmetic

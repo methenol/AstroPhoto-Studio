@@ -2,9 +2,10 @@
 
     python experiments/test_calibration.py
 
-A DWARF 3 writes its subs with few header keys, and its factory / user masters to
-Astronomy/CALI_FRAME.  This builds that layout with a known sky, pedestal, dark current
-(at a different sensor temperature than the lights), hot pixels and vignetting, and checks
+A DWARF 3 writes 12-bit subs (0..4095, black level ~200) and its factory / user masters to
+CALI_FRAME beside the session folders (the layout and value ranges of real C 20 data, 2026-09-30).
+This builds that layout with a known sky, pedestal, dark current (at a different sensor
+temperature than the lights), hot pixels and vignetting, and checks
 that the right masters are found and chosen, the thermal scale is recovered per sub, and
 the calibrated subs are flat and free of hot pixels.  A generic camera's darks/ folder of
 individual frames is checked as well.
@@ -23,16 +24,17 @@ from astrophoto import calibration, instruments  # noqa: E402
 from astrophoto.frames import build_defect_map, discover, read_frame  # noqa: E402
 
 H, W = 192, 256
-PED = 800.0                       # black level (ADU)
+PED = 200.0                       # black level (12-bit ADU, as a DWARF 3's)
+SCALE = 16.0                      # 12-bit data is read as 16-bit ADU
 EXP, GAIN = 15.0, 60
 T_DARK, T_LIGHT = 38.0, 31.0
 K_TRUE = 2 ** ((T_LIGHT - T_DARK) / 6.0)   # dark current doubles every 6 C
 rng = np.random.default_rng(1)
 
 
-def write_u16(path, data, hdr=None):
+def write_u16(path, data, hdr=None, white=4095):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fits.writeto(path, np.clip(np.round(data), 0, 65535).astype(np.uint16), hdr, overwrite=True)
+    fits.writeto(path, np.clip(np.round(data), 0, white).astype(np.uint16), hdr, overwrite=True)
 
 
 def model():
@@ -44,7 +46,7 @@ def model():
     bias = PED + rng.normal(0, 3, (H, W)).astype(np.float32)        # fixed-pattern offset
     thermal = rng.gamma(2.0, 4.0, (H, W)).astype(np.float32)        # dark current at T_DARK, EXP
     hot = rng.choice(H * W, 400, replace=False)
-    thermal.ravel()[hot] += rng.uniform(300, 4000, 400)
+    thermal.ravel()[hot] += rng.uniform(100, 1500, 400)
     return vign, qe, bias, thermal, hot
 
 
@@ -61,21 +63,22 @@ def build_dwarf_drive(base):
     write_u16(os.path.join(cal, "dark", "cam_1", f"dark_exp_{EXP:.6f}_gain_{GAIN}_bin_1_31C_stack_10.fits"),
               bias * 0 + 5000)                              # the wide-angle camera's: must never be picked
     # master flats stored with the pedestal still in them, one per filter
-    write_u16(os.path.join(cal, "flat", "cam_0", "flat_gain_2_bin_1_ir_1.fits"), bias + 30000 * vign * qe)
-    write_u16(os.path.join(cal, "flat", "cam_0", "flat_gain_2_bin_1_ir_2.fits"), bias + 20000 * (1 - 0.1 * vign) * qe)
+    write_u16(os.path.join(cal, "flat", "cam_0", "flat_gain_2_bin_1_ir_1.fits"), bias + 3000 * vign * qe)
+    write_u16(os.path.join(cal, "flat", "cam_0", "flat_gain_2_bin_1_ir_2.fits"), bias + 2000 * (1 - 0.1 * vign) * qe)
 
     sess = os.path.join(base, "Astronomy", f"DWARF_RAW_TELE_M 31_EXP_{EXP:g}_GAIN_{GAIN}_2025-10-01-21-30-00-100")
     os.makedirs(sess, exist_ok=True)
     json.dump({"target": "M 31", "exp": EXP, "gain": GAIN, "ir": "Astro", "binning": "1*1",
-               "minTemp": 30, "maxTemp": 32, "shotsTaken": 8, "shotsStacked": 7, "RA": 10.68, "DEC": 41.27},
+               "minTemp": 30, "maxTemp": 32, "shotsTaken": 8, "shotsStacked": 7, "RA": 0.712, "DEC": 41.27},
               open(os.path.join(sess, "shotsInfo.json"), "w"))
-    sky = 400.0
+    sky = 60.0
     names = []
     for t in range(8):
         stars = np.zeros((H, W), np.float32)
         for _ in range(25):
             y, x = rng.integers(4, H - 4), rng.integers(4, W - 4)
-            stars[y - 1:y + 2, x - 1:x + 2] += rng.uniform(200, 3000) * np.array([[.3, .6, .3], [.6, 1, .6], [.3, .6, .3]])
+            stars[y - 1:y + 2, x - 1:x + 2] += rng.uniform(50, 800) * np.array([[.3, .6, .3], [.6, 1, .6], [.3, .6, .3]])
+        stars[100:102, 100:102] = 5000                     # a saturated star core (clips at 4095)
         signal = (sky + stars) * vign
         light = bias + K_TRUE * thermal + rng.poisson(np.maximum(signal + K_TRUE * thermal, 0)) - K_TRUE * thermal
         light += rng.normal(0, 2.5, (H, W))
@@ -106,7 +109,8 @@ def test_dwarf(base):
                   f"profile: {i0.telescope}, {i0.bayer}, {i0.sensor}")
     good &= check(i0.exptime == EXP and i0.gain == GAIN and i0.filter == "Astro" and i0.temp == T_LIGHT,
                   f"file name: {i0.exptime:g} s, gain {i0.gain:g}, {i0.filter}, {i0.temp:g} C")
-    good &= check(i0.object == "M 31" and abs(i0.ra - 10.68) < 1e-6, "object from the name, RA/Dec from shotsInfo.json")
+    good &= check(i0.object == "M 31" and abs(i0.ra - 0.712 * 15) < 1e-6,
+                  "object from the name, RA (in hours) / Dec from shotsInfo.json")
     good &= check(i0.focallen == 150 and i0.camera_slot == "cam_0", f"focal length {i0.focallen:g} mm, {i0.camera_slot}")
 
     cal = calibration.attach(infos, sess, os.path.join(base, "work"))
@@ -118,11 +122,15 @@ def test_dwarf(base):
     lo, hi = rep["dark_scale"]
     good &= check(abs(lo - K_TRUE) < 0.06 and abs(hi - K_TRUE) < 0.06,
                   f"thermal scale {lo:.3f}-{hi:.3f} per sub (true {K_TRUE:.3f})")
-    good &= check(abs(i0.bias - PED) < 5, f"pedestal {i0.bias:.1f} ADU (true {PED:g})")
+    good &= check(i0.adu_scale == SCALE, f"12-bit data read as 16-bit ADU (x{i0.adu_scale:g})")
+    # the gain-2 bias is levelled to the gain-60 dark's pedestal, which includes its median dark current
+    ped_true = float(np.median(fits.getdata(os.path.join(base, "Astronomy", "CALI_FRAME", "dark", "cam_0",
+                     f"dark_exp_{EXP:.6f}_gain_{GAIN}_bin_1_{T_DARK:.0f}C_stack_10.fits")))) * SCALE
+    good &= check(abs(i0.bias - ped_true) < 2 * SCALE, f"pedestal {i0.bias:.1f} ADU (dark's {ped_true:g})")
     print("   ", cal["summary"])
 
     raw = read_frame(i0)
-    plain = fits.getdata(i0.path).astype(np.float32) - PED
+    plain = fits.getdata(i0.path).astype(np.float32) * SCALE - PED * SCALE
     sky_c, sky_r = raw[H // 2 - 20:H // 2 + 20, W // 2 - 20:W // 2 + 20], raw[4:30, 4:30]
     ratio = np.median(sky_r) / np.median(sky_c)
     ratio0 = np.median(plain[4:30, 4:30]) / np.median(plain[H // 2 - 20:H // 2 + 20, W // 2 - 20:W // 2 + 20])
@@ -132,8 +140,20 @@ def test_dwarf(base):
     res_hot = np.abs(raw.ravel()[mask] - np.median(raw)).mean()
     res_hot0 = np.abs(plain.ravel()[mask] - np.median(plain)).mean()
     good &= check(res_hot < 0.1 * res_hot0, f"hot pixels subtracted: mean excess {res_hot0:.0f} -> {res_hot:.0f} ADU")
+    good &= check(raw[100, 100] >= 0.9 * (65535 - i0.bias), f"saturated pixel stays saturated ({raw[100, 100]:.0f})")
+    good &= check((raw < 0).any(), "calibrated noise below black is kept (not clipped at 0)")
     dm = build_defect_map(infos)
     good &= check(dm.shape == (H, W), f"defect map with the masters' defects ({int(dm.sum())} px)")
+
+    # a firmware writing 16-bit-scaled data must not be scaled again
+    import shutil
+    d16 = sess + "_16bit"
+    os.makedirs(d16)
+    for p in sorted(os.listdir(sess))[:3]:
+        if p.endswith(".fits") and not p.startswith("stacked"):
+            write_u16(os.path.join(d16, p), fits.getdata(os.path.join(sess, p)).astype(np.float32) * 16, white=65535)
+    good &= check(discover(d16)[0].adu_scale == 1.0, "16-bit data from a 12-bit profile is not scaled again")
+    shutil.rmtree(d16)
 
     os.environ["ASTROPHOTO_CALIB"] = "off"
     good &= check(calibration.attach(discover(sess), sess, os.path.join(base, "work")) is None,

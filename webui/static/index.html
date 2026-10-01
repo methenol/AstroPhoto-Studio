@@ -29,12 +29,24 @@
     <section class="card">
       <h3>Pipeline</h3>
       <ol class="steps">
+        <li id="step-calibrate"><span class="dot"></span><div><b>Calibrate</b><small>bias, dark &amp; flat masters (a DWARF's CALI_FRAME, darks/ flats/ biases/); dark scaled per sub to its sensor temperature; flat checked against the sky</small></div><button class="btn small" data-job="calibrate">Run</button></li>
         <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, clouds, obstructions, ML anomalies</small></div><button class="btn small" data-job="analyse">Run</button></li>
         <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>local normalisation, sigma-clip, drizzle</small></div><button class="btn small" data-job="stack">Run</button></li>
         <li id="step-denoise"><span class="dot"></span><div><b>Restore</b><small>ImageMM on every sub (first run also prepares the subs, ~30 min), or the Noise2Noise networks</small></div><button class="btn small" data-job="denoise">Run</button></li>
         <li id="step-starnet"><span class="dot"></span><div><b>Train AI star remover</b><small>learns this image's stars (its own PSF, colours and brightnesses) to separate them cleanly; the Star reduction slider then goes all the way to starless</small></div><button class="btn small" data-job="starnet">Run</button></li>
       </ol>
       <button class="btn primary wide" data-job="all">▶ Run everything &amp; export</button>
+
+      <details class="adv" id="calibPanel">
+        <summary>Calibration <span id="calibBadge" class="muted"></span></summary>
+        <div id="calibInfo" class="calib-info small"></div>
+        <label class="check" title="Off: the black level comes from the BIAS header only (as without masters), hot pixels from the temporal median of the subs."><input id="cal-enabled" type="checkbox" checked> Use calibration masters</label>
+        <label title="Extra folders with calibration masters or frames (separate several with ':'), e.g. a copy of a DWARF's CALI_FRAME kept somewhere else. A CALI_FRAME beside or above the dataset is found without this.">Library folder <input id="cal-library" type="text" placeholder="found automatically"></label>
+        <label title="Auto: same gain and exposure, nearest sensor temperature, largest stack.">Dark <select id="cal-dark"></select></label>
+        <label title="Auto: the flat for the subs' filter (DWARF ir_0 VIS, ir_1 Astro, ir_2 Duo-Band); dropped when it makes the sky less even.">Flat <select id="cal-flat"></select></label>
+        <label title="Auto: the nearest gain. With a dark, the bias lets the dark's thermal signal be scaled to each sub's temperature.">Bias <select id="cal-bias"></select></label>
+        <div class="row" style="justify-content:flex-end;gap:6px"><button class="btn tiny" id="calSave" title="Save these settings and run the Calibrate step. If the masters change, the frame analysis is dropped and Analyse runs again with the next stage.">Save &amp; calibrate</button></div>
+      </details>
 
       <details class="adv">
         <summary>Integration &amp; compute options</summary>

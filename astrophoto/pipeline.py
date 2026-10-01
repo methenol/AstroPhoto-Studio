@@ -224,6 +224,7 @@ class Session:
             "object": self.infos[0].object if self.infos else None,
             "narrowband": is_narrowband(self.infos[0].filter) if self.infos else None,
             "telescope": getattr(self.infos[0], "telescope", "") if self.infos else None,
+            "calibration_checked": os.path.exists(self._p("calibration.json")),
             "calibration": self._calibration_status(),
         }
 
@@ -245,20 +246,85 @@ class Session:
             raise Cancelled()
 
     # ------------------------------------------------------------- stage 1
-    def scan(self):
+    def scan(self, progress=None):
         self.infos = discover(self.folder)
         if not self.infos:
             raise RuntimeError(f"No light frames (FITS) found in {self.folder}")
         from .calibration import attach
+        self.calib_error = None
         try:
-            attach(self.infos, self.folder, self.dir)
+            attach(self.infos, self.folder, self.dir, self.calib_prefs, progress)
         except Exception as e:          # a broken master must not stop the session: calibrate from the headers
-            print(f"calibration masters not used: {e}")
+            self.calib_error = f"{type(e).__name__}: {e}"
+            print(f"calibration masters not used: {self.calib_error}")
         return self.infos
+
+    # ------------------------------------------------------------- calibration (stage 0)
+    @property
+    def calib_prefs(self) -> dict:
+        from .calibration import DEFAULT_PREFS
+        p = self._p("calib_prefs.json")
+        try:
+            return {**DEFAULT_PREFS, **(json.load(open(p)) if os.path.exists(p) else {})}
+        except Exception:
+            return dict(DEFAULT_PREFS)
+
+    def set_calib_prefs(self, prefs: dict) -> dict:
+        from .calibration import DEFAULT_PREFS
+        new = {**self.calib_prefs, **{k: v for k, v in (prefs or {}).items() if k in DEFAULT_PREFS}}
+        json.dump(new, open(self._p("calib_prefs.json"), "w"), indent=1)
+        return new
+
+    @staticmethod
+    def _calib_signature(calib: dict | None):
+        if not calib:
+            return None
+        return tuple(calib.get(k) for k in ("bias", "dark", "flat", "flat_bias", "adu_scale", "relevel", "optimize"))
+
+    def run_calibration(self, progress=None) -> dict:
+        """Find and choose the calibration masters (and fit the dark scale, check the flat) for this
+        session's subs.  When the choice differs from the one the frame analysis was made with, the
+        analysis is stale: it is dropped, so the next stage measures the frames again."""
+        with self.lock:
+            before = self._calib_signature(getattr(self.infos[0], "calib", None)) if (self.infos and self.analysis) else "-"
+            self.scan(progress)
+            after = self._calib_signature(getattr(self.infos[0], "calib", None))
+            changed = self.analysis is not None and before != after
+            if changed:
+                self.analysis = None
+                for f in ("analysis.pkl", "defects.npy", "frames.json"):
+                    if os.path.exists(self._p(f)):
+                        os.remove(self._p(f))
+            info = self.calibration_info(with_candidates=False)
+            json.dump(clean_json(info), open(self._p("calibration.json"), "w"), indent=1, default=_json_default)
+            return {"changed_analysis": changed, "summary": (info.get("report") or {}).get("summary")}
+
+    def calibration_info(self, with_candidates: bool = True) -> dict:
+        """What ``python -m astrophoto calibration`` prints: the telescope profile, the lights'
+        settings, the masters chosen (and the ones that would fit), the fitted scale, the flat check."""
+        from .calibration import candidates
+        if not self.infos:
+            self.scan()
+        i0 = self.infos[0]
+        profile = {"telescope": i0.telescope or i0.instrument or "", "instrument": i0.instrument,
+                   "sensor": i0.sensor, "bayer": i0.bayer, "focallen": i0.focallen, "pixsize": i0.pixsize,
+                   "width": i0.width, "height": i0.height, "camera_slot": i0.camera_slot,
+                   "bit_depth": int(round(16 - np.log2(i0.adu_scale))) if getattr(i0, "adu_scale", 1) > 1 else 16,
+                   "device_rejected": int(sum(getattr(i, "device_rejected", False) for i in self.infos))}
+        out = {"profile": profile, "n_lights": len(self.infos), "prefs": self.calib_prefs,
+               "env": os.environ.get("ASTROPHOTO_CALIB", ""), "error": getattr(self, "calib_error", None),
+               "report": self._calibration_status()}
+        if with_candidates:
+            try:
+                out["candidates"] = candidates(self.infos, self.folder, self.dir, self.calib_prefs)
+            except Exception as e:
+                out["candidates"] = {"bias": [], "dark": [], "flat": []}
+                out["error"] = out["error"] or f"{type(e).__name__}: {e}"
+        return clean_json(out)
 
     def run_analysis(self, sensitivity: float = 1.0, progress=None):
         with self.lock:
-            self.scan()
+            self.scan(progress)
             if progress:
                 progress(0, 1, f"Building hot-pixel map from {len(self.infos)} frames")
             self.defects = build_defect_map(self.infos)

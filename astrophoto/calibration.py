@@ -341,12 +341,16 @@ def select(masters: list[Master], shape, exptime, gain, temp, filt: str, cam: st
 _PREP: dict = {}
 
 
-def _load(path: str) -> np.ndarray:
+def _load(path: str, scale: float = 1.0) -> np.ndarray:
+    """A master in 16-bit ADU: ``scale`` as the lights' (FrameInfo.adu_scale; a DWARF 3's masters
+    are 12-bit like its subs), a 32-bit master normalised to 0..1 (Siril's default) to 0..65535."""
     data = fits.getdata(path)
     was_float = data.dtype.kind == "f"
     data = np.asarray(data, np.float32)
     if was_float and np.nanmax(data) <= 2.0:
-        data = data * WHITE             # a 32-bit master normalised to 0..1 (Siril's default)
+        data = data * WHITE
+    elif scale != 1.0:
+        data = data * scale
     return np.nan_to_num(data, nan=0.0)
 
 
@@ -366,26 +370,32 @@ def _neighbours_at(a: np.ndarray, ys, xs) -> np.ndarray:
 
 def _prepared(calib: dict) -> dict:
     """Master arrays of one calibration (per process, loaded once)."""
-    key = (calib.get("bias"), calib.get("dark"), calib.get("flat"), calib.get("flat_bias"))
+    key = (calib.get("bias"), calib.get("dark"), calib.get("flat"), calib.get("flat_bias"),
+           calib.get("adu_scale", 1.0), calib.get("relevel", False))
     hit = _PREP.get(key)
     if hit is not None:
         return hit
     if len(_PREP) > 2:
         _PREP.clear()
     P = {"B": None, "D": None, "T": None, "F": None, "hot": None, "defects": None}
-    B = _load(calib["bias"]) if calib.get("bias") else None
-    D = _load(calib["dark"]) if calib.get("dark") else None
+    sc = float(calib.get("adu_scale", 1.0))
+    B = _load(calib["bias"], sc) if calib.get("bias") else None
+    D = _load(calib["dark"], sc) if calib.get("dark") else None
     shape = (B if B is not None else D).shape if (B is not None or D is not None) else None
     defects = None
     if D is not None and B is not None:
+        if calib.get("relevel"):
+            # a bias of another gain has another pedestal (a DWARF 3's gain-2 bias sits 2 ADU above
+            # its gain-60 dark): level it to the dark's, so the thermal map scaled by k is thermal only
+            B = B + float(np.median((D - B)[::3, ::3]))
         T = D - B                       # thermal signal (and amp glow) of the dark
         resid = T - _same_colour_median(T)
         sub = resid[::3, ::3]
         mad = 1.4826 * float(np.median(np.abs(sub - np.median(sub)))) + 1e-3
         thr = max(8 * mad, 20.0)
         hot = np.flatnonzero((resid > thr) & (D < SAT_RAW))
-        if len(hot) > 20000:            # the strongest are enough for the scale fit
-            hot = hot[np.argsort(resid.ravel()[hot])[-20000:]]
+        if len(hot) > 40000:            # a random subset is enough for the scale fit
+            hot = np.random.default_rng(0).choice(hot, 40000, replace=False)
         ys, xs = np.unravel_index(hot, T.shape)
         P["hot"] = (ys, xs, resid.ravel()[hot].astype(np.float32))
         P["B"], P["T"] = B, T
@@ -402,8 +412,8 @@ def _prepared(calib: dict) -> dict:
         ped = float(calib.get("header_bias", 0.0))
     P["pedestal"] = ped
     if calib.get("flat"):
-        F = _load(calib["flat"])
-        FB = _load(calib["flat_bias"]) if calib.get("flat_bias") else B
+        F = _load(calib["flat"], sc)
+        FB = _load(calib["flat_bias"], sc) if calib.get("flat_bias") else B
         note = "as stored"
         if FB is not None and FB.shape == F.shape:
             # a master flat stored without its bias removed still has the pedestal in its darkest pixels
@@ -446,13 +456,14 @@ def dark_scale(raw: np.ndarray, calib: dict) -> float:
     ok &= t > 0
     if ok.sum() < 50:
         return k0
-    # least squares through the origin, then trimmed of the pixels a star or a cosmic ray hit
-    k = float(np.sum(e[ok] * t[ok]) / np.sum(t[ok] ** 2))
-    r = e - k * t
-    s = 1.4826 * np.median(np.abs(r[ok])) + 1e-3
-    ok &= np.abs(r) < 4 * s
-    if ok.sum() >= 50:
-        k = float(np.sum(e[ok] * t[ok]) / np.sum(t[ok] ** 2))
+    # least absolute deviations through the origin: the t-weighted median of e / t.  Least squares
+    # is ruled by the few hundred hottest pixels, whose dark current grows faster with temperature
+    # than the bulk's (DWARF 3, C 20 at 42 C against a 27 C dark: 1.77 by least squares, 1.30 by L1,
+    # and only the L1 scale leaves less residual than plain subtraction in every strength band)
+    r, w = e[ok] / t[ok], t[ok]
+    o = np.argsort(r)
+    cw = np.cumsum(w[o])
+    k = float(r[o][np.searchsorted(cw, 0.5 * cw[-1])])
     return float(np.clip(k, 0.0, 10.0 * max(k0, 0.1)))
 
 
@@ -497,57 +508,161 @@ def _describe(m: Master | None) -> dict | None:
             "filter": m.filter or (DWARF_FILTERS.get(m.fcode) if m.fcode is not None else ""), "stack": m.stack}
 
 
-def attach(infos: list, folder: str, cache_dir: str) -> dict | None:
-    """Find and choose the masters for a session's lights and store them on every FrameInfo
-    (``info.calib``; ``info.bias`` becomes the masters' pedestal, which the saturation level uses)."""
+DEFAULT_PREFS = {"enabled": True, "library": "", "dark": "auto", "flat": "auto", "bias": "auto"}
+
+
+def _light_settings(infos: list) -> dict:
+    temps = [i.temp for i in infos if i.temp is not None and np.isfinite(i.temp)]
+    return {"shape": (infos[0].height, infos[0].width),
+            "exptime": float(np.median([i.exptime for i in infos])),
+            "gain": float(np.median([i.gain for i in infos])),
+            "temp": float(np.median(temps)) if temps else None,
+            "temp_range": [float(min(temps)), float(max(temps))] if temps else None,
+            "filter": infos[0].filter, "cam": getattr(infos[0], "camera_slot", None)}
+
+
+def _library(infos: list, folder: str, cache_dir: str, prefs: dict) -> list[Master]:
     setting = os.environ.get("ASTROPHOTO_CALIB", "").strip()
-    if not infos or setting.lower() in ("off", "none", "0", "false"):
+    extra = [p for p in setting.split(os.pathsep) if p] if setting.lower() not in ("", "off", "none", "0", "false") else []
+    extra += [p for p in str(prefs.get("library") or "").split(os.pathsep) if p.strip()]
+    return load_library(folder, cache_dir, [os.path.expanduser(p.strip()) for p in extra])
+
+
+def candidates(infos: list, folder: str, cache_dir: str, prefs: dict | None = None) -> dict:
+    """The masters that fit these lights (frame size and camera), per kind, for choosing by hand."""
+    prefs = {**DEFAULT_PREFS, **(prefs or {})}
+    if not infos:
+        return {"bias": [], "dark": [], "flat": []}
+    ls = _light_settings(infos)
+    out = {"bias": [], "dark": [], "flat": []}
+    for m in _library(infos, folder, cache_dir, prefs):
+        if _compatible(m, ls["shape"], ls["cam"]):
+            out[m.kind].append(_describe(m))
+    for k in out:
+        out[k].sort(key=lambda d: (d["file"]))
+    return out
+
+
+def attach(infos: list, folder: str, cache_dir: str, prefs: dict | None = None, progress=None) -> dict | None:
+    """Find and choose the masters for a session's lights and store them on every FrameInfo
+    (``info.calib``; ``info.bias`` becomes the masters' pedestal, which the saturation level uses).
+
+    ``prefs`` (the web UI's per-dataset settings, DEFAULT_PREFS): ``enabled``; ``library``, extra
+    folders; ``dark`` / ``flat`` / ``bias``: "auto", "none" or the path of a master to use."""
+    prefs = {**DEFAULT_PREFS, **(prefs or {})}
+    setting = os.environ.get("ASTROPHOTO_CALIB", "").strip()
+    for info in infos:
+        info.calib = None
+    if not infos or not prefs.get("enabled", True) or setting.lower() in ("off", "none", "0", "false"):
         return None
-    extra = [p for p in setting.split(os.pathsep) if p] if setting else []
-    masters = load_library(folder, cache_dir, extra)
+    if progress:
+        progress(0, 3, "Calibration: finding bias / dark / flat masters")
+    masters = _library(infos, folder, cache_dir, prefs)
     if not masters:
         return None
     i0 = infos[0]
-    temps = [i.temp for i in infos if i.temp is not None and np.isfinite(i.temp)]
-    temp = float(np.median(temps)) if temps else None
-    exptime = float(np.median([i.exptime for i in infos]))
-    gain = float(np.median([i.gain for i in infos]))
-    sel = select(masters, (i0.height, i0.width), exptime, gain, temp, i0.filter, getattr(i0, "camera_slot", None))
+    ls = _light_settings(infos)
+    temp, exptime, gain = ls["temp"], ls["exptime"], ls["gain"]
+    sel = select(masters, ls["shape"], exptime, gain, temp, i0.filter, ls["cam"])
+    chosen_by_hand = []
+    for kind in ("bias", "dark", "flat"):
+        want = prefs.get(kind, "auto") or "auto"
+        if want == "none":
+            sel[kind] = None
+            chosen_by_hand.append(f"{kind}: none")
+        elif want != "auto":
+            hit = next((m for m in masters if m.path == want and m.kind == kind
+                        and _compatible(m, ls["shape"], ls["cam"])), None)
+            if hit is not None:
+                sel[kind] = hit
+                chosen_by_hand.append(f"{kind}: {hit.name}")
+                if kind == "dark":
+                    sel["k0"] = exptime / hit.exptime if (hit.exptime and exptime) else 1.0
+    if sel["flat"] is not None and (prefs.get("bias") not in (None, "auto")):
+        sel["flat_bias"] = sel["bias"] or sel["flat_bias"]
+    elif sel["flat"] is None:
+        sel["flat_bias"] = None
     if not any(sel[k] for k in ("bias", "dark", "flat")):
         return None
     calib = {k: (sel[k].path if sel[k] else None) for k in ("bias", "dark", "flat", "flat_bias")}
-    calib.update({"k0": sel["k0"], "optimize": sel["bias"] is not None and sel["dark"] is not None,
-                  "header_bias": float(i0.bias)})
+    b, d = sel["bias"], sel["dark"]
+    calib.update({"k0": sel["k0"], "optimize": b is not None and d is not None,
+                  "header_bias": float(i0.bias), "adu_scale": float(getattr(i0, "adu_scale", 1.0)),
+                  "relevel": bool(b is not None and d is not None and b.gain is not None and d.gain is not None
+                                  and abs(b.gain - d.gain) > 0.5)})
+    if progress:
+        progress(1, 3, "Calibration: fitting the dark's thermal scale and checking the flat")
     P = _prepared(calib)
-    ks = []
-    if calib["optimize"]:
-        from .frames import load_raw_adu
-        for i in np.linspace(0, len(infos) - 1, min(FIT_SAMPLE, len(infos))).round().astype(int):
-            ks.append(dark_scale(load_raw_adu(infos[i].path), calib))
+    # a sample of the subs (the telescope's accepted ones first: the others are often cloudy)
+    pool = [i for i in infos if not getattr(i, "device_rejected", False)]
+    pool = pool if len(pool) >= FIT_SAMPLE else infos
+    sample = [pool[i] for i in np.linspace(0, len(pool) - 1, min(FIT_SAMPLE, len(pool))).round().astype(int)]
+    from .frames import load_raw_adu
+    ks, cal = [], []
+    for info in sample:
+        raw = load_raw_adu(info.path, calib["adu_scale"])
+        if calib["optimize"]:
+            ks.append(dark_scale(raw, calib))
+        if P["F"] is not None:
+            cal.append(apply(raw, calib))
+    flat_check = None
+    if cal:
+        after = np.median(np.stack(cal), axis=0)
+        del cal
+        before = after * P["F"]
+        flat_check = {"before": round(sky_unevenness(before), 2), "after": round(sky_unevenness(after), 2)}
     report = {"bias": _describe(sel["bias"]), "dark": _describe(sel["dark"]), "flat": _describe(sel["flat"]),
               "flat_bias": _describe(sel["flat_bias"]), "pedestal": round(P["pedestal"], 1),
               "light_temp": temp, "dark_scale": [round(min(ks), 3), round(max(ks), 3)] if ks else None,
-              "flat_note": P.get("flat_note"), "notes": []}
-    d = sel["dark"]
+              "flat_note": P.get("flat_note"), "flat_check": flat_check, "notes": [],
+              "lights": {**{k: v for k, v in ls.items() if k != "shape"}, "n": len(infos),
+                         "width": i0.width, "height": i0.height},
+              "chosen_by_hand": chosen_by_hand}
     if d is None:
         report["notes"].append(f"no dark for {exptime:g} s at gain {gain:g}: hot pixels come from the "
                                "temporal median only")
     elif d.temp is not None and temp is not None and abs(d.temp - temp) > 5 and not calib["optimize"]:
         report["notes"].append(f"dark taken at {d.temp:g} C, lights at {temp:.0f} C and no bias to "
                                "scale its thermal signal")
-    b = sel["bias"]
-    if b is not None and b.gain is not None and abs(b.gain - gain) > 0.5:
-        report["notes"].append(f"bias taken at gain {b.gain:g}, lights at {gain:g}: any offset difference is a "
-                               "constant, removed with the background")
+    if calib["relevel"]:
+        report["notes"].append(f"bias taken at gain {b.gain:g}, dark at {d.gain:g}: bias levelled to the dark's "
+                               "pedestal")
+    if flat_check and prefs.get("flat", "auto") == "auto" and flat_check["after"] > 1.1 * flat_check["before"] + 0.5:
+        # the flat does not describe this optical train (another filter position, dust that moved, ...)
+        report["notes"].append(f"the flat made the sky less even ({flat_check['before']:g} -> "
+                               f"{flat_check['after']:g} ADU): not used")
+        calib["flat"] = calib["flat_bias"] = None
+        report["flat"] = report["flat_bias"] = None
+        P = _prepared(calib)
     if sel["flat"] is None:
         report["notes"].append(f"no flat for filter {i0.filter or '(unnamed)'}: vignetting is left to "
                                "gradient removal")
     calib["report"] = report
     calib["summary"] = summary(report)
+    if progress:
+        progress(3, 3, "Calibration: " + calib["summary"])
     for info in infos:
         info.calib = calib
         info.bias = P["pedestal"]
     return calib
+
+
+def sky_unevenness(img: np.ndarray, block: int = 24) -> float:
+    """Large-scale unevenness of a calibrated sky (ADU): robust scatter of star-free block medians in
+    each CFA site after removing a plane (clouds and light pollution make gradients; vignetting and
+    dust rings are what a flat corrects, and they are not planar)."""
+    vals = []
+    for dy in (0, 1):
+        for dx in (0, 1):
+            s = img[dy::2, dx::2]
+            h, w = (s.shape[0] // block) * block, (s.shape[1] // block) * block
+            g = np.median(s[:h, :w].reshape(h // block, block, w // block, block).transpose(0, 2, 1, 3)
+                          .reshape(h // block, w // block, -1), axis=2)
+            yy, xx = np.mgrid[0:g.shape[0], 0:g.shape[1]]
+            A = np.c_[np.ones(g.size), yy.ravel(), xx.ravel()]
+            r = g.ravel() - A @ np.linalg.lstsq(A, g.ravel(), rcond=None)[0]
+            vals.append(1.4826 * float(np.median(np.abs(r - np.median(r)))))
+    return float(np.median(vals))
 
 
 def summary(rep: dict) -> str:

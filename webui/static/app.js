@@ -138,7 +138,7 @@ async function openDataset(folder) {
     $("#datasetTitle").textContent = `${r.status.object || ""} · ${folder}`;
     const nb = r.status.narrowband;
     $("#datasetInfo").innerHTML = `<span>Object</span><b>${r.status.object || "–"}</b><span>Filter</span><b>${r.status.filter || "–"} ${nb ? "(dual-band → HOO)" : "(broadband RGB)"}</b><span>Frames</span><b>${r.status.n_files}</b>${r.status.telescope ? `<span>Telescope</span><b>${r.status.telescope}</b>` : ""}<span>Calibration</span><b class="small" title="${calibTitle(r.status.calibration)}">${r.status.calibration ? r.status.calibration.summary : "black level from header"}</b><span>Cache</span><b class="small">${r.status.workdir.split("/").slice(-2).join("/")}</b>`;
-    updateSteps(); renderFrames();
+    updateSteps(); renderFrames(); loadCalibration();
     if (r.status.stacked) schedulePreview(0); else showPlaceholder(true);
     refreshExports(); refreshDiag();
     attachActiveJob();
@@ -153,8 +153,58 @@ function calibTitle(c) {
     c.light_temp != null ? `Lights at ${Math.round(c.light_temp)} °C` : null, ...(c.notes || [])].filter(Boolean).join("\n").replace(/"/g, "&quot;");
 }
 
+/* ------------------------------------------------------------ calibration */
+async function loadCalibration() {
+  if (!S.folder) return;
+  let c;
+  try { c = await api(`/api/calibration?folder=${encodeURIComponent(S.folder)}`); } catch (e) { $("#calibInfo").textContent = e.message; return; }
+  if (c.status) { S.status = c.status; updateSteps(); }
+  S.calib = c;
+  const p = c.profile || {}, r = c.report || {}, L = r.lights || {};
+  const row = (k, v) => v === undefined || v === null || v === "" ? "" : `<span>${k}</span><b>${v}</b>`;
+  const m = x => x ? `${esc(x.file)}${x.temp != null ? ` · ${x.temp} °C` : ""}${x.stack > 1 ? ` · ${x.stack} frames` : ""}` : "—";
+  let html = row("Telescope", esc(p.telescope || "unknown")) +
+    row("Sensor", `${esc(p.sensor || "from headers")} · ${p.bayer} · ${p.bit_depth}-bit`) +
+    row("Optics", `${p.focallen} mm · ${p.pixsize} µm`) +
+    row("Lights", `${c.n_lights} × ${L.exptime ?? "?"} s · gain ${L.gain ?? "?"}${L.filter ? " · " + esc(L.filter) : ""}${L.temp_range ? ` · ${L.temp_range[0]}–${L.temp_range[1]} °C` : ""}`) +
+    (p.device_rejected ? row("Live-stack rejects", `${p.device_rejected} (graded here like any other sub)`) : "");
+  if (c.report) {
+    html += row("Dark", m(r.dark)) + row("Bias", m(r.bias)) + row("Flat", m(r.flat)) +
+      row("Thermal scale", r.dark_scale ? `×${r.dark_scale[0]}–${r.dark_scale[1]} per sub (fitted on the dark's hot pixels)` : "") +
+      row("Flat check", r.flat_check ? `sky unevenness ${r.flat_check.before} → ${r.flat_check.after} ADU` : "") +
+      row("Pedestal", r.pedestal != null ? `${r.pedestal} ADU (16-bit)` : "") +
+      (r.chosen_by_hand || []).map(x => `<div class="note muted">chosen by hand: ${esc(x)}</div>`).join("") +
+      (r.notes || []).map(n => `<div class="note">${esc(n)}</div>`).join("");
+  } else {
+    html += `<div class="note">${c.prefs && !c.prefs.enabled ? "Calibration masters switched off" : "No calibration masters found"}: black level from the BIAS header, hot pixels from the temporal median.</div>`;
+  }
+  if (c.env) html += `<div class="note muted">ASTROPHOTO_CALIB=${esc(c.env)}</div>`;
+  if (c.error) html += `<div class="note">${esc(c.error)}</div>`;
+  $("#calibInfo").innerHTML = html;
+  $("#calibBadge").textContent = c.report ? `· ${c.report.summary}` : "· none";
+  const pr = c.prefs || {};
+  $("#cal-enabled").checked = pr.enabled !== false;
+  $("#cal-library").value = pr.library || "";
+  for (const k of ["dark", "flat", "bias"]) {
+    const opts = (c.candidates || {})[k] || [];
+    const cur = pr[k] || "auto";
+    $(`#cal-${k}`).innerHTML = [`<option value="auto">Auto${r[k] ? " (" + esc(r[k].file) + ")" : ""}</option>`, `<option value="none">None</option>`,
+      ...opts.map(o => `<option value="${esc(o.path)}" title="${esc(o.path)}">${m(o)}</option>`)].join("");
+    $(`#cal-${k}`).value = [...$(`#cal-${k}`).options].some(o => o.value === cur) ? cur : "auto";
+  }
+}
+
+async function saveCalibration() {
+  if (!S.folder) return toast("Open a dataset first", true);
+  const prefs = { enabled: $("#cal-enabled").checked, library: $("#cal-library").value.trim(),
+    dark: $("#cal-dark").value, flat: $("#cal-flat").value, bias: $("#cal-bias").value };
+  try { await api("/api/calibration", { method: "POST", body: { folder: S.folder, prefs } }); } catch (e) { return toast(e.message, true); }
+  startJob("calibrate");
+}
+
 function updateSteps() {
   const st = S.status || {};
+  $("#step-calibrate").classList.toggle("done", !!(st.calibration_checked || st.calibration));
   $("#step-analyse").classList.toggle("done", !!st.analysed);
   $("#step-stack").classList.toggle("done", !!st.stacked);
   $("#step-denoise").classList.toggle("done", !!st.denoised);
@@ -280,7 +330,7 @@ async function pollJob() {
   const pb = $("#pauseJob");
   pb.hidden = !(j.state === "running" || j.state === "paused");
   pb.textContent = j.state === "paused" ? "Resume" : "Pause";
-  const stepEl = { analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet" }[j.kind];
+  const stepEl = { calibrate: "#step-calibrate", analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet" }[j.kind];
   $$(".steps li").forEach(li => li.classList.remove("running"));
   if (stepEl && (j.state === "running" || j.state === "paused")) $(stepEl).classList.add("running");
   if (["running", "queued", "paused"].includes(j.state)) { setTimeout(pollJob, j.state === "queued" ? 1500 : 800); return; }
@@ -293,6 +343,8 @@ async function pollJob() {
       const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
       S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
       if (S.status.stacked) schedulePreview(0);
+      if (["calibrate", "analyse", "all"].includes(j.kind)) loadCalibration();
+      if (j.kind === "calibrate" && j.result?.changed_analysis) toast("Calibration changed: the frame analysis was dropped — run Analyse frames again");
       if (j.kind === "export" || j.kind === "all") { refreshExports(); switchTab("export"); }
       refreshDiag();
     }
@@ -521,6 +573,7 @@ function bindUI() {
     await openDataset(p);
   };
   $$("[data-job]").forEach(b => b.onclick = () => startJob(b.dataset.job));
+  $("#calSave").onclick = saveCalibration;
   $("#cancelJob").onclick = () => S.job && api(`/api/jobs/${S.job.id}/cancel`, { method: "POST" });
   $("#pauseJob").onclick = async () => {
     if (!S.job) return;

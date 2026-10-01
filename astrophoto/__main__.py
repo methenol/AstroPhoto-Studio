@@ -110,16 +110,22 @@ def main(argv=None):
 
     s = Session(args.folder, args.workdir)
     if args.cmd == "calibration":
-        infos = s.scan()
-        i0 = infos[0]
-        print(f"{len(infos)} lights: {i0.width}x{i0.height} {i0.bayer}, {i0.exptime:g} s, gain {i0.gain:g}, "
-              f"filter {i0.filter or '-'}, telescope {i0.telescope or i0.instrument or 'unknown'}")
-        print(f"  focal length {i0.focallen:g} mm, pixel {i0.pixsize:g} um, sensor curve {i0.sensor or 'from headers'}")
-        rej = sum(i.device_rejected for i in infos)
-        if rej:
-            print(f"  {rej} subs the telescope's live stack rejected (graded here like any other)")
-        print(json.dumps(s.status().get("calibration") or "no calibration masters found: black level from the "
-                         "BIAS header", indent=1, default=str))
+        res = s.run_calibration(_progress())
+        info = s.calibration_info()
+        pr, lt = info["profile"], (info.get("report") or {}).get("lights") or {}
+        i0 = s.infos[0]
+        print(f"{info['n_lights']} lights: {pr['width']}x{pr['height']} {pr['bayer']}, {i0.exptime:g} s, "
+              f"gain {i0.gain:g}, filter {i0.filter or '-'}, telescope {pr['telescope'] or 'unknown'}")
+        print(f"  focal length {pr['focallen']:g} mm, pixel {pr['pixsize']:g} um, {pr['bit_depth']}-bit data, "
+              f"sensor curve {pr['sensor'] or 'from headers'}")
+        if lt.get("temp_range"):
+            print(f"  sensor temperature {lt['temp_range'][0]:g}-{lt['temp_range'][1]:g} C")
+        if pr["device_rejected"]:
+            print(f"  {pr['device_rejected']} subs the telescope's live stack rejected (graded here like any other)")
+        if res["changed_analysis"]:
+            print("  calibration changed: the frame analysis was dropped, run analyse again")
+        print(json.dumps(info.get("report") or "no calibration masters found: black level from the BIAS header",
+                         indent=1, default=str))
         return
     if args.cmd == "analyse":
         table = s.run_analysis(args.sensitivity, _progress())
