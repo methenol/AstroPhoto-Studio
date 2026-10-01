@@ -1,7 +1,7 @@
 """AstroPhoto Studio web UI (FastAPI).
 
     python -m webui.server            # http://127.0.0.1:8000
-    python -m webui.server --host 0.0.0.0 --port 8080 --images /path/to/seestar/exports
+    python -m webui.server --host 0.0.0.0 --port 8080 --images /path/to/telescope/exports
 """
 from __future__ import annotations
 
@@ -141,16 +141,21 @@ def datasets(root: str | None = None):
         return {"root": root, "datasets": []}
     candidates = [root] + sorted(d for d in glob.glob(os.path.join(root, "**"), recursive=True) if os.path.isdir(d))
     for d in candidates:
+        # calibration libraries are not datasets (DWARF CALI_FRAME / DWARF_DARK, darks/ flats/ biases/)
+        parts = {p.lower() for p in os.path.relpath(d, root).replace("\\", "/").split("/")}
+        if parts & {"cali_frame", "dwarf_dark", "dark", "darks", "flat", "flats", "bias", "biases", "offsets",
+                    "calib", "restacked", "solving_failed"}:
+            continue
         fits_files = [f for ext in ("*.fit", "*.fits", "*.fts") for f in glob.glob(os.path.join(d, ext))]
         if not fits_files:
             continue
         info = {"path": d, "name": os.path.relpath(d, root) if d != root else os.path.basename(d),
                 "n_fits": len(fits_files)}
         try:
-            from astropy.io import fits
-            h = fits.getheader(sorted(fits_files)[0])
-            info.update({"object": str(h.get("OBJECT", "")).strip(), "filter": str(h.get("FILTER", "")).strip(),
-                         "exptime": float(h.get("EXPTIME", 0) or 0), "instrument": str(h.get("CREATOR", "")).strip()})
+            from astrophoto.frames import read_info
+            fi = read_info(sorted(fits_files)[0])
+            info.update({"object": fi.object, "filter": fi.filter, "exptime": fi.exptime,
+                         "instrument": fi.telescope or fi.instrument})
             info["total_min"] = round(info["exptime"] * len(fits_files) / 60, 1)
         except Exception:
             pass
@@ -1077,9 +1082,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--images", default=CONFIG["images"], help="root folder that contains Seestar *_sub folders")
+    ap.add_argument("--images", default=CONFIG["images"],
+                    help="root folder that contains the session folders of subs (Seestar *_sub, DWARF DWARF_RAW_*, ...)")
     ap.add_argument("--workdir", default=CONFIG["workdir"])
+    ap.add_argument("--calib", help="extra calibration library folder(s), e.g. a copy of a DWARF's CALI_FRAME")
+    ap.add_argument("--no-calibration", action="store_true", help="ignore bias / dark / flat masters")
     a = ap.parse_args()
+    if a.no_calibration:
+        os.environ["ASTROPHOTO_CALIB"] = "off"
+    elif a.calib:
+        os.environ["ASTROPHOTO_CALIB"] = os.path.abspath(a.calib)
     CONFIG["images"] = os.path.abspath(a.images)
     CONFIG["workdir"] = os.path.abspath(a.workdir)
     _load_jobs()

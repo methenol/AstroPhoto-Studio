@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from .frames import FrameInfo, cfa_masks, demosaic, fix_defects, read_raw
+from .frames import FrameInfo, cfa_masks, demosaic, fix_defects, read_frame
 
 
 def _bounded_map(fn, items, workers):
@@ -172,7 +172,7 @@ class Integrator:
     # ------------------------------------------------------------------ frames
     def _warp(self, idx: int):
         info, fr = self.items[idx]
-        raw = read_raw(info.path, info.bias)
+        raw = read_frame(info)
         raw = fix_defects(raw, self.defects)
         size = (self.W, self.H)
         maps = self._distortion_maps(fr)

@@ -138,10 +138,14 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def detect_sensor(instrument: str, width: int, height: int, pixsize: float, available: list[str]) -> tuple[str | None, str]:
-    """(database sensor name, how it was found) from the FITS header, or (None, reason)."""
+def detect_sensor(instrument: str, width: int, height: int, pixsize: float, available: list[str],
+                  hint: str = "", telescope: str = "") -> tuple[str | None, str]:
+    """(database sensor name, how it was found) from the FITS header, or (None, reason).
+    ``hint``: the sensor the telescope's profile names (instruments.py), used first."""
     inst = instrument or ""
     geo = sorted((int(width), int(height)))
+    if hint and hint in available:
+        return hint, f"{telescope or 'telescope'} ({hint.replace('_', ' ')})"
 
     def geometry_matches():
         return [n for (w, h, px, n) in SENSOR_GEOMETRY
@@ -175,6 +179,17 @@ def detect_filter(filter_name: str, instrument: str, available: list[str]) -> tu
     f = (filter_name or "").strip()
     fn = _norm(f)
     seestar = "seestar" in (instrument or "").lower()
+    dwarf = "dwarf" in (instrument or "").lower()
+    if dwarf:
+        # the database has DWARFLAB's DWARF mini curves only: for another DWARF the mini's Duo-Band
+        # curve (same maker, Ha + OIII) is the closest available, and its Astro / VIS filters are UV/IR cuts
+        mini = "mini" in instrument.lower()
+        if any(k in fn for k in ("duo", "dual")) and "DWARFLAB_Dwarf_Mini_Dual_Band" in available:
+            return "DWARFLAB_Dwarf_Mini_Dual_Band", f"filter {f} ({'DWARF mini' if mini else 'DWARF mini curve, closest'})"
+        if "astro" in fn and mini and "DWARFLAB_Dwarf_Mini_Astro" in available:
+            return "DWARFLAB_Dwarf_Mini_Astro", f"filter {f} (DWARF mini)"
+        if fn in ("astro", "astrofilter", "vis", "visfilter") and "UV-IR-Block" in available:
+            return "UV-IR-Block", f"filter {f} (UV/IR cut)"
     if fn in ("lp", "duoband", "dualband") and (seestar or not instrument):
         hits = [n for n in available if "seestar_lp" in n.lower()]
         if hits:
@@ -199,11 +214,13 @@ def resolve(infos0, params: dict, cache_dir: str) -> dict:
         sensor, s_how = s_pref, "chosen"
     else:
         sensor, s_how = detect_sensor(getattr(infos0, "instrument", "") or "", infos0.width, infos0.height,
-                                      infos0.pixsize, sensors)
+                                      infos0.pixsize, sensors, getattr(infos0, "sensor", "") or "",
+                                      getattr(infos0, "telescope", "") or "")
     if f_pref and f_pref != "auto":
         filt, f_how = f_pref, "chosen"
     else:
-        filt, f_how = detect_filter(infos0.filter, getattr(infos0, "instrument", "") or "", filters)
+        inst = " ".join(x for x in (getattr(infos0, "telescope", ""), getattr(infos0, "instrument", "")) if x)
+        filt, f_how = detect_filter(infos0.filter, inst, filters)
     ref = WHITE_REFS.get(params.get("spcc_white_ref", "average_spiral_galaxy"), "Average_spiral_galaxy")
     return {"sensor": sensor, "sensor_how": s_how, "filter": filt, "filter_how": f_how, "white_ref": ref,
             "db_offline": not sensors}

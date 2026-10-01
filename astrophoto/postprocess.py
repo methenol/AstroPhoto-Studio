@@ -1332,7 +1332,10 @@ def sharpen(rgb: np.ndarray, amount: float, px_scale: float) -> np.ndarray:
 
 
 def is_narrowband(filter_name: str) -> bool:
-    return filter_name.strip().upper() in {"LP", "DUO", "DUAL", "LENHANCE", "L-ENHANCE", "L-EXTREME", "HOO"}
+    """A dual-band (Ha + OIII) filter: Seestar LP, DWARF Duo-Band, L-eNhance / L-eXtreme, ..."""
+    import re
+    n = re.sub(r"[^A-Z0-9]", "", (filter_name or "").upper())
+    return n in {"LP", "DUO", "DUAL", "DUOBAND", "DUALBAND", "LENHANCE", "LEXTREME", "LULTIMATE", "HOO"}
 
 
 _SEP_CACHE: dict = {}

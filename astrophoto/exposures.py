@@ -3,7 +3,7 @@
 ImageMM needs, for every exposure t: the coregistered, background-subtracted
 image y(t), per-pixel variances v(t), a binary mask m(t) and the PSF f(t)
 measured from the exposure's stars.  This module derives them from the raw
-Seestar subs.
+(calibrated) subs.
 
 Each step is linear in the sky signal, so the paper's model y = f * x + noise
 holds for the prepared exposure, with f the PSF measured on it:
@@ -50,7 +50,7 @@ import numpy as np
 import sep
 
 from .analysis import poly_eval, poly_terms
-from .frames import cfa_masks, fix_defects, read_raw
+from .frames import cfa_masks, fix_defects, read_frame
 
 
 # ----------------------------------------------------------------- demosaic
@@ -892,7 +892,7 @@ class ExposureSet:
         hit = cache.get(info.path)
         if hit is not None:
             return hit[0].copy(), hit[1], self.defects
-        raw = read_raw(info.path, info.bias)
+        raw = read_frame(info)
         sat = raw >= 0.95 * self.sat
         raw = fix_defects(raw, self.defects)
         limit = self.__dict__.get("_raw_cache_frames")      # a preparation worker: the current sub only

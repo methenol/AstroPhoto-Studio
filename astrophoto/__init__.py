@@ -1,8 +1,11 @@
-"""AstroPhoto Studio: an end-to-end astrophotography pipeline for ZWO Seestar raw FITS subs.
+"""AstroPhoto Studio: an end-to-end astrophotography pipeline for raw one-shot-colour FITS subs
+(smart telescopes such as the ZWO Seestar and DWARFLAB DWARF 3, or any astronomy camera).
 
 Stages
 ------
 1. ``frames``      discovery, FITS/CFA handling, cosmetic (hot pixel) correction
+   ``instruments`` telescope profiles: header values the telescope does not write
+   ``calibration`` bias / dark / flat masters (a DWARF's CALI_FRAME, darks/ flats/ biases/)
 2. ``analysis``    per-frame star metrics, registration, obstruction & cloud detection,
                    statistical + ML (IsolationForest) frame rejection and weighting
 3. ``stacking``    streaming 3-pass integration: local normalization, weighted

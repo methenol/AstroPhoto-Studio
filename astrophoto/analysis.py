@@ -24,7 +24,7 @@ import sep
 from scipy.spatial import cKDTree
 from sklearn.ensemble import IsolationForest
 
-from .frames import FrameInfo, fix_defects, read_raw, superpixel
+from .frames import FrameInfo, fix_defects, read_frame, superpixel
 
 sep.set_extract_pixstack(3_000_000)
 sep.set_sub_object_limit(4096)
@@ -73,7 +73,7 @@ def measure_stars(lum: np.ndarray, thresh: float = 5.0):
 
 
 def analyse_frame(info: FrameInfo) -> dict:
-    raw = read_raw(info.path, info.bias)
+    raw = read_frame(info)
     raw = fix_defects(raw, _DEFECTS)
     sp = superpixel(raw, info.bayer)
     lum = sp.mean(axis=2)

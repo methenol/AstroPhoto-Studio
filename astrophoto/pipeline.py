@@ -25,7 +25,7 @@ from PIL import Image
 
 from . import __version__
 from .analysis import analyse, finalize_selection
-from .frames import FrameInfo, build_defect_map, discover, read_raw, superpixel
+from .frames import FrameInfo, build_defect_map, discover, read_frame, superpixel
 from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
 from .stacking import Integrator
 
@@ -223,7 +223,15 @@ class Session:
             "filter": self.infos[0].filter if self.infos else None,
             "object": self.infos[0].object if self.infos else None,
             "narrowband": is_narrowband(self.infos[0].filter) if self.infos else None,
+            "telescope": getattr(self.infos[0], "telescope", "") if self.infos else None,
+            "calibration": self._calibration_status(),
         }
+
+    def _calibration_status(self) -> dict | None:
+        cal = getattr(self.infos[0], "calib", None) if self.infos else None
+        if not cal:
+            return None
+        return clean_json({"summary": cal.get("summary"), **cal.get("report", {})})
 
     def checkpoint(self) -> bool:
         """Called by every long stage between units of work (a frame, a sub, an iteration):
@@ -241,6 +249,11 @@ class Session:
         self.infos = discover(self.folder)
         if not self.infos:
             raise RuntimeError(f"No light frames (FITS) found in {self.folder}")
+        from .calibration import attach
+        try:
+            attach(self.infos, self.folder, self.dir)
+        except Exception as e:          # a broken master must not stop the session: calibrate from the headers
+            print(f"calibration masters not used: {e}")
         return self.infos
 
     def run_analysis(self, sensitivity: float = 1.0, progress=None):
@@ -307,6 +320,7 @@ class Session:
                 "overridden": f.get("overridden", False), "reasons": f["reject_reasons"],
                 "tile_mask": f["tile_mask"].tolist() if f.get("tile_mask") is not None else None,
                 "is_reference": f["name"] == self.analysis["frames"][self.analysis["ref_idx"]]["name"],
+                "device_rejected": getattr(info, "device_rejected", False),
             })
         return clean_json(out)
 
@@ -320,7 +334,7 @@ class Session:
         if os.path.exists(cache):
             return open(cache, "rb").read()
         os.makedirs(os.path.dirname(cache), exist_ok=True)
-        raw = read_raw(info.path, info.bias)
+        raw = read_frame(info)
         sp = superpixel(raw, info.bayer)
         img = autostretch(sp)
         h, w = img.shape[:2]
@@ -349,7 +363,9 @@ class Session:
             out = integ.run()
             hdr = fits.Header()
             info0 = self.infos[0]
-            for k, v in {"OBJECT": info0.object, "FILTER": info0.filter, "NFRAMES": out["n_frames"],
+            for k, v in {"OBJECT": info0.object, "FILTER": info0.filter, "TELESCOP": getattr(info0, "telescope", ""),
+                         "CALIBRAT": (getattr(info0, "calib", None) or {}).get("summary", "header BIAS"),
+                         "NFRAMES": out["n_frames"],
                          "TOTEXP": out["total_exposure"], "STKMODE": out["mode"], "STKSCALE": out["scale"],
                          "CREATOR": f"AstroPhoto Studio {__version__}", "BAYERPAT": info0.bayer}.items():
                 hdr[k] = v
@@ -361,6 +377,7 @@ class Session:
             meta = {"mode": out["mode"], "scale": out["scale"], "n_frames": out["n_frames"],
                     "total_exposure": out["total_exposure"], "params": p,
                     "saturation": 65535.0 - info0.bias, "filter": info0.filter, "object": info0.object,
+                    "calibration": self._calibration_status(),
                     "created": datetime.now().isoformat(timespec="seconds"),
                     "shape": list(out["stack"].shape)}
             json.dump(meta, open(self._p("stack_meta.json"), "w"), indent=1, default=_json_default)

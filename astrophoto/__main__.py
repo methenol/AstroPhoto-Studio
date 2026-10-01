@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import warnings
@@ -35,7 +36,7 @@ def _progress():
 def main(argv=None):
     from .pipeline import DEFAULTS, STACK_DEFAULTS, Session
 
-    ap = argparse.ArgumentParser(prog="astrophoto", description="Seestar astrophotography pipeline")
+    ap = argparse.ArgumentParser(prog="astrophoto", description="Astrophotography pipeline for raw FITS subs")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="analyse, stack, denoise, process and export")
     r.add_argument("folder")
@@ -88,8 +89,19 @@ def main(argv=None):
     a.add_argument("folder")
     a.add_argument("--workdir", default="output")
     a.add_argument("--sensitivity", type=float, default=1.0)
+    c = sub.add_parser("calibration", help="show the telescope profile and the bias / dark / flat masters found")
+    c.add_argument("folder")
+    c.add_argument("--workdir", default="output")
+    for p_ in (r, a, c):
+        p_.add_argument("--calib", help="extra calibration library folder(s), e.g. a copy of a DWARF's CALI_FRAME "
+                                        "(also: ASTROPHOTO_CALIB)")
+        p_.add_argument("--no-calibration", action="store_true", help="ignore bias / dark / flat masters")
     sub.add_parser("devices", help="show compute devices")
     args = ap.parse_args(argv)
+    if getattr(args, "no_calibration", False):
+        os.environ["ASTROPHOTO_CALIB"] = "off"
+    elif getattr(args, "calib", None):
+        os.environ["ASTROPHOTO_CALIB"] = os.pathsep.join(os.path.abspath(x) for x in args.calib.split(os.pathsep))
 
     if args.cmd == "devices":
         from .denoise import device_info
@@ -97,6 +109,18 @@ def main(argv=None):
         return
 
     s = Session(args.folder, args.workdir)
+    if args.cmd == "calibration":
+        infos = s.scan()
+        i0 = infos[0]
+        print(f"{len(infos)} lights: {i0.width}x{i0.height} {i0.bayer}, {i0.exptime:g} s, gain {i0.gain:g}, "
+              f"filter {i0.filter or '-'}, telescope {i0.telescope or i0.instrument or 'unknown'}")
+        print(f"  focal length {i0.focallen:g} mm, pixel {i0.pixsize:g} um, sensor curve {i0.sensor or 'from headers'}")
+        rej = sum(i.device_rejected for i in infos)
+        if rej:
+            print(f"  {rej} subs the telescope's live stack rejected (graded here like any other)")
+        print(json.dumps(s.status().get("calibration") or "no calibration masters found: black level from the "
+                         "BIAS header", indent=1, default=str))
+        return
     if args.cmd == "analyse":
         table = s.run_analysis(args.sensitivity, _progress())
         acc = [f for f in table if f["accepted"]]

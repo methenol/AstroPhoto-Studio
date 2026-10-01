@@ -137,12 +137,20 @@ async function openDataset(folder) {
     applyParamsToUI();
     $("#datasetTitle").textContent = `${r.status.object || ""} · ${folder}`;
     const nb = r.status.narrowband;
-    $("#datasetInfo").innerHTML = `<span>Object</span><b>${r.status.object || "–"}</b><span>Filter</span><b>${r.status.filter || "–"} ${nb ? "(dual-band → HOO)" : "(broadband RGB)"}</b><span>Frames</span><b>${r.status.n_files}</b><span>Cache</span><b class="small">${r.status.workdir.split("/").slice(-2).join("/")}</b>`;
+    $("#datasetInfo").innerHTML = `<span>Object</span><b>${r.status.object || "–"}</b><span>Filter</span><b>${r.status.filter || "–"} ${nb ? "(dual-band → HOO)" : "(broadband RGB)"}</b><span>Frames</span><b>${r.status.n_files}</b>${r.status.telescope ? `<span>Telescope</span><b>${r.status.telescope}</b>` : ""}<span>Calibration</span><b class="small" title="${calibTitle(r.status.calibration)}">${r.status.calibration ? r.status.calibration.summary : "black level from header"}</b><span>Cache</span><b class="small">${r.status.workdir.split("/").slice(-2).join("/")}</b>`;
     updateSteps(); renderFrames();
     if (r.status.stacked) schedulePreview(0); else showPlaceholder(true);
     refreshExports(); refreshDiag();
     attachActiveJob();
   } catch (e) { toast(e.message, true); }
+}
+
+function calibTitle(c) {
+  if (!c) return "No bias / dark / flat masters found: the black level comes from the BIAS header and hot pixels from the temporal median of the subs.";
+  const m = (k, lbl) => c[k] ? `${lbl}: ${c[k].file}` : null;
+  return [m("dark", "Dark"), m("bias", "Bias"), m("flat", "Flat"), m("flat_bias", "Flat bias"),
+    c.dark_scale ? `Thermal scale fitted per sub on the dark's hot pixels: ${c.dark_scale.join("–")}` : null,
+    c.light_temp != null ? `Lights at ${Math.round(c.light_temp)} °C` : null, ...(c.notes || [])].filter(Boolean).join("\n").replace(/"/g, "&quot;");
 }
 
 function updateSteps() {
@@ -431,7 +439,7 @@ function renderFrames() {
       <td><button class="toggle ${f.accepted ? "on" : ""} ${f.overridden ? "ovr" : ""}" title="${f.overridden ? "manual override (click to cycle)" : "automatic"}"></button></td>
       <td>${fmt(f.fwhm)}</td><td>${fmt(f.elongation)}</td><td>${f.n_stars}</td><td>${fmt(f.transparency)}</td>
       <td>${f.obstructed > 0 ? Math.round(f.obstructed * 100) + "%" : ""}</td><td>${fmt(f.background, 0)}</td><td>${fmt(f.weight)}</td>
-      <td class="notes">${f.reasons.join("; ")}</td></tr>`).join("");
+      <td class="notes">${[...f.reasons, ...(f.device_rejected ? ["rejected by the telescope's live stack"] : [])].join("; ")}</td></tr>`).join("");
   $$("#framesTable tbody tr").forEach(tr => {
     tr.onmouseenter = () => showFramePreview(tr.dataset.name);
     $(".toggle", tr).onclick = async ev => {

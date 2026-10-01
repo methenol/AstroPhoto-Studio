@@ -1,17 +1,20 @@
-# AstroPhoto Studio — Seestar raw FITS → finished astrophoto
+# AstroPhoto Studio — raw FITS subs → finished astrophoto
 
-An end-to-end pipeline that turns the raw `.fit` subs saved by a ZWO Seestar
-(S50 / S50 Pro / S30) into a finished image. It
-handles the whole chain: frame grading, cloud/tree/obstruction rejection,
+An end-to-end pipeline that turns the raw one-shot-colour FITS subs from a smart
+telescope or an astronomy camera into a finished image. It
+handles the whole chain: calibration, frame grading, cloud/tree/obstruction rejection,
 registration with alt-az field rotation, local normalisation, sigma-clipped
 Bayer-drizzle integration, AI denoising, gradient removal, deconvolution,
 star separation, narrowband palettes, stretching and export to a
 full-resolution JPEG + 16-bit TIFF. It includes a web UI and a CLI.
 
-Nothing is tuned for a particular object. Every decision comes from the
-FITS headers (`BAYERPAT`, `BIAS`, `FILTER`, `EXPTIME`, …) and from statistics
-of the data. The `LP` dual-band filter automatically gets an Ha/OIII (HOO)
-workflow, and the `IRCUT` broadband filter gets a natural-colour RGB workflow.
+Nothing is tuned for a particular object or telescope. Every decision comes from the
+FITS headers (`BAYERPAT`, `BIAS`, `FILTER`, `EXPTIME`, …), from calibration frames
+when there are any, and from statistics of the data. Where a telescope leaves header
+keys out, a profile of that telescope fills them in (see
+[Supported telescopes and cameras](#supported-telescopes-and-cameras)). A dual-band filter
+(Seestar `LP`, DWARF `Duo-Band`, L-eXtreme, …) automatically gets an Ha/OIII (HOO)
+workflow. A broadband filter (`IRCUT`, `Astro`, `VIS`, none) gets a natural-colour RGB workflow.
 
 ## Quick start
 
@@ -20,18 +23,20 @@ source .venv/bin/activate
 pip install -r requirements.txt          # or: uv pip install -r requirements.txt
 
 # Web UI  →  http://127.0.0.1:8000
-python -m webui.server                   # --images /path/to/Seestar/MyWorks  --port 8080  --host 0.0.0.0
+python -m webui.server                   # --images /path/to/sessions  --port 8080  --host 0.0.0.0
 
 # or headless, one command:
 python -m astrophoto run "images/IC 5070_sub"
 python -m astrophoto run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
 python -m astrophoto analyse DIR          # just the frame-quality report
+python -m astrophoto calibration DIR      # telescope profile + the bias / dark / flat masters it will use
 python -m astrophoto devices              # show GPUs PyTorch can use
 ```
 
-Point the UI or CLI at any folder of Seestar subs, for example the
-`<Object>_sub` folders the Seestar writes. JPG thumbnails and non-light
-frames are ignored. Results are cached in `output/<folder>-<hash>/`:
+Point the UI or CLI at any folder of light subs: a Seestar `<Object>_sub` folder, a DWARF
+`DWARF_RAW_…` session folder, or a `lights/` folder from any camera. Only same-size
+light frames with the dominant filter are used. JPG/PNG previews, the telescope's own stacks,
+thumbnails and calibration frames are skipped. Results are cached in `output/<folder>-<hash>/`:
 `stack.fits`, the two half stacks, `denoised.fits`, the coverage and
 rejection maps, and `exports/`.
 
@@ -58,9 +63,9 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 
 | Stage | Technique |
 |---|---|
-| **Calibration** | Black level from the FITS `BIAS` header. There are no dark frames, so hot and warm pixels are found from the temporal median of unregistered subs: sky drifts between frames but sensor defects don't. A pixel is flagged when it is an isolated same-colour outlier, which protects star cores. |
+| **Calibration** | **Bias, dark and flat masters** when there are any: a DWARF's factory and user masters (`CALI_FRAME`), or `darks/` `flats/` `biases/` folders for any camera (see [Calibration frames](#calibration-frames)). The dark's thermal signal is **scaled per sub from its hot pixels**, so a dark taken at another sensor temperature still fits. The flat is normalised in each CFA site separately, so it corrects vignetting and dust without shifting colour. Without masters, the black level comes from the FITS `BIAS` header. In both cases, residual hot and warm pixels are found from the temporal median of unregistered subs: sky drifts between frames but sensor defects don't. A pixel is flagged when it is an isolated same-colour outlier, which protects star cores. Pixels the masters show are unusable (hot beyond the linear range, dead in the flat) are added. |
 | **Frame grading** | SEP star extraction on every sub measures star count, FWHM, elongation (wind or tracking trails), sky level and noise. |
-| **Registration** | Asterism (triangle) matching, then RANSAC similarity refinement on every matched star. This handles the alt-az field rotation of the Seestar, which can reach about 100° over a long session. A robust **third-order polynomial distortion model** is then fitted per frame to hundreds of matched stars, which keeps edge stars round as the field rotates across the optics. |
+| **Registration** | Asterism (triangle) matching, then RANSAC similarity refinement on every matched star. This handles the field rotation of an alt-az mount, which can reach about 100° over a long session. A robust **third-order polynomial distortion model** is then fitted per frame to hundreds of matched stars, which keeps edge stars round as the field rotates across the optics. |
 | **Cloud / obstruction detection** | Reference-star photometry: each bright reference star that should appear in a frame is looked up, and the flux ratio is aggregated on a tile grid. Tiles whose stars dim or vanish (a tree, a roof, a passing cloud) become per-frame masks, so a partly blocked frame still contributes its clean area. |
 | **Rejection & weighting** | Robust median/MAD tests on each metric, plus an unsupervised **Isolation Forest** over the multivariate metrics. Weights are signal²/noise² × sharpness. Sensitivity is adjustable, and each frame can be overridden in the UI. |
 | **Integration** | Streaming three-pass integration with bounded memory (hundreds of subs fit in 16 GB of RAM). **Local normalisation** removes each frame's rotating gradient against the running mean. Weighted **sigma clipping** removes satellites, planes and cosmic rays. **Bayer drizzle** resamples each colour's samples directly, with no demosaic interpolation. Optional 1.5× or 2× output uses the dithering and rotation between frames. Frames alternate between two independent **half stacks**. |
@@ -73,18 +78,112 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 | **Star separation** | An **AI star remover trained on your own image** (like StarNet, with no pretrained weights). Its training pairs are made from the dataset: the classic starless image as the background, plus stars rendered with the image's own measured star profile per colour channel (halo and any dark ring included), star colours and brightnesses, up to saturated cores. The network then removes the real stars, including faint ones below the detection limit and stars on nebulosity, where inpainting smears. **Star reduction** at 1 gives the fully starless image. Until the remover is trained, the classic method is used: stars detected on a background mesh scaled to the PSF, with a concentration index that keeps galaxy nuclei and nebula knots out of the star layer, and push-pull inpainting with matched grain. |
 | **Star colour & halos** | Refractors bring blue/violet (and the OIII band) to a slightly different focus, so bright stars get coloured rings. Halo light above the local background is desaturated in linear data. The star layer uses a luminance-only stretch, true linear star colour and an "unscreen" recombination, which gives white cores with no coloured blooming, dark donuts or tints over bright backgrounds. |
 | **Stretch** | Four algorithms, as in Siril: **Generalized Hyperbolic Stretch** (default), **arcsinh**, **histogram transformation** (midtones transfer function, as in an autostretch) and **logarithmic**. For each one the strength is solved automatically so that the starless background lands on a target level. The stretch is colour-preserving, with luminance-preserving gamut mapping so that saturated highlights never darken. |
-| **Narrowband (LP filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. |
+| **Narrowband (dual-band filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. |
 | **Finishing** | Post-stretch starlet shrinkage on luminance, OKLab chroma noise reduction, wavelet local contrast, perceptual (OKLab) vibrance with background protection, SCNR, curves and masked sharpening. |
+
+## Supported telescopes and cameras
+
+Any one-shot-colour (Bayer) camera that writes 2-D FITS light frames works. The headers used
+are `BAYERPAT`, `EXPTIME`, `GAIN`, `FILTER`, `DATE-OBS`, `BIAS`, `CCD-TEMP`, `FOCALLEN`, `XPIXSZ`,
+`XBINNING`, `INSTRUME`, `TELESCOP`, `RA`/`DEC` (or `OBJCTRA`/`OBJCTDEC`) and `IMAGETYP`.
+Smart telescopes leave some of these out, so a profile of the telescope (`astrophoto/instruments.py`)
+fills the gaps. A header value always wins over the profile.
+
+| Telescope | Recognised from | Profile fills in |
+|---|---|---|
+| **DWARFLAB DWARF 3** (telephoto) | `TELESCOP`/`INSTRUME` (`DWARFIII`, `DWARF 3`), or the DWARF file layout | Sony IMX678, RGGB, 150 mm, 2.0 µm × binning (1920×1080 subs are 2×2 binned), and exposure / gain / filter / temperature / time from the file name. Target and RA/Dec come from `shotsInfo.json`. |
+| DWARF mini, DWARF II | headers or file layout | sensor (IMX662 / IMX415), focal length, pixel size |
+| **ZWO Seestar** S50 / S30 | `INSTRUME`/`TELESCOP` | GRBG, focal length, pixel size (black level from its `BIAS` header) |
+| Astronomy cameras (ZWO, QHY, Player One, Touptek, …) | `INSTRUME` | nothing: their capture software writes full headers |
+
+Without a profile, missing values fall back to GRBG, 250 mm and 2.9 µm. The web UI shows
+the telescope that was recognised, and `python -m astrophoto calibration DIR` prints the values it used.
+
+### DWARF 3
+
+Copy the DWARF's `Astronomy` folder from the telescope (USB or the app's file access), or
+at least the session folder together with `CALI_FRAME`:
+
+```
+Astronomy/
+├── CALI_FRAME/                        factory + your own masters, found automatically
+│   ├── bias/cam_0/bias_gain_2_bin_1.fits
+│   ├── dark/cam_0/dark_exp_15.000000_gain_60_bin_1_38C_stack_10.fits
+│   └── flat/cam_0/flat_gain_2_bin_1_ir_1.fits          ir: 0 VIS, 1 Astro, 2 Duo-Band
+└── DWARF_RAW_TELE_M 31_EXP_15_GAIN_60_2025-10-01-21-30-00-100/   ← open this folder
+    ├── shotsInfo.json
+    ├── M 31_15s60_Astro_20251001-213012345_31C.fits
+    ├── failed_M 31_15s60_Astro_20251001-213530123_31C.fits
+    └── stacked-….fits / .jpg / .png                     the DWARF's own stack: ignored
+```
+
+What the pipeline takes from the DWARF:
+
+- **Factory and user masters** (`CALI_FRAME`). It picks the telephoto camera's (`cam_0`) dark
+  with the same exposure, gain and binning, at the nearest sensor temperature. The flat is
+  the one for the filter the subs were shot with (`ir_1` Astro, `ir_2` Duo-Band), and its
+  pedestal is removed with the bias. The wide-angle camera's masters (`cam_1`) are only used
+  for wide-angle sessions.
+- **Temperature-matched darks without a matching temperature.** The DWARF's sensor is uncooled.
+  Its temperature is in every sub's file name and drifts by 10 °C or more in a night, and dark
+  current doubles about every 6 °C. So the dark's thermal signal (dark − bias) is scaled
+  for each sub, from how much its hot pixels stand above their neighbours
+  (the same idea as Siril's dark optimisation). The processing info reports the scale range.
+- **`failed_` subs**, which the DWARF's live stack rejected, are not dropped unseen. They are
+  graded like every other sub, so a frame with a passing cloud can still give its clean
+  tiles. The frames table notes them, and you can override them in the Frames tab.
+- **Colour calibration** uses the IMX678 sensor curve. The Siril SPCC database has no DWARF 3
+  filter curves: `Astro` and `VIS` are taken as UV/IR cuts, and `Duo-Band` uses DWARFLAB's
+  DWARF mini dual-band curve, the closest one available. You can pick others in
+  *Linear → Colour calibration*.
+- `Duo-Band` subs get the Ha/OIII workflow; `Astro` and `VIS` subs get natural-colour RGB.
+
+If `CALI_FRAME` lives elsewhere, pass it with `--calib /path/to/CALI_FRAME` (CLI and web
+server) or `ASTROPHOTO_CALIB=/path/to/CALI_FRAME`. To record darks for your own exposure,
+gain and temperature, use the DWARF app's dark library. The masters it stacks land in
+`CALI_FRAME` and are picked up automatically.
+
+## Calibration frames
+
+Calibration is optional: without it, sessions calibrate from the `BIAS` header as before.
+Masters are looked for in these places:
+
+1. a DWARF `CALI_FRAME` folder, in the session folder, beside it, or in a parent up to three levels up
+2. `darks/`, `flats/`, `biases/` (also `dark`, `flat`, `bias`, `offsets`) folders in the session folder
+   or beside it (the Siril `lights/ darks/ flats/ biases/` layout)
+3. calibration frames (`IMAGETYP` Dark / Flat / Bias) among the lights
+4. `--calib DIR` / `ASTROPHOTO_CALIB` (several folders separated by `:`; `off` disables calibration)
+
+Individual frames are median-combined into a master once and cached in the session's
+`calib/` folder. Frames that already are masters (`STACKCNT` > 1, `stack_N` or `master` in
+the name, anything under `CALI_FRAME`) are used as they are. Masters stored as 32-bit
+floats normalised to 0–1 (Siril's default) are rescaled to ADU.
+
+A master must match the lights' frame size (and so their binning) and camera. The choice
+is then:
+
+- **Dark**: same gain and exposure, nearest temperature, then the largest stack. A dark of
+  another exposure is used only with a bias, scaled by the exposure ratio and then refined per sub.
+- **Flat**: the lights' filter. A flat stored with its pedestal still in it is detected and
+  the bias removed.
+- **Bias**: the nearest gain.
+
+Each sub is then calibrated as `(light − bias − k·(dark − bias)) / flat`, where `k` is fitted
+per sub when a bias is available. Without a bias, it is `(light − dark) / flat`. Saturated
+pixels stay saturated after the flat division. The web UI's dataset panel shows which
+masters are used; hover over it for the files, the fitted thermal scale and any warnings.
+The stack's FITS header records it too (`CALIBRAT`). Checks on a synthetic DWARF drive:
+`python experiments/test_calibration.py`.
 
 ## Super-resolution
 
-Every Seestar sub lands on the sky slightly shifted and rotated (tracking drift and alt-az
+Every sub from an alt-az smart telescope lands on the sky slightly shifted and rotated (tracking drift and alt-az
 field rotation), so a stack samples the sky on a finer grid than any single frame. With
 **Super-resolution 1.5× / 2×** (web UI: *Integration & compute options*; CLI: `--scale 2`),
 the Bayer-drizzle integrator resamples every colour sample straight onto the finer grid.
 There is no demosaic step and no invented detail: the extra resolution comes from the data.
 
-Measured on 100 subs of M 27: star FWHM went from **7.7″ at 1× to 6.5″ at 2×**, about 16% sharper,
+Measured on 100 Seestar S50 subs of M 27: star FWHM went from **7.7″ at 1× to 6.5″ at 2×**, about 16% sharper,
 with better colour resolution because each colour channel is sampled directly. At 2× the pixel scale
 (1.15″/px) already samples the seeing-limited stars properly, so going beyond 2× gains nothing.
 The deconvolution stage then works on the finer grid.
@@ -189,7 +288,7 @@ How results are scored:
 - **Real data** is scored on held-out data only, never on data the method saw:
   - restorations: the odd subs, predicted through each one's own PSF
   - the denoiser: the independent half-stack, on held-out bands
-- **Synthetic datasets** are Seestar-format raw subs of an analytic sky (stars, nebulae,
+- **Synthetic datasets** are raw subs of an analytic sky in the Seestar S50's format (stars, nebulae,
   galaxies) with the same held-out scores, plus comparison against the exact truth: error,
   SSIM, faint-emission error and star photometry. Each sub has its own dither, field
   rotation, Moffat seeing, transparency, sky gradient, shot and read noise, hot pixels,
