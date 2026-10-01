@@ -59,6 +59,49 @@ specific GPU with `--device cuda:1`, or with `ASTROPHOTO_DEVICE=cuda:1`. The
 UI also has a device selector. Everything outside the denoiser (NumPy,
 OpenCV, SEP) runs on the CPU and is platform-independent.
 
+### Docker (NVIDIA or CPU)
+
+`Dockerfile` and `docker-compose.yml` run the web UI in a container, with one profile per
+compute backend:
+
+```bash
+cp .env.example .env                              # then set IMAGES_DIR, OUTPUT_DIR, PORT
+docker compose --profile nvidia up -d --build     # NVIDIA GPU
+docker compose --profile cpu up -d --build        # CPU only
+# → http://localhost:8000  (or your PORT)
+docker compose --profile nvidia logs -f           # follow the server log
+docker compose --profile nvidia down              # stop
+```
+
+- **Images folder, read-only:** `IMAGES_DIR` (default `./images`) is mounted at `/data/images`.
+  Nothing is ever written there: masters combined from individual calibration frames, previews
+  and plate solutions all go to the output folder. Quote paths with spaces in `.env`, e.g.
+  `IMAGES_DIR="/Volumes/Home/Seestar Images/images"`.
+- **Output folder, read-write:** `OUTPUT_DIR` (default `./output`) is mounted at `/data/output`.
+  It holds the per-dataset caches, stacks, exports, the job history and the SPCC database
+  download. It is created if missing. Point it at the same `output/` as a native install to
+  share results, but use one or the other at a time. Cache folders are named after the dataset's
+  path, so a dataset opened as `/data/images/…` in the container gets its own cache, separate
+  from the one a native run made.
+- **Port:** `PORT` on the host maps to 8000 in the container.
+- **User:** the container runs as `UID:GID` (default `1000:1000`), so on Linux the output files
+  belong to you. Set them to `id -u` / `id -g` in `.env`.
+- **NVIDIA:** needs the NVIDIA driver and the
+  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
+  on the host (Linux, or Windows with WSL2). The image uses PyTorch's CUDA 12.8 wheels, which
+  cover RTX 20 to 50 series cards with a driver of version 570 or newer. For older drivers, set
+  `TORCH_INDEX=https://download.pytorch.org/whl/cu126` and rebuild. `GPU_COUNT` and
+  `ASTROPHOTO_DEVICE=cuda:1` select GPUs.
+- **macOS:** Docker on a Mac cannot pass the Apple GPU (Metal) into a container, so only the
+  `cpu` profile works there, and the AI stages are much slower than a native run on MPS.
+  Docker Desktop must be allowed to share the images folder (*Settings → Resources → File
+  sharing*; `/Volumes` covers mounted NAS shares).
+- **Calibration library elsewhere:** set `ASTROPHOTO_CALIB` to its path *inside* the container
+  (under `/data/images`), or set it per dataset in the UI's *Calibration* panel.
+- **Memory:** worker pools are sized from the container's memory and CPU limits (`mem_limit`,
+  `cpus`), not the host's. Stacking and PyTorch share data through `/dev/shm`
+  (`SHM_SIZE`, default 8 GB).
+
 ## What happens to your data
 
 | Stage | Technique |

@@ -808,7 +808,8 @@ def _raw_cache_budget() -> float:
     if env:
         return float(env) * 2 ** 30
     try:
-        return 0.35 * os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        from .resources import total_ram_bytes            # a container's memory limit, not the host's
+        return 0.35 * total_ram_bytes()
     except (ValueError, OSError, AttributeError):
         return 4 * 2 ** 30
 

@@ -8,3 +8,6 @@ __pycache__/
 
 # experiment caches
 experiments/cache/
+
+# docker compose settings
+.env

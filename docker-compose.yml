@@ -1,0 +1,72 @@
+# AstroPhoto Studio web UI.  Pick one profile:
+#
+#   docker compose --profile nvidia up -d --build     # NVIDIA GPU (needs the NVIDIA Container Toolkit)
+#   docker compose --profile cpu up -d --build        # CPU only (macOS: containers cannot use the Apple GPU)
+#
+# then open http://localhost:${PORT} (default 8000).  Settings come from the environment or a
+# .env file next to this one (see .env.example):
+#   IMAGES_DIR   host folder with the session folders, mounted read-only   (default ./images)
+#   OUTPUT_DIR   host folder for caches, stacks and exports, read-write    (default ./output)
+#   PORT         host port                                                  (default 8000)
+#   UID / GID    user the container runs as, so output files belong to you  (default 1000:1000)
+
+x-astrophoto: &astrophoto
+  ports:
+    - "${PORT:-8000}:8000"
+  volumes:
+    - type: bind
+      source: ${IMAGES_DIR:-./images}
+      target: /data/images
+      read_only: true
+    - type: bind
+      source: ${OUTPUT_DIR:-./output}
+      target: /data/output
+      bind:
+        create_host_path: true
+  user: "${UID:-1000}:${GID:-1000}"
+  # the stacking / preparation worker pools and PyTorch share memory through /dev/shm
+  shm_size: "${SHM_SIZE:-8gb}"
+  restart: unless-stopped
+
+# environment of both services:
+#   ASTROPHOTO_CALIB          extra calibration library inside the container
+#                             (e.g. /data/images/Dwarf/CALI_FRAME), or "off"
+#   ASTROPHOTO_*_RAM_GB       RAM budgets per stage, GB (default: from the container's memory)
+
+services:
+  astrophoto:
+    <<: *astrophoto
+    profiles: ["nvidia"]
+    image: astrophoto-studio:cuda
+    build:
+      context: .
+      args:
+        TORCH_INDEX: "${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
+    environment:
+      ASTROPHOTO_DEVICE: "${ASTROPHOTO_DEVICE:-auto}"
+      ASTROPHOTO_CALIB: "${ASTROPHOTO_CALIB:-}"
+      ASTROPHOTO_STACK_RAM_GB: "${ASTROPHOTO_STACK_RAM_GB:-}"
+      ASTROPHOTO_PREP_RAM_GB: "${ASTROPHOTO_PREP_RAM_GB:-}"
+      ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: "${GPU_COUNT:-all}"
+              capabilities: [gpu]
+
+  astrophoto-cpu:
+    <<: *astrophoto
+    profiles: ["cpu"]
+    image: astrophoto-studio:cpu
+    build:
+      context: .
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cpu
+    environment:
+      ASTROPHOTO_DEVICE: cpu
+      ASTROPHOTO_CALIB: "${ASTROPHOTO_CALIB:-}"
+      ASTROPHOTO_STACK_RAM_GB: "${ASTROPHOTO_STACK_RAM_GB:-}"
+      ASTROPHOTO_PREP_RAM_GB: "${ASTROPHOTO_PREP_RAM_GB:-}"
+      ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
