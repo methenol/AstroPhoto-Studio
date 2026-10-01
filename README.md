@@ -84,8 +84,12 @@ docker compose --profile nvidia down              # stop
   path, so a dataset opened as `/data/images/…` in the container gets its own cache, separate
   from the one a native run made.
 - **Port:** `PORT` on the host maps to 8000 in the container.
-- **User:** the container runs as `UID:GID` (default `1000:1000`), so on Linux the output files
-  belong to you. Set them to `id -u` / `id -g` in `.env`.
+- **User:** the server runs as `PUID:PGID`. By default that's whoever owns `OUTPUT_DIR` on the
+  host, or `1000:1000` when Docker had to create the folder (then it belongs to root). The
+  entrypoint starts as root only to give that user the output folder (it changes only files
+  that belong to someone else), then drops root. On a NAS share that squashes root, that
+  ownership change cannot work. Set `PUID` / `PGID` in `.env` to the share's owner; the
+  container says so and exits if the folder stays unwritable.
 - **NVIDIA:** needs the NVIDIA driver and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
   on the host (Linux, or Windows with WSL2). The image uses PyTorch's CUDA 12.8 wheels, which

@@ -87,8 +87,12 @@ def _get(url: str, timeout: float = 20.0) -> bytes:
 
 def list_curves(kind: str, cache_dir: str) -> list[str]:
     """Names (file stems) in one folder of the database: osc_sensors, osc_filters or wb_refs.
-    Cached for a month; an offline machine keeps using the cached index, or gets []."""
-    os.makedirs(cache_dir, exist_ok=True)
+    Cached for a month; an offline machine keeps using the cached index, or gets [].  An
+    unwritable cache folder only costs the caching (the list is fetched every time)."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        pass
     p = os.path.join(cache_dir, f"index_{kind}.json")
     if os.path.exists(p) and time.time() - os.path.getmtime(p) < INDEX_MAX_AGE:
         return json.load(open(p))
@@ -100,7 +104,10 @@ def list_curves(kind: str, cache_dir: str) -> list[str]:
             if len(items) < 100:
                 break
             page += 1
-        json.dump(sorted(names), open(p, "w"))
+        try:
+            json.dump(sorted(names), open(p, "w"))
+        except OSError:
+            pass
         return sorted(names)
     except Exception:
         return json.load(open(p)) if os.path.exists(p) else []

@@ -37,8 +37,13 @@ COPY webui ./webui
 COPY README.md ./
 
 # /data/images: the session folders (mounted read-only), /data/output: caches and exports
-RUN mkdir -p /data/images /data/output && chmod 777 /data/output
+RUN mkdir -p /data/images /data/output
 VOLUME ["/data/output"]
+
+# runs as root only to make the output volume writable, then as PUID:PGID (see the script)
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["docker-entrypoint.sh"]
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
