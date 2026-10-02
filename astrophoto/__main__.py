@@ -39,7 +39,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="astrophoto", description="Astrophotography pipeline for raw FITS subs")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="analyse, stack, denoise, process and export")
-    r.add_argument("folder")
+    r.add_argument("folder", nargs="+", help="folder(s) of subs; several (one per night) are stacked together")
     r.add_argument("--workdir", default="output")
     r.add_argument("--mode", default=STACK_DEFAULTS["mode"], choices=["auto", "drizzle", "demosaic"])
     r.add_argument("--scale", type=float, default=STACK_DEFAULTS["scale"])
@@ -86,11 +86,11 @@ def main(argv=None):
         else:
             r.add_argument(f"--{k.replace('_', '-')}", default=None)
     a = sub.add_parser("analyse", help="frame quality report")
-    a.add_argument("folder")
+    a.add_argument("folder", nargs="+", help="folder(s) of subs; several (one per night) are stacked together")
     a.add_argument("--workdir", default="output")
     a.add_argument("--sensitivity", type=float, default=1.0)
     c = sub.add_parser("calibration", help="show the telescope profile and the bias / dark / flat masters found")
-    c.add_argument("folder")
+    c.add_argument("folder", nargs="+", help="folder(s) of subs; several (one per night) are stacked together")
     c.add_argument("--workdir", default="output")
     for p_ in (r, a, c):
         p_.add_argument("--calib", help="extra calibration library folder(s), e.g. a copy of a DWARF's CALI_FRAME "

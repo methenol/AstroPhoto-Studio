@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from astrophoto import __version__  # noqa: E402
 from astrophoto.pipeline import (DEFAULTS, STACK_DEFAULTS, Cancelled, Session, clean_json,  # noqa: E402
-                                 restoration_done, slugify)
+                                 dataset_slug, restoration_done, slugify, split_folders)
 
 CONFIG = {"images": os.path.join(ROOT, "images"), "workdir": os.path.join(ROOT, "output")}
 
@@ -97,12 +97,17 @@ PRESETS = {
 
 
 def get_session(folder: str) -> Session:
-    folder = os.path.abspath(os.path.expanduser(folder))
-    if not os.path.isdir(folder):
-        raise HTTPException(404, f"Folder not found: {folder}")
-    key = slugify(folder)
+    """The session of a dataset: one folder, or several (same target, several nights) joined
+    with os.pathsep, stacked together."""
+    folders = split_folders(folder)
+    if not folders:
+        raise HTTPException(400, "No folder given")
+    missing = [f for f in folders if not os.path.isdir(f)]
+    if missing:
+        raise HTTPException(404, f"Folder not found: {', '.join(missing)}")
+    key = dataset_slug(folders)
     if key not in SESSIONS:
-        SESSIONS[key] = Session(folder, CONFIG["workdir"])
+        SESSIONS[key] = Session(folders, CONFIG["workdir"])
     return SESSIONS[key]
 
 
@@ -156,7 +161,7 @@ def datasets(root: str | None = None):
             from astrophoto.frames import read_info
             fi = read_info(sorted(fits_files)[0])
             info.update({"object": fi.object, "filter": fi.filter, "exptime": fi.exptime,
-                         "instrument": fi.telescope or fi.instrument})
+                         "instrument": fi.telescope or fi.instrument, "date": (fi.date_obs or "")[:10] or None})
             info["total_min"] = round(info["exptime"] * len(fits_files) / 60, 1)
         except Exception:
             pass
@@ -165,7 +170,7 @@ def datasets(root: str | None = None):
                           "stacked": os.path.exists(os.path.join(cache_dir, "stack.fits")),
                           "denoised": restoration_done(cache_dir)}
         out.append(info)
-    return {"root": root, "datasets": out}
+    return {"root": root, "datasets": out, "sep": os.pathsep}
 
 
 @app.post("/api/open")
@@ -497,7 +502,8 @@ def start_job(body: dict = Body(...)):
     s = get_session(body["folder"])
     job_id = uuid.uuid4().hex[:10]
     st = s.status()
-    JOBS[job_id] = {"id": job_id, "kind": kind, "folder": body["folder"], "dataset": st.get("object") or os.path.basename(body["folder"]),
+    JOBS[job_id] = {"id": job_id, "kind": kind, "folder": body["folder"], "dataset": (st.get("object") or os.path.basename(s.folders[0]))
+                    + (f" ({len(s.folders)} sessions)" if len(s.folders) > 1 else ""),
                     "n_subs": st.get("n_files"), "state": "queued", "progress": 0.0, "message": "Waiting in the queue",
                     "log": [], "stages": [], "created": time.time(), "started": None, "result": None,
                     "params": body.get("params") or {}, "stack_params": body.get("stack_params") or {},

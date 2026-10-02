@@ -1,7 +1,10 @@
-# AstroPhoto Studio web UI.  Pick one profile:
+# AstroPhoto Studio web UI:
 #
-#   docker compose --profile nvidia up -d --build     # NVIDIA GPU (needs the NVIDIA Container Toolkit)
+#   docker compose up -d --build                      # NVIDIA GPU (needs the NVIDIA Container Toolkit)
 #   docker compose --profile cpu up -d --build        # CPU only (macOS: containers cannot use the Apple GPU)
+#
+# The GPU service is the default through COMPOSE_PROFILES=nvidia in .env (copy .env.example);
+# --profile cpu replaces it.  Without a .env, name the profile: --profile nvidia.
 #
 # then open http://localhost:${PORT} (default 8000).  Settings come from the environment or a
 # .env file next to this one (see .env.example):

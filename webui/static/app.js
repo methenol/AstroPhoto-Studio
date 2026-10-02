@@ -7,7 +7,7 @@ const store = {
 };
 
 const S = {
-  system: null, folder: null, status: null, frames: [], params: {}, job: null,
+  system: null, folder: null, status: null, frames: [], params: {}, job: null, datasets: [], sep: ":",
   view: "after", sort: { k: "idx", dir: 1 }, split: 0.5,
   zoom: { s: 1, x: 0, y: 0 }, imgW: 0, imgH: 0, previewSeq: 0,
 };
@@ -47,19 +47,24 @@ async function init() {
   buildPresets();
   bindUI();
   await loadDatasets();
-  const last = store.get("lastFolder");
-  if (last && [...$("#datasetSelect").options].some(o => o.value === last)) {
-    $("#datasetSelect").value = last; openDataset(last);
+  const last = splitFolders(store.get("lastFolder"));
+  if (last.length && last.every(p => S.datasets.some(d => d.path === p))) {
+    $("#datasetSelect").value = last[0]; openDataset(last.join(S.sep));
   }
 }
+
+// a dataset is one folder, or several (same target, several nights) joined with the server's path separator
+const splitFolders = f => String(f || "").split(S.sep).filter(Boolean);
+const targetKey = d => String(d?.object || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 
 async function loadDatasets() {
   const r = await api("/api/datasets");
   const sel = $("#datasetSelect");
+  S.datasets = r.datasets; S.sep = r.sep || ":";
   if (!r.datasets.length) { sel.innerHTML = `<option value="">No FITS folders under ${r.root}</option>`; return; }
   sel.innerHTML = `<option value="">Select a dataset…</option>` + r.datasets.map(d => {
     const tag = d.cached.denoised ? " ✓✓✓" : d.cached.stacked ? " ✓✓" : d.cached.analysed ? " ✓" : "";
-    return `<option value="${d.path}">${d.object || d.name} — ${d.n_fits}× ${d.exptime || "?"}s ${d.filter || ""} (${d.total_min} min)${tag}</option>`;
+    return `<option value="${esc(d.path)}">${esc(d.object || d.name)}${d.date ? " · " + d.date : ""} — ${d.n_fits}× ${d.exptime || "?"}s ${d.filter || ""} (${d.total_min} min)${tag}</option>`;
   }).join("");
 }
 
@@ -130,19 +135,54 @@ async function openDataset(folder) {
   if (!folder) return;
   try {
     const r = await api("/api/open", { method: "POST", body: { folder } });
+    folder = r.status.folder || folder;          // the server's canonical form (sorted, absolute)
     S.folder = folder; store.set("lastFolder", folder);
     if (typeof Explore !== "undefined") Explore.reset();
     S.status = r.status; S.frames = r.frames;
     S.params = { ...currentDefaults(), ...store.get("params:" + folder, {}) };
     applyParamsToUI();
-    $("#datasetTitle").textContent = `${r.status.object || ""} · ${folder}`;
+    const parts = r.status.folders || [folder];
+    $("#datasetTitle").textContent = `${r.status.object || ""} · ${parts.length > 1 ? `${parts.length} sessions stacked together` : folder}`;
+    $("#datasetTitle").title = parts.join("\n");
+    const sel = $("#datasetSelect");
+    if (!parts.includes(sel.value)) sel.value = S.datasets.some(d => d.path === parts[0]) ? parts[0] : "";
+    renderCombine();
     const nb = r.status.narrowband;
-    $("#datasetInfo").innerHTML = `<span>Object</span><b>${r.status.object || "–"}</b><span>Filter</span><b>${r.status.filter || "–"} ${nb ? "(dual-band → HOO)" : "(broadband RGB)"}</b><span>Frames</span><b>${r.status.n_files}</b>${r.status.telescope ? `<span>Telescope</span><b>${r.status.telescope}</b>` : ""}<span>Calibration</span><b class="small" title="${calibTitle(r.status.calibration)}">${r.status.calibration ? r.status.calibration.summary : "black level from header"}</b><span>Cache</span><b class="small">${r.status.workdir.split("/").slice(-2).join("/")}</b>`;
+    $("#datasetInfo").innerHTML = `<span>Object</span><b>${r.status.object || "–"}</b><span>Filter</span><b>${r.status.filter || "–"} ${nb ? "(dual-band → HOO)" : "(broadband RGB)"}</b>${parts.length > 1 ? `<span>Sessions</span><b>${parts.length}</b>` : ""}<span>Frames</span><b>${r.status.n_files}</b>${r.status.telescope ? `<span>Telescope</span><b>${r.status.telescope}</b>` : ""}<span>Calibration</span><b class="small" title="${calibTitle(r.status.calibration)}">${r.status.calibration ? r.status.calibration.summary : "black level from header"}</b><span>Cache</span><b class="small">${r.status.workdir.split("/").slice(-2).join("/")}</b>`;
     updateSteps(); renderFrames(); loadCalibration();
     if (r.status.stacked) schedulePreview(0); else showPlaceholder(true);
     refreshExports(); refreshDiag();
     attachActiveJob();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { toast(e.message, true); renderCombine(); }
+}
+
+/* Other sessions of the open dataset's target (e.g. the nights of a multi-night project), to stack
+   together with it: ticking one opens the combined dataset (its own cache, analysis and stack). */
+function renderCombine() {
+  const box = $("#combineBox");
+  const primary = S.datasets.find(d => d.path === $("#datasetSelect").value);
+  const key = targetKey(primary);
+  const same = key ? S.datasets.filter(d => targetKey(d) === key) : [];
+  if (same.length < 2) { box.hidden = true; box.innerHTML = ""; return; }
+  const chosen = new Set(splitFolders(S.folder));
+  const dates = same.map(d => d.date);
+  const row = d => {
+    const isPrimary = d.path === primary.path;
+    const label = d.date && dates.filter(x => x === d.date).length === 1 ? d.date : d.name;
+    const filt = d.filter !== primary.filter
+      ? ` <span class="warn" title="Another filter than ${esc(primary.filter || "the first session")}: only the subs of the filter with the most exposure time are stacked">⚠ ${esc(d.filter || "no filter")}</span>` : "";
+    return `<label class="${isPrimary ? "primary" : ""}" title="${esc(d.path)}"><input type="checkbox" data-path="${esc(d.path)}"
+      ${chosen.has(d.path) || isPrimary ? "checked" : ""} ${isPrimary ? "disabled" : ""}>
+      <span>${esc(label)} · ${d.n_fits}× ${d.exptime ?? "?"}s · ${d.total_min ?? "?"} min${filt}</span></label>`;
+  };
+  const sel = same.filter(d => chosen.has(d.path) || d.path === primary.path);
+  box.innerHTML = `<div class="ctitle">Stack together with other sessions of ${esc(primary.object)}:</div>` + same.map(row).join("") +
+    (sel.length > 1 ? `<div class="ctotal">${sel.length} sessions · ${sel.reduce((a, d) => a + d.n_fits, 0)} subs · ${sel.reduce((a, d) => a + (d.total_min || 0), 0).toFixed(1)} min</div>` : "");
+  box.hidden = false;
+  $$("input:not([disabled])", box).forEach(cb => cb.onchange = () => {
+    const paths = $$("input:checked", box).map(c => c.dataset.path);
+    openDataset(paths.join(S.sep));
+  });
 }
 
 function calibTitle(c) {

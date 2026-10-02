@@ -185,8 +185,10 @@ def find_dwarf_library(folder: str) -> str | None:
     return None
 
 
-def _candidates(folder: str, extra: list[str]) -> list[tuple[str, str | None]]:
-    """(file, kind from its folder name) of every calibration candidate for ``folder``."""
+def _candidates(folder: str | list[str], extra: list[str]) -> list[tuple[str, str | None]]:
+    """(file, kind from its folder name) of every calibration candidate for ``folder`` (or for
+    several folders of one dataset: their libraries together)."""
+    folders = [folder] if isinstance(folder, str) else list(folder)
     seen, out = set(), []
 
     def add(path, hint):
@@ -203,21 +205,25 @@ def _candidates(folder: str, extra: list[str]) -> list[tuple[str, str | None]]:
     for root in extra:
         if os.path.isdir(root):
             walk(root, 3)
-    lib = find_dwarf_library(folder)
-    if lib:
-        walk(lib, 3)
-    for base in (folder, os.path.dirname(os.path.abspath(folder))):
-        for name in _DIR_KINDS:
-            d = _child(base, name)
-            if d:
-                walk(d, 2)
-    # calibration frames saved among the lights
-    for p in _fits_under(folder, 0):
-        try:
-            if _kind(str(fits.getheader(p).get("IMAGETYP", ""))):
-                add(p, None)
-        except Exception:
-            pass
+    walked = set()
+    for f in folders:
+        lib = find_dwarf_library(f)
+        if lib and lib not in walked:
+            walked.add(lib)
+            walk(lib, 3)
+        for base in (f, os.path.dirname(os.path.abspath(f))):
+            for name in _DIR_KINDS:
+                d = _child(base, name)
+                if d and d not in walked:
+                    walked.add(d)
+                    walk(d, 2)
+        # calibration frames saved among the lights
+        for p in _fits_under(f, 0):
+            try:
+                if _kind(str(fits.getheader(p).get("IMAGETYP", ""))):
+                    add(p, None)
+            except Exception:
+                pass
     return out
 
 
@@ -257,7 +263,7 @@ def _combine(members: list[Master], cache_dir: str) -> Master:
     return res
 
 
-def load_library(folder: str, cache_dir: str, extra: list[str] | None = None) -> list[Master]:
+def load_library(folder: str | list[str], cache_dir: str, extra: list[str] | None = None) -> list[Master]:
     """Every usable calibration master for ``folder`` (individual frames combined)."""
     masters, singles = [], {}
     for path, hint in _candidates(folder, extra or []):
@@ -521,14 +527,14 @@ def _light_settings(infos: list) -> dict:
             "filter": infos[0].filter, "cam": getattr(infos[0], "camera_slot", None)}
 
 
-def _library(infos: list, folder: str, cache_dir: str, prefs: dict) -> list[Master]:
+def _library(infos: list, folder: str | list[str], cache_dir: str, prefs: dict) -> list[Master]:
     setting = os.environ.get("ASTROPHOTO_CALIB", "").strip()
     extra = [p for p in setting.split(os.pathsep) if p] if setting.lower() not in ("", "off", "none", "0", "false") else []
     extra += [p for p in str(prefs.get("library") or "").split(os.pathsep) if p.strip()]
     return load_library(folder, cache_dir, [os.path.expanduser(p.strip()) for p in extra])
 
 
-def candidates(infos: list, folder: str, cache_dir: str, prefs: dict | None = None) -> dict:
+def candidates(infos: list, folder: str | list[str], cache_dir: str, prefs: dict | None = None) -> dict:
     """The masters that fit these lights (frame size and camera), per kind, for choosing by hand."""
     prefs = {**DEFAULT_PREFS, **(prefs or {})}
     if not infos:
@@ -543,7 +549,7 @@ def candidates(infos: list, folder: str, cache_dir: str, prefs: dict | None = No
     return out
 
 
-def attach(infos: list, folder: str, cache_dir: str, prefs: dict | None = None, progress=None) -> dict | None:
+def attach(infos: list, folder: str | list[str], cache_dir: str, prefs: dict | None = None, progress=None) -> dict | None:
     """Find and choose the masters for a session's lights and store them on every FrameInfo
     (``info.calib``; ``info.bias`` becomes the masters' pedestal, which the saturation level uses).
 

@@ -122,11 +122,13 @@ def read_info(path: str) -> FrameInfo:
     )
 
 
-def discover(folder: str) -> list[FrameInfo]:
-    """Find light frames in ``folder``, keep the dominant (filter, exposure, size) group."""
+def discover(folder: str | list[str]) -> list[FrameInfo]:
+    """Find light frames in ``folder`` (or in several folders of the same target, e.g. one per
+    night), keep the dominant (filter, exposure, size) group."""
+    folders = [folder] if isinstance(folder, str) else list(folder)
     paths = sorted(
-        p for ext in ("*.fit", "*.fits", "*.fts", "*.FIT", "*.FITS")
-        for p in glob.glob(os.path.join(folder, ext))
+        p for d in folders for ext in ("*.fit", "*.fits", "*.fts", "*.FIT", "*.FITS")
+        for p in glob.glob(os.path.join(d, ext))
     )
     # the telescope's own products next to the subs: stacks, thumbnails
     paths = sorted(p for p in set(paths)
@@ -149,7 +151,22 @@ def discover(folder: str) -> list[FrameInfo]:
         groups.setdefault((fi.filter, fi.width, fi.height, fi.bayer), []).append(fi)
     best = max(groups.values(), key=lambda g: sum(f.exptime for f in g))
     _check_adu_scale(best)
+    if len(folders) > 1:
+        _unique_names(best)
     return sorted(best, key=lambda f: f.timestamp or 0)
+
+
+def _unique_names(infos: list[FrameInfo]):
+    """Subs from several folders can share a file name (Light_0001.fits on every night): those are
+    named by their folder too, since the name identifies a sub (overrides, thumbnails)."""
+    counts: dict[str, int] = {}
+    for fi in infos:
+        counts[fi.name] = counts.get(fi.name, 0) + 1
+    top = os.path.commonpath([os.path.dirname(os.path.abspath(fi.path)) for fi in infos])
+    for fi in infos:
+        if counts[fi.name] > 1:
+            rel = os.path.relpath(os.path.dirname(os.path.abspath(fi.path)), os.path.dirname(top))
+            fi.name = re.sub(r"[^A-Za-z0-9_.-]+", "_", rel).strip("_") + "__" + fi.name
 
 
 def _check_adu_scale(infos: list[FrameInfo]):

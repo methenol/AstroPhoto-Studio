@@ -114,6 +114,24 @@ def slugify(path: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_") + "-" + h
 
 
+def split_folders(folder) -> list[str]:
+    """The folders of a dataset: one path, a list, or several joined with ``os.pathsep`` (subs of
+    the same target from several nights, stacked together).  Sorted, so a selection names one session."""
+    parts = folder if isinstance(folder, (list, tuple)) else str(folder).split(os.pathsep)
+    return sorted({os.path.abspath(os.path.expanduser(p.strip())) for p in parts if p and p.strip()})
+
+
+def dataset_slug(folder) -> str:
+    """The cache folder name of a dataset (one folder: as before; several: the first one's name,
+    how many more, and a hash of them all)."""
+    folders = split_folders(folder)
+    if len(folders) == 1:
+        return slugify(folders[0])
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(folders[0]) or "dataset").strip("_")
+    h = hashlib.sha1("\n".join(folders).encode()).hexdigest()[:6]
+    return f"{base}+{len(folders) - 1}-{h}"
+
+
 def _save_fits(path, arr, header=None):
     data = np.moveaxis(arr, -1, 0) if arr.ndim == 3 else arr
     fits.PrimaryHDU(data.astype(np.float32), header=header).writeto(path, overwrite=True)
@@ -164,11 +182,15 @@ class Cancelled(Exception):
 
 
 class Session:
-    """All state for one dataset (folder of subs)."""
+    """All state for one dataset: a folder of subs, or several folders of the same target (nights)
+    stacked together (a list, or paths joined with ``os.pathsep``)."""
 
-    def __init__(self, folder: str, workdir: str = "output"):
-        self.folder = os.path.abspath(folder)
-        self.dir = os.path.join(os.path.abspath(workdir), slugify(folder))
+    def __init__(self, folder: str | list[str], workdir: str = "output"):
+        self.folders = split_folders(folder)
+        if not self.folders:
+            raise ValueError("no dataset folder given")
+        self.folder = os.pathsep.join(self.folders)
+        self.dir = os.path.join(os.path.abspath(workdir), dataset_slug(self.folders))
         os.makedirs(self.dir, exist_ok=True)
         self.infos: list[FrameInfo] = []
         self.analysis: dict | None = None
@@ -214,6 +236,7 @@ class Session:
     def status(self) -> dict:
         return {
             "folder": self.folder,
+            "folders": self.folders,
             "workdir": self.dir,
             "n_files": len(self.infos) if self.infos else None,
             "analysed": self.analysis is not None,
@@ -249,13 +272,13 @@ class Session:
 
     # ------------------------------------------------------------- stage 1
     def scan(self, progress=None):
-        self.infos = discover(self.folder)
+        self.infos = discover(self.folders)
         if not self.infos:
-            raise RuntimeError(f"No light frames (FITS) found in {self.folder}")
+            raise RuntimeError(f"No light frames (FITS) found in {', '.join(self.folders)}")
         from .calibration import attach
         self.calib_error = None
         try:
-            attach(self.infos, self.folder, self.dir, self.calib_prefs, progress)
+            attach(self.infos, self.folders, self.dir, self.calib_prefs, progress)
         except Exception as e:          # a broken master must not stop the session: calibrate from the headers
             self.calib_error = f"{type(e).__name__}: {e}"
             print(f"calibration masters not used: {self.calib_error}")
@@ -336,7 +359,7 @@ class Session:
                "report": self._calibration_status()}
         if with_candidates:
             try:
-                out["candidates"] = candidates(self.infos, self.folder, self.dir, self.calib_prefs)
+                out["candidates"] = candidates(self.infos, self.folders, self.dir, self.calib_prefs)
             except Exception as e:
                 out["candidates"] = {"bias": [], "dark": [], "flat": []}
                 out["error"] = out["error"] or f"{type(e).__name__}: {e}"

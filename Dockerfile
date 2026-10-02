@@ -1,6 +1,6 @@
 # AstroPhoto Studio web UI in a container: NVIDIA CUDA or CPU.
 #
-#   docker compose --profile nvidia up -d --build     # NVIDIA GPU (Linux / Windows + WSL2)
+#   docker compose up -d --build                      # NVIDIA GPU (Linux / Windows + WSL2; default profile)
 #   docker compose --profile cpu up -d --build        # CPU only (any host, including macOS)
 #
 # Containers on macOS cannot use the Apple GPU (Metal / MPS); run natively there for GPU speed.

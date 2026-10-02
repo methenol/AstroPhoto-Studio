@@ -28,6 +28,7 @@ python -m webui.server                   # --images /path/to/sessions  --port 80
 # or headless, one command:
 python -m astrophoto run "images/IC 5070_sub"
 python -m astrophoto run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
+python -m astrophoto run NIGHT1 NIGHT2     # several sessions of one target, stacked together
 python -m astrophoto analyse DIR          # just the frame-quality report
 python -m astrophoto calibration DIR      # telescope profile + the bias / dark / flat masters it will use
 python -m astrophoto devices              # show GPUs PyTorch can use
@@ -36,7 +37,11 @@ python -m astrophoto devices              # show GPUs PyTorch can use
 Point the UI or CLI at any folder of light subs: a Seestar `<Object>_sub` folder, a DWARF
 `DWARF_RAW_…` session folder, or a `lights/` folder from any camera. Only same-size
 light frames with the dominant filter are used. JPG/PNG previews, the telescope's own stacks,
-thumbnails and calibration frames are skipped. Results are cached in `output/<folder>-<hash>/`:
+thumbnails and calibration frames are skipped. Several sessions of the same target (one
+folder per night) can be stacked as one dataset: in the UI, open one of them and tick the others
+under *Stack together with*; on the CLI, give all the folders. A combination has its own cache
+folder (`output/<first folder>+<n more>-<hash>/`), and the calibration masters are searched beside
+every folder. Results are cached in `output/<folder>-<hash>/`:
 `stack.fits`, the two half stacks, `denoised.fits`, the coverage and
 rejection maps, and `exports/`.
 
@@ -62,15 +67,16 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 ### Docker (NVIDIA or CPU)
 
 `Dockerfile` and `docker-compose.yml` run the web UI in a container, with one profile per
-compute backend:
+compute backend. NVIDIA is the default (`COMPOSE_PROFILES=nvidia` in `.env`); `--profile cpu`
+replaces it:
 
 ```bash
 cp .env.example .env                              # then set IMAGES_DIR, OUTPUT_DIR, PORT
-docker compose --profile nvidia up -d --build     # NVIDIA GPU
+docker compose up -d --build                      # NVIDIA GPU
 docker compose --profile cpu up -d --build        # CPU only
 # → http://localhost:8000  (or your PORT)
-docker compose --profile nvidia logs -f           # follow the server log
-docker compose --profile nvidia down              # stop
+docker compose logs -f                            # follow the server log (add --profile cpu for CPU)
+docker compose down                               # stop
 ```
 
 - **Images folder, read-only:** `IMAGES_DIR` (default `./images`) is mounted at `/data/images`.
