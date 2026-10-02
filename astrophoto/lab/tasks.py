@@ -849,32 +849,48 @@ class StarRemoverTask(Task):
 class BackgroundTask(Task):
     name = "background"
     label = "Gradient removal"
-    description = ("The linear stage's background model (light pollution gradient, vignetting residual) fitted to "
-                   "the stack, auto-cropped like the pipeline. Real data: the gradient left in the sky (the range of a "
-                   "robust quadratic over the star-free sky tiles, plus the border's offset from the interior, × the "
-                   "per-pixel noise) and the "
-                   "extended emission kept (the fraction of the emission tiles' signal the model took away). Sky and "
-                   "emission tiles are set once, against a robust plane through the faintest tiles, so no trial's "
-                   "model decides what counts as sky. Where faint emission fills the frame, no tile is "
-                   "sky and the two pull against each other: tune them together (two objectives, Pareto front), "
-                   "or on synthetic data against the truth. Synthetic data: the result against the true "
-                   "sky, whose gradient is known (only a constant offset is fitted). Grid and clipping are "
-                   "constants of postprocess.py (BACKGROUND).")
+    description = ("The linear stage's gradient model (light pollution, airglow, vignetting residual) on the stack, "
+                   "auto-cropped like the pipeline: a sky survey reference (NSNS DR0.2, when the stack is plate-solved "
+                   "and covered), or tile samples with a polynomial or RBF. Real data: the gradient left in the sky "
+                   "(the range of a robust quadratic over the star-free sky tiles, plus the border's offset from the "
+                   "interior, × the per-pixel noise) and the extended emission removed (the fraction of the emission "
+                   "tiles' signal the model took away). Sky and emission tiles are set once, against a robust plane "
+                   "through the faintest tiles, so no trial's model decides what counts as sky. Where faint emission "
+                   "fills the frame, no tile is sky and the two pull against each other: tune them together (two "
+                   "objectives, Pareto front), or on synthetic data against the truth (only a constant offset is "
+                   "fitted; synthetic data have no plate solution, so no survey reference). Sampling, clipping and "
+                   "the auto choice are constants of postprocess.py (BACKGROUND).")
     params = [
-        {"name": "bg_method", "label": "Gradient model", "type": "categorical", "choices": ["auto", "poly", "rbf"],
-         "default": "auto", "tune": True, "processing": "bg_method"},
-        {"name": "bg_degree", "label": "Polynomial degree", "type": "int", "low": 1, "high": 4, "default": 2,
+        {"name": "bg_method", "label": "Gradient model", "type": "categorical",
+         "choices": ["auto", "reference", "poly", "rbf"], "default": "auto", "tune": True, "processing": "bg_method"},
+        {"name": "bg_correction", "label": "Correction", "type": "categorical", "choices": ["subtract", "divide"],
+         "default": "subtract", "tune": False, "processing": "bg_correction"},
+        {"name": "bg_degree", "label": "Polynomial degree", "type": "int", "low": 0, "high": 4, "default": 2,
          "tune": True, "processing": "bg_degree"},
+        {"name": "bg_smoothing", "label": "RBF smoothing", "type": "float", "low": 0.0, "high": 1.0, "default": 0.5,
+         "tune": False, "processing": "bg_smoothing"},
         {"name": "grid", "label": "Sample grid (tiles across)", "type": "int", "low": 8, "high": 48, "default": 24,
-         "tune": True, "code": "postprocess.BACKGROUND"},
+         "tune": False, "code": "postprocess.BACKGROUND"},
         {"name": "clip_high", "label": "Reject samples above the model (× rms)", "type": "float", "low": 0.5,
-         "high": 4.0, "default": 1.5, "tune": True, "code": "postprocess.BACKGROUND"},
+         "high": 4.0, "default": 1.5, "tune": False, "code": "postprocess.BACKGROUND"},
         {"name": "clip_low", "label": "Reject samples below the model (× rms)", "type": "float", "low": 1.0,
          "high": 8.0, "default": 4.0, "tune": False, "code": "postprocess.BACKGROUND"},
         {"name": "start_percentile", "label": "First fit: samples up to this percentile", "type": "float",
          "low": 30.0, "high": 95.0, "default": 75.0, "tune": False, "code": "postprocess.BACKGROUND"},
         {"name": "min_sky_fraction", "label": "Star-free area a sample tile needs", "type": "float", "low": 0.1,
          "high": 0.9, "default": 0.4, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "nebula_fraction", "label": "Polynomial → plane below this sky fraction", "type": "float",
+         "low": 0.0, "high": 0.9, "default": 0.35, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "auto_margin", "label": "Auto: gradient gain a flexible model needs (× noise)", "type": "float",
+         "low": 0.0, "high": 2.0, "default": 0.25, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "auto_margin_rel", "label": "Auto: relative gain a flexible model needs", "type": "float",
+         "low": 0.0, "high": 0.9, "default": 0.3, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "ref_degree", "label": "Reference: gradient degree", "type": "int", "low": 1, "high": 5,
+         "default": 3, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "ref_smooth", "label": "Reference: comparison resolution (survey px)", "type": "float",
+         "low": 0.5, "high": 4.0, "default": 1.5, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "ref_clip_high", "label": "Reference: ignore light above survey + gradient (× rms)",
+         "type": "float", "low": 1.0, "high": 10.0, "default": 2.5, "tune": False, "code": "postprocess.BACKGROUND"},
     ]
     metrics = {
         "sky_flatness": {"label": "Gradient left in the sky (× pixel noise)", "direction": "minimize"},
@@ -887,57 +903,24 @@ class BackgroundTask(Task):
                 "default": 4.0}]
     default_objective = "sky_flatness"
 
-    @staticmethod
-    def _tiles(T, img):
-        return np.array([np.median(img[sl][m], axis=0) for sl, m in T])
-
     def prepare(self, ds, opts, device, log, cancel, study_dir):
         from ..pipeline import DEFAULTS, _load_fits
-        from ..postprocess import auto_crop_box, background_model, luminance, mad_sigma, star_mask_simple
+        from ..postprocess import auto_crop_box, sky_yardstick
         s = ds.ensure_stacked(log, cancel)
         st, cov = _load_fits(s._p("stack.fits")), _load_fits(s._p("coverage.fits"))
         y0, y1, x0, x1 = auto_crop_box(cov, DEFAULTS["crop_threshold"])
         img = np.ascontiguousarray(st[y0:y1, x0:x1], np.float32)
-        h, w = img.shape[:2]
-        L = luminance(img)
-        smask = star_mask_simple(L)
-        nx, ny = 32, max(4, int(round(32 * h / w)))
-        ys, xs = np.linspace(0, h, ny + 1).astype(int), np.linspace(0, w, nx + 1).astype(int)
-        T, edge = [], []
-        for i in range(ny):
-            for j in range(nx):
-                sl = (slice(ys[i], ys[i + 1]), slice(xs[j], xs[j + 1]))
-                m = ~smask[sl]
-                if m.mean() >= 0.5:
-                    T.append((sl, m))
-                    edge.append(i in (0, ny - 1) or j in (0, nx - 1))
-        # the yardstick, independent of every trial's model: tiles relative to a robust plane fitted to
-        # the faintest ones (a plane cannot follow a nebula; the default model, which can, made a
-        # frame-filling synthetic nebula "sky", and the score then rewarded removing it).  Sky: not
-        # clearly above the plane (vignetted corners included); emission: far above it.
-        T0 = self._tiles(T, img)
-        wl = np.array([0.2126, 0.7152, 0.0722])
-        l0 = T0 @ wl
-        cy = np.array([(sl[0].start + sl[0].stop) / 2 / h for sl, _ in T])
-        cx = np.array([(sl[1].start + sl[1].stop) / 2 / w for sl, _ in T])
-        A = np.stack([np.ones_like(cx), cx, cy], 1)
-        sel = l0 <= np.percentile(l0, 50)
-        for _ in range(10):
-            coef, *_ = np.linalg.lstsq(A[sel], l0[sel], rcond=None)
-            r0 = l0 - A @ coef
-            sd = mad_sigma(r0[sel]) + 1e-9
-            new = r0 < 2.0 * sd
-            if new.sum() < 12 or np.array_equal(new, sel):
-                break
-            sel = new
-        sky = r0 <= 2.5 * sd
-        neb = r0 > 8 * sd
-        noise = np.array([mad_sigma((img[..., c] - cv2.GaussianBlur(img[..., c], (0, 0), 1.5))[::3, ::3])
-                          for c in range(3)], np.float32)
-        quad = np.stack([np.ones_like(cx), cx, cy, cx * cx, cx * cy, cy * cy], 1)
-        ctx = {"ds": ds, "opts": opts, "img": img, "T": T, "T0": T0, "edge": np.array(edge), "sky": sky, "quad": quad,
-               "neb": neb if neb.sum() >= 3 else None, "noise": noise}
-        if ctx["neb"] is None:
+        yard = sky_yardstick(img)
+        ctx = {"ds": ds, "opts": opts, "img": img, "yard": yard, "reference": None}
+        if not ds.synthetic:
+            log("Sky survey reference (plate solution and NSNS maps; fetched once per stack)")
+            sref = s.sky_reference()
+            if sref is not None:
+                ctx["reference"] = {**sref, "origin": (y0, x0)}
+            else:
+                log("No sky survey reference (not plate-solved, offline, or outside the survey): 'reference' "
+                    "falls back to 'auto'")
+        if not yard["emission"].any():
             log("No extended emission found: 'Extended emission removed' is not measured on this dataset")
         if ds.synthetic:
             fr = [i for i, f in enumerate(s.analysis["frames"]) if f["accepted"]]
@@ -952,41 +935,28 @@ class BackgroundTask(Task):
             valid = (cov[sl] >= 0.6 * np.percentile(cov[sl], 90))
             valid &= cv2.erode((img.max(-1) < 0.5 * sat).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
             ctx["valid"] = valid
-        log(f"{len(T)} scoring tiles: {int(sky.sum())} sky, {int(neb.sum())} emission")
+        log(f"{len(yard['tiles'])} scoring tiles: {int(yard['sky'].sum())} sky, {int(yard['emission'].sum())} emission")
         return ctx
 
     def run(self, ctx, p, log, cancel):
         from .. import postprocess as PP
-        img = ctx["img"]
+        img, yard = ctx["img"], ctx["yard"]
         t = time.time()
         with _overriding(PP.BACKGROUND, p):
-            bg, info = PP.background_model(img, p["bg_method"], int(p["bg_degree"]))
+            bg, info = PP.background_model(img, p["bg_method"], int(p["bg_degree"]), reference=ctx["reference"],
+                                           smoothing=float(p["bg_smoothing"]))
         dt = time.time() - t
-        res = img - bg
-        T1 = self._tiles(ctx["T"], res)
-        sky, edge, Q = ctx["sky"], ctx["edge"], ctx["quad"][ctx["sky"]]
-        flat = 0.0
-        for c in range(3):
-            # the large-scale trend left in the sky (a robust quadratic over the sky tiles: their
-            # tile-to-tile scatter is mostly faint emission's texture, which a gradient model must keep)
-            t_ = T1[sky, c]
-            ok = np.ones(len(t_), bool)
-            for _ in range(3):
-                coef, *_ = np.linalg.lstsq(Q[ok], t_[ok], rcond=None)
-                fit = Q @ coef
-                ok = np.abs(t_ - fit) < 3 * (PP.mad_sigma(t_ - fit) + 1e-12)
-            trend = float(np.percentile(fit, 98) - np.percentile(fit, 2))
-            rim = (abs(float(np.median(t_[edge[sky]])) - float(np.median(t_[~edge[sky]])))
-                   if edge[sky].any() and (~edge[sky]).any() else 0.0)
-            flat = max(flat, (trend + rim) / float(ctx["noise"][c]))
-        out = {"sky_flatness": flat, "seconds": dt, "method_used": info.get("auto") or info.get("method"),
-               "samples": info.get("samples")}
-        if ctx["neb"] is not None:
-            wl = np.array([0.2126, 0.7152, 0.0722])
-            neb = ctx["neb"]
-            e0 = (ctx["T0"][neb] - np.median(ctx["T0"][sky], 0)) @ wl
-            e1 = (T1[neb] - np.median(T1[sky], 0)) @ wl
-            out["signal_removed"] = float(abs(1 - e1.sum() / max(e0.sum(), 1e-12)))
+        if p["bg_correction"] == "divide":
+            lvl = np.maximum(bg.reshape(-1, 3).mean(0), 1e-12)
+            res = img / np.maximum(bg / lvl, 0.05) - lvl
+        else:
+            res = img - bg
+        T1 = PP.tile_medians(res, yard)
+        out = {"sky_flatness": PP.gradient_left(res, yard, T1), "seconds": dt,
+               "method_used": info.get("auto") or info.get("method"), "note": info.get("note")}
+        sr = PP.emission_removed(res, yard, T1)
+        if sr is not None:
+            out["signal_removed"] = sr
         if ctx["ds"].synthetic:
             m = MX.truth_metrics(res, ctx["truth"], ctx["valid"], star_truth=ctx["truth_stars"],
                                  sigma_eval=float(ctx["opts"].get("sigma_eval", 4.0)), fit_plane=False,

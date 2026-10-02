@@ -123,7 +123,7 @@ docker compose down                               # stop
 | **Rejection & weighting** | Robust median/MAD tests on each metric, plus an unsupervised **Isolation Forest** over the multivariate metrics. Weights are signal²/noise² × sharpness. Sensitivity is adjustable, and each frame can be overridden in the UI. |
 | **Integration** | Streaming three-pass integration with bounded memory (hundreds of subs fit in 16 GB of RAM). **Local normalisation** removes each frame's rotating gradient against the running mean. Weighted **sigma clipping** removes satellites, planes and cosmic rays. **Bayer drizzle** resamples each colour's samples directly, with no demosaic interpolation. Optional 1.5× or 2× output uses the dithering and rotation between frames. Frames alternate between two independent **half stacks**. |
 | **AI denoise** | **Noise2Noise**: a U-Net is trained *on your own data* to map half-stack A to half-stack B. Because the noise in the two is independent, the network learns the expected clean signal for this exact sensor, sky and integration. It uses no pretrained weights, so it can't invent detail from other people's images. Training runs in a variance-stabilised (asinh) domain, inference averages 8 rotations/flips (self-ensemble), and bright star cores are handed back unchanged. |
-| **Gradient removal** | Tile samples with stars masked. An iterative *lower-envelope* surface fit (polynomial or thin-plate RBF) rejects samples sitting on nebulosity or galaxies. When nebulosity dominates the field, the model order is reduced automatically. |
+| **Gradient removal** | **Against a sky survey** once the stack is plate-solved (done automatically after stacking when online), the idea of PixInsight's MARS. The calibrated, gradient-free maps of the NSNS survey (Hα, [OIII], continuum) are resampled onto your field. Each colour channel is fitted as a mix of those maps plus a smooth polynomial, and only the polynomial is removed: what the survey cannot explain is the gradient. Emission that fills the frame is kept. Sample-based models remove part of a frame-filling nebula's diffuse body (about 20 % on the North America Nebula). Without a plate solution, offline, or outside the survey: tile samples with stars masked and an iterative *lower-envelope* fit (polynomial of degree 0–4, or thin-plate RBF with adjustable smoothing). *Auto* keeps a plane unless a more flexible model leaves clearly less gradient in the sky. The gradient is subtracted (light pollution, airglow) or divided out (vignetting). The ImageMM restoration uses the same sky model. |
 | **Crop** | Largest fully covered rectangle, found by an aspect-ratio search on the coverage map and centred on the deepest part of the stack. The minimum coverage is adjustable. |
 | **Colour** | Background neutralisation, then **spectrophotometric colour calibration** (SPCC, as in Siril). Once the stack is plate-solved (done automatically after stacking when online), every Gaia DR3 star in the field gets a predicted colour *in your camera*: a Pickles library spectrum for its Gaia temperature, reddened by its own Gaia extinction (CCM89), integrated through your sensor's R/G/B response and your filter's transmission. The per-channel gains are the robust fit of the measured star colours to those predictions, relative to a white reference (average spiral galaxy, or G2V). Sensor and filter come from the FITS headers (camera name, model number, sensor geometry, `FILTER`), or you pick them from Siril's database. Without a plate solution it falls back to star-based white balance (the average star is white). Aperture photometry uses isolated, unsaturated stars, with the aperture sized to the *widest* colour channel. Pixels clipped in any channel are rendered neutral. |
 | **AI deconvolution** (option) | A second network is trained on the same half-stack pairs to *undo the blur*. This is a Noise2Noise adaptation of ZS-DeconvNet. The network takes the denoised half A. Its output, blurred by **PSFs measured from your own stars (one per colour channel)**, must predict the raw half B (χ² with the measured per-pixel noise). The only way to lower that loss is to recover the true, sharper sky. A Hessian penalty and a physical **sky-floor prior** (no flux below the local sky) prevent the dark rings and noise that classic deconvolution produces. In held-out tests on M 27, IC 5070 and M 31, star FWHM fell by 2–2.5× with no ringing, against 1.1× for the old masked Richardson–Lucy (see `experiments/README.md`). Saturated stars are handed back to the denoised image. Richardson–Lucy with TV regularisation remains as the fallback when too few stars are available. |
@@ -330,6 +330,31 @@ separation. The **Star reduction** slider then works in two ranges:
 - from 0.5 to 1 it also fades them out, and 1 is the starless image.
 
 A new restack or restoration makes the trained remover stale, and it has to be trained again.
+
+## Gradient removal against a sky survey
+
+A gradient model fitted to "free sky" samples cannot tell a gradient from faint emission that fills
+the field. On a wide nebula field it takes part of the nebula with it. Once the stack is
+plate-solved, the gradient model therefore compares the image with a survey of the same field:
+the [Northern Sky Narrowband Survey](http://www.simg.de/nebulae3/dr0_2) (NSNS DR0.2). Its Hα map
+is calibrated in Rayleighs against WHAM; it also has [OIII] and star-subtracted continuum maps, at
+about 10″, for declinations −16° to +76°. The maps come from the CDS hips2fits service, resampled
+onto your plate solution, and are cached with the session (`skyref.npz`).
+
+- Each colour channel is fitted, robustly and with stars masked, as a mix of the survey maps plus a
+  degree-3 polynomial. Only the polynomial is removed. Light far above survey + gradient (a bright
+  star's halo: the survey is star-subtracted) does not pull the fit.
+- The survey also shows where the field has the least emission. The sky's zero point is set there,
+  not at the image's median (in a field full of nebula, the median is nebula).
+- Limits: NSNS's [OIII] and continuum maps are background-filtered above about 3°. On fields wider
+  than that, structure larger than 3° is treated as gradient. Outside the survey, offline, or
+  without a plate solution, the sample-based *auto* model is used; the processing info says which.
+- The ImageMM restoration subtracts the same sky model from every sub. A restoration made before
+  this was added used a degree-2 polynomial: run *Restore* again to use the survey.
+
+NSNS DR0.2 is © its authors, CC BY-NC-SA 4.0 (non-commercial use; cite
+[doi:10.3847/2515-5172/adfec7](https://doi.org/10.3847/2515-5172/adfec7)). Thanks to CDS
+(Strasbourg) for the HiPS and hips2fits services.
 
 ## Explore: what else is in your image
 

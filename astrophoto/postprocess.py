@@ -23,8 +23,11 @@ DEFAULTS = {
     "crop": True,
     "crop_threshold": 0.3,
     "background": True,
-    "bg_method": "auto",        # auto | poly | rbf
-    "bg_degree": 2,
+    "bg_method": "auto",        # auto (reference when available, else the best of plane / poly / rbf) | reference
+                                # (a calibrated sky survey, skyref.py) | poly | rbf
+    "bg_degree": 2,             # polynomial degree, 0 (a constant) .. 4
+    "bg_smoothing": 0.5,        # RBF smoothing (0 = interpolates the samples exactly .. 1)
+    "bg_correction": "subtract",  # subtract (light pollution, airglow) | divide (vignetting, multiplicative)
     "white_balance": "auto",    # auto (spectrophotometric, Gaia) | stars | background | none
     "spcc_sensor": "auto",      # camera sensor curve (Siril SPCC database) - auto: from the FITS headers
     "spcc_filter": "auto",      # filter curve - auto: from the FILTER header
@@ -89,6 +92,12 @@ BACKGROUND = {
     "start_percentile": 75.0,  # the first fit uses the samples up to this luminance percentile
     "clip_high": 1.5,         # then keeps samples less than this x the residual rms above the model...
     "clip_low": 4.0,          # ...and less than this x below it
+    "nebula_fraction": 0.35,  # a polynomial drops to a plane when fewer samples than this stay sky
+    "auto_margin": 0.25,      # auto: a more flexible model than the plane only when it leaves this much less
+    "auto_margin_rel": 0.3,   #   gradient (x the pixel noise), and this fraction less
+    "ref_degree": 3,          # reference (skyref.py): degree of the gradient fitted beside the survey's maps
+    "ref_smooth": 1.5,        #   and the Gaussian (survey pixels) both are compared through,
+    "ref_clip_high": 2.5,     #   ignoring blocks this many robust sigma above survey + gradient (object light)
 }
 
 
@@ -259,14 +268,146 @@ def star_mask_simple(L: np.ndarray, k: float = 4.0, grow: int = 3) -> np.ndarray
     return m.astype(bool)
 
 
+def sky_yardstick(img: np.ndarray, n: int = 32) -> dict:
+    """What a gradient model is judged against, set once and independent of every model: a tile grid
+    (stars masked), each tile classified against a robust plane through the faintest tiles - sky: not
+    clearly above it (vignetted corners included); emission: far above it.  A plane cannot follow a
+    nebula, so no flexible model decides what counts as sky (the default model, judged by the sky it
+    left, made a frame-filling nebula "sky" and was rewarded for removing it)."""
+    h, w = img.shape[:2]
+    L = luminance(img)
+    smask = star_mask_simple(L)
+    nx, ny = n, max(4, int(round(n * h / w)))
+    ys, xs = np.linspace(0, h, ny + 1).astype(int), np.linspace(0, w, nx + 1).astype(int)
+    tiles, edge, cy, cx = [], [], [], []
+    for i in range(ny):
+        for j in range(nx):
+            sl = (slice(ys[i], ys[i + 1]), slice(xs[j], xs[j + 1]))
+            m = ~smask[sl]
+            if m.mean() >= 0.5:
+                tiles.append((sl, m))
+                edge.append(i in (0, ny - 1) or j in (0, nx - 1))
+                cy.append((ys[i] + ys[i + 1]) / 2 / h)
+                cx.append((xs[j] + xs[j + 1]) / 2 / w)
+    yard = {"tiles": tiles, "edge": np.array(edge, bool)}
+    if len(tiles) < 12:
+        return {**yard, "sky": np.zeros(len(tiles), bool), "emission": np.zeros(len(tiles), bool)}
+    T0 = tile_medians(img, yard)
+    l0 = T0 @ np.array([0.2126, 0.7152, 0.0722])
+    cx, cy = np.array(cx), np.array(cy)
+    A = np.stack([np.ones_like(cx), cx, cy], 1)
+    sel = l0 <= np.percentile(l0, 50)
+    for _ in range(10):
+        coef, *_ = np.linalg.lstsq(A[sel], l0[sel], rcond=None)
+        r0 = l0 - A @ coef
+        sd = mad_sigma(r0[sel]) + 1e-9
+        new = r0 < 2.0 * sd
+        if new.sum() < 12 or np.array_equal(new, sel):
+            break
+        sel = new
+    noise = np.array([mad_sigma((img[..., c] - cv2.GaussianBlur(np.ascontiguousarray(img[..., c]), (0, 0), 1.5))[::3, ::3])
+                      for c in range(3)], np.float32)
+    return {**yard, "T0": T0, "sky": r0 <= 2.5 * sd, "emission": r0 > 8 * sd, "noise": np.maximum(noise, 1e-12),
+            "quad": np.stack([np.ones_like(cx), cx, cy, cx * cx, cx * cy, cy * cy], 1)}
+
+
+def tile_medians(img: np.ndarray, yard: dict) -> np.ndarray:
+    return np.array([np.median(img[sl][m], axis=0) for sl, m in yard["tiles"]])
+
+
+def gradient_left(res: np.ndarray, yard: dict, T: np.ndarray | None = None) -> float:
+    """The large-scale trend left in the sky tiles of a corrected image, x the pixel noise: the range of
+    a robust quadratic over them (their tile-to-tile scatter is mostly faint emission's texture, which a
+    gradient model must keep) plus the border's offset from the interior; the worst colour channel."""
+    sky, edge = yard["sky"], yard["edge"]
+    if sky.sum() < 12:
+        return float("nan")
+    T = tile_medians(res, yard) if T is None else T
+    Q = yard["quad"][sky]
+    worst = 0.0
+    for c in range(3):
+        t_ = T[sky, c]
+        ok = np.ones(len(t_), bool)
+        for _ in range(3):
+            coef, *_ = np.linalg.lstsq(Q[ok], t_[ok], rcond=None)
+            fit = Q @ coef
+            ok = np.abs(t_ - fit) < 3 * (mad_sigma(t_ - fit) + 1e-12)
+        trend = float(np.percentile(fit, 98) - np.percentile(fit, 2))
+        e = edge[sky]
+        rim = abs(float(np.median(t_[e])) - float(np.median(t_[~e]))) if e.any() and (~e).any() else 0.0
+        worst = max(worst, (trend + rim) / float(yard["noise"][c]))
+    return worst
+
+
+def emission_removed(res: np.ndarray, yard: dict, T: np.ndarray | None = None) -> float | None:
+    """The fraction of the emission tiles' signal (above the sky tiles) a correction took away; None
+    when the field has no clear emission."""
+    sky, em = yard["sky"], yard["emission"]
+    if em.sum() < 3 or sky.sum() < 12:
+        return None
+    wl = np.array([0.2126, 0.7152, 0.0722])
+    T = tile_medians(res, yard) if T is None else T
+    e0 = (yard["T0"][em] - np.median(yard["T0"][sky], 0)) @ wl
+    e1 = (T[em] - np.median(T[sky], 0)) @ wl
+    return float(abs(1 - e1.sum() / max(e0.sum(), 1e-12)))
+
+
 def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, grid: int | None = None,
-                     progress=None) -> tuple[np.ndarray, dict]:
+                     progress=None, reference: dict | None = None,
+                     smoothing: float | None = None) -> tuple[np.ndarray, dict]:
     """Model sky background (light pollution gradient + vignetting residual).
 
-    Samples a tile grid (stars masked), then iteratively fits a smooth surface
-    while rejecting tiles that sit *above* the model (nebulosity, galaxies) –
-    a lower-envelope fit that behaves like a careful DBE sample placement.
+    ``reference`` (skyref.py; for "auto" and "reference"): a calibrated sky survey's maps of the
+    field, {"refs", "px_per_ref", "origin"}.  The gradient is then what the survey cannot explain,
+    so emission that fills the field is kept.  Without one (no plate solution, offline, outside the
+    survey), "reference" falls back to "auto".
+
+    Otherwise: samples a tile grid (stars masked), then iteratively fits a smooth surface while
+    rejecting tiles that sit *above* the model (nebulosity, galaxies) – a lower-envelope fit that
+    behaves like a careful DBE sample placement.  "auto" fits a plane, the polynomial of ``degree``
+    and the RBF, and keeps the plane unless a more flexible model leaves clearly less gradient in the
+    sky (``gradient_left``): a flexible model also follows faint emission that fills the field.
+    ``smoothing``: the RBF's (0..1, DEFAULTS["bg_smoothing"]).
     """
+    note = None
+    if method in ("auto", "reference"):
+        if reference is not None:
+            from . import skyref
+            B_ = BACKGROUND
+            try:
+                return skyref.fit(img, reference["refs"], float(reference["px_per_ref"]),
+                                  tuple(reference.get("origin", (0, 0))), degree=int(B_["ref_degree"]),
+                                  smooth=float(B_["ref_smooth"]), clip_high=float(B_["ref_clip_high"]))
+            except Exception as e:
+                note = f"sky survey reference not used: {e}"
+        elif method == "reference":
+            note = ("no sky survey reference (it needs a plate-solved stack, a connection, and a field the survey "
+                    "covers)")
+        method = "auto"
+    if method == "auto":
+        yard = sky_yardstick(img)
+        cands = [("poly", 1)] + ([("poly", int(degree))] if int(degree) > 1 else []) + [("rbf", int(degree))]
+        fits_ = {}
+        for m_, d_ in cands:
+            bg_, inf_ = background_model(img, m_, d_, grid, smoothing=smoothing)
+            fits_[(m_, d_)] = (gradient_left(img - bg_, yard), bg_, inf_)
+        scores = {f"{m_}{d_ if m_ == 'poly' else ''}": round(v[0], 3) for (m_, d_), v in fits_.items()}
+        if not np.isfinite(fits_[cands[0]][0]):
+            pick = cands[1] if len(cands) > 2 else cands[0]          # no sky tiles to judge by
+        else:
+            s0 = fits_[cands[0]][0]
+            pick = cands[0]
+            need = s0 - max(BACKGROUND["auto_margin"], BACKGROUND["auto_margin_rel"] * s0)
+            better = [k for k in cands[1:] if fits_[k][0] < need]
+            if better:
+                pick = min(better, key=lambda k: fits_[k][0])
+        bg_, inf_ = fits_[pick][1], fits_[pick][2]
+        label = f"{pick[0]}{pick[1] if pick[0] == 'poly' else ''}"
+        inf_ = {**inf_, "auto": f"{label} (gradient left in the sky, x pixel noise: "
+                                + ", ".join(f"{k} {v:g}" for k, v in scores.items()) + ")"}
+        if note:
+            inf_["note"] = note
+        return bg_, inf_
     h, w, _ = img.shape
     B = BACKGROUND
     grid = int(grid or B["grid"])
@@ -301,41 +442,12 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
                                                       "note": "too few star-free sky tiles: no gradient removed"}
     lum = vals @ np.array([0.2126, 0.7152, 0.0722])
     sel = lum <= np.percentile(lum, B["start_percentile"])
-    if method == "auto":
-        # the polynomial unless it cannot follow the sky: a vignetting rim, patchy residual glow
-        # (C 33: bright edges and corners).  Both are fitted to the same lower-envelope samples and
-        # the one whose sky residuals are clearly smaller is used
-        res = {}
-        for m_ in ("poly", "rbf"):
-            bg_, inf_ = background_model(img, m_, degree, grid)
-            sky_ = img - bg_
-            tiles_, edge_ = [], []
-            for i in range(ny):
-                for j in range(nx):
-                    tm_ = ~smask[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
-                    if tm_.mean() >= B["min_sky_fraction"]:
-                        tiles_.append(np.median(sky_[ys[i]:ys[i + 1], xs[j]:xs[j + 1]][tm_], axis=0))
-                        edge_.append(i in (0, ny - 1) or j in (0, nx - 1))
-            T_, e_ = np.array(tiles_), np.array(edge_)
-            # per colour (a rim is often in one channel: C 33's red border): the sky tiles' scatter
-            # (nebula tiles, far above, are cut robustly) plus the border's offset from the interior
-            score = 0.0
-            for c_ in range(T_.shape[1]):
-                t_ = T_[:, c_]
-                ok_ = t_ <= np.median(t_) + 3 * mad_sigma(t_)
-                rim = (abs(np.median(t_[ok_ & e_]) - np.median(t_[ok_ & ~e_]))
-                       if (ok_ & e_).any() and (ok_ & ~e_).any() else 0.0)
-                score = max(score, mad_sigma(t_[ok_]) + rim)
-            res[m_] = (score, bg_, inf_)
-        pick = "rbf" if res["rbf"][0] <= res["poly"][0] else "poly"
-        bg_, inf_ = res[pick][1], res[pick][2]
-        inf_ = {**inf_, "auto": f"{pick} (sky residual poly {res['poly'][0]:.3g}, rbf {res['rbf'][0]:.3g})"}
-        return bg_, inf_
 
     def fit(sel_, deg):
         if method == "rbf":
+            sm_ = DEFAULTS["bg_smoothing"] if smoothing is None else float(smoothing)
             model = RBFInterpolator(pts[sel_], vals[sel_], kernel="thin_plate_spline",
-                                    smoothing=float(sel_.sum()) * 2.0)
+                                    smoothing=float(sel_.sum()) * 4.0 * sm_)
             return model
         X = np.stack([pts[:, 1] ** a * pts[:, 0] ** b for a in range(deg + 1) for b in range(deg + 1 - a)], 1)
         beta, *_ = np.linalg.lstsq(X[sel_], vals[sel_], rcond=None)
@@ -355,7 +467,7 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
             break
         sel = new_sel
     # nebula-dominated fields: protect large-scale structure with a lower-order model
-    if sel.mean() < 0.35 and deg > 1 and method == "poly":
+    if sel.mean() < B["nebula_fraction"] and deg > 1 and method == "poly":
         deg = 1
         model = fit(sel, deg)
     info = {"samples": int(sel.sum()), "total": int(len(sel)), "method": method, "degree": deg}
@@ -536,7 +648,7 @@ def deconvolve(img: np.ndarray, strength: float, sat: float, noise_ref: float | 
 def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.ndarray | None,
                  params: dict, sat: float, progress=None, sharp: np.ndarray | None = None,
                  restored: bool = False, clip_ref: np.ndarray | None = None,
-                 ref_stars: dict | None = None) -> tuple[np.ndarray, dict]:
+                 ref_stars: dict | None = None, sky_reference: dict | None = None) -> tuple[np.ndarray, dict]:
     """``sharp``: output of the self-supervised deconvolution network (denoise.n2n_restore).
     When present, "deconvolution" blends towards it; otherwise Richardson-Lucy is used.
 
@@ -547,7 +659,10 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     white level and the image maximum so restored cores are not clipped.
 
     ``ref_stars``: catalogue stars for the spectrophotometric white balance ("auto"; spcc.py),
-    positions in ``stack`` pixels, or {"error": why there are none}."""
+    positions in ``stack`` pixels, or {"error": why there are none}.
+
+    ``sky_reference``: a sky survey's maps of the field on the ``stack`` grid ({"refs", "px_per_ref"};
+    skyref.py) for the "auto" / "reference" gradient model."""
     p = {**DEFAULTS, **(params or {})}
     info = {}
     img = stack
@@ -581,17 +696,37 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
         ped = 3 * max(mad_sigma(ref[..., c] - cv2.GaussianBlur(np.ascontiguousarray(ref[..., c]), (0, 0), 1.5)) * 1.6
                       for c in range(3))
     else:
+        zero = None
         if p["background"]:
-            bg, binfo = background_model(img, p["bg_method"], int(p["bg_degree"]))
+            ref = None
+            if sky_reference is not None:
+                y0, _, x0, _ = info.get("crop") or [0, 0, 0, 0]
+                ref = {**sky_reference, "origin": (y0, x0)}
+            bg, binfo = background_model(img, p["bg_method"], int(p["bg_degree"]), reference=ref,
+                                         smoothing=float(p.get("bg_smoothing", DEFAULTS["bg_smoothing"])))
+            if binfo.get("_emission") is not None:
+                # the survey says where the field holds the least emission: the sky's zero point there,
+                # not the median (in a field filled with nebula, the median is nebula)
+                from .skyref import sky_zero_mask
+                zero = sky_zero_mask(binfo, img.shape)
+            binfo = {k: v for k, v in binfo.items() if not k.startswith("_")}
+            if p.get("bg_correction") == "divide":
+                # multiplicative (vignetting, extinction): divided by the model normalised to its mean level
+                lvl = np.maximum(bg.reshape(-1, 3).mean(0), 1e-12)
+                img = img / np.maximum(bg / lvl, 0.05)
+                binfo["correction"] = "divide"
+            else:
+                img = img - bg
+                binfo["correction"] = "subtract"
             info["background"] = binfo
-            img = img - bg
         else:
             img = img - np.array([np.median(img[..., c][::4, ::4]) for c in range(3)], np.float32)
         # background neutralisation: equal, small pedestal in every channel
         s_bg = [mad_sigma(img[..., c][::4, ::4]) for c in range(3)]
         ped = 3 * max(s_bg)
+        use_zero = zero is not None and zero[::4, ::4].sum() > 1000
         for c in range(3):
-            img[..., c] -= np.median(img[..., c][::4, ::4])
+            img[..., c] -= np.median(img[..., c][::4, ::4][zero[::4, ::4]] if use_zero else img[..., c][::4, ::4])
     img += ped
     if progress:
         progress(2, 4, "Colour calibration")

@@ -66,7 +66,7 @@ STACK_DEFAULTS = {
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
 
-LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree",
+LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree", "bg_smoothing", "bg_correction",
                "white_balance", "spcc_sensor", "spcc_filter", "spcc_white_ref", "denoise", "deconvolution",
                "restored_resolution"]
 
@@ -545,7 +545,7 @@ class Session:
         path = self._p("imagemm/exposures.pkl")
         if os.path.exists(path):
             try:
-                return es.load(path)
+                return self._apply_sky_model(es.load(path))
             except Exception:
                 pass
         # everything cached from earlier prepared exposures (the network's multi-frame targets)
@@ -555,7 +555,7 @@ class Session:
         es.prepare(progress=progress, cancel=self.checkpoint)
         os.makedirs(self._p("imagemm"), exist_ok=True)
         es.save(path)
-        return es
+        return self._apply_sky_model(es)
 
     def multiframe_targets(self, n_groups: int, sigma: float, psf_model: str, progress=None, device="auto") -> dict:
         """Targets of the deconvolution network's multi-frame data term: seeing-group coadds of
@@ -629,6 +629,7 @@ class Session:
                     os.remove(self._p("imagemm_residual.fits"))
                 _save_fits(self._p("imagemm_coverage.fits"), (cov / max(float(cov.max()), 1e-12)).astype(np.float32))
                 info["ptc"] = {k: np.asarray(v).tolist() for k, v in es.ptc.items()}
+                info["sky_model"] = es.sky_info.get("auto") or es.sky_info.get("method")
                 self._restored_cache = None
             else:
                 st = self._load_stack()
@@ -705,8 +706,10 @@ class Session:
     def linear(self, params: dict, progress=None):
         p = {**DEFAULTS, **(params or {})}
         sol = self._p("explore/solution.json")
+        survey = p["background"] and p["bg_method"] in ("auto", "reference")
         key = (json.dumps({k: p[k] for k in LINEAR_KEYS}, sort_keys=True) + self.meta.get("created", "") +
-               (str(os.path.getmtime(sol)) if p["white_balance"] == "auto" and os.path.exists(sol) else ""))
+               (str(os.path.getmtime(sol)) if (p["white_balance"] == "auto" or survey) and os.path.exists(sol) else "") +
+               (str(os.path.getmtime(self._p("skyref.npz"))) if survey and os.path.exists(self._p("skyref.npz")) else ""))
         with self.lock:
             if self._lin_cache and self._lin_cache[0] == key:
                 return self._lin_cache[1], self._lin_cache[2]
@@ -735,6 +738,10 @@ class Session:
                                          progress=progress, restored=True, clip_ref=clip_ref,
                                          ref_stars=self._ref_stars(p, img.shape[1] / ref.shape[1]))
                 info["restoration"] = "ImageMM"
+                sky_model = self._restore_info().get("sky_model")
+                info["background"] = {"method": "subtracted before the restoration"
+                                                + (f": {sky_model}" if sky_model else " (degree-2 polynomial: restored "
+                                                   "before the sky-survey reference; run Restore again to use it)")}
                 info["upscaled"] = img.shape[1] / st["stack"].shape[1]
                 # the coadd on the same grid, cropped and scaled like the output: stars are found on
                 # it (the restoration's sky speckle would pass for faint stars)
@@ -766,7 +773,8 @@ class Session:
                     # px: flux-conserving, Nyquist-sampled cores, the same profile in every channel
                     sharp = restored_view_sigma(sharp, float(p.get("restored_resolution", 1.0)), {})
                 lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
-                                         progress=progress, sharp=sharp, ref_stars=self._ref_stars(p))
+                                         progress=progress, sharp=sharp, ref_stars=self._ref_stars(p),
+                                         sky_reference=self.sky_reference() if survey else None)
             self._lin_cache = (key, lin, info, detect, resid)
             return lin, info
 
@@ -792,13 +800,72 @@ class Session:
         connection and RA/Dec in the headers): None when it cannot."""
         from .astrometry import load_solution, solve_session
         try:
-            return load_solution(self) or solve_session(self, progress=progress)
+            sol = load_solution(self) or solve_session(self, progress=progress)
         except Cancelled:
             raise
         except Exception as e:
             if progress:
                 progress(1, 1, f"Plate solving skipped ({type(e).__name__}: {str(e)[:80]})")
             return None
+        if progress:
+            progress(1, 1, "Sky survey reference for the gradient model")
+        self.sky_reference()                     # fetched now, not at the first preview
+        return sol
+
+    # ------------------------------------------------------------- sky survey reference
+    def sky_reference(self, fetch: bool = True) -> dict | None:
+        """A calibrated sky survey's maps of the field on the stack's grid (skyref.py), for the gradient
+        model: {"refs", "px_per_ref"}, cached in skyref.npz.  None without a plate solution, offline
+        (a failed fetch is not retried for 10 minutes) or outside the survey (the model then falls back)."""
+        from . import skyref
+        from .astrometry import load_solution
+        if not os.path.exists(self._p("stack.fits")):
+            return None
+        sol = load_solution(self)
+        if sol is None:
+            return None
+        shape = tuple(sol.get("shape") or self.meta.get("shape", [0, 0])[:2])
+        key = json.dumps([sol["wcs_header"][:4000], list(shape), skyref.SURVEYS, skyref.FACTOR])
+        path = self._p("skyref.npz")
+        cached = getattr(self, "_skyref", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        if os.path.exists(path):
+            try:
+                z = np.load(path)
+                if str(z["key"]) == key:
+                    ref = {"refs": z["refs"].astype(np.float32), "px_per_ref": float(skyref.FACTOR)}
+                    self._skyref = (key, ref)
+                    return ref
+            except Exception:
+                pass
+        fail = getattr(self, "_skyref_fail", None)
+        if not fetch or (fail and fail[0] == key and time.time() - fail[1] < 600):
+            return None
+        try:
+            refs = skyref.fetch(sol["wcs"], shape)
+        except Exception as e:
+            self._skyref_fail = (key, time.time(), f"{type(e).__name__}: {e}")
+            print(f"sky survey reference unavailable: {self._skyref_fail[2]}")
+            return None
+        np.savez_compressed(path, key=key, refs=refs.astype(np.float32))
+        ref = {"refs": refs, "px_per_ref": float(skyref.FACTOR)}
+        self._skyref = (key, ref)
+        return ref
+
+    def _apply_sky_model(self, es):
+        """The sky model every exposure is background-subtracted by before ImageMM (``es.sky_ref``, on
+        the reference coadd's 1x grid): against the sky survey when available, else the gradient model's
+        "auto" choice.  It is subtracted when a window is restored, so a new one needs no new preparation."""
+        from .postprocess import background_model
+        sref = self.sky_reference()
+        ref = None
+        if sref is not None:
+            ref = {**sref, "px_per_ref": sref["px_per_ref"] / float(self.meta.get("scale", 1.0))}
+        es.sky_ref, info = background_model(es.ref, "auto", 2, reference=ref)
+        es.sky_info = {k: v for k, v in info.items() if not k.startswith("_")}
+        es.sky_ref = es.sky_ref.astype(np.float32)
+        return es
 
     # ------------------------------------------------------------- AI star remover
     def _star_source(self) -> str:
