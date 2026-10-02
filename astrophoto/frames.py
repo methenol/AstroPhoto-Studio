@@ -41,6 +41,7 @@ class FrameInfo:
     device_rejected: bool = False    # the telescope's own live stack rejected this sub (DWARF "failed_")
     calib: dict | None = field(default=None, repr=False)   # calibration masters (calibration.py)
     adu_scale: float = 1.0           # raw values x this = 16-bit ADU (DWARF 3: 12-bit data, x16)
+    pattern: str | None = field(default=None, repr=False)   # sensor-pattern residual (.npy, stacking.sensor_pattern)
 
     def to_dict(self):
         return asdict(self)
@@ -190,9 +191,27 @@ def read_raw(path: str, bias: float, calib: dict | None = None, scale: float = 1
     return data
 
 
+_PATTERN: dict = {}
+
+
+def _load_pattern(path: str) -> np.ndarray:
+    key = (path, os.path.getmtime(path))
+    if key not in _PATTERN:
+        _PATTERN.clear()
+        _PATTERN[key] = np.load(path).astype(np.float32)
+    return _PATTERN[key]
+
+
 def read_frame(info: FrameInfo) -> np.ndarray:
-    """``read_raw`` of a sub with its session's calibration."""
-    return read_raw(info.path, info.bias, getattr(info, "calib", None), getattr(info, "adu_scale", 1.0))
+    """``read_raw`` of a sub with its session's calibration, less the sensor pattern the
+    calibration left (``info.pattern``: measured from the subs themselves, stacking.sensor_pattern)."""
+    data = read_raw(info.path, info.bias, getattr(info, "calib", None), getattr(info, "adu_scale", 1.0))
+    pat = getattr(info, "pattern", None)
+    if pat and os.path.exists(pat):
+        P = _load_pattern(pat)
+        if P.shape == data.shape:
+            data -= P
+    return data
 
 
 # --------------------------------------------------------------------------- CFA

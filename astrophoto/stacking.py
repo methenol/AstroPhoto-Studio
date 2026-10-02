@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from .frames import FrameInfo, cfa_masks, demosaic, fix_defects, read_frame
+from .frames import FrameInfo, cfa_channel_map, cfa_masks, demosaic, fix_defects, read_frame
 
 
 def _bounded_map(fn, items, workers):
@@ -114,6 +114,29 @@ def eval_surface(coefs: np.ndarray, h: int, w: int, deg: int = 2) -> np.ndarray:
     return cv2.resize(low.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC).reshape(h, w, -1)
 
 
+def _block_median(img: np.ndarray, valid: np.ndarray, block: int, sub: int = 2) -> np.ndarray:
+    """Robust (median) level of every ``block`` x ``block`` cell of a (H, W, C) image, NaN where
+    under half of the cell is valid.  Returns (H // block, W // block, C)."""
+    h, w, c = img.shape
+    hb, wb = h // block, w // block
+    b = block // sub
+    small = img[: hb * block: sub, : wb * block: sub]
+    vs = valid[: hb * block: sub, : wb * block: sub]
+    arr = np.where(vs[..., None], small, np.nan).reshape(hb, b, wb, b, c).transpose(0, 2, 4, 1, 3).reshape(hb, wb, c, b * b)
+    with np.errstate(all="ignore"):
+        med = np.nanmedian(arr, axis=-1)
+    med[vs.reshape(hb, b, wb, b).mean((1, 3)) < 0.5] = np.nan
+    return med.astype(np.float32)
+
+
+def _smooth_fill(m: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """Gaussian smoothing of a low-resolution map with NaN holes (normalised convolution)."""
+    ok = np.isfinite(m).astype(np.float32)
+    num = np.stack([cv2.GaussianBlur(np.nan_to_num(m[..., c]), (0, 0), sigma) for c in range(m.shape[-1])], -1)
+    den = cv2.GaussianBlur(ok.min(-1) if ok.ndim == 3 else ok, (0, 0), sigma)
+    return np.where(den[..., None] > 1e-3, num / np.maximum(den[..., None], 1e-3), 0).astype(np.float32)
+
+
 class Integrator:
     def __init__(self, infos: list[FrameInfo], analysis: dict, defects: np.ndarray | None,
                  mode: str = "auto", scale: float = 1.0, sigma_low: float = 4.0,
@@ -148,7 +171,9 @@ class Integrator:
         self.groups, self.group_info = self._psf_groups(int(psf_groups))
         self.unit_sink = unit_sink
         self.offsets: dict[int, np.ndarray] = {}
-        self.gradients: dict[int, np.ndarray] = {}
+        self.gradients: dict[int, np.ndarray] = {}     # per-frame large-scale background correction (low-res)
+        self.norm_block = max(16, int(round(32 * self.scale)))
+        self.norm_info: dict = {}
 
     def _psf_groups(self, n_groups: int):
         """Assign every frame to a seeing class: equal total weight per class, sharpest first."""
@@ -202,8 +227,10 @@ class Integrator:
             wts *= ok
         else:
             rgb = demosaic(raw, self.pattern)
+            # not clipped at 0: a calibrated sub's sky can sit below its noise (DWARF 3 Duo-Band), and
+            # cutting off the negative half of the noise biases each pixel by an amount that follows its
+            # own noise (dark, flat) and the sky level (cloud) - a pattern no number of subs averages out
             vals = warp(rgb, cv2.INTER_LANCZOS4)
-            np.maximum(vals, 0, out=vals)
             cov = warp(ones, cv2.INTER_LINEAR) > 0.999
             wts = np.repeat(cov[..., None].astype(np.float32), 3, axis=2)
         # obstruction mask (tile grid in reference coordinates) -> smooth full-res weight
@@ -261,8 +288,57 @@ class Integrator:
             self.offsets[idx] = np.median(sub, axis=0) if len(sub) else np.zeros(3, np.float32)
         vals -= (self.offsets[idx] - self.ref_level).astype(np.float32)[None, None, :]
         if use_gradient and idx in self.gradients:
-            vals -= eval_surface(self.gradients[idx], self.H, self.W)
+            vals -= self._background_correction(idx)
         return vals, valid
+
+    def _background_correction(self, idx) -> np.ndarray:
+        """The frame's large-scale background correction at full resolution."""
+        g, b = self.gradients[idx], self.norm_block
+        up = cv2.resize(g, (g.shape[1] * b, g.shape[0] * b), interpolation=cv2.INTER_LINEAR)
+        return np.pad(up, ((0, self.H - up.shape[0]), (0, self.W - up.shape[1]), (0, 0)), mode="edge")
+
+    def _local_normalisation(self, mu1: np.ndarray):
+        """Cloud-proof local normalisation.
+
+        Thin cloud lit by light pollution adds a patchy glow, 50-300 px across, that changes from
+        sub to sub; a per-frame polynomial cannot follow it, and it is far below the per-pixel
+        noise the clipping works against, so it went into the stack as colour blotches.  Each
+        sub's deviation from the first-pass mean is measured as robust block medians (stars and
+        noise cancel; the static sky is in the mean); the subs whose deviation is smallest are
+        the clean ones, and every sub's large-scale background is set to theirs.  Structure
+        smaller than a block is never touched, and the static sky is never in a deviation."""
+        n, b = len(self.items), self.norm_block
+        dev: dict[int, np.ndarray] = {}
+        for k, (vals, wts, fw) in enumerate(_bounded_map(self._warp, range(n), self.workers)):
+            if self.cancel():
+                raise RuntimeError("cancelled")
+            vals, valid = self._normalise(k, vals, wts, False)
+            vals -= mu1
+            dev[k] = _block_median(vals, valid, b)
+            self.progress(k + 1, n, f"Local normalisation ({k + 1}/{n})")
+        spread = np.array([np.nanmedian(np.abs(d - np.nanmedian(d, axis=(0, 1)))) if np.isfinite(d).any() else np.inf
+                           for d in (dev[k] for k in range(n))])
+        # the reference is the clearest subs - darkest sky, most transparent - NOT the ones closest
+        # to the mean: under a hazy night the mean is itself hazy, and the subs nearest it carry
+        # the average cloud glow into every other sub
+        n_clean = max(min(n, 8), n // 4)
+        frs = [fr for _, fr in self.items]
+        bgv = np.array([np.mean(fr.get("background", [np.nan])) for fr in frs], float)
+        trv = np.array([fr.get("transparency", np.nan) for fr in frs], float)
+        bgv = np.where(np.isfinite(bgv), bgv, np.nanmax(bgv) if np.isfinite(bgv).any() else 0.0)
+        trv = np.where(np.isfinite(trv), trv, np.nanmin(trv) if np.isfinite(trv).any() else 0.0)
+        rank = np.argsort(np.argsort(bgv)) + np.argsort(np.argsort(-trv)) + 0.5 * np.argsort(np.argsort(spread))
+        clean = np.argsort(rank, kind="stable")[:n_clean]
+        w = np.array([self.items[k][1]["weight"] for k in clean], np.float64)[:, None, None, None]
+        stackd = np.stack([dev[k] for k in clean])
+        ok = np.isfinite(stackd)
+        ref = (np.where(ok, stackd, 0) * w).sum(0) / np.maximum((ok * w).sum(0), 1e-12)
+        ref = np.where(ok.any(0), ref, np.nan)
+        for k in range(n):
+            self.gradients[k] = _smooth_fill(dev[k] - ref, 1.0)
+        self.norm_info = {"method": "block", "block_px": b, "n_reference": int(n_clean),
+                          "spread_median": float(np.median(spread[np.isfinite(spread)])) if np.isfinite(spread).any() else None,
+                          "spread_reference_max": float(spread[clean].max())}
 
     # ------------------------------------------------------------------ passes
     def run(self) -> dict:
@@ -294,6 +370,9 @@ class Integrator:
         mu1 /= np.maximum(Wt, 1e-6)
         del S
 
+        if self.local_norm:
+            self._local_normalisation(mu1)
+
         # ---- pass 2: local normalisation + mean/variance
         S1 = np.zeros((H, W, 3), np.float32)
         S2 = np.zeros((H, W, 3), np.float32)
@@ -301,11 +380,8 @@ class Integrator:
         for k, (vals, wts, fw) in enumerate(_bounded_map(self._warp, range(n), self.workers)):
             if self.cancel():
                 raise RuntimeError("cancelled")
-            vals, valid = self._normalise(k, vals, wts, False)
+            vals, valid = self._normalise(k, vals, wts, self.local_norm)
             vals -= mu1                                  # vals is now d = x - mu1
-            if self.local_norm:
-                self.gradients[k] = fit_smooth_surface(vals, valid, deg=2)
-                vals -= eval_surface(self.gradients[k], H, W)
             wts *= np.float32(fw)
             Wt += wts
             vals *= wts                                  # w*d
@@ -395,4 +471,87 @@ class Integrator:
             "n_frames": n,
             "total_exposure": float(sum(info.exptime for info, _ in self.items)),
             "psf_groups": self.group_info,
+            "local_norm": self.norm_info,
         }
+
+
+# ------------------------------------------------------------------ sensor pattern
+
+def sensor_pattern(items: list, stack: np.ndarray, defects: np.ndarray | None, scale: float = 1.0,
+                   n_sample: int = 300, workers: int = 8, progress=None, cancel=None) -> tuple[np.ndarray, dict]:
+    """The fixed pattern the calibration left in the subs, measured from the subs themselves.
+
+    A master dark taken at another temperature (a DWARF 3's 27 C dark against 40-43 C lights,
+    scaled x1.5) and with few frames leaves a per-pixel pattern in every calibrated sub that
+    does not average down: the field only drifts and rotates slowly over the sensor, so the
+    stack smears it into the worm-like mottle of "walking noise", identical in both half
+    stacks (the Noise2Noise denoiser keeps it as signal).
+
+    Each sampled sub, less the stack warped back into its pixels (scaled and offset per CFA
+    colour, so transparency and sky level do not matter) and less its own large-scale residual
+    (cloud glow, gradients), leaves its noise plus the sensor's pattern.  The per-pixel median
+    over the subs is the pattern: the sky has been removed, and what is left of stars and
+    passing cloud lands on different pixels in every sub.  The estimate's own noise (a median of
+    ``n_sample`` subs) becomes a fixed pattern in its turn, hence many subs (float16: ~17 MB each
+    for a DWARF 3).  Returns (CFA-resolution pattern in the subs' ADU, info)."""
+    if len(items) < 12:
+        raise ValueError("too few subs to measure the sensor pattern")
+    pick = [items[j] for j in np.unique(np.linspace(0, len(items) - 1, min(n_sample, len(items))).round().astype(int))]
+    info0 = pick[0][0]
+    H, W = info0.height, info0.width
+    cmap = cfa_channel_map(info0.bayer, (H, W))
+    sites = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+    def resid(item):
+        info, fr = item
+        raw = fix_defects(read_frame(info), defects)
+        M = _scaled_transform(fr["transform"], scale)
+        # the stack sampled at this sub's pixels (output grid -> sub pixels), invalid outside it
+        model = cv2.warpAffine(stack, M, (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=(np.nan, np.nan, np.nan))
+        m_cfa = np.take_along_axis(model, cmap[..., None].astype(np.intp), axis=2)[..., 0]
+        out = np.full((H, W), np.nan, np.float32)
+        for dy, dx in sites:
+            y, m = raw[dy::2, dx::2], m_cfa[dy::2, dx::2]
+            ok = np.isfinite(m)
+            if ok.sum() < 1000:
+                continue
+            ys, ms = y[ok][::5], m[ok][::5]
+            keep = ms < np.percentile(ms, 99)              # stars' cores: seeing and sampling differ
+            A = np.stack([ms[keep], np.ones(int(keep.sum()))], 1)
+            a, b = np.linalg.lstsq(A, ys[keep], rcond=None)[0]
+            r = np.where(ok, y - a * np.nan_to_num(m) - b, 0).astype(np.float32)
+            w = ok.astype(np.float32)
+            large = cv2.GaussianBlur(r, (0, 0), 12) / np.maximum(cv2.GaussianBlur(w, (0, 0), 12), 1e-3)
+            out[dy::2, dx::2] = np.where(ok, r - large, np.nan)
+        return out.astype(np.float16)
+
+    R = np.empty((len(pick), H, W), np.float16)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for k, r in enumerate(ex.map(resid, pick)):
+            R[k] = r
+            if progress:
+                progress(k + 1, len(pick), f"Sensor pattern: sub {k + 1}/{len(pick)}")
+            if cancel and cancel():
+                raise RuntimeError("cancelled")
+    P = np.zeros((H, W), np.float32)
+    n_valid = np.zeros((H, W), np.int32)
+    for y0 in range(0, H, 128):                            # nanmedian in row blocks (bounded memory)
+        blk = R[:, y0:y0 + 128].astype(np.float32)
+        n_valid[y0:y0 + 128] = np.isfinite(blk).sum(0)
+        with np.errstate(all="ignore"):
+            P[y0:y0 + 128] = np.nan_to_num(np.nanmedian(blk, axis=0))
+    P[n_valid < max(8, len(pick) // 4)] = 0.0
+    # how much of it is reproducible: two independent halves of the sample against each other
+    half = []
+    for sel in (slice(0, None, 2), slice(1, None, 2)):
+        h = np.zeros((H // 4, W), np.float32)
+        for y0 in range(0, H // 4, 128):
+            y1 = min(y0 + 128, H // 4)
+            with np.errstate(all="ignore"):
+                h[y0:y1] = np.nan_to_num(np.nanmedian(R[sel, H // 2 + y0:H // 2 + y1].astype(np.float32), axis=0))
+        half.append(h)
+    corr = float(np.corrcoef(half[0].ravel(), half[1].ravel())[0, 1])
+    rms = float(1.4826 * np.median(np.abs(P - np.median(P))))
+    del R
+    return P, {"n_subs": len(pick), "rms_adu": rms, "reproducibility": corr}

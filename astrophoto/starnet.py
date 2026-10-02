@@ -276,12 +276,23 @@ def train(lin: np.ndarray, starless: np.ndarray, noise: float = 0.0, iters: int 
     bg_all = torch.from_numpy(np.ascontiguousarray(starless.transpose(2, 0, 1))).to(device)
     h, w = starless.shape[:2]
     sig_t = torch.as_tensor(dom.sigma, device=device).view(1, 3, 1, 1)
+    # half of every batch comes from the brightest backgrounds: drawn uniformly, crops are nearly all
+    # dark sky (a nebula fills a few % of a wide field), the network never saw a star on bright
+    # nebulosity - where the stabilised domain compresses it differently - and left them all in
+    # place (C 33: every star on the Veil's filaments)
+    Ls = cv2.GaussianBlur(luminance(starless), (0, 0), patch / 4)[: h - patch, : w - patch]
+    bright = np.argwhere(Ls[::8, ::8] >= np.percentile(Ls[::8, ::8], 90)) * 8
     t0 = time.time()
     for it in range(iters):
         if cancel and cancel():
             raise RuntimeError("cancelled")
         ys = rng.integers(0, h - patch, batch)
         xs = rng.integers(0, w - patch, batch)
+        if len(bright):
+            pick = bright[rng.integers(0, len(bright), batch)]
+            on = rng.random(batch) < 0.5
+            ys = np.where(on, np.clip(pick[:, 0] - patch // 2, 0, h - patch - 1), ys)
+            xs = np.where(on, np.clip(pick[:, 1] - patch // 2, 0, w - patch - 1), xs)
         bg = torch.stack([bg_all[:, y:y + patch, x:x + patch] for y, x in zip(ys, xs)])
         k = int(rng.integers(0, 4))
         bg = torch.rot90(bg, k, (2, 3))

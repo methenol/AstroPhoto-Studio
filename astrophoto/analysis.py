@@ -250,7 +250,11 @@ def analyse(infos: list[FrameInfo], defects: np.ndarray | None, progress=None,
     workers = workers or workers_for(12 * 4.0 * infos[0].width * infos[0].height, "ASTROPHOTO_ANALYSIS_RAM_GB")
     n = len(infos)
     results: list[dict] = [None] * n  # type: ignore
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(defects,)) as ex:
+    # spawn, not fork: the web UI forks from a threaded process (and CUDA), and a forked worker
+    # can inherit a lock another thread held, blocking for ever before measuring a single frame
+    import multiprocessing as mp
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"),
+                             initializer=_init_worker, initargs=(defects,)) as ex:
         for i, r in enumerate(ex.map(analyse_frame, infos, chunksize=2)):
             results[i] = r
             if progress:
@@ -261,8 +265,19 @@ def analyse(infos: list[FrameInfo], defects: np.ndarray | None, progress=None,
     elong = np.array([r["elongation"] for r in results])
     nst = np.array([r["n_stars"] for r in results], float)
 
-    # reference: many sharp, round stars
+    # reference: many sharp, round stars.  Only frames with a typical star count and a real star
+    # FWHM compete: a cloudy sub's few detections are often hot-pixel / calibration residuals, a
+    # fraction of the stars' FWHM, which the 1/FWHM^2 term would otherwise rank first (and they stay
+    # put on the sensor while the sky rotates, so nothing registers to them).  The telescope's own
+    # rejects ("failed_") are passed over when there is anything else.
     score = nst / np.maximum(np.nan_to_num(fwhm, nan=99), 0.5) ** 2 / np.maximum(np.nan_to_num(elong, nan=9), 1)
+    fwhm_med = np.nanmedian(fwhm) if np.isfinite(fwhm).any() else 0.0
+    eligible = (nst >= np.median(nst)) & (np.nan_to_num(fwhm, nan=0) >= 0.7 * fwhm_med)
+    device_ok = ~np.array([getattr(i, "device_rejected", False) for i in infos])
+    for pool in (eligible & device_ok, eligible):
+        if pool.any():
+            score = np.where(pool, score, -np.inf)
+            break
     ref_idx = int(np.nanargmax(score))
     ref_stars = results[ref_idx]["stars"]
     ref_tree = cKDTree(ref_stars[:, :2])

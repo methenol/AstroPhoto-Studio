@@ -43,7 +43,12 @@ def pick_device(preference: str = "auto") -> torch.device:
     if pref == "auto":
         pref = os.environ.get("ASTROPHOTO_DEVICE", "auto").lower()
     if pref.startswith("cuda") and torch.cuda.is_available():
-        return torch.device(pref)
+        dev = torch.device(pref)
+        if dev.index is not None and dev.index >= torch.cuda.device_count():
+            # e.g. ASTROPHOTO_DEVICE=cuda:1 on a single-GPU machine: the GPUs are numbered from 0
+            print(f"[astrophoto] {pref} not present ({torch.cuda.device_count()} CUDA device(s)); using cuda:0")
+            return torch.device("cuda:0")
+        return dev
     if pref == "mps" and torch.backends.mps.is_available():
         return torch.device("mps")
     if pref == "cpu":

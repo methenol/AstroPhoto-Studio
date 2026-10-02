@@ -27,7 +27,7 @@ from . import __version__
 from .analysis import analyse, finalize_selection
 from .frames import FrameInfo, build_defect_map, discover, read_frame, superpixel
 from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
-from .stacking import Integrator
+from .stacking import Integrator, sensor_pattern
 
 STACK_DEFAULTS = {
     "mode": "auto",          # auto | drizzle | demosaic
@@ -36,6 +36,8 @@ STACK_DEFAULTS = {
     "sigma_high": 3.0,
     "local_norm": True,
     "sensitivity": 1.0,      # frame-rejection aggressiveness
+    "pattern_correction": True,  # measure the sensor pattern calibration left in the subs and remove it
+                                 # (stacking.sensor_pattern: one extra stack pass the first time)
     "denoise_iters": 2000,
     "ai_deconvolution": True,  # train the self-supervised deconvolution network after the denoiser
     "deconv_method": "imagemm",  # imagemm | network | none  (best on held-out subs: experiments/README.md)
@@ -257,7 +259,25 @@ class Session:
         except Exception as e:          # a broken master must not stop the session: calibrate from the headers
             self.calib_error = f"{type(e).__name__}: {e}"
             print(f"calibration masters not used: {self.calib_error}")
+        self._attach_pattern()
         return self.infos
+
+    # ------------------------------------------------------------- sensor pattern
+    def _pattern_key(self):
+        return json.loads(json.dumps(self._calib_signature(getattr(self.infos[0], "calib", None)) if self.infos else None))
+
+    def _attach_pattern(self) -> bool:
+        """Point every sub at the measured sensor pattern when it was made with the current calibration."""
+        path, meta = self._p("pattern.npy"), self._p("pattern.json")
+        ok = False
+        if os.path.exists(path) and os.path.exists(meta):
+            try:
+                ok = json.load(open(meta)).get("calib") == self._pattern_key()
+            except Exception:
+                ok = False
+        for info in self.infos:
+            info.pattern = path if ok else None
+        return ok
 
     # ------------------------------------------------------------- calibration (stage 0)
     @property
@@ -292,7 +312,7 @@ class Session:
             changed = self.analysis is not None and before != after
             if changed:
                 self.analysis = None
-                for f in ("analysis.pkl", "defects.npy", "frames.json"):
+                for f in ("analysis.pkl", "defects.npy", "frames.json", "pattern.npy", "pattern.json"):
                     if os.path.exists(self._p(f)):
                         os.remove(self._p(f))
             info = self.calibration_info(with_candidates=False)
@@ -422,11 +442,40 @@ class Session:
             for d in ("groups", "imagemm"):
                 if os.path.isdir(self._p(d)):
                     shutil.rmtree(self._p(d))
-            integ = Integrator(self.infos, self.analysis, self.defects, mode=p["mode"], scale=float(p["scale"]),
-                               sigma_low=float(p["sigma_low"]), sigma_high=float(p["sigma_high"]),
-                               local_norm=bool(p["local_norm"]), progress=progress,
-                               cancel=self.checkpoint)
-            out = integ.run()
+            def integrate():
+                return Integrator(self.infos, self.analysis, self.defects, mode=p["mode"], scale=float(p["scale"]),
+                                  sigma_low=float(p["sigma_low"]), sigma_high=float(p["sigma_high"]),
+                                  local_norm=bool(p["local_norm"]), progress=progress,
+                                  cancel=self.checkpoint)
+            pattern_info = None
+            if not p.get("pattern_correction", True):
+                for info in self.infos:
+                    info.pattern = None
+                out = integrate().run()
+            elif self._attach_pattern():
+                out = integrate().run()
+                pattern_info = json.load(open(self._p("pattern.json")))
+            else:
+                # first pass without it, the pattern measured against that stack, then the stack again
+                for info in self.infos:
+                    info.pattern = None
+                integ = integrate()
+                out = integ.run()
+                if progress:
+                    progress(0, 1, "Sensor pattern: measuring what calibration left in the subs")
+                try:
+                    P, pattern_info = sensor_pattern(integ.items, out["stack"], self.defects, out["scale"],
+                                                     progress=progress, cancel=self.checkpoint)
+                except ValueError as e:      # too few subs: stack without it
+                    pattern_info = {"skipped": str(e)}
+                else:
+                    del out
+                    np.save(self._p("pattern.npy"), P)
+                    pattern_info = {**pattern_info, "calib": self._pattern_key(),
+                                    "created": datetime.now().isoformat(timespec="seconds")}
+                    json.dump(pattern_info, open(self._p("pattern.json"), "w"), indent=1)
+                    self._attach_pattern()
+                    out = integrate().run()
             hdr = fits.Header()
             info0 = self.infos[0]
             for k, v in {"OBJECT": info0.object, "FILTER": info0.filter, "TELESCOP": getattr(info0, "telescope", ""),
@@ -444,6 +493,8 @@ class Session:
                     "total_exposure": out["total_exposure"], "params": p,
                     "saturation": 65535.0 - info0.bias, "filter": info0.filter, "object": info0.object,
                     "calibration": self._calibration_status(),
+                    "sensor_pattern": pattern_info,
+                    "local_norm": out.get("local_norm"),
                     "created": datetime.now().isoformat(timespec="seconds"),
                     "shape": list(out["stack"].shape)}
             json.dump(meta, open(self._p("stack_meta.json"), "w"), indent=1, default=_json_default)
@@ -683,6 +734,14 @@ class Session:
                 detect = resid = None
                 den = self._load_denoised()
                 sharp = self._load_sharp() if den is not None else None
+                if sharp is not None:
+                    # the deconvolution network deconvolves towards points: a bright star became a
+                    # single-pixel spike 10x its stacked peak (C 33: 175 000 ADU against 17 700, 2.8x
+                    # the white level) with its surroundings drained - a dark hole round a dot whose
+                    # colour is whichever channel spiked highest (red after white balance).  It is
+                    # shown, like an ImageMM restoration, through a Gaussian of "restored_resolution"
+                    # px: flux-conserving, Nyquist-sampled cores, the same profile in every channel
+                    sharp = restored_view_sigma(sharp, float(p.get("restored_resolution", 1.0)), {})
                 lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
                                          progress=progress, sharp=sharp, ref_stars=self._ref_stars(p))
             self._lin_cache = (key, lin, info, detect, resid)

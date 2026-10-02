@@ -273,7 +273,35 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
     lum = vals @ np.array([0.2126, 0.7152, 0.0722])
     sel = lum <= np.percentile(lum, 75)
     if method == "auto":
-        method = "poly"
+        # the polynomial unless it cannot follow the sky: a vignetting rim, patchy residual glow
+        # (C 33: bright edges and corners).  Both are fitted to the same lower-envelope samples and
+        # the one whose sky residuals are clearly smaller is used
+        res = {}
+        for m_ in ("poly", "rbf"):
+            bg_, inf_ = background_model(img, m_, degree, grid)
+            sky_ = img - bg_
+            tiles_, edge_ = [], []
+            for i in range(ny):
+                for j in range(nx):
+                    tm_ = ~smask[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+                    if tm_.mean() >= 0.4:
+                        tiles_.append(np.median(sky_[ys[i]:ys[i + 1], xs[j]:xs[j + 1]][tm_], axis=0))
+                        edge_.append(i in (0, ny - 1) or j in (0, nx - 1))
+            T_, e_ = np.array(tiles_), np.array(edge_)
+            # per colour (a rim is often in one channel: C 33's red border): the sky tiles' scatter
+            # (nebula tiles, far above, are cut robustly) plus the border's offset from the interior
+            score = 0.0
+            for c_ in range(T_.shape[1]):
+                t_ = T_[:, c_]
+                ok_ = t_ <= np.median(t_) + 3 * mad_sigma(t_)
+                rim = (abs(np.median(t_[ok_ & e_]) - np.median(t_[ok_ & ~e_]))
+                       if (ok_ & e_).any() and (ok_ & ~e_).any() else 0.0)
+                score = max(score, mad_sigma(t_[ok_]) + rim)
+            res[m_] = (score, bg_, inf_)
+        pick = "rbf" if res["rbf"][0] <= res["poly"][0] else "poly"
+        bg_, inf_ = res[pick][1], res[pick][2]
+        inf_ = {**inf_, "auto": f"{pick} (sky residual poly {res['poly'][0]:.3g}, rbf {res['rbf'][0]:.3g})"}
+        return bg_, inf_
 
     def fit(sel_, deg):
         if method == "rbf":
@@ -617,10 +645,13 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
 
 # ============================================================ non-linear stage
 
-def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: float = 0.0):
+def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: float = 0.0,
+                          detect_floor: float | None = None):
     """``noise_floor``: per-pixel noise of the original data at this scale; detection
     significance is relative to the larger of it and the image's own background rms (after
-    a restoration or ML denoising the image's own noise no longer describes the data)."""
+    a restoration or ML denoising the image's own noise no longer describes the data).
+    ``detect_floor``: a different floor for the detection threshold alone (the PSF width and
+    the returned rms still use ``noise_floor``).  Returns (objects, rms, fwhm)."""
     Lc = np.ascontiguousarray(L, np.float32)
     # a first coarse pass measures the PSF; the background mesh then scales with it so
     # it follows extended light (galaxy discs, nebula ridges) and stars on top of it
@@ -635,7 +666,8 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     bkg = sep.Background(Lc, bw=mesh, bh=mesh, fw=3, fh=3)
     sub = Lc - bkg.back()
     rms = max(bkg.globalrms, noise_floor)
-    objs = _extract(sub, 4.0, rms, minarea=3, deblend_cont=0.002)
+    rms_det = max(bkg.globalrms, noise_floor if detect_floor is None else detect_floor)
+    objs = _extract(sub, 4.0, rms_det, minarea=3, deblend_cont=0.002)
     if len(objs) == 0:
         return objs, rms, 3.0
     fw = 2 * sep.flux_radius(sub, objs["x"], objs["y"], 6 * objs["a"], 0.5, subpix=5)[0]
@@ -647,7 +679,11 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     back_med = float(np.median(bkg.back()))
     # data are normalised to the sensor's full well, so "near saturation" is absolute
     sat_peak = objs["peak"] + back_med > min(0.85 * float(np.max(Lc)), 0.5)
-    compact = (fw < 3.0 * fw_med) & (elong < 2.0)
+    # the half-light size is only measured well on bright objects: for a faint one in a crowded field
+    # the aperture is ruled by its neighbours and the background residual (C 33: compact, round faint
+    # stars measured 3.4-8x the stars' FWHM and were rejected as extended - 2700 of them stayed in the
+    # starless image).  Faint objects are judged by shape and concentration (below) alone.
+    compact = ((fw < 3.0 * fw_med) | (objs["peak"] < 20 * rms)) & (elong < 2.0)
     star = compact | (sat_peak & (elong < 1.5))
     # concentration index: for a point source total flux ~ 2*pi*sigma^2*peak with the
     # image PSF; galaxy nuclei / compact galaxies / knots carry far more flux than
@@ -686,12 +722,16 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     k = max(5, int(round(3 * fw_med)) | 1)
     th = Lc - cv2.morphologyEx(Lc, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     try:
-        extra = _extract(np.ascontiguousarray(th), 8.0, rms, minarea=3, deblend_cont=0.002)
+        extra = _extract(np.ascontiguousarray(th), 8.0, rms_det, minarea=3, deblend_cont=0.002)
     except Exception:
         extra = []
     if len(extra):
         fe = 2 * sep.flux_radius(th, extra["x"], extra["y"], 6 * extra["a"], 0.5, subpix=5)[0]
-        ok = (fe < 1.6 * fw_med) & (extra["a"] / np.maximum(extra["b"], 1e-3) < 1.6) & (extra["flag"] == 0)
+        # (as above: the size is only trusted on bright objects; and blended / merged detections are
+        # kept - on a star-dense nebula nearly every star touches a neighbour, and requiring flag 0
+        # left all of them on the Veil's filaments)
+        ok = (((fe < 1.6 * fw_med) | (extra["peak"] < 20 * rms)) & (extra["a"] / np.maximum(extra["b"], 1e-3) < 1.6)
+              & ((extra["flag"] & ~0x03) == 0))
         if len(found) and ok.any():
             from scipy.spatial import cKDTree
             d, _ = cKDTree(np.stack([found["x"], found["y"]], 1)).query(np.stack([extra["x"], extra["y"]], 1))
@@ -727,7 +767,12 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
             cv2.circle(mask, (int(round(x)), int(round(y))), int(np.ceil(rr)), 1.0, -1, lineType=cv2.LINE_AA)
         star_mask.last_expanded = 0
         return np.clip(mask, 0, 1)
-    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0)
+    # detection at the image's own noise: on denoised data a faint star is obvious at a peak of 1-4x
+    # the raw stack's per-pixel noise, and with that noise as the detection floor half the stars of
+    # a Milky Way field (C 33: 6965 of ~14000) were never masked - they stayed in the starless
+    # image, and in the AI star remover's training targets, so it learnt to keep them as well.
+    # Their sizes are still measured against the raw stack's noise (below).
+    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0, detect_floor=0.0)
     if len(objs) == 0:
         return mask
     sigma = max(fw, 1.0) / 2.3548
@@ -742,7 +787,14 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
     # Bright stars' real halos are measured from their profiles below.
     r = sigma * np.sqrt(2 * np.log(np.minimum(ratio, 200.0)))
     r = r * 1.35 * grow + 1.0
-    r = np.clip(r, 1.5, 0.08 * max(h, w))
+    # never below one FWHM: a faint star's wings hold half its light, and a core-only disc left
+    # them in the starless image as a ring of dots
+    r = np.clip(r, max(1.5, 1.0 * fw * grow), 0.08 * max(h, w))
+    # and never inside the star's own measured extent (3 x its second-moment size, i.e. ~3 sigma of
+    # its profile): faint stars on denoised data are wider than the bright stars' FWHM, so a disc
+    # sized from that FWHM left their wings outside, and the inpainting filled the disc back up
+    # from them (a dot in every hole)
+    r = np.maximum(r, np.minimum(3.0 * objs["a"] * grow + 1.0, 4.0 * fw * grow + 1.0))
     # bright stars: measure the real extent of the halo from the radial profile
     # (chromatic/scattering halos of small refractors are far wider than a Gaussian)
     # Only the brightest stars carry significant halos: top 2% by peak, or saturated.
@@ -1153,7 +1205,7 @@ def ha_oiii_params(lin: np.ndarray, unmix: bool = True) -> tuple[float, float]:
 
 
 def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0, neutral: np.ndarray | None = None,
-                    params: tuple[float, float] | None = None):
+                    params: tuple[float, float] | None = None, continuum: float | None = None):
     """Split dual-band OSC data into Ha (red pixels) and OIII (green+blue pixels).
 
     Colour filters on a Bayer sensor are not perfectly selective: green/blue
@@ -1186,8 +1238,72 @@ def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0, neu
         ob = np.median(oiii[::4, ::4])
     gain = gain * boost
     g = gain if neutral is None else 1 + (gain - 1) * (1 - neutral)
-    oiii = hb + (oiii - ob) * g
+    if continuum is not None and continuum > 0:
+        # ``continuum``: OIII/Ha of continuum light (the stars', unmixed, before the gain).  Each
+        # pixel's light above the sky is split into continuum (as much as both lines allow), an Ha
+        # line and an OIII line; the continuum goes into both lines equally - white - and only the
+        # OIII *line* gets the gain.  Applied to everything, the gain turned every star, every star
+        # the removal left and the Milky Way's unresolved star clouds teal.
+        h_, o_ = ha - hb, oiii - ob
+        C = np.clip(np.minimum(h_, o_ / continuum), 0, None)
+        oiii = hb + C + (o_ - continuum * C) * g
+    else:
+        oiii = hb + (oiii - ob) * g
     return ha, oiii.astype(np.float32)
+
+
+def _local_sky(x: np.ndarray, px_scale: float, window: float = 96.0) -> np.ndarray:
+    """Robust local sky level of a line map: a median over ~``window`` px (scaled), so stars and
+    filaments do not lift it but the large-scale background does.  96 px: the sky's residual cloud
+    glow comes in patches 50-200 px across, and against a wider window every one of them counted as
+    line emission and was painted red or teal; the Veil's filaments are far narrower."""
+    from scipy.ndimage import median_filter, percentile_filter
+    f = 8
+    h, w = x.shape
+    small = cv2.resize(x, (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA)
+    k = max(5, int(round(window * px_scale / f)) | 1)
+    # the window's median where it is sky, its lower envelope where a nebula fills part of it: there
+    # the median is nebula, and its diffuse light measured as "sky" was rendered grey between red
+    # clumps.  (The envelope everywhere coloured the plain sky again: sky sits above its own 20th
+    # percentile.)  A window is "nebula" when median - envelope exceeds what plain sky gives.
+    med = median_filter(small, size=k, mode="reflect")
+    env = percentile_filter(small, 20, size=k, mode="reflect")
+    d0 = 1.5 * float(np.median(med - env))
+    sky = np.minimum(med, env + d0)
+    sky = cv2.GaussianBlur(sky, (0, 0), k / 4)
+    return cv2.resize(sky, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _line_significance(x: np.ndarray, sigma: float, sky: np.ndarray) -> np.ndarray:
+    """Signal of a linear line map above its local sky, in units of its own noise after a
+    Gaussian blur of ``sigma`` px (noise from the fine-scale residual of the faint pixels).
+    Measured against the *local* sky: against one global level, every large-scale patch of
+    background (a residual of cloud glow a few ADU strong) counted as line emission, and the
+    palette painted the sky in red and teal blotches."""
+    xb = cv2.GaussianBlur(x, (0, 0), sigma)
+    d = xb - sky
+    faint = d[::4, ::4] <= 0
+    resid = (xb - cv2.GaussianBlur(xb, (0, 0), 2 * sigma))[::4, ::4][faint]
+    return d / max(mad_sigma(resid), 1e-12)
+
+
+def _palette_chroma(ha: np.ndarray, oiii: np.ndarray, palette: str, line_s, px_scale: float) -> np.ndarray:
+    """OKLab a/b of the narrowband palette from noise-suppressed line maps (see nonlinear_stage)."""
+    s_fine, s_broad = max(1.0, 1.5 * px_scale), max(3.0, 8.0 * px_scale)
+    sky_h, sky_o = _local_sky(ha, px_scale), _local_sky(oiii, px_scale)
+
+    def chroma(sig):
+        hb, ob = cv2.GaussianBlur(ha, (0, 0), sig), cv2.GaussianBlur(oiii, (0, 0), sig)
+        lab = rgb_to_oklab(palette_compose(line_s(hb), line_s(ob), palette))
+        z = np.maximum(_line_significance(ha, sig, sky_h), _line_significance(oiii, sig, sky_o))
+        return lab[..., 1:], z
+
+    c_fine, z_fine = chroma(s_fine)
+    c_broad, z_broad = chroma(s_broad)
+    # (a few sigma: at 1.5 the sky's own residual texture passed for emission, a red/teal speckle)
+    w_fine = smoothstep(4.0, 7.0, z_fine)[..., None]
+    w_any = np.maximum(smoothstep(2.5, 5.0, z_broad), w_fine[..., 0])[..., None]
+    return ((c_fine * w_fine + c_broad * (1 - w_fine)) * w_any).astype(np.float32)
 
 
 def _chroma_denoise_lab(lab: np.ndarray, amount: float, px_scale: float) -> np.ndarray:
@@ -1460,24 +1576,37 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     tick("Palette")
     if palette in ("hoo", "foraxx", "hoo_warm"):
         # a restoration's own statistics are speckle: the leakage and the OIII scale come from its coadd
-        hp = ha_oiii_params(detect_ref, bool(p["oiii_unmix"])) if detect_ref is not None else None
+        hp = ha_oiii_params(detect_ref if detect_ref is not None else starless, bool(p["oiii_unmix"]))
+        # the continuum's OIII/Ha: the stars', unmixed like the lines and before the gain
+        cont = None
+        if p["star_separation"]:
+            sh_, so_ = extract_ha_oiii(stars_lin, unmix=bool(p["oiii_unmix"]), boost=1.0, params=(hp[0], 1.0))
+            sh_, so_ = sh_ - np.median(sh_[::4, ::4]), so_ - np.median(so_[::4, ::4])
+            sel_ = luminance(stars_lin) > np.percentile(luminance(stars_lin)[::4, ::4], 99)
+            if sel_.sum() > 200 and float(np.sum(sh_[sel_])) > 0:
+                cont = float(np.sum(so_[sel_]) / np.sum(sh_[sel_]))
         ha, oiii = extract_ha_oiii(starless, unmix=bool(p["oiii_unmix"]), boost=float(p["oiii_boost"]), neutral=halo_w,
-                                   params=hp)
+                                   params=hp, continuum=cont)
         # identical stretch for both lines preserves their relative signal/noise
         bpn, Dn, spn = solve_stretch(_stretch_proxy(ha), target, b, nfloor, sm)
-        ha_s = tone_fast(np.clip((ha - bpn) / (1 - bpn), 0, 1), Dn, b, spn, sm)
-        o_s = tone_fast(np.clip((oiii - bpn) / (1 - bpn), 0, 1), Dn, b, spn, sm)
-        pal = palette_compose(ha_s, o_s, palette)
+        line_s = lambda x: tone_fast(np.clip((x - bpn) / (1 - bpn), 0, 1), Dn, b, spn, sm)
+        pal = palette_compose(line_s(ha), line_s(oiii), palette)
+        # Colour comes from noise-suppressed line maps.  Built pixel by pixel, the palette turned the
+        # independent noise of the Ha and OIII pixels into red / cyan colour wherever there is no line
+        # signal - the whole sky - and the synthetic luminance below kept that chroma at full strength.
+        # Chroma is taken at a fine scale where a line is significant there, at a broad scale where it
+        # is only significant when averaged, and is neutral where neither line is significant at all.
+        lab_c = _palette_chroma(ha, oiii, palette, line_s, px_scale)
+        lab_p = rgb_to_oklab(pal)
+        lab_p[..., 1:] = lab_c
         # LRGB-style: palette provides chrominance, the stretched all-channel image
         # provides lightness (synthetic luminance = best SNR, perceptually balanced)
         lm = float(p["synthetic_luminance"])
         if lm > 0:
-            lab_p = rgb_to_oklab(pal)
             lab_l = rgb_to_oklab(sl_s)
             lab_p[..., 0] = (1 - lm) * lab_p[..., 0] + lm * lab_l[..., 0]
-            # keep hue & chroma of the palette relative to the new lightness
-            pal = oklab_to_rgb(lab_p)
-        sl_s = pal
+        # keep hue & chroma of the palette relative to the new lightness
+        sl_s = oklab_to_rgb(lab_p)
     sl_s = neutralize_background(sl_s)
     tick("Local contrast")
     # the whole finishing chain runs in a single OKLab session (one conversion each way)
