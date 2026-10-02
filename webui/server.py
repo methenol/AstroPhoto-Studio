@@ -1009,16 +1009,21 @@ def lab_best():
             continue
         task = TASKS[cfg["task"]]
         allp = t.user_attrs.get("params_all") or {**task.defaults(), **t.params}
-        settings, other = {}, {}
+        settings, processing, other = {}, {}, {}
         for p in task.params:
             if p["name"] in allp:
-                (settings if p.get("pipeline") else other)[p.get("pipeline") or p["name"]] = allp[p["name"]]
+                if p.get("pipeline"):
+                    settings[p["pipeline"]] = allp[p["name"]]
+                elif p.get("processing"):
+                    processing[p["processing"]] = allp[p["name"]]
+                else:
+                    other[p["name"]] = allp[p["name"]]
         if cfg["task"] in ("imagemm", "network"):
             settings["deconv_method"] = cfg["task"]
         out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "task_label": task.label,
                     "dataset": cfg["dataset"].get("name"), "state": _read_status(d).get("state"),
                     "trial": t.number, "values": t.values, "objectives": cfg["objectives"], "criterion": why,
-                    "settings": settings, "not_pipeline": other})
+                    "settings": settings, "processing": processing, "not_pipeline": other})
     return clean_json({"studies": out})
 
 
@@ -1053,9 +1058,11 @@ def lab_detail(sid: str, log_lines: int = 200):
             log = f.readlines()[-log_lines:]
     task = TASKS[cfg["task"]]
     pipeline_map = {p["name"]: p.get("pipeline") for p in task.params}
+    processing_map = {p["name"]: p.get("processing") for p in task.params}
+    code_map = {p["name"]: p.get("code") for p in task.params}
     return clean_json({"id": sid, "config": cfg, "status": st, "trials": rows, "best": best,
                        "importance": importance, "log": "".join(log), "pipeline_map": pipeline_map,
-                       "metrics": task.metrics})
+                       "processing_map": processing_map, "code_map": code_map, "metrics": task.metrics})
 
 
 @app.get("/api/lab/studies/{sid}/trial/{n}.jpg")

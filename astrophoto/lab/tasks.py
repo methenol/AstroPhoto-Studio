@@ -1,7 +1,8 @@
 """Tunable experiments: what a trial runs and how it is scored.
 
-A task declares its parameters (search space, with the pipeline default of each and the
-pipeline setting it maps to), its metrics (with the direction of improvement and whether
+A task declares its parameters (search space, with the pipeline default of each and what it maps
+to: ``pipeline``, an integration & compute option (STACK_DEFAULTS); ``processing``, a processing
+setting (postprocess.DEFAULTS); ``code``, a constant of the code, changed there), its metrics (with the direction of improvement and whether
 they need a ground truth) and two functions: ``prepare`` loads everything a study shares
 between trials, once; ``run`` executes one trial and returns its metrics and a preview.
 
@@ -12,6 +13,7 @@ truth as well.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -109,6 +111,19 @@ def _auto_window(ref: np.ndarray, size: int, where: str = "auto") -> tuple[int, 
         cy, cx = np.unravel_index(np.argmax(sm), sm.shape)
     y0, x0 = int(cy - size // 2), int(cx - size // 2)
     return y0, y0 + size, x0, x0 + size
+
+
+@contextlib.contextmanager
+def _overriding(table: dict, values: dict):
+    """A module's table of constants (``postprocess.STAR_DETECT``, ...) with the keys it shares with
+    ``values`` set for the duration (studies run in their own process: nothing else sees it)."""
+    old = dict(table)
+    table.update({k: v for k, v in values.items() if k in table})
+    try:
+        yield
+    finally:
+        table.clear()
+        table.update(old)
 
 
 def _mean(v):
@@ -525,6 +540,8 @@ class StackTask(Task):
          "default": "auto", "tune": False, "pipeline": "mode"},
         {"name": "scale", "label": "Output scale", "type": "categorical", "choices": [1.0, 1.5, 2.0], "default": 1.0,
          "tune": False, "pipeline": "scale"},
+        {"name": "pattern_correction", "label": "Sensor pattern correction", "type": "bool", "default": True,
+         "tune": False, "pipeline": "pattern_correction"},
     ]
     metrics = {
         "bg_noise": {"label": "Background noise (native pixels)", "direction": "minimize"},
@@ -561,7 +578,8 @@ class StackTask(Task):
         t = time.time()
         try:
             meta = s.run_stack({**STACK_DEFAULTS, **{k: p[k] for k in ("sigma_low", "sigma_high", "local_norm",
-                                                                         "sensitivity", "mode", "scale")}},
+                                                                         "sensitivity", "mode", "scale",
+                                                                         "pattern_correction")}},
                                _prog(log, 20))
             dt = time.time() - t
             st, cov = _load_fits(s._p("stack.fits")), _load_fits(s._p("coverage.fits"))
@@ -592,4 +610,390 @@ class StackTask(Task):
             shutil.rmtree(wd, ignore_errors=True)
 
 
-TASKS = {t.name: t for t in (ImageMMTask(), DenoiseTask(), NetworkTask(), StackTask())}
+# ----------------------------------------------------------------------------- star separation
+_STAR_TRUTH = {k: v for k, v in TRUTH_METRICS.items() if k in ("truth_nrmse", "truth_faint_nrmse", "truth_ssim",
+                                                                  "truth_psnr")}
+STAR_METRICS = {
+    "residual_flux": {"label": "Star flux left in the starless image (fraction)", "direction": "minimize"},
+    "residual_stars": {"label": "Stars still detected in the starless image (fraction)", "direction": "minimize"},
+    "offstar_change": {"label": "Change away from the stars (× noise)", "direction": "minimize"},
+    "seconds": {"label": "Run time (s)", "direction": "minimize"},
+    **_STAR_TRUTH,
+}
+_STAR_OPTIONS = [
+    {"name": "window", "label": "Scored window (px)", "type": "int", "default": 1024},
+    {"name": "where", "label": "Window position", "type": "categorical", "choices": ["auto", "center"],
+     "default": "auto"},
+    {"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0},
+]
+_STAR_SCORING = ("Scored on a window of the linear image (the brightest extended structure, where stars on "
+                 "nebulosity are hardest) against the stars the default detector finds in it: their flux left in "
+                 "the starless image (local-background apertures), the fraction still detected, and the change "
+                 "away from every star (damage to the nebula and sky, × the stack's noise). Synthetic data: the "
+                 "starless image against the true sky without stars.")
+
+
+def _star_prepare(ds, opts, device, log, cancel) -> dict:
+    """The linear image the pipeline separates stars on, a window of it, and the yardstick: the
+    stars the default detector finds there and the default mask's star-free pixels.  A synthetic
+    dataset goes through the linear stage without a restoration, deconvolution or white balance,
+    so that its stars are the subs' mean PSF and the truth is known on that grid."""
+    import sep
+    from ..pipeline import DEFAULTS, _load_fits
+    from ..postprocess import classic_star_separation, detect_stars_for_mask, linear_stage, luminance
+    s = ds.ensure_stacked(log, cancel)
+    ctx = {"ds": ds, "opts": opts, "device": device}
+    if ds.synthetic:
+        st, cov = _load_fits(s._p("stack.fits")), _load_fits(s._p("coverage.fits"))
+        sat = float(s.meta.get("saturation", 63471.0))
+        lin, info = linear_stage(st, cov, None, {**DEFAULTS, "denoise": 0.0, "deconvolution": 0.0,
+                                                 "white_balance": "none"}, sat)
+        detect, rsig = None, None
+    else:
+        log("Linear image with the pipeline's default processing (the first time: background, colour, restoration)")
+        lin, info = s.linear(dict(DEFAULTS))
+        restored = info.get("restoration") == "ImageMM"
+        det = s._lin_cache[3] if restored else None
+        detect = luminance(det) if det is not None else None
+        rsig = info.get("restored_sigma") if restored else None
+    noise = float(info.get("noise_ref") or 0.0)
+    window = _auto_window(lin, int(opts.get("window", 1024)), opts.get("where", "auto"))
+    y0, y1, x0, x1 = window
+    win = np.ascontiguousarray(lin[y0:y1, x0:x1])
+    win_det = np.ascontiguousarray(detect[y0:y1, x0:x1]) if detect is not None else None
+    ctx.update(lin=lin, detect=detect, rsig=rsig, noise=noise, window=window, win=win, win_det=win_det)
+    # the yardstick (default constants: nothing is overridden here)
+    L0 = np.ascontiguousarray(luminance(win), np.float32)
+    if rsig is not None:
+        objs, _, fw = detect_stars_for_mask(win_det, 1.0, noise)
+    else:
+        objs, _, fw = detect_stars_for_mask(L0, 1.0, noise, detect_floor=0.0)
+    if len(objs) < 20:
+        raise RuntimeError(f"only {len(objs)} stars in the window: too few to score a star removal")
+    r_ap = max(1.5 * fw, 2.0)
+    f0, _, _ = sep.sum_circle(L0, objs["x"], objs["y"], r_ap, bkgann=(2.5 * r_ap, 4 * r_ap), subpix=5)
+    keep = f0 > 0
+    smask0, _ = classic_star_separation(win, 1.0, noise_ref=noise, detect_L=win_det, restored_sigma=rsig)
+    k = int(2 * round(2 * fw) + 1)
+    off = cv2.dilate((smask0 > 0.05).astype(np.uint8), np.ones((k, k), np.uint8)) == 0
+    off[:8], off[-8:], off[:, :8], off[:, -8:] = False, False, False, False
+    ctx.update(L0=L0, ref_x=objs["x"][keep], ref_y=objs["y"][keep], ref_f=f0[keep], r_ap=r_ap, fw=fw, off=off)
+    if ds.synthetic:
+        fr = [i for i, f in enumerate(s.analysis["frames"]) if f["accepted"]]
+        sc = float(s.meta.get("scale", 1.0))
+        psf = SY.effective_psf(ds.dir, fr, [s.analysis["frames"][i]["weight"] for i in fr], sc)
+        H, W = s.meta["shape"][:2]
+        ref = s.analysis["ref_idx"]
+        cy0, _, cx0, _ = info.get("crop") or [0, 0, 0, 0]
+        sl = (slice(cy0 + y0, cy0 + y1), slice(cx0 + x0, cx0 + x1))
+        ctx["truth"] = SY.truth_image(ds.dir, ref, (H, W), sc, psf, device=device, stars=False)[sl] / sat
+        ctx["truth_stars"] = SY.truth_image(ds.dir, ref, (H, W), sc, psf, device=device, extended=False)[sl] / sat
+        valid = cv2.erode((win.max(-1) < 0.5).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+        valid[:8], valid[-8:], valid[:, :8], valid[:, -8:] = False, False, False, False
+        ctx["valid"] = valid
+    log(f"Window y {y0}:{y1} x {x0}:{x1}: {int(keep.sum())} reference stars (FWHM {fw:.2f} px), "
+        f"{int(off.mean() * 100)} % of it away from every star")
+    return ctx
+
+
+def _star_score(ctx: dict, starless: np.ndarray) -> dict:
+    import sep
+    from scipy.spatial import cKDTree
+    from ..postprocess import detect_stars_for_mask, luminance
+    L1 = np.ascontiguousarray(luminance(starless), np.float32)
+    r = ctx["r_ap"]
+    f1, _, _ = sep.sum_circle(L1, ctx["ref_x"], ctx["ref_y"], r, bkgann=(2.5 * r, 4 * r), subpix=5)
+    out = {"residual_flux": float(np.clip(f1, 0, None).sum() / ctx["ref_f"].sum())}
+    # stars still there: the default detector on the starless image (a restoration's sky speckle
+    # is kept out by detecting at the stack's noise)
+    objs, _, _ = detect_stars_for_mask(L1, 1.0, ctx["noise"], detect_floor=None if ctx["rsig"] is not None else 0.0)
+    if len(objs):
+        d, _ = cKDTree(np.stack([objs["x"], objs["y"]], 1)).query(np.stack([ctx["ref_x"], ctx["ref_y"]], 1))
+        out["residual_stars"] = float(np.mean(d < max(1.5 * ctx["fw"], 2.0)))
+    else:
+        out["residual_stars"] = 0.0
+    out["n_reference_stars"] = int(len(ctx["ref_x"]))
+    out["offstar_change"] = float(np.mean(np.abs(L1 - ctx["L0"])[ctx["off"]]) / max(ctx["noise"], 1e-9))
+    if ctx["ds"].synthetic:
+        m = MX.truth_metrics(starless, ctx["truth"], ctx["valid"], star_truth=ctx["truth_stars"],
+                             sigma_eval=float(ctx["opts"].get("sigma_eval", 1.0)))
+        out.update(_truth_row(m))
+    return out
+
+
+class StarSeparationTask(Task):
+    name = "stars"
+    label = "Star detection & separation (classic)"
+    description = ("The classic star separation the pipeline uses until the AI star remover is trained, and "
+                   "whose starless image the remover is trained on: star detection (sep, a top-hat pass for "
+                   "stars on bright extended light, shape and concentration tests), photometric masks with "
+                   "measured halos, and push-pull inpainting. " + _STAR_SCORING + " Its parameters are "
+                   "constants of postprocess.py (STAR_DETECT, STAR_MASK).")
+    params = [
+        {"name": "detect_sigma", "label": "Detection threshold (× rms)", "type": "float", "low": 2.0, "high": 8.0,
+         "default": 4.0, "tune": True, "code": "postprocess.STAR_DETECT"},
+        {"name": "tophat_sigma", "label": "Top-hat pass threshold (× rms)", "type": "float", "low": 4.0,
+         "high": 16.0, "default": 8.0, "tune": True, "code": "postprocess.STAR_DETECT"},
+        {"name": "compact_fwhm", "label": "Max. size of a bright star (× FWHM)", "type": "float", "low": 1.5,
+         "high": 6.0, "default": 3.0, "tune": False, "code": "postprocess.STAR_DETECT"},
+        {"name": "max_elongation", "label": "Max. elongation a / b", "type": "float", "low": 1.2, "high": 4.0,
+         "default": 2.0, "tune": False, "code": "postprocess.STAR_DETECT"},
+        {"name": "concentration", "label": "Max. concentration index", "type": "float", "low": 1.5, "high": 6.0,
+         "default": 3.0, "tune": False, "code": "postprocess.STAR_DETECT"},
+        {"name": "deblend_cont", "label": "Deblending contrast", "type": "float", "low": 1e-4, "high": 0.05,
+         "log": True, "default": 0.002, "tune": False, "code": "postprocess.STAR_DETECT"},
+        {"name": "grow", "label": "Mask growth (× every radius)", "type": "float", "low": 0.6, "high": 2.0,
+         "default": 1.0, "tune": True, "code": "postprocess.STAR_MASK"},
+        {"name": "radius_scale", "label": "Mask radius (× core radius at the noise)", "type": "float", "low": 0.8,
+         "high": 2.5, "default": 1.35, "tune": True, "code": "postprocess.STAR_MASK"},
+        {"name": "min_radius_fwhm", "label": "Min. mask radius (× FWHM)", "type": "float", "low": 0.5, "high": 2.5,
+         "default": 1.0, "tune": True, "code": "postprocess.STAR_MASK"},
+        {"name": "halo_floor", "label": "Halo end (fraction of the peak)", "type": "float", "low": 2e-4,
+         "high": 0.02, "log": True, "default": 0.002, "tune": True, "code": "postprocess.STAR_MASK"},
+        {"name": "halo_margin", "label": "Halo mask margin (× halo radius)", "type": "float", "low": 1.0,
+         "high": 1.6, "default": 1.15, "tune": False, "code": "postprocess.STAR_MASK"},
+        {"name": "grain", "label": "Inpainting grain (× texture noise)", "type": "float", "low": 0.0, "high": 3.0,
+         "default": 1.8, "tune": False, "code": "postprocess.STAR_MASK"},
+    ]
+    metrics = {**{k: v for k, v in STAR_METRICS.items() if not k.startswith("truth")},
+               "masked_fraction": {"label": "Area masked and inpainted (fraction)", "direction": "minimize"},
+               **_STAR_TRUTH}
+    options = _STAR_OPTIONS
+    default_objective = "residual_flux"
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        return _star_prepare(ds, opts, device, log, cancel)
+
+    def run(self, ctx, p, log, cancel):
+        from .. import postprocess as PP
+        t = time.time()
+        with _overriding(PP.STAR_DETECT, p), _overriding(PP.STAR_MASK, p):
+            smask, starless = PP.classic_star_separation(ctx["win"], 1.0, noise_ref=ctx["noise"],
+                                                         detect_L=ctx["win_det"], restored_sigma=ctx["rsig"])
+        dt = time.time() - t
+        out = _star_score(ctx, starless)
+        out.update(seconds=dt, masked_fraction=float((smask > 0.3).mean()))
+        return out, starless
+
+
+class StarRemoverTask(Task):
+    name = "star_remover"
+    label = "AI star remover"
+    description = ("The pipeline's AI star remover (starnet.py): a U-Net trained on the dataset's own classic "
+                   "starless image (default constants) with the image's own stars rendered and pasted onto it, "
+                   "then applied to the window. " + _STAR_SCORING)
+    params = [
+        {"name": "iters", "label": "Training steps", "type": "int", "low": 250, "high": 8000, "log": True,
+         "default": 3000, "tune": True, "pipeline": "star_remover_iters"},
+        {"name": "max_lr", "label": "Peak learning rate (one-cycle)", "type": "float", "low": 1e-4, "high": 5e-3,
+         "log": True, "default": 1e-3, "tune": True, "code": "starnet.train"},
+        {"name": "patch", "label": "Patch size", "type": "categorical", "choices": [64, 96, 128, 192],
+         "default": 128, "tune": True, "code": "starnet.train"},
+        {"name": "star_weight", "label": "Extra loss weight on star pixels", "type": "float", "low": 0.0,
+         "high": 10.0, "default": 4.0, "tune": True, "code": "starnet.train"},
+        {"name": "bright_fraction", "label": "Batch share from bright backgrounds", "type": "float", "low": 0.0,
+         "high": 0.9, "default": 0.5, "tune": True, "code": "starnet.train"},
+        {"name": "paste_fraction", "label": "Own bright stars pasted (probability)", "type": "float", "low": 0.0,
+         "high": 1.0, "default": 0.5, "tune": False, "code": "starnet.train"},
+        {"name": "base", "label": "U-Net width (first level)", "type": "categorical", "choices": [16, 24, 32, 48],
+         "default": 32, "tune": False, "code": "starnet.train"},
+    ]
+    metrics = STAR_METRICS
+    options = _STAR_OPTIONS + [{"name": "train_crop", "label": "Training region (px per side; 0 = whole image)",
+                                "type": "int", "default": 2048}]
+    default_objective = "residual_flux"
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        from ..postprocess import classic_star_separation
+        ctx = _star_prepare(ds, opts, device, log, cancel)
+        lin, (y0, y1, x0, x1) = ctx["lin"], ctx["window"]
+        H, W = lin.shape[:2]
+        tc = int(opts.get("train_crop", 2048))
+        if tc and (tc < H or tc < W):
+            cy, cx = (y0 + y1) // 2, (x0 + x1) // 2
+            Y0, X0 = int(np.clip(cy - tc // 2, 0, max(H - tc, 0))), int(np.clip(cx - tc // 2, 0, max(W - tc, 0)))
+            reg = (slice(Y0, min(H, Y0 + tc)), slice(X0, min(W, X0 + tc)))
+        else:
+            reg = (slice(0, H), slice(0, W))
+        ctx["train_lin"] = np.ascontiguousarray(lin[reg])
+        log("Classic starless image of the training region (the remover's training backgrounds)")
+        det = ctx["detect"][reg] if ctx["detect"] is not None else None
+        _, ctx["train_starless"] = classic_star_separation(ctx["train_lin"], 1.0, noise_ref=ctx["noise"],
+                                                           detect_L=det, restored_sigma=ctx["rsig"])
+        m = 64                                   # context round the window for the network
+        Y0, X0 = max(0, y0 - m), max(0, x0 - m)
+        ctx["win_ctx"] = np.ascontiguousarray(lin[Y0:min(H, y1 + m), X0:min(W, x1 + m)])
+        ctx["win_off"] = (y0 - Y0, x0 - X0)
+        return ctx
+
+    def run(self, ctx, p, log, cancel):
+        from .. import starnet
+        t = time.time()
+        net, meta = starnet.train(ctx["train_lin"], ctx["train_starless"], noise=ctx["noise"], iters=int(p["iters"]),
+                                  patch=int(p["patch"]), device=ctx["device"], progress=_prog(log, 250),
+                                  cancel=cancel.is_set, base=int(p["base"]), max_lr=float(p["max_lr"]),
+                                  star_weight=float(p["star_weight"]), bright_fraction=float(p["bright_fraction"]),
+                                  paste_fraction=float(p["paste_fraction"]))
+        full = starnet.remove_stars(net, meta, ctx["win_ctx"])
+        del net
+        oy, ox = ctx["win_off"]
+        h, w = ctx["win"].shape[:2]
+        starless = np.ascontiguousarray(full[oy:oy + h, ox:ox + w])
+        dt = time.time() - t
+        out = _star_score(ctx, starless)
+        out["seconds"] = dt
+        return out, starless
+
+
+# ----------------------------------------------------------------------------- gradient removal
+class BackgroundTask(Task):
+    name = "background"
+    label = "Gradient removal"
+    description = ("The linear stage's background model (light pollution gradient, vignetting residual) fitted to "
+                   "the stack, auto-cropped like the pipeline. Real data: the gradient left in the sky (the range of a "
+                   "robust quadratic over the star-free sky tiles, plus the border's offset from the interior, × the "
+                   "per-pixel noise) and the "
+                   "extended emission kept (the fraction of the emission tiles' signal the model took away). Sky and "
+                   "emission tiles are set once, against a robust plane through the faintest tiles, so no trial's "
+                   "model decides what counts as sky. Where faint emission fills the frame, no tile is "
+                   "sky and the two pull against each other: tune them together (two objectives, Pareto front), "
+                   "or on synthetic data against the truth. Synthetic data: the result against the true "
+                   "sky, whose gradient is known (only a constant offset is fitted). Grid and clipping are "
+                   "constants of postprocess.py (BACKGROUND).")
+    params = [
+        {"name": "bg_method", "label": "Gradient model", "type": "categorical", "choices": ["auto", "poly", "rbf"],
+         "default": "auto", "tune": True, "processing": "bg_method"},
+        {"name": "bg_degree", "label": "Polynomial degree", "type": "int", "low": 1, "high": 4, "default": 2,
+         "tune": True, "processing": "bg_degree"},
+        {"name": "grid", "label": "Sample grid (tiles across)", "type": "int", "low": 8, "high": 48, "default": 24,
+         "tune": True, "code": "postprocess.BACKGROUND"},
+        {"name": "clip_high", "label": "Reject samples above the model (× rms)", "type": "float", "low": 0.5,
+         "high": 4.0, "default": 1.5, "tune": True, "code": "postprocess.BACKGROUND"},
+        {"name": "clip_low", "label": "Reject samples below the model (× rms)", "type": "float", "low": 1.0,
+         "high": 8.0, "default": 4.0, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "start_percentile", "label": "First fit: samples up to this percentile", "type": "float",
+         "low": 30.0, "high": 95.0, "default": 75.0, "tune": False, "code": "postprocess.BACKGROUND"},
+        {"name": "min_sky_fraction", "label": "Star-free area a sample tile needs", "type": "float", "low": 0.1,
+         "high": 0.9, "default": 0.4, "tune": False, "code": "postprocess.BACKGROUND"},
+    ]
+    metrics = {
+        "sky_flatness": {"label": "Gradient left in the sky (× pixel noise)", "direction": "minimize"},
+        "signal_removed": {"label": "Extended emission removed (fraction)", "direction": "minimize"},
+        "seconds": {"label": "Run time (s)", "direction": "minimize"},
+        **{k: v for k, v in TRUTH_METRICS.items() if k in ("truth_nrmse", "truth_faint_nrmse", "truth_ssim",
+                                                             "truth_psnr")},
+    }
+    options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float",
+                "default": 4.0}]
+    default_objective = "sky_flatness"
+
+    @staticmethod
+    def _tiles(T, img):
+        return np.array([np.median(img[sl][m], axis=0) for sl, m in T])
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        from ..pipeline import DEFAULTS, _load_fits
+        from ..postprocess import auto_crop_box, background_model, luminance, mad_sigma, star_mask_simple
+        s = ds.ensure_stacked(log, cancel)
+        st, cov = _load_fits(s._p("stack.fits")), _load_fits(s._p("coverage.fits"))
+        y0, y1, x0, x1 = auto_crop_box(cov, DEFAULTS["crop_threshold"])
+        img = np.ascontiguousarray(st[y0:y1, x0:x1], np.float32)
+        h, w = img.shape[:2]
+        L = luminance(img)
+        smask = star_mask_simple(L)
+        nx, ny = 32, max(4, int(round(32 * h / w)))
+        ys, xs = np.linspace(0, h, ny + 1).astype(int), np.linspace(0, w, nx + 1).astype(int)
+        T, edge = [], []
+        for i in range(ny):
+            for j in range(nx):
+                sl = (slice(ys[i], ys[i + 1]), slice(xs[j], xs[j + 1]))
+                m = ~smask[sl]
+                if m.mean() >= 0.5:
+                    T.append((sl, m))
+                    edge.append(i in (0, ny - 1) or j in (0, nx - 1))
+        # the yardstick, independent of every trial's model: tiles relative to a robust plane fitted to
+        # the faintest ones (a plane cannot follow a nebula; the default model, which can, made a
+        # frame-filling synthetic nebula "sky", and the score then rewarded removing it).  Sky: not
+        # clearly above the plane (vignetted corners included); emission: far above it.
+        T0 = self._tiles(T, img)
+        wl = np.array([0.2126, 0.7152, 0.0722])
+        l0 = T0 @ wl
+        cy = np.array([(sl[0].start + sl[0].stop) / 2 / h for sl, _ in T])
+        cx = np.array([(sl[1].start + sl[1].stop) / 2 / w for sl, _ in T])
+        A = np.stack([np.ones_like(cx), cx, cy], 1)
+        sel = l0 <= np.percentile(l0, 50)
+        for _ in range(10):
+            coef, *_ = np.linalg.lstsq(A[sel], l0[sel], rcond=None)
+            r0 = l0 - A @ coef
+            sd = mad_sigma(r0[sel]) + 1e-9
+            new = r0 < 2.0 * sd
+            if new.sum() < 12 or np.array_equal(new, sel):
+                break
+            sel = new
+        sky = r0 <= 2.5 * sd
+        neb = r0 > 8 * sd
+        noise = np.array([mad_sigma((img[..., c] - cv2.GaussianBlur(img[..., c], (0, 0), 1.5))[::3, ::3])
+                          for c in range(3)], np.float32)
+        quad = np.stack([np.ones_like(cx), cx, cy, cx * cx, cx * cy, cy * cy], 1)
+        ctx = {"ds": ds, "opts": opts, "img": img, "T": T, "T0": T0, "edge": np.array(edge), "sky": sky, "quad": quad,
+               "neb": neb if neb.sum() >= 3 else None, "noise": noise}
+        if ctx["neb"] is None:
+            log("No extended emission found: 'Extended emission removed' is not measured on this dataset")
+        if ds.synthetic:
+            fr = [i for i, f in enumerate(s.analysis["frames"]) if f["accepted"]]
+            sc = float(s.meta.get("scale", 1.0))
+            psf = SY.effective_psf(ds.dir, fr, [s.analysis["frames"][i]["weight"] for i in fr], sc)
+            H, W = st.shape[:2]
+            ref = s.analysis["ref_idx"]
+            sl = (slice(y0, y1), slice(x0, x1))
+            ctx["truth"] = SY.truth_image(ds.dir, ref, (H, W), sc, psf, device=device)[sl]
+            ctx["truth_stars"] = SY.truth_image(ds.dir, ref, (H, W), sc, psf, device=device, extended=False)[sl]
+            sat = float(s.meta.get("saturation", 63471.0))
+            valid = (cov[sl] >= 0.6 * np.percentile(cov[sl], 90))
+            valid &= cv2.erode((img.max(-1) < 0.5 * sat).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+            ctx["valid"] = valid
+        log(f"{len(T)} scoring tiles: {int(sky.sum())} sky, {int(neb.sum())} emission")
+        return ctx
+
+    def run(self, ctx, p, log, cancel):
+        from .. import postprocess as PP
+        img = ctx["img"]
+        t = time.time()
+        with _overriding(PP.BACKGROUND, p):
+            bg, info = PP.background_model(img, p["bg_method"], int(p["bg_degree"]))
+        dt = time.time() - t
+        res = img - bg
+        T1 = self._tiles(ctx["T"], res)
+        sky, edge, Q = ctx["sky"], ctx["edge"], ctx["quad"][ctx["sky"]]
+        flat = 0.0
+        for c in range(3):
+            # the large-scale trend left in the sky (a robust quadratic over the sky tiles: their
+            # tile-to-tile scatter is mostly faint emission's texture, which a gradient model must keep)
+            t_ = T1[sky, c]
+            ok = np.ones(len(t_), bool)
+            for _ in range(3):
+                coef, *_ = np.linalg.lstsq(Q[ok], t_[ok], rcond=None)
+                fit = Q @ coef
+                ok = np.abs(t_ - fit) < 3 * (PP.mad_sigma(t_ - fit) + 1e-12)
+            trend = float(np.percentile(fit, 98) - np.percentile(fit, 2))
+            rim = (abs(float(np.median(t_[edge[sky]])) - float(np.median(t_[~edge[sky]])))
+                   if edge[sky].any() and (~edge[sky]).any() else 0.0)
+            flat = max(flat, (trend + rim) / float(ctx["noise"][c]))
+        out = {"sky_flatness": flat, "seconds": dt, "method_used": info.get("auto") or info.get("method"),
+               "samples": info.get("samples")}
+        if ctx["neb"] is not None:
+            wl = np.array([0.2126, 0.7152, 0.0722])
+            neb = ctx["neb"]
+            e0 = (ctx["T0"][neb] - np.median(ctx["T0"][sky], 0)) @ wl
+            e1 = (T1[neb] - np.median(T1[sky], 0)) @ wl
+            out["signal_removed"] = float(abs(1 - e1.sum() / max(e0.sum(), 1e-12)))
+        if ctx["ds"].synthetic:
+            m = MX.truth_metrics(res, ctx["truth"], ctx["valid"], star_truth=ctx["truth_stars"],
+                                 sigma_eval=float(ctx["opts"].get("sigma_eval", 4.0)), fit_plane=False,
+                                 fit_offset=True)
+            out.update(_truth_row(m))
+        return out, res
+
+
+TASKS = {t.name: t for t in (ImageMMTask(), DenoiseTask(), NetworkTask(), StackTask(), StarSeparationTask(),
+                             StarRemoverTask(), BackgroundTask())}

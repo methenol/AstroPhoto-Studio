@@ -4,7 +4,7 @@
 
 ``<study_dir>/config.json``::
 
-    {"name": ..., "task": "imagemm" | "denoise" | "network" | "stack",
+    {"name": ..., "task": "imagemm" | "denoise" | "network" | "stack" | "stars" | "star_remover" | "background",
      "dataset": {"kind": "real", "folder": ...} | {"kind": "synthetic", "dir": ...},
      "options": {...task options...},
      "space": {param: {"tune": bool, "low", "high", "log", "step", "choices", "value"}},

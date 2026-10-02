@@ -256,9 +256,13 @@ def render_stars(model: dict, n: int, patch: int, rng: np.random.Generator, devi
 
 # ============================================================ training & inference
 def train(lin: np.ndarray, starless: np.ndarray, noise: float = 0.0, iters: int = 3000, patch: int = 128,
-          device="auto", progress=None, cancel=None, seed: int = 0, base: int = 32):
+          device="auto", progress=None, cancel=None, seed: int = 0, base: int = 32, max_lr: float = 1e-3,
+          star_weight: float = 4.0, bright_fraction: float = 0.5, paste_fraction: float = 0.5):
     """Train the star remover on (starless crop + rendered stars -> starless crop) pairs.
-    ``lin``: the linear image (0..1, white level 1); ``starless``: its classic starless image."""
+    ``lin``: the linear image (0..1, white level 1); ``starless``: its classic starless image.
+    ``max_lr``: one-cycle peak learning rate; ``star_weight``: extra loss weight of star pixels;
+    ``bright_fraction``: share of each batch drawn from the brightest backgrounds;
+    ``paste_fraction``: probability of pasting the image's own bright stars into a crop."""
     device = pick_device(device) if isinstance(device, str) else device
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -272,7 +276,7 @@ def train(lin: np.ndarray, starless: np.ndarray, noise: float = 0.0, iters: int 
     use_scaler = device.type == "cuda" and not torch.cuda.is_bf16_supported()
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     opt = torch.optim.Adam(net.parameters(), lr=3e-4)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=1e-3, total_steps=iters, pct_start=0.15)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=max_lr, total_steps=iters, pct_start=0.15)
     bg_all = torch.from_numpy(np.ascontiguousarray(starless.transpose(2, 0, 1))).to(device)
     h, w = starless.shape[:2]
     sig_t = torch.as_tensor(dom.sigma, device=device).view(1, 3, 1, 1)
@@ -290,7 +294,7 @@ def train(lin: np.ndarray, starless: np.ndarray, noise: float = 0.0, iters: int 
         xs = rng.integers(0, w - patch, batch)
         if len(bright):
             pick = bright[rng.integers(0, len(bright), batch)]
-            on = rng.random(batch) < 0.5
+            on = rng.random(batch) < bright_fraction
             ys = np.where(on, np.clip(pick[:, 0] - patch // 2, 0, h - patch - 1), ys)
             xs = np.where(on, np.clip(pick[:, 1] - patch // 2, 0, w - patch - 1), xs)
         bg = torch.stack([bg_all[:, y:y + patch, x:x + patch] for y, x in zip(ys, xs)])
@@ -298,7 +302,7 @@ def train(lin: np.ndarray, starless: np.ndarray, noise: float = 0.0, iters: int 
         bg = torch.rot90(bg, k, (2, 3))
         if rng.random() < 0.5:
             bg = bg.flip(3)
-        stars = paste_stamps(render_stars(model, batch, patch, rng, device), stamps, rng)
+        stars = paste_stamps(render_stars(model, batch, patch, rng, device), stamps, rng, paste_fraction)
         x = bg + stars
         # clipped cores: the linear stage renders anything clipped in one channel neutral (its max
         # channel); they sit at the level the image's brightest stars peak at
@@ -307,7 +311,7 @@ def train(lin: np.ndarray, starless: np.ndarray, noise: float = 0.0, iters: int 
         x = torch.where(clip, torch.full_like(x, lvl), x)
         inp, tgt = dom.fwd_t(x), dom.fwd_t(bg)
         # star pixels weigh more: the sky (identity) is most of every crop
-        wgt = 1 + 4 * (stars.mean(1, keepdim=True) > sig_t.mean()).float()
+        wgt = 1 + star_weight * (stars.mean(1, keepdim=True) > sig_t.mean()).float()
         with _autocast(device):
             pred = net(inp)
         loss = (wgt * (pred.float() - tgt).abs()).mean()

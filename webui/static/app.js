@@ -271,6 +271,9 @@ function applyExperiment(id) {
     if (k === "deconv_method") el.dispatchEvent(new Event("change", { bubbles: true }));
     set.push(`${k} = ${v}`);
   }
+  const proc = Object.entries(e.processing || {});
+  for (const [k, v] of proc) { S.params[k] = v; set.push(`${k} = ${v} (processing)`); }
+  if (proc.length) { applyParamsToUI(); saveParams(); schedulePreview(0); }
   const other = Object.entries(e.not_pipeline || {}).map(([k, v]) => `${k} = ${v}`);
   $("#sp-experiment-info").innerHTML = `Applied trial #${e.trial} of “${e.name}” (${e.criterion}) on ${e.dataset}: ${set.join(", ")}.` +
     (other.length ? ` Not pipeline settings (not applied): ${other.join(", ")}.` : "") + " Re-run the step to use them.";
@@ -311,6 +314,8 @@ function stackParams() {
     imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 2000, imagemm_psf: g("imagemm_psf").value,
     imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
     imagemm_n2n: g("imagemm_n2n").checked, network_groups: parseInt(g("network_groups").value) || 0,
+    pattern_correction: g("pattern_correction").checked,
+    star_remover_iters: parseInt(g("star_remover_iters").value) || 3000,
   };
 }
 function exportOpts() {
@@ -596,6 +601,7 @@ async function refreshDiag() {
 }
 
 function switchTab(name) {
+  if (typeof Lab !== "undefined") Lab.hidePop();
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "process") setTimeout(fitView, 50);

@@ -60,6 +60,7 @@
         <label>Sigma low <input id="sp-sigma_low" type="number" step="0.5" value="4"></label>
         <label>Sigma high <input id="sp-sigma_high" type="number" step="0.5" value="3"></label>
         <label class="check"><input id="sp-local_norm" type="checkbox" checked> Local normalisation</label>
+        <label class="check" title="Measure the fixed pattern calibration left in the subs (residual bias / dark structure) and remove it: one extra stack pass the first time."><input id="sp-pattern_correction" type="checkbox" checked> Sensor pattern correction</label>
         <label>Denoise training steps <input id="sp-denoise_iters" type="number" step="250" value="2000"></label>
         <label title="AI network: a second Noise2Noise network learns to undo the star blur of the stack, checked against the independent half-stack. ImageMM (arXiv:2501.03002): one latent image fitted to every sub at once, each with its own measured PSF, variances and masks (majorization-minimization); the sky background is driven to zero. None: Richardson-Lucy in processing.">Restoration <select id="sp-deconv_method"><option value="imagemm" selected>ImageMM (all subs) — best</option><option value="network">AI network (Noise2Noise)</option><option value="none">None (Richardson-Lucy later)</option></select></label>
         <fieldset id="imagemm-opts"><legend>ImageMM</legend>
@@ -80,6 +81,7 @@
           <input id="sp-imagemm_n2n" type="checkbox"> Noise2Noise pass</label>
         </fieldset>
         <label title="AI network only: replace its data term by ImageMM's multi-frame likelihood (Huber) over this many seeing-group coadds of the other half's subs, each with its own PSF and exact variances. 0 = the single-PSF half-stack loss.">Multi-frame loss groups <input id="sp-network_groups" type="number" step="1" min="0" value="0"></label>
+        <label title="Training steps of the AI star remover (Train star remover step).">Star remover training steps <input id="sp-star_remover_iters" type="number" step="250" min="250" value="3000"></label>
         <label>Compute device <select id="sp-device"></select></label>
       </details>
     </section>

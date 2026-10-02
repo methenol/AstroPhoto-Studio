@@ -98,7 +98,7 @@ const Lab = (() => {
         : p.type === "categorical" ? `<select class="fixed" data-k="value">${p.choices.map(c => `<option ${String(c) === String(s.value) ? "selected" : ""}>${c}</option>`).join("")}</select>`
         : `<input class="fixed" type="number" step="any" data-k="value" value="${s.value}">`;
       return `<div class="lbparam" data-p="${p.name}"><div class="hd"><input type="checkbox" data-k="tune" ${s.tune ? "checked" : ""}>
-        <span title="${esc(p.pipeline ? "pipeline setting: " + p.pipeline : "not a pipeline setting")}">${esc(p.label)}</span>${fixed}</div>${body}</div>`;
+        <span title="${esc(p.pipeline ? "pipeline setting: " + p.pipeline : p.processing ? "processing setting: " + p.processing : p.code ? "constant in " + p.code + ": " + p.name : "not a pipeline setting")}">${esc(p.label)}</span>${fixed}</div>${body}</div>`;
     }).join("");
     $$("#lbSpace [data-k]").forEach(inp => inp.onchange = () => {
       const name = inp.closest("[data-p]").dataset.p, s = L.space[name], k = inp.dataset.k;
@@ -176,11 +176,39 @@ const Lab = (() => {
     }, 3000);
   }
 
+  /* ---------------------------------------------------------------- trial preview on hover */
+  // One popup for the whole tab.  The table is re-rendered under the pointer (a click, the poll
+  // while a study runs), and a replaced row never gets its mouseleave: every re-render, a row
+  // change, scrolling, leaving the table and switching tabs hide it.
+  const pop = { el: null, n: null };
+  function hidePop() { pop.el?.remove(); pop.el = null; pop.n = null; }
+  function placePop(e) {
+    if (!pop.el) return;
+    pop.el.style.left = Math.min(e.clientX + 20, window.innerWidth - 380) + "px";
+    pop.el.style.top = Math.max(10, Math.min(e.clientY - 200, window.innerHeight - 290)) + "px";
+  }
+  function showPop(id, n, e) {
+    if (pop.n !== n) {
+      hidePop();
+      const im = document.createElement("img");
+      im.className = "lbimgpop"; im.alt = "";
+      im.src = `/api/lab/studies/${encodeURIComponent(id)}/trial/${n}.jpg`;
+      document.body.appendChild(im);
+      pop.el = im; pop.n = n;
+    }
+    placePop(e);
+  }
+  document.addEventListener("mouseover", e => { if (pop.el && !e.target.closest?.("#lbDetail tbody tr[data-img]")) hidePop(); });
+  document.addEventListener("scroll", hidePop, true);
+  window.addEventListener("blur", hidePop);
+  document.addEventListener("visibilitychange", hidePop);
+
   /* ---------------------------------------------------------------- detail */
   function objectiveOf(D, k = 0) { return D.config.objectives[k]; }
   function isBetter(a, b, dir) { return dir === "minimize" ? a < b : a > b; }
 
   function renderDetail() {
+    hidePop();
     const D = L.detail, cfg = D.config, st = D.status;
     const done = D.trials.filter(t => t.state === "COMPLETE");
     const tuned = Object.entries(cfg.space).filter(([, v]) => v.tune).map(([k]) => k);
@@ -219,14 +247,19 @@ const Lab = (() => {
         return `<span>${esc(def.label)}</span><b>${f4(v)}${delta}</b>`;
       }).join("");
       const params = shown.metrics ? (Object.entries(shown.params).map(([k, v]) => `<span>${esc(k)}</span><b>${esc(f4(v))}</b>`).join("")) : "";
-      const applicable = Object.keys(shown.params).filter(k => D.pipeline_map[k]);
+      const pmap = D.processing_map || {}, cmap = D.code_map || {};
+      const applicable = Object.keys(shown.params).filter(k => D.pipeline_map[k] || pmap[k]);
+      const stackKeys = applicable.filter(k => D.pipeline_map[k]).map(k => D.pipeline_map[k]);
+      const procKeys = applicable.filter(k => pmap[k]).map(k => pmap[k]);
+      const codeKeys = Object.keys(shown.params).filter(k => !applicable.includes(k));
       bestCard = `<div class="card"><h3>${shown.number === bestNum ? "Best trial" : "Trial"} #${shown.number}${shown.baseline ? " (baseline: current pipeline settings)" : ""}</h3>
         <div class="lbbest"><div>
           <div class="kv">${params}</div>
           <div class="kv" style="margin-top:10px">${mrows}</div>
           ${base && shown.number !== base.number ? `<p class="muted small">Percentages: change from the baseline trial #${base.number}.</p>` : ""}
           ${applicable.length ? `<button class="btn small" id="lbApply" style="margin-top:10px">Apply to the pipeline settings</button>
-            <p class="muted small">Sets ${applicable.map(k => D.pipeline_map[k]).join(", ")} in “Integration &amp; compute options”.${Object.keys(shown.params).length > applicable.length ? " Not pipeline settings: " + Object.keys(shown.params).filter(k => !D.pipeline_map[k]).join(", ") + "." : ""}</p>` : ""}
+            <p class="muted small">Sets ${[stackKeys.length ? `${stackKeys.join(", ")} in “Integration &amp; compute options”` : "", procKeys.length ? `${procKeys.join(", ")} in the processing settings` : ""].filter(Boolean).join(" and ")}.${codeKeys.length ? " Not settings: " + codeKeys.map(k => cmap[k] ? `${k} (a constant in ${cmap[k]})` : k).join(", ") + "." : ""}</p>` : ""}
+          ${!applicable.length && Object.keys(shown.params).length ? `<p class="muted small">These are constants of the code, not settings: ${Object.keys(shown.params).map(k => cmap[k] ? `${k} in ${cmap[k]}` : k).join(", ")}. Change them there to make a better value the default.</p>` : ""}
           ${shown.error ? `<p style="color:var(--bad)" class="small">${esc(shown.error)}</p>` : ""}
         </div><div>${shown.image ? `<img src="/api/lab/studies/${encodeURIComponent(D.id)}/trial/${shown.number}.jpg" alt="">
           <p class="muted small">Same stretch for every trial of this study.</p>` : ""}</div></div></div>`;
@@ -236,7 +269,7 @@ const Lab = (() => {
     const table = `<div class="card"><h3>Trials</h3><div class="lbtable"><table><thead><tr><th>#</th><th>State</th>
       ${cfg.objectives.map(o => `<th>${esc(o.metric)} ${o.direction === "minimize" ? "↓" : "↑"}</th>`).join("")}
       ${tuned.map(k => `<th>${esc(k)}</th>`).join("")}${mcols.map(k => `<th>${esc(k)}</th>`).join("")}<th>Time</th></tr></thead><tbody>
-      ${[...D.trials].reverse().map(t => `<tr data-n="${t.number}" class="${(D.best || []).includes(t.number) ? "best" : ""} ${t.state === "FAIL" ? "fail" : ""}" title="${esc(t.error || "")}">
+      ${[...D.trials].reverse().map(t => `<tr data-n="${t.number}" ${t.image ? "data-img" : ""} class="${(D.best || []).includes(t.number) ? "best" : ""} ${t.state === "FAIL" ? "fail" : ""}" title="${esc(t.error || "")}">
         <td>${t.number}${t.baseline ? " ●" : ""}</td><td>${esc(t.state.toLowerCase())}</td>
         ${cfg.objectives.map((o, i) => `<td class="num">${t.values ? f4(t.values[i]) : "–"}</td>`).join("")}
         ${tuned.map(k => `<td class="num">${esc(f4(t.params[k]))}</td>`).join("")}
@@ -255,23 +288,26 @@ const Lab = (() => {
     $("#lbApply")?.addEventListener("click", () => applyToPipeline(D, shown));
     $$("#lbDetail tbody tr").forEach(tr => {
       tr.onclick = () => { L.trialSel = +tr.dataset.n; renderDetail(); };
-      const t = D.trials.find(q => q.number === +tr.dataset.n);
-      if (!t?.image) return;
-      tr.onmouseenter = e => { const im = document.createElement("img"); im.className = "lbimgpop"; im.src = `/api/lab/studies/${encodeURIComponent(D.id)}/trial/${t.number}.jpg`;
-        im.style.left = Math.min(e.clientX + 20, window.innerWidth - 380) + "px"; im.style.top = Math.max(10, e.clientY - 200) + "px"; document.body.appendChild(im); tr._pop = im; };
-      tr.onmouseleave = () => { tr._pop?.remove(); tr._pop = null; };
+      if (!tr.hasAttribute("data-img")) return;
+      const n = +tr.dataset.n;
+      tr.onmouseenter = e => showPop(D.id, n, e);
+      tr.onmousemove = e => showPop(D.id, n, e);
+      tr.onmouseleave = hidePop;
     });
     $$("#lbDetail [data-trial]").forEach(el => el.onclick = () => { L.trialSel = +el.dataset.trial; renderDetail(); });
   }
 
   function applyToPipeline(D, t) {
-    const set = [];
+    const set = [], pmap = D.processing_map || {};
+    let proc = false;
     for (const [k, v] of Object.entries(t.params)) {
+      if (pmap[k]) { S.params[pmap[k]] = v; proc = true; set.push(`${pmap[k]} = ${v}`); continue; }
       const key = D.pipeline_map[k]; if (!key) continue;
       const el = $("#sp-" + key); if (!el) continue;
       if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
       set.push(`${key} = ${v}`);
     }
+    if (proc) { applyParamsToUI(); saveParams(); schedulePreview(0); }
     const task = D.config.task;
     if (task === "imagemm" || task === "network") { $("#sp-deconv_method").value = task; $("#sp-deconv_method").dispatchEvent(new Event("change", { bubbles: true })); }
     $(".sidebar details.adv").open = true;
@@ -347,5 +383,5 @@ const Lab = (() => {
     return `<div class="lbchart"><h4>${esc(k)} vs ${esc(o.metric)}</h4><svg viewBox="0 0 ${W} ${H}">${ax}${done.map((t, i) => dot(X(sx, xs[i]), Y(sy, t.values[0]), t)).join("")}</svg></div>`;
   }
 
-  return { show };
+  return { show, hidePop };
 })();

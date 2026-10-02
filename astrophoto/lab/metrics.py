@@ -181,12 +181,13 @@ def gaussian_blur(img, sigma):
 
 
 def truth_metrics(est, truth, valid, star_truth=None, stars=None, sigma_eval: float = 1.0,
-                  fit_plane: bool = True, ap_radius: float = 3.0):
+                  fit_plane: bool = True, ap_radius: float = 3.0, fit_offset: bool = False):
     """Comparison of ``est`` with the exact ``truth`` (both (h, w, 3), same grid and units) on
     ``valid`` pixels, after smoothing both with a Gaussian of ``sigma_eval`` pixels (the
     resolution at which they are compared) and, if ``fit_plane``, removing a per-channel
     plane from the difference (the sky background and its gradient are not part of the
-    truth).
+    truth).  ``fit_offset`` (with ``fit_plane`` off) removes only a per-channel constant: for
+    scoring a gradient removal, whose errors a plane would absorb.
 
     * nrmse: rms error / rms of the truth's structure (per channel, averaged); lower is better
     * psnr: 20 log10(truth peak / rms error)
@@ -207,6 +208,8 @@ def truth_metrics(est, truth, valid, star_truth=None, stars=None, sigma_eval: fl
         d = e[..., c] - t[..., c]
         if fit_plane:
             d = d - _plane_fit(d, valid)
+        elif fit_offset:
+            d = d - float(np.median(d[valid]))
         rms = float(np.sqrt(np.mean(d[valid] ** 2)))
         spread = float(np.std(t[..., c][valid])) or 1.0
         nr.append(rms / spread)

@@ -368,7 +368,8 @@ The **Experiments** tab tunes the pipeline with [Optuna](https://optuna.org) stu
 each study you choose:
 
 - an experiment: ImageMM restoration, the Noise2Noise denoiser, the N2N restoration
-  network, or registration & integration
+  network, registration & integration, star detection & separation (classic), the AI star
+  remover, or gradient removal
 - a dataset: a stacked real session, or a **synthetic** one generated in the tab
 - which parameters to tune, and over what ranges
 - one or two objectives
@@ -380,13 +381,22 @@ importances, slice plots, a trials table with a preview of every result in one s
 stretch, and the log. Trial 0 is the pipeline's current settings, so every result is shown
 as a change from the baseline. Stop a study, continue it with more trials, or apply its
 best trial to the pipeline: from the study itself, or with **From experiment** in
-*Integration & compute options*.
+*Integration & compute options*. That sets integration & compute options and processing
+settings. Some tuned values are constants of the code instead, such as the star detection
+thresholds and mask radii (`postprocess.STAR_DETECT`, `STAR_MASK`), the gradient model's
+sampling (`postprocess.BACKGROUND`) and the star remover's training (`starnet.train`). The
+study names these, and a better value becomes the default for every dataset when it is
+changed there.
 
 How results are scored:
 
 - **Real data** is scored on held-out data only, never on data the method saw:
   - restorations: the odd subs, predicted through each one's own PSF
   - the denoiser: the independent half-stack, on held-out bands
+  - star separation and the star remover: the stars the default detector finds in a window
+    (flux left behind and the fraction still detected), and the change away from every star
+  - gradient removal: the flatness of the star-free sky tiles, and how much of the brightest
+    tiles' emission the model took away
 - **Synthetic datasets** are raw subs of an analytic sky in the Seestar S50's format (stars, nebulae,
   galaxies) with the same held-out scores, plus comparison against the exact truth: error,
   SSIM, faint-emission error and star photometry. Each sub has its own dither, field

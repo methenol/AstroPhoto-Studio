@@ -64,6 +64,33 @@ DEFAULTS = {
     "sharpen": 0.25,
 }
 
+# Constants of star detection, star masks and gradient removal.  They are not processing settings
+# (no slider): the experiment lab (lab/tasks.py: "Star detection & separation", "Gradient removal")
+# tunes them - a better value found there is changed here, for every dataset.
+STAR_DETECT = {
+    "detect_sigma": 4.0,      # detection threshold, x the background rms
+    "tophat_sigma": 8.0,      # threshold of the top-hat pass (stars on bright extended light)
+    "compact_fwhm": 3.0,      # a bright object wider than this x the stars' FWHM is extended (not a star)
+    "max_elongation": 2.0,    # a / b above this: not a star
+    "concentration": 3.0,     # flux / (2 pi sigma^2 peak) above this: a galaxy nucleus or a knot
+    "deblend_cont": 0.002,    # sep's deblending contrast
+}
+STAR_MASK = {
+    "grow": 1.0,              # every mask radius x this
+    "radius_scale": 1.35,     # radius x where a star's Gaussian core falls to the noise
+    "min_radius_fwhm": 1.0,   # never below this x the stars' FWHM
+    "halo_floor": 0.002,      # a bright star's halo ends below this fraction of its peak
+    "halo_margin": 1.15,      # mask radius x the measured halo radius
+    "grain": 1.8,             # inpainting: synthetic grain, x the local texture noise
+}
+BACKGROUND = {
+    "grid": 24,               # sample tiles across the frame
+    "min_sky_fraction": 0.4,  # a tile needs this much star-free area to be a sample
+    "start_percentile": 75.0,  # the first fit uses the samples up to this luminance percentile
+    "clip_high": 1.5,         # then keeps samples less than this x the residual rms above the model...
+    "clip_low": 4.0,          # ...and less than this x below it
+}
+
 
 # ============================================================ helpers
 
@@ -232,7 +259,7 @@ def star_mask_simple(L: np.ndarray, k: float = 4.0, grow: int = 3) -> np.ndarray
     return m.astype(bool)
 
 
-def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, grid: int = 24,
+def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, grid: int | None = None,
                      progress=None) -> tuple[np.ndarray, dict]:
     """Model sky background (light pollution gradient + vignetting residual).
 
@@ -241,6 +268,8 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
     a lower-envelope fit that behaves like a careful DBE sample placement.
     """
     h, w, _ = img.shape
+    B = BACKGROUND
+    grid = int(grid or B["grid"])
     L = luminance(img)
     smask = star_mask_simple(L)
     nx = grid
@@ -252,7 +281,7 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
         for j in range(nx):
             tile = img[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
             tm = ~smask[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
-            if tm.mean() < 0.4:
+            if tm.mean() < B["min_sky_fraction"]:
                 continue
             px = tile[tm]
             med = np.median(px, axis=0)
@@ -271,7 +300,7 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
                                                       "method": "none", "degree": 0,
                                                       "note": "too few star-free sky tiles: no gradient removed"}
     lum = vals @ np.array([0.2126, 0.7152, 0.0722])
-    sel = lum <= np.percentile(lum, 75)
+    sel = lum <= np.percentile(lum, B["start_percentile"])
     if method == "auto":
         # the polynomial unless it cannot follow the sky: a vignetting rim, patchy residual glow
         # (C 33: bright edges and corners).  Both are fitted to the same lower-envelope samples and
@@ -284,7 +313,7 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
             for i in range(ny):
                 for j in range(nx):
                     tm_ = ~smask[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
-                    if tm_.mean() >= 0.4:
+                    if tm_.mean() >= B["min_sky_fraction"]:
                         tiles_.append(np.median(sky_[ys[i]:ys[i + 1], xs[j]:xs[j + 1]][tm_], axis=0))
                         edge_.append(i in (0, ny - 1) or j in (0, nx - 1))
             T_, e_ = np.array(tiles_), np.array(edge_)
@@ -319,7 +348,7 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
         pred = model(pts) @ np.array([0.2126, 0.7152, 0.0722])
         r = lum - pred
         s = mad_sigma(r[sel]) + 1e-9
-        new_sel = (r < 1.5 * s) & (r > -4 * s)
+        new_sel = (r < B["clip_high"] * s) & (r > -B["clip_low"] * s)
         if new_sel.sum() < 12:
             break
         if np.array_equal(new_sel, sel):
@@ -652,6 +681,7 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     a restoration or ML denoising the image's own noise no longer describes the data).
     ``detect_floor``: a different floor for the detection threshold alone (the PSF width and
     the returned rms still use ``noise_floor``).  Returns (objects, rms, fwhm)."""
+    D = STAR_DETECT
     Lc = np.ascontiguousarray(L, np.float32)
     # a first coarse pass measures the PSF; the background mesh then scales with it so
     # it follows extended light (galaxy discs, nebula ridges) and stars on top of it
@@ -667,7 +697,7 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     sub = Lc - bkg.back()
     rms = max(bkg.globalrms, noise_floor)
     rms_det = max(bkg.globalrms, noise_floor if detect_floor is None else detect_floor)
-    objs = _extract(sub, 4.0, rms_det, minarea=3, deblend_cont=0.002)
+    objs = _extract(sub, D["detect_sigma"], rms_det, minarea=3, deblend_cont=D["deblend_cont"])
     if len(objs) == 0:
         return objs, rms, 3.0
     fw = 2 * sep.flux_radius(sub, objs["x"], objs["y"], 6 * objs["a"], 0.5, subpix=5)[0]
@@ -683,7 +713,7 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     # the aperture is ruled by its neighbours and the background residual (C 33: compact, round faint
     # stars measured 3.4-8x the stars' FWHM and were rejected as extended - 2700 of them stayed in the
     # starless image).  Faint objects are judged by shape and concentration (below) alone.
-    compact = ((fw < 3.0 * fw_med) | (objs["peak"] < 20 * rms)) & (elong < 2.0)
+    compact = ((fw < D["compact_fwhm"] * fw_med) | (objs["peak"] < 20 * rms)) & (elong < D["max_elongation"])
     star = compact | (sat_peak & (elong < 1.5))
     # concentration index: for a point source total flux ~ 2*pi*sigma^2*peak with the
     # image PSF; galaxy nuclei / compact galaxies / knots carry far more flux than
@@ -710,8 +740,8 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
         r_flat = int(flat[0]) if len(flat) else len(prof)
         probe = int(r_flat + 3 * fw_med)
         sat_star[i] = probe < len(prof) and prof[probe] < 0.12 * pk
-    star &= (conc < 3.0) | sat_star
-    star &= ~(sat_peak & ~sat_star & ~((fw < 3.0 * fw_med) & (conc < 3.0)))
+    star &= (conc < D["concentration"]) | sat_star
+    star &= ~(sat_peak & ~sat_star & ~((fw < D["compact_fwhm"] * fw_med) & (conc < D["concentration"])))
     found = objs[star]
     # stars on bright extended light (a planetary nebula's lobes, a galaxy disc): the mesh background
     # cannot follow structure of a few tens of pixels, so such a star merges with the object into one
@@ -722,7 +752,8 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: flo
     k = max(5, int(round(3 * fw_med)) | 1)
     th = Lc - cv2.morphologyEx(Lc, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     try:
-        extra = _extract(np.ascontiguousarray(th), 8.0, rms_det, minarea=3, deblend_cont=0.002)
+        extra = _extract(np.ascontiguousarray(th), D["tophat_sigma"], rms_det, minarea=3,
+                         deblend_cont=D["deblend_cont"])
     except Exception:
         extra = []
     if len(extra):
@@ -761,7 +792,7 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
         sig = max(float(restored_sigma), 0.5)
         peak = np.maximum(objs["flux"], 0) / (2 * np.pi * sig ** 2)       # the restoration conserves flux
         ratio = np.maximum(peak / max(rms, noise_ref or 0.0, 1e-12), 1.01)
-        r = sig * np.sqrt(2 * np.log(ratio)) * 1.35 * grow + 1.0
+        r = sig * np.sqrt(2 * np.log(ratio)) * STAR_MASK["radius_scale"] * grow + 1.0
         r = np.clip(r, 1.5, 0.02 * max(h, w))
         for x, y, rr in zip(objs["x"], objs["y"], r):
             cv2.circle(mask, (int(round(x)), int(round(y))), int(np.ceil(rr)), 1.0, -1, lineType=cv2.LINE_AA)
@@ -786,10 +817,10 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
     # pure noise criterion balloons the mask (dense Milky Way fields -> 50% masked).
     # Bright stars' real halos are measured from their profiles below.
     r = sigma * np.sqrt(2 * np.log(np.minimum(ratio, 200.0)))
-    r = r * 1.35 * grow + 1.0
+    r = r * STAR_MASK["radius_scale"] * grow + 1.0
     # never below one FWHM: a faint star's wings hold half its light, and a core-only disc left
     # them in the starless image as a ring of dots
-    r = np.clip(r, max(1.5, 1.0 * fw * grow), 0.08 * max(h, w))
+    r = np.clip(r, max(1.5, STAR_MASK["min_radius_fwhm"] * fw * grow), 0.08 * max(h, w))
     # and never inside the star's own measured extent (3 x its second-moment size, i.e. ~3 sigma of
     # its profile): faint stars on denoised data are wider than the bright stars' FWHM, so a disc
     # sized from that FWHM left their wings outside, and the inpainting filled the disc back up
@@ -838,7 +869,7 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
             amp = max(prof[0] - bgc, 1e-9)
             # the halo ends where the channel falls below 0.2% of the star's own peak
             # (or the local pixel noise) – relative, so it works on any background
-            thr = bgc + max(0.002 * amp, 1.0 * pix_noise)
+            thr = bgc + max(STAR_MASK["halo_floor"] * amp, 1.0 * pix_noise)
             below_all &= prof <= thr
             k2 = min(R - 1, int(round(2 * fw)) + 1)
             core_frac = max(core_frac, (prof[k2] - bgc) / amp)
@@ -849,7 +880,7 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
         saturated = L[yi, xi] > 0.85 * lmax if 0 <= yi < h and 0 <= xi < w else False
         if not saturated and core_frac > 0.08:
             continue  # not point-like (galaxy nucleus, nebula knot)
-        new_r = edge * 1.15 * grow + 2
+        new_r = edge * STAR_MASK["halo_margin"] * grow + 2
         if new_r > r[i]:
             r[i] = new_r
             expanded += 1
@@ -1007,7 +1038,7 @@ def inpaint_stars(img: np.ndarray, mask: np.ndarray, seed: int = 0) -> np.ndarra
     resid = img - cv2.GaussianBlur(img, (0, 0), 1.5)
     sig = np.array([mad_sigma(resid[..., c][::3, ::3][hard[::3, ::3] < 0.5]) for c in range(img.shape[2])], np.float32)
     rng = np.random.default_rng(seed)
-    noise = cv2.GaussianBlur(rng.standard_normal(img.shape).astype(np.float32), (0, 0), 0.7) * 1.8 * sig
+    noise = cv2.GaussianBlur(rng.standard_normal(img.shape).astype(np.float32), (0, 0), 0.7) * STAR_MASK["grain"] * sig
     fill = fill + noise
     soft = cv2.GaussianBlur(hard, (0, 0), 1.2)[..., None]
     return (img * (1 - soft) + fill * soft).astype(np.float32)
@@ -1017,8 +1048,8 @@ def classic_star_separation(lin: np.ndarray, px_scale: float = 1.0, noise_ref: f
                             detect_L: np.ndarray | None = None, restored_sigma: float | None = None):
     """Star removal without the network: photometric star mask (``star_mask``) and push-pull
     inpainting.  Arguments at the scale of ``lin``.  Returns (mask, starless)."""
-    smask = star_mask(luminance(lin), px_scale, rgb=lin, noise_ref=noise_ref, detect_L=detect_L,
-                      restored_sigma=restored_sigma)
+    smask = star_mask(luminance(lin), px_scale, grow=STAR_MASK["grow"], rgb=lin, noise_ref=noise_ref,
+                      detect_L=detect_L, restored_sigma=restored_sigma)
     return smask, inpaint_stars(lin, smask)
 
 
