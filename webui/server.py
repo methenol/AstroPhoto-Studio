@@ -510,6 +510,10 @@ def start_job(body: dict = Body(...)):
                     "log": [], "stages": [], "created": time.time(), "started": None, "result": None,
                     "params": body.get("params") or {}, "stack_params": body.get("stack_params") or {},
                     "export_opts": body.get("export") or {}}
+    # set by /api/v1 (webui/api.py): who submitted it, which profile, the client's own reference
+    for k in ("origin", "profile", "client_ref", "label"):
+        if body.get(k):
+            JOBS[job_id][k] = body[k]
     with QUEUE_LOCK:
         QUEUE.append(job_id)
         QUEUE_EVENT.set()
@@ -622,7 +626,8 @@ def rerun_job(job_id: str):
     if not j:
         raise HTTPException(404)
     return start_job({"kind": j["kind"], "folder": j["folder"], "params": j.get("params"),
-                      "stack_params": j.get("stack_params"), "export": j.get("export_opts")})
+                      "stack_params": j.get("stack_params"), "export": j.get("export_opts"),
+                      "origin": j.get("origin"), "profile": j.get("profile"), "label": j.get("label")})
 
 
 @app.delete("/api/jobs")
@@ -1111,6 +1116,14 @@ def lab_delete(sid: str):
         raise HTTPException(409, "Stop the study first")
     shutil.rmtree(d)
     return {"ok": True}
+
+
+# the programmatic API for other programs: /api/v1.  It is given this module
+# itself: run as `python -m webui.server`, an `import webui.server` would load a second copy
+# with its own (empty) job table.
+from webui import api as _api  # noqa: E402
+
+_api.mount(app, sys.modules[__name__])
 
 
 def main():

@@ -112,6 +112,48 @@ docker compose down                               # stop
   `cpus`), not the host's. Stacking and PyTorch share data through `/dev/shm`
   (`SHM_SIZE`, default 8 GB).
 
+### Programmatic API
+
+The web server also has a JSON API at `/api/v1` for scripts and other programs, such as a
+capture computer that queues its sessions when a night ends. Jobs submitted there go into the
+same queue as the UI's and show in its Jobs panel. The API has no authentication, so keep the
+server on a private network.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/health` | Quick reachability check |
+| `GET /api/v1` | Version, devices, profiles, presets, job kinds, images and uploads folders |
+| `GET /api/v1/profiles` | Named restoration recipes (`astrophoto/pipeline.py` `PROFILES`) |
+| `POST /api/v1/datasets/resolve` | Whether the server sees a session folder: sub count, target, filter |
+| `PUT /api/v1/uploads/{path}`, `GET /api/v1/uploads?prefix=` | Upload subs (and calibration) the server cannot see; resumable |
+| `POST /api/v1/jobs` | Queue a job |
+| `GET /api/v1/jobs`, `GET /api/v1/jobs/{id}` | State, stage, progress, ETAs and output files |
+| `POST /api/v1/jobs/{id}/cancel` | Cancel a job |
+| `GET /api/v1/jobs/{id}/files/{name}` | Download an output (JPEG, TIFF, JSON sidecar) |
+| `GET /api/v1/queue`, `POST /api/v1/queue/move` | Running and queued jobs in order, with start estimates; reorder |
+
+```bash
+curl -X POST http://server:8000/api/v1/jobs -H 'content-type: application/json' -d '{
+  "paths": ["DWARF_RAW_TELE_C 33_EXP_15_GAIN_60_2026-09-30-22-11-12-896",
+            "DWARF_RAW_TELE_C 33_EXP_15_GAIN_60_2026-10-01-21-02-01-264"],
+  "profile": "n2n-network", "client_ref": "c33-both-nights"}'
+```
+
+- **Paths** are relative to the images folder (`--images`), or to the uploads folder with
+  `"source": "uploads"` (`<workdir>/uploads`, or `ASTROPHOTO_UPLOADS`). Several `paths` are stacked
+  together as one dataset, like *Stack together with* in the UI. A folder whose subs are in a
+  `lights/` subfolder is also accepted.
+- **kind** defaults to `all` (analyse, stack, restore, star remover, export). The other kinds are
+  the UI's pipeline steps.
+- **profile** picks a restoration recipe. The default, `default`, is `STACK_DEFAULTS` (ImageMM).
+  `n2n-network` (Noise2Noise + the deconvolution network) is the fast one, `n2n-imagemm` adds the
+  Noise2Noise pass to ImageMM, and `n2n-rl` uses Noise2Noise with Richardson–Lucy. `stack_params`,
+  `params` and `preset` override single settings on top of the profile.
+- **client_ref** makes a submission idempotent: sending it again returns the job already queued
+  or finished, so a client can safely retry after a lost reply.
+- Uploaded sessions keep their layout, so a DWARF `CALI_FRAME` uploaded beside the session folders
+  is found as usual.
+
 ## What happens to your data
 
 | Stage | Technique |

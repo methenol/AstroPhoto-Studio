@@ -66,6 +66,22 @@ STACK_DEFAULTS = {
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
 
+# Named restoration recipes for clients that choose one by name instead of setting every option
+# (the /api/v1 job API).  Each holds only what differs from
+# STACK_DEFAULTS, so "default" always follows STACK_DEFAULTS as it changes.
+PROFILES = {
+    "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
+    "imagemm": {"label": "ImageMM: multi-frame restoration of every sub (no Noise2Noise pass)",
+                "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": False}},
+    "n2n-imagemm": {"label": "ImageMM on even / odd subs + Noise2Noise pass",
+                    "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
+    "n2n-network": {"label": "Noise2Noise denoiser + self-supervised deconvolution network (conv2d U-Net); "
+                             "much faster than ImageMM",
+                    "stack_params": {"deconv_method": "network", "ai_deconvolution": True}},
+    "n2n-rl": {"label": "Noise2Noise denoiser, Richardson-Lucy (TV) deconvolution when rendering",
+               "stack_params": {"deconv_method": "none", "ai_deconvolution": False}},
+}
+
 LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree", "bg_smoothing", "bg_correction",
                "white_balance", "spcc_sensor", "spcc_filter", "spcc_white_ref", "denoise", "deconvolution",
                "restored_resolution"]
