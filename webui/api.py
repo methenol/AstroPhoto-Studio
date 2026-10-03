@@ -135,6 +135,8 @@ def _outputs(j: dict) -> list[dict]:
 
 def _view(j: dict, full: bool = False) -> dict:
     v = srv._job_view(j)
+    v["kind_label"] = v["label"]                 # _job_view's label is the kind's name
+    v["label"] = j.get("label") or v.get("dataset")
     v["folders"] = srv.split_folders(j["folder"])
     v["outputs"] = _outputs(j)
     if not full:
@@ -283,7 +285,12 @@ def submit(body: dict = Body(...)):
         "origin": body.get("origin") or "api", "profile": profile, "client_ref": ref,
         "label": body.get("label")})
     import json as _json
-    return JSONResponse(_view(srv.JOBS[_json.loads(job.body)["id"]]) | {"duplicate": False, "dataset_info": srv.clean_json(seen)})
+    j = srv.JOBS[_json.loads(job.body)["id"]]
+    # the session is not scanned before the job runs, so name it from its subs as the UI does
+    if seen.get("object"):
+        j["dataset"] = seen["object"] + (f" ({len(folders)} sessions)" if len(folders) > 1 else "")
+        srv._save_jobs(force=True)
+    return JSONResponse(_view(j) | {"duplicate": False, "dataset_info": srv.clean_json(seen)})
 
 
 @router.get("/jobs")
