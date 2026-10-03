@@ -49,6 +49,13 @@ DEFAULT_SPEC = {
     "nebula": "emission",                    # emission | reflection | none
     "nebula_peak_e": 120.0, "n_galaxies": 6, "galaxy_peak_e": 150.0,
     "hot_pixel_fraction": 3e-4, "trail_fraction": 0.1, "cosmic_rays": 4,
+    # dithering in blocks, as smart telescopes do it (a DWARF: every 6 subs below 60 s): this many
+    # subs share one dither offset and only drift by drift_px per sub; the frame exposed during
+    # each dither is discarded (a gap in time).  1 = an independent dither every sub
+    "dither_every": 1, "drift_px": 0.3,
+    # a per-pixel offset fixed on the sensor (electrons rms), as a dark of another temperature or
+    # from few frames leaves after calibration: the "walking noise" of a slowly drifting field
+    "fixed_pattern_e": 0.0,
 }
 
 
@@ -155,6 +162,13 @@ def frame_geometry(spec: dict) -> list[dict]:
                        "fwhm": fw, "beta": spec["moffat_beta"], "e": e, "psf_angle": float(rng.uniform(0, np.pi)),
                        "transparency": trans,
                        "grad_angle": float(rng.uniform(0, 2 * np.pi)), "trail": bool(rng.random() < spec["trail_fraction"])})
+    every = max(1, int(spec.get("dither_every", 1)))
+    if every > 1:                     # one dither offset per block, a slow drift within it
+        drift = float(spec.get("drift_px", 0.3))
+        for t, f in enumerate(frames):
+            first = frames[t - t % every]
+            f["dx"], f["dy"] = first["dx"] + 0.6 * drift * (t % every), first["dy"] + 0.8 * drift * (t % every)
+            f["block"] = t // every
     return frames
 
 
@@ -310,6 +324,9 @@ def generate(spec: dict, out_dir: str, device=None, progress=None) -> dict:
     cmap = cfa_channel_map(spec["bayer"], (H, W))
     hot = rng.random((H, W)) < spec["hot_pixel_fraction"]
     hot_e = rng.uniform(2e3, 3e4, (H, W)) * hot
+    if spec.get("fixed_pattern_e", 0.0) > 0:      # own generator: the other draws stay as they were
+        hot_e = hot_e + np.random.default_rng(spec["seed"] + 3).normal(0, spec["fixed_pattern_e"], (H, W)).astype(np.float32)
+    every = max(1, int(spec.get("dither_every", 1)))
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     t0 = datetime(2026, 1, 1, 22, 0, 0)
     sky_e = np.asarray(spec["sky_e"], np.float32)
@@ -331,7 +348,8 @@ def generate(spec: dict, out_dir: str, device=None, progress=None) -> dict:
             e[cy, cx] += rng.uniform(2e3, 2e4)
         adu = np.clip(np.round(e / spec["e_per_adu"] + spec["bias_adu"]), 0, 65535).astype(np.uint16)
         hdr = fits.Header()
-        date = t0 + timedelta(seconds=t * (spec["exptime"] + 2.0))
+        # a dithered telescope discards the frame exposed while it moves: one cadence lost per block
+        date = t0 + timedelta(seconds=(t + (t // every if every > 1 else 0)) * (spec["exptime"] + 2.0))
         for k, v in {"CREATOR": "AstroPhoto synthetic", "IMAGETYP": "Light", "OBJECT": spec["name"],
                      "FILTER": spec["filter"], "EXPTIME": spec["exptime"], "EXPOSURE": spec["exptime"],
                      "GAIN": 80, "CCD-TEMP": 20.0, "DATE-OBS": date.isoformat(), "BAYERPAT": spec["bayer"],

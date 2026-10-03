@@ -68,8 +68,10 @@ def main(argv=None):
                    help="0: every sub (the paper); N: N seeing-group coadds")
     r.add_argument("--no-imagemm-accelerate", action="store_true",
                    help="plain MM iterations (default: Biggs-Andrews acceleration, same result, ~2x faster)")
-    r.add_argument("--imagemm-n2n", action="store_true",
-                   help="ImageMM on the even and on the odd subs, combined by a Noise2Noise pass")
+    r.add_argument("--imagemm-n2n", action=argparse.BooleanOptionalAction, default=STACK_DEFAULTS["imagemm_n2n"],
+                   help="ImageMM on the two halves of the subs, combined by a Noise2Noise pass (default on; --no-imagemm-n2n: all subs at once)")
+    r.add_argument("--n2n-split", default=STACK_DEFAULTS["n2n_split"], choices=["alternate", "dither"],
+                   help="how the subs are split into the Noise2Noise halves: alternate frames or whole dither blocks")
     r.add_argument("--network-groups", type=int, default=STACK_DEFAULTS["network_groups"],
                    help="deconvolution network: ImageMM multi-frame likelihood over N seeing groups (0 = off)")
     r.add_argument("--no-star-remover", action="store_true",
@@ -156,7 +158,7 @@ def main(argv=None):
              "imagemm_delta": args.imagemm_delta, "imagemm_kappa": args.imagemm_kappa,
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
-             "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
+             "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n, "n2n_split": args.n2n_split,
              "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
              "star_remover_iters": args.star_remover_iters}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)

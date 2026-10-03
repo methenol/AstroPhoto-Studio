@@ -392,3 +392,83 @@ def finalize_selection(results, ref_idx, grid, sensitivity=1.0) -> dict:
 
     return {"frames": results, "ref_idx": ref_idx, "grid": grid,
             "medians": {k2: float(v) for k2, v in med.items()}}
+
+
+# ------------------------------------------------------------------ dither blocks and the two halves
+
+def dither_blocks(infos: list[FrameInfo], frames: list[dict]) -> np.ndarray:
+    """The dither block of every frame (time order): the runs of subs taken at one pointing.
+
+    A block ends where the mount dithered, seen either way:
+      * a gap in time: the frames exposed while the mount moves are discarded (a DWARF drops
+        one every 6 subs below 60 s, every 10 above), so the cadence jumps;
+      * a jump of the field on the sensor: where the reference frame's centre lands in each
+        sub (from its registration), compared with the slow frame-to-frame drift of tracking
+        and field rotation.
+    Unregistered frames take the block of the frame before them."""
+    n = len(infos)
+    blocks = np.zeros(n, int)
+    if n < 2:
+        return blocks
+    ts = np.array([float(i.timestamp or 0.0) for i in infos])
+    dt = np.diff(ts)
+    pos_dt = dt[dt > 0]
+    cadence = float(np.median(pos_dt)) if pos_dt.size else 0.0
+    gap = (dt > 1.5 * cadence) if cadence > 0 else np.zeros(n - 1, bool)
+    W, H = infos[0].width, infos[0].height
+    c = np.array([W / 2.0, H / 2.0])
+    pos = np.full((n, 2), np.nan)
+    for k, fr in enumerate(frames):
+        M = fr.get("transform")
+        if M is None:
+            continue
+        M = np.asarray(M, float)
+        try:
+            pos[k] = np.linalg.solve(M[:, :2], c - M[:, 2])
+        except np.linalg.LinAlgError:
+            pass
+    step = np.linalg.norm(np.diff(pos, axis=0), axis=1)
+    ok = np.isfinite(step)
+    jump = np.zeros(n - 1, bool)
+    if ok.sum() >= 3:
+        thr = max(3.0, 5.0 * float(np.median(step[ok])))
+        jump[ok] = step[ok] > thr
+    blocks[1:] = np.cumsum(gap | jump)
+    return blocks
+
+
+def half_split(infos: list[FrameInfo], frames: list[dict], mode: str = "alternate", n_sets: int = 2) -> tuple[np.ndarray, dict]:
+    """Assign every accepted frame (``accepted`` and weight > 0) to one of ``n_sets`` independent
+    sets: the Noise2Noise half stacks A / B (and a held-out set C for the experiment lab).
+    Frames that are not stacked get -1.
+
+    ``alternate``: frame by frame (A B A B ...), the classic split.
+    ``dither``: whole dither blocks (``dither_blocks``) go to one set, so the two halves never
+    share a pointing.  Whatever the calibration leaves fixed on the sensor (a dark taken at
+    another temperature or from few frames, residual hot pixels, column offsets) then lands on
+    different sky pixels in A and B and is independent noise for the denoiser, instead of a
+    signal both halves agree on.  Blocks are dealt in time order to the set with the least
+    weight so far, which keeps the sets' depth and their spread over the night alike.  With
+    fewer than 2 x ``n_sets`` blocks (no dithering) it falls back to ``alternate``."""
+    acc = np.array([bool(f["accepted"]) and f["weight"] > 0 for f in frames])
+    labels = np.full(len(frames), -1, int)
+    idx = np.flatnonzero(acc)
+    info = {"requested": mode, "mode": "alternate"}
+    if mode == "dither":
+        blocks = dither_blocks(infos, frames)
+        ub = list(dict.fromkeys(blocks[idx].tolist()))
+        info.update(n_blocks=len(ub), median_block=float(np.median(np.bincount(blocks[idx])[ub])) if ub else 0.0)
+        if len(ub) >= 2 * n_sets:
+            wsum = np.zeros(n_sets)
+            for b in ub:
+                members = idx[blocks[idx] == b]
+                s = int(np.argmin(wsum))
+                labels[members] = s
+                wsum[s] += sum(frames[m]["weight"] for m in members)
+            info.update(mode="dither", weights=[round(float(w), 3) for w in wsum])
+            return labels, info
+        info["fallback"] = f"only {len(ub)} dither block(s) found"
+    elif mode != "alternate":
+        raise ValueError(f"unknown n2n_split {mode!r} (alternate | dither)")
+    labels[idx] = np.arange(len(idx)) % n_sets
+    return labels, info

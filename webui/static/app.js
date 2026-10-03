@@ -314,7 +314,7 @@ function stackParams() {
     imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 2000, imagemm_psf: g("imagemm_psf").value,
     imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
     imagemm_n2n: g("imagemm_n2n").checked, network_groups: parseInt(g("network_groups").value) || 0,
-    pattern_correction: g("pattern_correction").checked,
+    pattern_correction: g("pattern_correction").checked, n2n_split: g("n2n_split").value,
     star_remover_iters: parseInt(g("star_remover_iters").value) || 3000,
   };
 }

@@ -58,7 +58,10 @@ STACK_DEFAULTS = {
     "imagemm_groups": 0,     # 0 = every exposure (the paper); N = N seeing-group coadds
     "imagemm_accelerate": True,  # Biggs & Andrews extrapolation (not in the paper): the converged
                                  # result in half the time of the plain run
-    "imagemm_n2n": False,    # ImageMM on even / odd subs + Noise2Noise pass
+    "imagemm_n2n": True,     # ImageMM on the two halves of the subs + Noise2Noise pass
+    "n2n_split": "alternate",  # how the subs are split into the two Noise2Noise halves (half stacks,
+                               # ImageMM's N2N pass, the network's multi-frame targets): alternate
+                               # (frame by frame) | dither (whole dither blocks, analysis.half_split)
     "star_remover": True,    # train the AI star remover (starnet.py) after the restoration
     "star_remover_iters": 3000,
     "network_groups": 0,     # > 0: the network's data term is ImageMM's multi-frame likelihood over
@@ -73,7 +76,7 @@ PROFILES = {
     "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
     "imagemm": {"label": "ImageMM: multi-frame restoration of every sub (no Noise2Noise pass)",
                 "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": False}},
-    "n2n-imagemm": {"label": "ImageMM on even / odd subs + Noise2Noise pass",
+    "n2n-imagemm": {"label": "ImageMM on the two halves of the subs + Noise2Noise pass",
                     "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-network": {"label": "Noise2Noise denoiser + self-supervised deconvolution network (conv2d U-Net); "
                              "much faster than ImageMM",
@@ -485,7 +488,7 @@ class Session:
                 return Integrator(self.infos, self.analysis, self.defects, mode=p["mode"], scale=float(p["scale"]),
                                   sigma_low=float(p["sigma_low"]), sigma_high=float(p["sigma_high"]),
                                   local_norm=bool(p["local_norm"]), progress=progress,
-                                  cancel=self.checkpoint)
+                                  cancel=self.checkpoint, split=p.get("n2n_split", "alternate"))
             pattern_info = None
             if not p.get("pattern_correction", True):
                 for info in self.infos:
@@ -534,6 +537,7 @@ class Session:
                     "calibration": self._calibration_status(),
                     "sensor_pattern": pattern_info,
                     "local_norm": out.get("local_norm"),
+                    "split": out.get("split"),
                     "created": datetime.now().isoformat(timespec="seconds"),
                     "shape": list(out["stack"].shape)}
             json.dump(meta, open(self._p("stack_meta.json"), "w"), indent=1, default=_json_default)
@@ -591,9 +595,11 @@ class Session:
         s = int(round(s))
         es = self.exposure_set(progress)
         use = es.usable()
+        # the split the stack's halves were made with (its targets are the other half's subs)
+        halves = self.halves((self.meta.get("split") or {}).get("mode", "alternate"))
         sets = []
-        for parity in (1, 0):                       # half A = even stacker frames -> odd-sub targets
-            idx = [k for k in use if k % 2 == parity]
+        for other in (1, 0):                        # half A's targets: the subs of half B, and back
+            idx = [k for k in use if halves[k] == other]
             T_ = es.group_coadds(idx, n_groups, psf_model, progress=progress, cancel=self.checkpoint)
             # the network works in the stack's units, sky pedestal included: put the reference
             # sky model the exposures were background-subtracted by back into the targets
@@ -606,6 +612,14 @@ class Session:
         with open(cache, "wb") as f:            # imagemm/ is cleared when the session is restacked
             pickle.dump(mf, f, protocol=4)
         return mf
+
+    def halves(self, split: str) -> np.ndarray:
+        """Half (0 = A, 1 = B) of every stacked frame, in the order of the stacker's and the
+        prepared exposures' frames (accepted, weight > 0)."""
+        from .analysis import half_split
+        frames = self.analysis["frames"]
+        labels, _ = half_split(self.infos, frames, split)
+        return labels[[i for i, f in enumerate(frames) if f["accepted"] and f["weight"] > 0]]
 
     def run_denoise(self, params: dict | None = None, progress=None):
         """Restoration: Noise2Noise denoiser and (optionally) the N2N deconvolution network,
@@ -634,6 +648,7 @@ class Session:
                     max_iters=int(p["imagemm_max_iters"]),
                     accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
                     n2n_iters=int(p["denoise_iters"]), device=p["device"], progress=progress,
+                    halves=self.halves(p.get("n2n_split", "alternate")) if p.get("imagemm_n2n") else None,
                     kernel_cache=self._p(f"imagemm/kernels_r{r_}_s{sigma}_{p['imagemm_psf']}.pkl"),
                     cancel=self.checkpoint)
                 cov = info.pop("coverage").mean(-1)

@@ -322,10 +322,15 @@ class DenoiseTask(Task):
     name = "denoise"
     label = "Noise2Noise denoiser"
     description = ("The pipeline's Noise2Noise U-Net trained on the two half-stacks (two of every three 256 px "
-                   "bands), applied to half A and scored against half B on the held-out bands "
-                   "(error / half-stack noise variance: 1 = no better than raw, lower is better), "
-                   "and against the truth on synthetic data.")
+                   "bands), applied to half A and scored on the held-out bands. Every third dither block is "
+                   "held out of both halves as a third coadd C: the score against C (\"vs held-out blocks\") is "
+                   "fair to every way of splitting the subs, because C never shares a pointing with A, so "
+                   "pattern fixed on the sensor cannot look like signal. The score against half B (\"held-out "
+                   "error\") favours the frame-by-frame split, whose halves share every pointing. Synthetic data "
+                   "is also scored against the truth.")
     params = [
+        {"name": "split", "label": "Noise2Noise halves", "type": "categorical", "choices": ["alternate", "dither"],
+         "default": "alternate", "tune": True, "pipeline": "n2n_split"},
         {"name": "iters", "label": "Training steps", "type": "int", "low": 250, "high": 8000, "log": True,
          "default": 2000, "tune": True, "pipeline": "denoise_iters"},
         {"name": "max_lr", "label": "Peak learning rate (one-cycle)", "type": "float", "low": 1e-4, "high": 5e-3,
@@ -339,36 +344,53 @@ class DenoiseTask(Task):
          "default": 8, "tune": False},
     ]
     metrics = {
-        "heldout_lin": {"label": "Held-out error, linear (× noise var.)", "direction": "minimize"},
-        "heldout_str": {"label": "Held-out error, stretched (× noise var.)", "direction": "minimize"},
+        "blocks_lin": {"label": "Error vs held-out dither blocks, linear (× reference var.)", "direction": "minimize"},
+        "blocks_str": {"label": "Error vs held-out dither blocks, stretched", "direction": "minimize"},
+        "heldout_lin": {"label": "Held-out error vs half B, linear (× noise var.)", "direction": "minimize"},
+        "heldout_str": {"label": "Held-out error vs half B, stretched (× noise var.)", "direction": "minimize"},
         "seconds": {"label": "Run time (s)", "direction": "minimize"},
         **TRUTH_METRICS,
     }
     options = [{"name": "crop", "label": "Crop (px per side, stack grid)", "type": "int", "default": 1024},
                {"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
-    default_objective = "heldout_str"
+    default_objective = "blocks_str"
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
-        from ..denoise import Stabiliser
+        from ..analysis import half_split
         from ..pipeline import _load_fits
         s = ds.ensure_stacked(log, cancel)
+        frames = s.analysis["frames"]
+        # integrate as the pipeline did: with the sensor pattern when the stack used it
+        if (s.meta.get("params") or {}).get("pattern_correction", True):
+            s._attach_pattern()
+        else:
+            for info in s.infos:
+                info.pattern = None
+        # set 2 = the held-out blocks C (whole dither blocks, one in three by weight); A / B are made
+        # from the rest, per trial, by the split under test
+        labels3, info3 = half_split(s.infos, frames, "dither", n_sets=3)
+        if info3["mode"] != "dither":
+            raise RuntimeError(f"cannot hold out dither blocks: {info3.get('fallback', 'no dither blocks')}")
+        log(f"{info3['n_blocks']} dither blocks (median {info3['median_block']:g} subs); one third held out as C")
         cov = _load_fits(s._p("coverage.fits"))
         sl = _deep_crop(cov, int(opts.get("crop", 1024)))
-        a, b = _load_fits(s._p("half_a.fits"))[sl], _load_fits(s._p("half_b.fits"))[sl]
-        full = _load_fits(s._p("stack.fits"))[sl]
         cov = cov[sl]
+        ctx = {"session": s, "labels3": labels3, "sl": sl, "sets": {}, "device": device, "ds": ds, "opts": opts,
+               "scale": float(s.meta.get("scale", 1.0)), "cancel": cancel, "log": log}
+        a, b, c, full = self._sets(ctx, "dither")
         train, test = MX.split_masks(a.shape)
         good = cov >= 0.6 * np.percentile(cov, 90)
         sat = s.meta.get("saturation", 63471.0)
         unsat = cv2.erode((full.max(-1) < 0.5 * sat).astype(np.uint8), np.ones((13, 13), np.uint8)) > 0
-        stab = Stabiliser(a, b)
-        ctx = {"a": a, "b": b, "full": full, "train": train & good, "test": test, "valid": good & unsat,
-               "stab": stab, "var": MX.NoiseModel(a, b).v, "device": device, "ds": ds, "opts": opts,
-               "ga": stab.fwd(a), "gb": stab.fwd(b), "sl": sl, "scale": float(s.meta.get("scale", 1.0))}
+        # one reference scale for every trial: C against the coadd of the rest (the same frames,
+        # whatever the split)
+        from ..denoise import Stabiliser
+        ctx.update(c=c, full=full, train=train & good, test=test, valid=good & unsat,
+                   v_ref=MX.NoiseModel(c, full).v, stab_ref=Stabiliser(c, full))
         if ds.synthetic:
-            fr = [i for i, f in enumerate(s.analysis["frames"]) if f["accepted"]]
+            fr = [i for i, f in enumerate(frames) if f["accepted"]]
             sc = ctx["scale"]
-            psf = SY.effective_psf(ds.dir, fr, [s.analysis["frames"][i]["weight"] for i in fr], sc)
+            psf = SY.effective_psf(ds.dir, fr, [frames[i]["weight"] for i in fr], sc)
             H, W = s.meta["shape"][:2]
             ref = s.analysis["ref_idx"]
             ctx["truth"] = SY.truth_image(ds.dir, ref, (H, W), sc, psf, device=device)[sl]
@@ -378,17 +400,47 @@ class DenoiseTask(Task):
         log(f"Crop {a.shape[0]}×{a.shape[1]} px of the stack; {int(ctx['train'].mean() * 100)} % of it for training")
         return ctx
 
+    @staticmethod
+    def _sets(ctx, split):
+        """Half stacks A, B (the subs outside C, split the given way), C and the coadd of A + B,
+        cropped; one integration per split, kept for the study."""
+        if split in ctx["sets"]:
+            return ctx["sets"][split]
+        from ..stacking import Integrator
+        s, lab = ctx["session"], ctx["labels3"].copy()
+        rest = np.flatnonzero((lab == 0) | (lab == 1))
+        if split == "alternate":
+            lab[rest] = np.arange(len(rest)) % 2
+        elif split != "dither":
+            raise ValueError(f"unknown split {split}")
+        ctx["log"](f"Integrating the {split} halves A / B and the held-out blocks C")
+        pp = {**(s.meta.get("params") or {})}
+        out = Integrator(s.infos, s.analysis, s.defects, mode=s.meta.get("mode", "auto"), scale=ctx["scale"],
+                         sigma_low=float(pp.get("sigma_low", 4.0)), sigma_high=float(pp.get("sigma_high", 3.0)),
+                         local_norm=bool(pp.get("local_norm", True)), progress=_prog(ctx["log"], 100),
+                         cancel=ctx["cancel"].is_set, labels=lab).run()
+        sl = ctx["sl"]
+        res = (out["half_a"][sl], out["half_b"][sl], out["extra_sets"][0][sl], out["stack"][sl])
+        ctx["sets"][split] = res
+        return res
+
     def run(self, ctx, p, log, cancel):
-        from ..denoise import _batch_and_tile, infer, train_n2n
+        from ..denoise import Stabiliser, _batch_and_tile, infer, train_n2n
         dev = ctx["device"]
+        a, b, c, _ = self._sets(ctx, p.get("split", "alternate"))
+        stab = Stabiliser(a, b)
         _, tile = _batch_and_tile(dev)
         t = time.time()
-        net = train_n2n(ctx["ga"], ctx["gb"], iters=int(p["iters"]), patch=int(p["patch"]), batch=int(p["batch"]),
+        net = train_n2n(stab.fwd(a), stab.fwd(b), iters=int(p["iters"]), patch=int(p["patch"]), batch=int(p["batch"]),
                         device=dev, progress=_prog(log, 250), cancel=cancel.is_set, sample_mask=ctx["train"],
                         max_lr=float(p["max_lr"]), base=int(p["base"]))
-        xa = ctx["stab"].inv(infer(net, ctx["ga"], tile=tile, tta=int(p["tta"])))
+        xa = stab.inv(infer(net, stab.fwd(a), tile=tile, tta=int(p["tta"])))
         dt = time.time() - t
-        out = MX.halfstack_score(xa, ctx["a"], ctx["b"], ctx["test"], ctx["valid"], ctx["stab"], ctx["var"])
+        out = MX.halfstack_score(xa, a, b, ctx["test"], ctx["valid"], stab, MX.NoiseModel(a, b).v)
+        ok = ctx["test"] & ctx["valid"]
+        sr = ctx["stab_ref"]
+        out["blocks_lin"] = float(((xa - c) ** 2 / ctx["v_ref"])[ok].mean())
+        out["blocks_str"] = float(((sr.fwd(xa) - sr.fwd(c)) ** 2)[ok].mean())
         out["seconds"] = dt
         if ctx["ds"].synthetic:
             m = MX.truth_metrics(xa, ctx["truth"], ctx["valid"], star_truth=ctx["truth_stars"], stars=ctx["truth_pos"],

@@ -7,6 +7,11 @@
 # Docker created because it did not exist).
 set -e
 OUT=/data/output
+# PUID usually has no /etc/passwd entry in the image: name the user through the environment, as
+# getpass.getuser() (PyTorch's compile cache, among others) otherwise fails with
+# "getpwuid(): uid not found"
+export USER="${USER:-astrophoto}" LOGNAME="${LOGNAME:-astrophoto}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/torchinductor}"
 
 if [ "$(id -u)" != "0" ]; then
     exec "$@"                       # started with --user: nothing to fix, run as given

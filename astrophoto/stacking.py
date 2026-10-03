@@ -141,11 +141,24 @@ class Integrator:
     def __init__(self, infos: list[FrameInfo], analysis: dict, defects: np.ndarray | None,
                  mode: str = "auto", scale: float = 1.0, sigma_low: float = 4.0,
                  sigma_high: float = 3.0, local_norm: bool = True, workers: int | None = None,
-                 progress=None, cancel=None, psf_groups: int = 0, unit_sink=None):
+                 progress=None, cancel=None, psf_groups: int = 0, unit_sink=None,
+                 split: str = "alternate", labels: np.ndarray | None = None):
         frames = analysis["frames"]
         self.items = [(info, fr) for info, fr in zip(infos, frames) if fr["accepted"] and fr["weight"] > 0]
         if not self.items:
             raise RuntimeError("No frames accepted for stacking")
+        # which half stack each frame goes to (analysis.half_split); ``labels`` (one per frame of
+        # ``infos``, -1 = not stacked) overrides it - the experiment lab adds a held-out set 2
+        from .analysis import half_split
+        if labels is None:
+            labels, self.split_info = half_split(infos, frames, split)
+        else:
+            self.split_info = {"mode": "given", "sets": int(np.max(labels)) + 1}
+        acc = [i for i, fr in enumerate(frames) if fr["accepted"] and fr["weight"] > 0]
+        self.halves = np.asarray(labels)[acc].astype(int)
+        if (self.halves < 0).any():
+            raise ValueError("every stacked frame needs a half (labels >= 0)")
+        self.n_sets = max(2, int(self.halves.max()) + 1)
         self.defects = defects
         self.pattern = infos[0].bayer
         self.bias = infos[0].bias
@@ -411,7 +424,7 @@ class Integrator:
         # one (sum, weight) accumulator per PSF group and parity; without groups
         # that is exactly the two half stacks
         G = int(self.groups.max()) + 1
-        units = [[(np.zeros((H, W, 3), np.float32), np.zeros((H, W, 3), np.float32)) for _ in range(2)]
+        units = [[(np.zeros((H, W, 3), np.float32), np.zeros((H, W, 3), np.float32)) for _ in range(self.n_sets)]
                  for _ in range(G)]
         rejected = np.zeros((H, W), np.uint16)
         clip = n >= 5
@@ -428,7 +441,7 @@ class Integrator:
                 bad |= r < -self.sigma_low
                 wts[bad] = 0
                 rejected += bad.any(-1) & valid
-            acc_s, acc_w = units[self.groups[k]][k % 2]
+            acc_s, acc_w = units[self.groups[k]][self.halves[k]]
             acc_w += wts
             vals *= wts
             acc_s += vals
@@ -439,10 +452,18 @@ class Integrator:
                 for par in range(2):
                     S_, W_ = units[g][par]
                     self.unit_sink(g, par, S_, W_)
+        # sets beyond A and B (the lab's held-out set): their own coadds, not part of the stack
+        extra = []
+        for j in range(2, self.n_sets):
+            S_ = sum(units[g][j][0] for g in range(G))
+            W_ = sum(units[g][j][1] for g in range(G))
+            extra.append(S_ / np.maximum(W_, 1e-6))
+        for g in range(G):
+            units[g] = units[g][:2]
         # fold the groups into the two halves, freeing each group as it is added
-        (SA, WA), (SB, WB) = units[0]
+        (SA, WA), (SB, WB) = units[0][:2]
         for g in range(1, G):
-            for (S_, W_), (acc_s, acc_w) in zip(units[g], ((SA, WA), (SB, WB))):
+            for (S_, W_), (acc_s, acc_w) in zip(units[g][:2], ((SA, WA), (SB, WB))):
                 acc_s += S_
                 acc_w += W_
             units[g] = None
@@ -464,6 +485,8 @@ class Integrator:
             "stack": full,
             "half_a": half_a,
             "half_b": half_b,
+            "extra_sets": extra,
+            "split": self.split_info,
             "coverage": coverage.astype(np.float32),
             "rejected_frac": (rejected.astype(np.float32) / n),
             "mode": self.mode,

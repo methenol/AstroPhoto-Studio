@@ -885,6 +885,7 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
             robust: bool = True, delta: float = 2.0, kappa: float = 2.0, epsilon: float = 1e-6,
             max_iters: int = 1000, accelerate: bool = False, stop: str = "c15", tile: int = 384, device: str = "auto",
             n2n: bool = False, n2n_iters: int = 2000, min_iters: int = 0, kernel_cache: str | None = None,
+            halves: np.ndarray | None = None,
             region: tuple[int, int, int, int] | None = None, progress=None, cancel=None) -> tuple[np.ndarray, dict]:
     """ImageMM over the whole field of the prepared exposures ``es`` (exposures.ExposureSet).
 
@@ -895,7 +896,8 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     complete ImageMM problem with its own padded latent (so flux from just outside the
     cutout is modelled) and its own Eq. C15 stop.  Cutouts overlap by at least two kernel
     widths and are blended with feathered weights.
-    ``n2n``: restore the even and the odd subs separately (disjoint data, independent noise)
+    ``n2n``: restore the two halves of the subs separately (disjoint data, independent noise;
+    ``halves``: 0 / 1 per exposure of ``es`` from ``analysis.half_split``, default even / odd)
     and combine them with ``n2n_pass`` instead of restoring all subs at once.
     ``region``: (y0, y1, x0, x1) of the reference grid to restore instead of the whole field
     (previews, experiments); the result then covers that window only.
@@ -925,7 +927,14 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     # exposure's temporaries; otherwise use smaller cutouts (same overlap, so the same result
     # up to the blending of more seams - see test_tiling in experiments/test_imagemm.py)
     free = free_device_memory(dev)
-    n_exp = len(idx) if not n2n else (len(idx) + 1) // 2
+    if not n2n:
+        sets = [np.arange(len(idx))]
+    elif halves is not None:
+        h = np.asarray(halves)[idx]
+        sets = [np.flatnonzero(h == 0), np.flatnonzero(h == 1)]
+    else:
+        sets = [np.arange(0, len(idx), 2), np.arange(1, len(idx), 2)]
+    n_exp = max(len(q) for q in sets)
     n_exp = min(n_exp, n_groups) if n_groups else n_exp
     if free is not None:
         def need(t):              # bytes: exposures of the cutout + one chunk + ~12 latent-size arrays
@@ -940,7 +949,6 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     step = tile - overlap
     ys = sorted({min(y, max(H0 - tile, 0)) for y in range(0, max(H0 - overlap, 1), step)})
     xs = sorted({min(x, max(W0 - tile, 0)) for x in range(0, max(W0 - overlap, 1), step)})
-    sets = [np.arange(len(idx))] if not n2n else [np.arange(0, len(idx), 2), np.arange(1, len(idx), 2)]
     outs, tiles = [], []
     cov = np.zeros((H0 * r, W0 * r, 3), np.float32)
     ntot = len(ys) * len(xs) * len(sets)

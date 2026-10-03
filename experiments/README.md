@@ -59,6 +59,44 @@ The recent astro papers point the same way: AstroSURE (arXiv:2604.16793) uses a
 ~1 M-parameter U-Net and reports that Noise2Noise nearly matches supervised
 training when paired exposures exist, as they do here.
 
+### Splitting the halves by dither block (`n2n_split`, 2026-10-03)
+
+**Question.** Smart telescopes dither in blocks: a DWARF 3 moves every 6 subs below 60 s and drops
+the frame exposed during the move. Alternating frames (A B A B …) puts both halves at every
+pointing. Whatever calibration leaves fixed on the sensor (a few-frame dark at another temperature
+leaves ~90 ADU rms on a DWARF 3 before `sensor_pattern` removes it) then sits on the same sky pixels
+in A and B. Noise2Noise would keep it as signal. The alternative, `n2n_split: dither`, deals whole
+blocks to the halves. Blocks come from `analysis.dither_blocks`: gaps in the cadence and jumps of the
+field on the sensor.
+
+**A fair score.** The usual held-out score (against half B) cannot judge this, because it rewards
+whatever the two halves share. The lab's denoiser task therefore holds out one third of the dither
+blocks as a separate coadd C. A and B are built from the other subs under each split, the network
+is trained on A/B, and its output from A is scored against C (`blocks_lin`, `blocks_str`). C never
+shares a pointing with A, under either split. On synthetic data the truth decides.
+
+**Results** (2000 steps, 1024 px crop, paired: same subs, same C, same training seed):
+
+| Dataset | Metric | alternate | dither |
+|---|---|---|---|
+| Synthetic, 72 subs in blocks of 6, 12 e⁻ fixed pattern | truth NRMSE | **0.121** | 0.134 |
+| | truth faint NRMSE | 0.061 | **0.058** |
+| | `blocks_str` | **0.0525** | 0.0528 |
+| Same, no fixed pattern (control) | truth NRMSE | **0.119** | 0.133 |
+| | truth faint NRMSE | **0.042** | 0.045 |
+| NGC 281, DWARF 3, 120 subs, 20 blocks | `blocks_lin` | **1.311** | 1.314 |
+| | `blocks_str` | **0.1182** | 0.1185 |
+| | (`heldout_str`, against B: biased) | 0.025 | 0.054 |
+
+**Verdict: no improvement, kept as an option; `alternate` stays the default.**
+- On synthetic data the block split costs ~10 % NRMSE, with and without a fixed pattern. Halves made of whole blocks are less alike in seeing and transparency than interleaved frames.
+- The fixed pattern only moves faint-emission error in its favour by ~10 %, from 5 % worse to 5 % better.
+- On real DWARF 3 data the two are within 0.3 % on the fair score: `sensor_pattern` already removes what the block split was meant to decorrelate.
+- The biased score against half B would have shown the frame split twice as good on real data. It shows nothing about this question.
+
+Reproduce: Experiments tab → *Noise2Noise denoiser*, tune `split`, grid sampler. Synthetic datasets:
+`dither_every: 6`, `fixed_pattern_e: 12`.
+
 ## Deconvolution (`exp_deconv.py`)
 
 Every method gets the N2N-denoised half A and per-channel PSFs measured from the
