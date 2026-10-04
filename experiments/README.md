@@ -387,6 +387,7 @@ Each task declares:
 | `denoise` | N2N U-Net on the half-stacks (steps, peak learning rate, patch, batch, width, self-ensemble) | half-B error on held-out bands, linear and stretched (× noise variance; 1 = raw) | truth seen through the subs' weighted mean PSF |
 | `network` | N2N denoiser + deconvolution network, window held out of training | as `imagemm` | as `imagemm` |
 | `stack` | re-stack in the study folder (rejection σ, local normalisation, resampling, scale, sensitivity) | background noise and star FWHM, both in native pixels | truth through the subs' mean PSF |
+| `autofinish` | Auto-finish with the objective's constants (`autofinish.OBJECTIVE`: weights, soft minimum, slider cost, small-object rule, budget); the trial image is the finished render | distance to the reference looks (always with the default objective), sky grain and colour mottle, mottle on the object, how far the sliders moved | real data only |
 
 The `denoise` task exposes the peak learning rate and patch size. This is the place to
 test whether 2× drizzled stacks want a different schedule; their N2N loss converges to a

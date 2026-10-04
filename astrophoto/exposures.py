@@ -671,6 +671,30 @@ def empirical_psf_field(img: np.ndarray, valid: np.ndarray, cat: dict, half: int
             "support": rsup, "deg": deg, "n_stars": int(N), "psf": _finish_psf(mu_bar, rsup)}
 
 
+def _fit_size(a: np.ndarray, n: int, fill: float = 1e30) -> np.ndarray:
+    """A centred (m, m) array cropped or padded (with ``fill``) to (n, n)."""
+    m = a.shape[-1]
+    if m >= n:
+        o = (m - n) // 2
+        return a[o:o + n, o:o + n]
+    o = (n - m) // 2
+    return np.pad(a, o, constant_values=fill)
+
+
+def scale_psf(K: np.ndarray, sc: float) -> np.ndarray:
+    """Kernels K (..., N, N) radially scaled by ``sc`` about their centre: K_s(x) = K(x / s) / s^2,
+    clipped at 0 and renormalised to unit sum (same N; pad K first to leave room)."""
+    N = K.shape[-1]
+    c = N // 2
+    M_ = np.float32([[1 / sc, 0, c - c / sc], [0, 1 / sc, c - c / sc]])          # dst x <- src c + (x - c) / s
+    flat = K.reshape(-1, N, N)
+    out = np.empty_like(flat, dtype=np.float32)
+    for i, k in enumerate(flat):
+        k = np.clip(cv2.warpAffine(k.astype(np.float32), M_, (N, N), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP), 0, None)
+        out[i] = k / max(float(k.sum()), 1e-30)
+    return out.reshape(K.shape)
+
+
 def hybrid_psf(sub: dict, ref: dict, fwhm: float, r_fit: float = 2.5,
                scales: np.ndarray = np.round(np.arange(0.60, 1.80001, 0.02), 2)) -> dict:
     """Per-exposure PSF field: the deep reference coadd's field PSF, radially scaled to the
@@ -700,14 +724,7 @@ def hybrid_psf(sub: dict, ref: dict, fwhm: float, r_fit: float = 2.5,
     Kr, ms = pad(Kr, nr), pad(ms, n)
     se = np.pad(se, (N - n) // 2, constant_values=1e30)
     c = N // 2
-    Ks = np.empty((len(scales), ny, nx, N, N), np.float32)
-    for q, sc in enumerate(scales):
-        M_ = np.float32([[1 / sc, 0, c - c / sc], [0, 1 / sc, c - c / sc]])       # dst x <- src c + (x - c) / s
-        for i in range(ny):
-            for j in range(nx):
-                k = cv2.warpAffine(Kr[i, j].astype(np.float32), M_, (N, N), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
-                k = np.clip(k, 0, None)
-                Ks[q, i, j] = k / max(float(k.sum()), 1e-30)
+    Ks = np.stack([scale_psf(Kr, sc) for sc in scales])
     rr = np.hypot(*np.mgrid[:N, :N] - c)
     fit = (rr <= r_fit * fwhm) & (se < 1e29)
     w = 1.0 / np.maximum(se[fit], 1e-30) ** 2
@@ -1165,6 +1182,71 @@ class ExposureSet:
         for k in self._STATE:
             setattr(self, k, st[k])
         return self
+
+    def normalise_seeing(self, lams: np.ndarray = np.round(np.arange(0.80, 1.50001, 0.01), 2)) -> list[float]:
+        """Make the exposures' PSFs consistent with the coadd's: the coadd is the mean of the registered
+        exposures, so its PSF is the mean of theirs.  ``hybrid_psf`` scales the coadd's PSF to each
+        exposure's seeing, fitted to the exposure's own mean star profile, and that profile is
+        broadened by the noise of a short sub (centroiding the noisy PSF stars before averaging):
+        on M 42 (DWARF 3, 15 s subs) the scale was 1.09 for the median sub - broader than the coadd
+        they make up - the mean of the exposures' PSFs held 5-11 % less light in the core and 3-8 %
+        more in the wings than the coadd's, and ImageMM, explaining each star's wings as the blur of
+        a too-compact core and unable to put negative light on the sky, emptied a disc round every
+        star to fit the data.
+
+        So per channel the exposures keep their relative seeing (s_t / s_u, which the fits measure
+        well) but share one factor lambda, the one for which the mean of their kernels K(s_t /
+        lambda) best matches the coadd's (least squares over the coadd PSF's support, field means),
+        and every exposure's node kernels are rebuilt from the coadd's at s_t / lambda.  Done once
+        (recorded per channel as "seeing_norm"); returns the factors."""
+        out = []
+        idx = [k for k, p in enumerate(self.params) if p is not None]
+        for c in range(3):
+            ref = self.psf_ref[c] if self.psf_ref else None
+            subs = [k for k in idx if self.params[k]["psf_field"][c] is not None and "scale" in self.params[k]["psf_field"][c]]
+            if ref is None or len(subs) < 3:
+                out.append(1.0)
+                continue
+            if all(self.params[k]["psf_field"][c].get("seeing_norm") is not None for k in subs):
+                out.append(float(self.params[subs[0]]["psf_field"][c]["seeing_norm"]))
+                continue
+            Kr = np.asarray(ref["nodes"], np.float32)                     # (ny, nx, nr, nr), unit sum
+            nr = Kr.shape[-1]
+            st = np.array([float(np.median(self.params[k]["psf_field"][c]["scale"])) for k in subs])
+            N = int(np.ceil(nr * max(st.max() / lams.min(), 1.0))) | 1
+            o = (N - nr) // 2
+            Kp = np.pad(Kr, [(0, 0), (0, 0), (o, o), (o, o)])
+            Km = Kp.mean((0, 1))                                          # the coadd's field-mean PSF
+            cache: dict = {}
+
+            def scaled(sc):
+                sc = round(float(sc), 3)
+                if sc not in cache:
+                    cache[sc] = scale_psf(Kp, sc)
+                return cache[sc]
+
+            def mean_kernel(lam):
+                q, n = np.unique(np.round(st / lam, 3), return_counts=True)
+                return sum(nn * scaled(sc).mean((0, 1)) for sc, nn in zip(q, n)) / len(st)
+            err = [float(((mean_kernel(l) - Km) ** 2).sum()) for l in lams]
+            lam = float(lams[int(np.argmin(err))])
+            sup = float(ref["support"])
+            for k in subs:
+                f = self.params[k]["psf_field"][c]
+                sc = float(np.median(f["scale"])) / lam
+                K = scaled(sc)
+                h = min(N // 2, int(np.ceil(sup * sc)) + 1)
+                K = K[..., N // 2 - h:N // 2 + h + 1, N // 2 - h:N // 2 + h + 1]
+                K = K / np.maximum(K.sum((-2, -1), keepdims=True), 1e-30)
+                f2 = dict(f)
+                f2.update({"nodes": K.astype(np.float32), "mean": K.astype(np.float32), "psf": K.mean((0, 1)).astype(np.float32),
+                           "scale": np.full_like(np.asarray(f["scale"], np.float32), sc), "seeing_norm": lam,
+                           "se": _fit_size(np.asarray(f["se"], np.float32), K.shape[-1])})
+                self.params[k]["psf_field"][c] = f2
+                self.params[k]["psf"][c] = f2["psf"]
+            out.append(lam)
+        self.seeing_norm = out
+        return out
 
     def usable(self) -> list[int]:
         """Exposures with a PSF in every channel (the model needs f(t))."""

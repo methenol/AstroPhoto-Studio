@@ -108,6 +108,13 @@ docker compose down                               # stop
   sharing*; `/Volumes` covers mounted NAS shares).
 - **Calibration library elsewhere:** set `ASTROPHOTO_CALIB` to its path *inside* the container
   (under `/data/images`), or set it per dataset in the UI's *Calibration* panel.
+- **Images on a NAS:** `LOCAL_COPY=true` in `.env` makes every job that reads the subs (calibrate,
+  analyse, stack, ImageMM restore, run everything) copy the dataset's light frames to a local folder
+  first and read them from there, so each stage does not read every sub over the network again.
+  The folder (`LOCAL_DIR`, default `/data/output/.local_copy` on the output volume) is cleared
+  before the copy and deleted when the job ends, also when it fails or is cancelled. It needs free
+  space for one dataset's subs. Natively, set `ASTROPHOTO_LOCAL_COPY=true` (and optionally
+  `ASTROPHOTO_LOCAL_DIR`).
 - **Memory:** worker pools are sized from the container's memory and CPU limits (`mem_limit`,
   `cpus`), not the host's. Stacking and PyTorch share data through `/dev/shm`
   (`SHM_SIZE`, default 8 GB).
@@ -412,7 +419,8 @@ and a list of common names. Without a known class it uses all the dual-band or a
 references. The tuned settings land on the sliders, where you can adjust them further. A report
 above the sliders shows the reference it matched, the distance before and after, and each
 statistic. `autofinish.json` in the session folder keeps the last result. On the CLI,
-`--no-autofinish` turns it off.
+`--no-autofinish` turns it off. The objective's constants can be tuned in the Experiments tab
+(task *Auto-finish (finishing look)*).
 
 ## Gradient removal against a sky survey
 

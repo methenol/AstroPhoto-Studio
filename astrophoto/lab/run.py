@@ -180,10 +180,13 @@ def main():
             if img is not None:
                 from .tasks import stretch
                 import cv2
-                ref = json.load(open(stretch_path)) if os.path.exists(stretch_path) else None
-                im8, ref = stretch(img, ref)
-                if not os.path.exists(stretch_path):
-                    _write_json(stretch_path, ref)
+                if getattr(task, "display_ready", False):          # already a finished (sRGB) image
+                    im8 = (np.clip(img, 0, 1)[..., ::-1] * 255 + 0.5).astype(np.uint8)
+                else:
+                    ref = json.load(open(stretch_path)) if os.path.exists(stretch_path) else None
+                    im8, ref = stretch(img, ref)
+                    if not os.path.exists(stretch_path):
+                        _write_json(stretch_path, ref)
                 s = min(1.0, 900 / max(im8.shape[:2]))
                 if s < 1:
                     im8 = cv2.resize(im8, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)

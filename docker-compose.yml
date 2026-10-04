@@ -35,6 +35,8 @@ x-astrophoto: &astrophoto
 #   ASTROPHOTO_CALIB          extra calibration library inside the container
 #                             (e.g. /data/images/Dwarf/CALI_FRAME), or "off"
 #   ASTROPHOTO_*_RAM_GB       RAM budgets per stage, GB (default: from the container's memory)
+#   ASTROPHOTO_LOCAL_COPY     (LOCAL_COPY in .env) jobs read the subs from a local copy, deleted after
+#   ASTROPHOTO_LOCAL_DIR      (LOCAL_DIR) where that copy goes (default /data/output/.local_copy)
 
 services:
   astrophoto:
@@ -53,6 +55,8 @@ services:
       ASTROPHOTO_STACK_RAM_GB: "${ASTROPHOTO_STACK_RAM_GB:-}"
       ASTROPHOTO_PREP_RAM_GB: "${ASTROPHOTO_PREP_RAM_GB:-}"
       ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
+      ASTROPHOTO_LOCAL_COPY: "${LOCAL_COPY:-false}"
+      ASTROPHOTO_LOCAL_DIR: "${LOCAL_DIR:-}"
     deploy:
       resources:
         reservations:
@@ -77,3 +81,5 @@ services:
       ASTROPHOTO_STACK_RAM_GB: "${ASTROPHOTO_STACK_RAM_GB:-}"
       ASTROPHOTO_PREP_RAM_GB: "${ASTROPHOTO_PREP_RAM_GB:-}"
       ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
+      ASTROPHOTO_LOCAL_COPY: "${LOCAL_COPY:-false}"
+      ASTROPHOTO_LOCAL_DIR: "${LOCAL_DIR:-}"

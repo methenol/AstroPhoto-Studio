@@ -85,7 +85,19 @@ CEILINGS = [
     ("sky_noise", 3.0, 0.004, 0.006),    # grain of the sky
     ("obj_blotch", 2.0, 0.003, 0.004),   # colour mottle on the object (amplified OIII noise: blue patches in Ha)
 ]
-REGULARISE = 1.5                         # cost of moving a setting across its whole range
+# the objective's constants in one place (the Experiments tab's "Auto-finish" task tunes them;
+# lab/tasks.py AutofinishTask): w_<statistic> multiplies that statistic's weight above
+OBJECTIVE = {
+    "regularise": 1.5,          # cost of moving a setting across its whole range
+    "temperature": 2.0,         # soft minimum over the references (lower: closer to the nearest alone)
+    "hue_weight": 3.0,          # hue histogram term (robust, logarithmic) ...
+    "hue_tol": 0.12,            # ... and its scale (fraction of a half turn)
+    "object_frac": 0.08,        # object statistics count fully from this share of the frame ...
+    "object_min_weight": 0.25,  # ... and at least this much for a small object
+    "budget": 140,              # renders of the settings search
+    **{f"w_{k}": 1.0 for k in ("sky_L", "sky_C", "sig_L50", "peak_L", "detail", "C50", "C90", "star_C",
+                                "star_frac", "sky_blotch", "sky_noise", "obj_blotch")},
+}
 
 
 # ------------------------------------------------------------------ statistics
@@ -218,7 +230,7 @@ def object_weight(st: dict) -> float:
     down to a quarter for a small object in a wide field (M 27 in a Seestar frame).  The references
     frame their object closely, and matching its brightness in a wide field only lifts the sky and
     its noise.  Taken from the starting render, so the search cannot lower it."""
-    return float(np.clip(st.get("sig_frac", 1.0) / 0.08, 0.25, 1.0))
+    return float(np.clip(st.get("sig_frac", 1.0) / OBJECTIVE["object_frac"], OBJECTIVE["object_min_weight"], 1.0))
 
 
 def score_one(st: dict, ref: dict, obj_w: float = 1.0) -> tuple[float, dict]:
@@ -228,22 +240,23 @@ def score_one(st: dict, ref: dict, obj_w: float = 1.0) -> tuple[float, dict]:
         if k not in ref:
             continue
         d = (math.log(max(st[k], 1e-6)) - math.log(max(ref[k], 1e-6))) if log else st[k] - ref[k]
-        terms[k] = wgt * (d / tol) ** 2 * (obj_w if k in OBJECT_TERMS else 1.0)
+        terms[k] = OBJECTIVE[f"w_{k}"] * wgt * (d / tol) ** 2 * (obj_w if k in OBJECT_TERMS else 1.0)
     if "hue" in ref:
         # robust: dual-band data cannot always reach an RGB reference's hues, and a quadratic term then
         # outweighed everything else - the cheapest way to lower it was to drain the colour
-        terms["hue"] = obj_w * 3.0 * math.log1p((hue_distance(st["hue"], ref["hue"]) / 0.12) ** 2)
+        terms["hue"] = obj_w * OBJECTIVE["hue_weight"] * math.log1p((hue_distance(st["hue"], ref["hue"]) / OBJECTIVE["hue_tol"]) ** 2)
     for k, wgt, tol, floor in CEILINGS:
         if k in ref:
-            terms[k] = wgt * (max(st[k] - max(ref[k], floor), 0) / tol) ** 2 * (obj_w if k in OBJECT_TERMS else 1.0)
+            terms[k] = OBJECTIVE[f"w_{k}"] * wgt * (max(st[k] - max(ref[k], floor), 0) / tol) ** 2 * (obj_w if k in OBJECT_TERMS else 1.0)
     # quality penalties, whatever the references do
     terms["clip_hi"] = 4.0 * (max(st["clip_hi"] - max(ref.get("clip_hi", 0.0), 0.002), 0) / 0.003) ** 2
     terms["crush"] = 2.0 * (max(st["crush"] - max(ref.get("crush", 0.0), 0.02) - 0.02, 0) / 0.03) ** 2
     return float(sum(terms.values())), terms
 
 
-def score(st: dict, looks: list[dict], obj_w: float = 1.0, temperature: float = 2.0) -> tuple[float, dict]:
+def score(st: dict, looks: list[dict], obj_w: float = 1.0, temperature: float | None = None) -> tuple[float, dict]:
     """Soft minimum of the distances to the reference looks, and the terms of the nearest."""
+    temperature = OBJECTIVE["temperature"] if temperature is None else temperature
     res = [score_one(st, r, obj_w) for r in looks]
     v = np.array([r[0] for r in res])
     soft = float(v.min() - temperature * math.log(np.mean(np.exp(-(v - v.min()) / temperature))))
@@ -265,7 +278,7 @@ def _bounded(key: str, v: float) -> float:
 
 def _reg(q: dict, start: dict, space) -> float:
     """Cost of moving the settings away from where the search started."""
-    return REGULARISE * sum(((float(q[k]) - float(start[k])) / (s[2] - s[1])) ** 2 for s in space for k in [s[0]])
+    return OBJECTIVE["regularise"] * sum(((float(q[k]) - float(start[k])) / (s[2] - s[1])) ** 2 for s in space for k in [s[0]])
 
 
 def fit_grade(img: np.ndarray, looks: list[dict], base: dict, budget: int = 160, obj_w: float = 1.0) -> tuple[dict, float]:
@@ -299,11 +312,13 @@ def fit_grade(img: np.ndarray, looks: list[dict], base: dict, budget: int = 160,
     return g, best
 
 
-def autofinish(session, params: dict | None = None, progress=None, budget: int = 140) -> dict:
+def autofinish(session, params: dict | None = None, progress=None, budget: int | None = None,
+               save: bool = True) -> dict:
     """Tune the processing settings and fit the colour grade of a stacked dataset.  Returns the new
     settings (``params``: the given ones with the tuned keys replaced) and a report.  Also saved as
-    ``autofinish.json`` in the session folder."""
+    ``autofinish.json`` in the session folder (unless ``save`` is False: the Experiments tab's trials)."""
     t0 = time.time()
+    budget = int(OBJECTIVE["budget"] if budget is None else budget)
     meta = session.meta
     obj, filt = meta.get("object") or "", meta.get("filter") or ""
     nb = is_narrowband(filt)
@@ -383,11 +398,12 @@ def autofinish(session, params: dict | None = None, progress=None, budget: int =
     }
     res = {"params": {k: out_params[k] for k in DEFAULTS if k in out_params}, "report": report,
            "created": time.time()}
-    try:
-        with open(os.path.join(session.dir, "autofinish.json"), "w") as fh:
-            json.dump(res, fh, indent=1, default=float)
-    except OSError:
-        pass
+    if save:
+        try:
+            with open(os.path.join(session.dir, "autofinish.json"), "w") as fh:
+                json.dump(res, fh, indent=1, default=float)
+        except OSError:
+            pass
     return res
 
 

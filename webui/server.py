@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import os
 import shutil
@@ -398,38 +399,43 @@ def _run_job(job_id: str):
         job["message"] = "Starting"
         _save_jobs(force=True)
         try:
-            if kind == "calibrate":
-                job["result"] = s.run_calibration(progress)
-            elif kind == "analyse":
-                s.run_analysis(float(stack_params.get("sensitivity", 1.0)), progress)
-                job["result"] = {"n": len(s.infos)}
-            elif kind == "stack":
-                job["result"] = s.run_stack(stack_params, progress)
-                s.plate_solve(progress)              # catalogue stars for the colour calibration
-            elif kind == "denoise":
-                s.run_denoise(stack_params, progress)
-                job["result"] = {"ok": True}
-            elif kind == "starnet":
-                job["result"] = s.train_star_remover(params, stack_params, progress)
-            elif kind == "autofinish":
-                job["result"] = {"autofinish": s.autofinish(params, progress)}
-            elif kind == "all":
-                sp = {**STACK_DEFAULTS, **stack_params}
-                s.run_analysis(sp["sensitivity"], progress)
-                s.run_stack(sp, progress)
-                s.plate_solve(progress)
-                s.run_denoise(sp, progress)
-                if sp["star_remover"]:
-                    s.train_star_remover(params, sp, progress)
-                fin = None
-                if sp["autofinish"]:                 # the tuned settings are the ones exported
-                    fin = s.autofinish(params, progress)
-                    params = fin["params"]
-                job["result"] = s.export(params, progress=progress, **export_opts)
-                if fin:
-                    job["result"]["autofinish"] = fin
-            elif kind == "export":
-                job["result"] = s.export(params, progress=progress, **export_opts)
+            # the stages that read the subs do it from a local copy when ASTROPHOTO_LOCAL_COPY is on
+            sp_ = {**STACK_DEFAULTS, **stack_params}
+            reads_subs = kind in ("calibrate", "analyse", "stack", "all") or (
+                kind == "denoise" and sp_.get("deconv_method") == "imagemm")
+            with (s.local_copy(progress) if reads_subs else contextlib.nullcontext()):
+                if kind == "calibrate":
+                    job["result"] = s.run_calibration(progress)
+                elif kind == "analyse":
+                    s.run_analysis(float(stack_params.get("sensitivity", 1.0)), progress)
+                    job["result"] = {"n": len(s.infos)}
+                elif kind == "stack":
+                    job["result"] = s.run_stack(stack_params, progress)
+                    s.plate_solve(progress)              # catalogue stars for the colour calibration
+                elif kind == "denoise":
+                    s.run_denoise(stack_params, progress)
+                    job["result"] = {"ok": True}
+                elif kind == "starnet":
+                    job["result"] = s.train_star_remover(params, stack_params, progress)
+                elif kind == "autofinish":
+                    job["result"] = {"autofinish": s.autofinish(params, progress)}
+                elif kind == "all":
+                    sp = {**STACK_DEFAULTS, **stack_params}
+                    s.run_analysis(sp["sensitivity"], progress)
+                    s.run_stack(sp, progress)
+                    s.plate_solve(progress)
+                    s.run_denoise(sp, progress)
+                    if sp["star_remover"]:
+                        s.train_star_remover(params, sp, progress)
+                    fin = None
+                    if sp["autofinish"]:                 # the tuned settings are the ones exported
+                        fin = s.autofinish(params, progress)
+                        params = fin["params"]
+                    job["result"] = s.export(params, progress=progress, **export_opts)
+                    if fin:
+                        job["result"]["autofinish"] = fin
+                elif kind == "export":
+                    job["result"] = s.export(params, progress=progress, **export_opts)
             job["state"] = "done"
             job["progress"] = 1.0
             job["message"] = "Finished"

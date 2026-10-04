@@ -6,6 +6,7 @@ interactively without touching the raw frames again.
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import math
@@ -90,6 +91,16 @@ PROFILES = {
 LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree", "bg_smoothing", "bg_correction",
                "white_balance", "spcc_sensor", "spcc_filter", "spcc_white_ref", "denoise", "deconvolution",
                "restored_resolution"]
+
+
+def local_copy_enabled() -> bool:
+    """``ASTROPHOTO_LOCAL_COPY``: jobs read the subs from a local copy (Session.local_copy)."""
+    return os.environ.get("ASTROPHOTO_LOCAL_COPY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def local_copy_dir(workdir: str) -> str:
+    """``ASTROPHOTO_LOCAL_DIR``, else ``<workdir>/.local_copy``."""
+    return os.path.abspath(os.environ.get("ASTROPHOTO_LOCAL_DIR") or os.path.join(workdir, ".local_copy"))
 
 
 def restoration_done(session_dir: str) -> bool:
@@ -568,9 +579,12 @@ class Session:
         path = self._p("imagemm/exposures.pkl")
         if os.path.exists(path):
             try:
-                return self._apply_sky_model(es.load(path))
+                es.load(path)
             except Exception:
                 pass
+            else:
+                es.normalise_seeing()
+                return self._apply_sky_model(es)
         # everything cached from earlier prepared exposures (the network's multi-frame targets)
         # is stale once they are prepared again
         for f in glob.glob(self._p("imagemm/mf_targets_*.pkl")):
@@ -578,6 +592,7 @@ class Session:
         es.prepare(progress=progress, cancel=self.checkpoint)
         os.makedirs(self._p("imagemm"), exist_ok=True)
         es.save(path)
+        es.normalise_seeing()
         return self._apply_sky_model(es)
 
     def multiframe_targets(self, n_groups: int, sigma: float, psf_model: str, progress=None, device="auto") -> dict:
@@ -1056,15 +1071,58 @@ class Session:
         _save_fits(path, lin)
         return path
 
+    # ------------------------------------------------------------- local copy of the subs
+    @contextlib.contextmanager
+    def local_copy(self, progress=None):
+        """Read the subs from a local copy for the duration of a job (``ASTROPHOTO_LOCAL_COPY``):
+        the folder (``ASTROPHOTO_LOCAL_DIR``, default ``<workdir>/.local_copy``) is cleared, the
+        dataset's light frames are copied into it, every read of a sub's pixels or header goes to the
+        copy (frames.local_path; worker processes included), and the copy is removed when the job
+        ends, however it ends.  For a library on a NAS: each stage reads every sub again (analysis,
+        integration, the ImageMM preparation), from the local disk instead of the network.  Off, or
+        with nothing to copy, this does nothing."""
+        from .frames import LOCAL_ENV, local_copy_path
+        if not local_copy_enabled():
+            yield None
+            return
+        root = local_copy_dir(os.path.dirname(self.dir))
+        shutil.rmtree(root, ignore_errors=True)
+        os.makedirs(root, exist_ok=True)
+        prev = os.environ.get(LOCAL_ENV)
+        try:
+            if not self.infos:
+                self.scan(progress)
+            paths = sorted({i.path for i in self.infos})
+            total = sum(os.path.getsize(p) for p in paths)
+            done = 0
+            for n, p in enumerate(paths):
+                q = local_copy_path(p, root)
+                os.makedirs(os.path.dirname(q), exist_ok=True)
+                shutil.copyfile(p, q)
+                done += os.path.getsize(p)
+                if progress:
+                    progress(n + 1, len(paths), f"Copying the subs to the local disk ({n + 1}/{len(paths)}, "
+                                                f"{done / 2**30:.1f} of {total / 2**30:.1f} GB)")
+                self._check_cancel()
+            os.environ[LOCAL_ENV] = root
+            yield root
+        finally:
+            if prev is None:
+                os.environ.pop(LOCAL_ENV, None)
+            else:
+                os.environ[LOCAL_ENV] = prev
+            shutil.rmtree(root, ignore_errors=True)
+
     # ------------------------------------------------------------- one-shot
     def run_all(self, stack_params=None, proc_params=None, progress=None, **export_kw):
         t0 = time.time()
         sp = {**STACK_DEFAULTS, **(stack_params or {})}
-        self.run_analysis(sp["sensitivity"], progress)
-        self.run_stack(sp, progress)
-        self.plate_solve(progress)                     # catalogue stars for the colour calibration
-        if float((proc_params or {}).get("denoise", DEFAULTS["denoise"])) > 0:
-            self.run_denoise(sp, progress)
+        with self.local_copy(progress):                # the stages that read the subs
+            self.run_analysis(sp["sensitivity"], progress)
+            self.run_stack(sp, progress)
+            self.plate_solve(progress)                 # catalogue stars for the colour calibration
+            if float((proc_params or {}).get("denoise", DEFAULTS["denoise"])) > 0:
+                self.run_denoise(sp, progress)
         if sp["star_remover"]:
             self.train_star_remover(proc_params, sp, progress)
         fin = None

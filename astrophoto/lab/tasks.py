@@ -1017,5 +1017,91 @@ class BackgroundTask(Task):
         return out, res
 
 
+# ----------------------------------------------------------------------------- Auto-finish
+class AutofinishTask(Task):
+    name = "autofinish"
+    label = "Auto-finish (finishing look)"
+    display_ready = True        # the trial image is the finished render itself (no lab stretch)
+    description = ("Auto-finish (autofinish.py) on a stacked or restored dataset: the Process settings and the colour "
+                   "grade tuned towards reference astrophotographs of the target (astrophoto/data/"
+                   "autofinish_refs.json). The parameters are the constants of its objective (autofinish.OBJECTIVE): "
+                   "how much each statistic of the look counts, the soft minimum over the references, the cost of "
+                   "moving a slider, the small-object rule and the render budget. The trial image is the "
+                   "auto-finished render. 'Distance to the references' is always scored with the default objective, "
+                   "so trials that change the weights stay comparable; tune it together with the sky's grain or "
+                   "colour mottle (two objectives) to see what a closer match costs. Real data only.")
+    params = [
+        {"name": "regularise", "label": "Cost of moving a slider across its range", "type": "float", "low": 0.0,
+         "high": 6.0, "default": 1.5, "tune": True, "code": "autofinish.OBJECTIVE"},
+        {"name": "temperature", "label": "Soft minimum over the references (lower: nearest only)", "type": "float",
+         "low": 0.25, "high": 10.0, "default": 2.0, "tune": True, "code": "autofinish.OBJECTIVE"},
+        {"name": "hue_weight", "label": "Hue histogram weight", "type": "float", "low": 0.0, "high": 8.0,
+         "default": 3.0, "tune": True, "code": "autofinish.OBJECTIVE"},
+        {"name": "hue_tol", "label": "Hue scale (fraction of a half turn)", "type": "float", "low": 0.04,
+         "high": 0.4, "default": 0.12, "tune": False, "code": "autofinish.OBJECTIVE"},
+        {"name": "object_frac", "label": "Object counts fully from this share of the frame", "type": "float",
+         "low": 0.01, "high": 0.3, "default": 0.08, "tune": False, "code": "autofinish.OBJECTIVE"},
+        {"name": "object_min_weight", "label": "Smallest object weight", "type": "float", "low": 0.0, "high": 1.0,
+         "default": 0.25, "tune": False, "code": "autofinish.OBJECTIVE"},
+        {"name": "budget", "label": "Renders of the settings search", "type": "int", "low": 30, "high": 400,
+         "default": 140, "tune": False, "code": "autofinish.OBJECTIVE"},
+        *[{"name": f"w_{k}", "label": f"Weight × {lbl}", "type": "float", "low": 0.0, "high": 4.0, "default": 1.0,
+           "tune": k in ("sky_L", "C50", "sky_noise", "sky_blotch"), "code": "autofinish.OBJECTIVE"}
+          for k, lbl in (("sky_L", "sky brightness"), ("sky_C", "sky colour cast"), ("sig_L50", "object midtones"),
+                         ("peak_L", "brightest structures"), ("detail", "structure contrast"),
+                         ("C50", "colourfulness"), ("C90", "vivid colour"), ("star_C", "star colour"),
+                         ("star_frac", "star coverage (ceiling)"), ("sky_blotch", "sky colour mottle (ceiling)"),
+                         ("sky_noise", "sky grain (ceiling)"), ("obj_blotch", "object colour mottle (ceiling)"))],
+    ]
+    metrics = {
+        "distance": {"label": "Distance to the references (default objective)", "direction": "minimize"},
+        "sky_noise": {"label": "Sky grain (OKLab L, 800 px)", "direction": "minimize"},
+        "sky_blotch": {"label": "Sky colour mottle", "direction": "minimize"},
+        "obj_blotch": {"label": "Colour mottle on the object", "direction": "minimize"},
+        "moved": {"label": "How far the sliders moved (sum of squares, fraction of range)", "direction": "minimize"},
+        "seconds": {"label": "Run time (s)", "direction": "minimize"},
+    }
+    default_objective = "distance"
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        from .. import autofinish as AF
+        if ds.synthetic:
+            raise RuntimeError("Auto-finish compares the look with photographs of the target: it needs a real dataset")
+        s = ds.session()
+        if not s.status()["stacked"]:
+            raise RuntimeError("Stack the dataset in the pipeline first")
+        looks, _, desc, _ = AF.reference_looks(s.meta.get("object"), AF.is_narrowband(s.meta.get("filter") or ""))
+        log(f"References: {desc}")
+        s.render_inputs({}, max_size=AF.PROXY)          # linear stage (and the star remover) once, cached
+        return {"session": s, "looks": looks, "defaults": dict(AF.OBJECTIVE)}
+
+    def run(self, ctx, p, log, cancel):
+        from .. import autofinish as AF
+        from ..postprocess import DEFAULTS, nonlinear_stage
+        s = ctx["session"]
+        t = time.time()
+        def progress(i, n, msg):
+            if cancel.is_set():
+                raise RuntimeError("cancelled")
+        with _overriding(AF.OBJECTIVE, p):
+            res = AF.autofinish(s, {}, progress=progress, save=False)
+        dt = time.time() - t
+        q = res["params"]
+        lin, extra, f, _ = s.render_inputs(q, max_size=AF.PROXY)
+        img = nonlinear_stage(lin, extra, s.meta.get("filter", ""), px_scale=f)
+        st = AF.look_stats(img)
+        dist = AF.score(st, ctx["looks"], AF.object_weight(AF.look_stats(
+            nonlinear_stage(lin, {**DEFAULTS, **{k: v for k, v in extra.items() if k.startswith("_")}},
+                            s.meta.get("filter", ""), px_scale=f))))[0]
+        space = [x for x in AF.SEARCH] + [(k, lo, hi, 0) for k, lo, hi in AF.GRADE_SEARCH]
+        moved = sum(((float(q.get(k, DEFAULTS[k])) - float(DEFAULTS[k])) / (hi - lo)) ** 2 for k, lo, hi, _ in space)
+        rep = res["report"]
+        log(f"{rep['reference']}: {rep['score_before']} -> {rep['score_after']} (this trial's objective); "
+            f"nearest: {(rep.get('nearest') or {}).get('title')}")
+        return {"distance": dist, "sky_noise": st["sky_noise"], "sky_blotch": st["sky_blotch"],
+                "obj_blotch": st["obj_blotch"], "moved": moved, "seconds": dt,
+                "palette": q.get("palette"), "nearest": (rep.get("nearest") or {}).get("title")}, img
+
+
 TASKS = {t.name: t for t in (ImageMMTask(), DenoiseTask(), NetworkTask(), StackTask(), StarSeparationTask(),
-                             StarRemoverTask(), BackgroundTask())}
+                             StarRemoverTask(), BackgroundTask(), AutofinishTask())}

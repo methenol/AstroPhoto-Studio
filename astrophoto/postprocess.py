@@ -34,11 +34,13 @@ DEFAULTS = {
     "spcc_white_ref": "average_spiral_galaxy",  # white reference: average_spiral_galaxy | g2v
     "denoise": 0.95,            # blend with Noise2Noise result (0..1)
     "deconvolution": 0.7,       # 0..1 strength (AI deconvolution blend, or Richardson-Lucy fallback)
-    "restored_resolution": 1.25,  # ImageMM: shown as the sky seen through a Gaussian g_sigma, sigma this
-                                  # factor x the Eq. 11 sigma_0 (the restoration already is the sky through
-                                  # g_sigma_0).  Finer than that is the latent's speckle, whose zero pixels
-                                  # showed as dark pits at full resolution (1.25: 2133 -> 420 pits on
-                                  # NGC 6960 at r = 1, stars still sharp)
+    "restored_resolution": 1.0,   # ImageMM: shown as the sky seen through a Gaussian g_sigma, sigma this
+                                  # factor x the Eq. 11 sigma_0.  1 = the restoration as fitted (it already is
+                                  # the sky through g_sigma_0, the paper's 1 px at 1x and 1.1 px at 2x); more
+                                  # is an extra blur on top.  (1.25 was the default for a while, to hide the
+                                  # latent's pixel speckle - 2133 -> 420 dark pits on NGC 6960 - but the blur
+                                  # spread speckle into the sky, and the auto-stretch then read it as
+                                  # structure and lifted the sky, showing the restoration's star dips)
     # non-linear stage
     "palette": "auto",          # auto | natural | hoo | foraxx | hoo_warm
     "oiii_boost": 1.0,

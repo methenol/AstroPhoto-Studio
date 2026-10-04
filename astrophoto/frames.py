@@ -54,11 +54,33 @@ def _parse_time(s: str) -> float:
         return 0.0
 
 
+LOCAL_ENV = "ASTROPHOTO_LOCAL_ACTIVE"     # set while a job reads its subs from a local copy (pipeline.local_copy)
+
+
+def local_copy_path(path: str, root: str) -> str:
+    """Where ``path`` (a sub in the library) is copied under ``root``: one folder per source folder."""
+    import hashlib
+    d = os.path.dirname(os.path.abspath(path))
+    return os.path.join(root, hashlib.sha1(d.encode()).hexdigest()[:12], os.path.basename(path))
+
+
+def local_path(path: str) -> str:
+    """The file to read for ``path``: its local copy while one is active (an environment variable,
+    so the analysis and preparation worker processes see it too), else ``path`` itself.  Paths keep
+    their library form everywhere else (frame lists, caches)."""
+    root = os.environ.get(LOCAL_ENV)
+    if root:
+        q = local_copy_path(path, root)
+        if os.path.exists(q):
+            return q
+    return path
+
+
 def read_info(path: str) -> FrameInfo:
     """A sub's metadata from its FITS header.  What the header leaves out comes from the
     telescope's profile, and for a DWARF from its file name and shotsInfo.json (instruments.py)."""
     from . import instruments
-    h = fits.getheader(path)
+    h = fits.getheader(local_path(path))
     prof = instruments.identify(h, path)
     fn = instruments.parse_dwarf_name(path) if prof.dwarf else {}
     si = instruments.shots_info(os.path.dirname(os.path.abspath(path))) if prof.dwarf else {}
@@ -176,7 +198,7 @@ def _check_adu_scale(infos: list[FrameInfo]):
     if scale == 1.0:
         return
     for info in infos[:: max(1, len(infos) // 3)][:3]:
-        if float(fits.getdata(info.path).max()) > 65535.0 / scale:
+        if float(fits.getdata(local_path(info.path)).max()) > 65535.0 / scale:
             for i in infos:
                 i.bias /= i.adu_scale
                 i.adu_scale = 1.0
@@ -185,7 +207,7 @@ def _check_adu_scale(infos: list[FrameInfo]):
 
 def load_raw_adu(path: str, scale: float = 1.0) -> np.ndarray:
     """A raw CFA frame as float32 16-bit ADU (``scale``: FrameInfo.adu_scale), nothing removed."""
-    data = fits.getdata(path).astype(np.float32)
+    data = fits.getdata(local_path(path)).astype(np.float32)
     if scale != 1.0:
         data *= scale
     return data
