@@ -65,6 +65,16 @@ DEFAULTS = {
     "black_point": 0.02,
     "brightness": 0.0,          # -1..1 midtone curve
     "sharpen": 0.25,
+    # colour grade (color_grade): the last step, after curves and sharpening.  These values are
+    # neutral (no change); Auto-finish (autofinish.py) fits them to reference images of the target
+    "grade_amount": 1.0,        # blend of the graded image (0 = ungraded)
+    "grade_temperature": 0.0,   # -1 cool .. 1 warm (OKLab b) on the object, the sky protected
+    "grade_tint": 0.0,          # -1 green .. 1 magenta (OKLab a), likewise
+    "grade_warm_hue": 0.0,      # warm hues (magenta-red-orange-yellow): -1 towards magenta .. 1 towards yellow
+    "grade_warm_sat": 1.0,      # chroma of the warm hues
+    "grade_cool_hue": 0.0,      # cool hues (green-cyan-blue): -1 towards green .. 1 towards blue
+    "grade_cool_sat": 1.0,      # chroma of the cool hues
+    "grade_contrast": 0.0,      # -1..1 S-curve on the object's lightness, pivot at its median
 }
 
 # Constants of star detection, star masks and gradient removal.  They are not processing settings
@@ -1658,6 +1668,64 @@ def sharpen(rgb: np.ndarray, amount: float, px_scale: float) -> np.ndarray:
     return oklab_to_rgb(lab)
 
 
+GRADE_KEYS = ("grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue",
+              "grade_cool_sat", "grade_contrast")
+_WARM_HUE, _COOL_HUE = np.deg2rad(40.0), np.deg2rad(220.0)    # OKLab hue: red ~25, yellow ~110, cyan ~195, blue ~265
+
+
+def grade_neutral(p: dict) -> bool:
+    return float(p.get("grade_amount", 1.0)) <= 0 or all(
+        abs(float(p.get(k, DEFAULTS[k])) - DEFAULTS[k]) < 1e-4 for k in GRADE_KEYS)
+
+
+def grade_masks(lab: np.ndarray):
+    """The weights of the grade: ``obj`` 0 on the sky .. 1 on the object (smoothed lightness above the
+    sky's), and the warm / cool hue sectors (raised cosines 180 deg wide, centred on red-orange and on
+    cyan-blue, so every hue moves smoothly and greys not at all)."""
+    L = lab[..., 0]
+    Ls = cv2.GaussianBlur(L, (0, 0), max(1.5, 0.002 * max(L.shape)))
+    sky = float(np.percentile(Ls[::4, ::4], 15))
+    obj = smoothstep(sky + 0.02, sky + 0.25, Ls).astype(np.float32)
+    h = np.arctan2(lab[..., 2], lab[..., 1])
+    C = np.hypot(lab[..., 1], lab[..., 2])
+    w_warm = np.clip(np.cos(h - _WARM_HUE), 0, 1) ** 1.5
+    w_cool = np.clip(np.cos(h - _COOL_HUE), 0, 1) ** 1.5
+    return obj, w_warm.astype(np.float32), w_cool.astype(np.float32), C, h, sky
+
+
+def color_grade(rgb: np.ndarray, p: dict) -> np.ndarray:
+    """Colour grade of the finished image (OKLab): white balance of the object (temperature, tint),
+    hue and chroma of the warm and the cool hues separately (an HSL-style grade: Ha red towards
+    crimson or orange, OIII teal towards cyan or blue) and an S-curve of the object's lightness.
+    The sky (the darkest 15 %) is protected, so its neutral background stays neutral."""
+    p = {**DEFAULTS, **(p or {})}
+    if grade_neutral(p):
+        return rgb
+    lab = rgb_to_oklab(np.clip(rgb, 0, 1))
+    obj, w_warm, w_cool, C, h, sky = grade_masks(lab)
+    # hue rotation (up to 25 deg) and chroma gain per sector
+    h = h + np.deg2rad(25.0) * (float(p["grade_warm_hue"]) * w_warm + float(p["grade_cool_hue"]) * w_cool)
+    # (chroma on the object only: a chroma gain on the sky turns its colour noise into blotches)
+    gain = 1 + ((float(p["grade_warm_sat"]) - 1) * w_warm + (float(p["grade_cool_sat"]) - 1) * w_cool) * obj
+    C = C * np.maximum(gain, 0)
+    a, b = C * np.cos(h), C * np.sin(h)
+    # white balance of the object (shadows of the sky untouched)
+    a = a + 0.025 * float(p["grade_tint"]) * obj
+    b = b + 0.025 * float(p["grade_temperature"]) * obj
+    # S-curve above the sky: y = x + k x (1 - x)(x - pivot); monotonic for |k| <= 1, pivot in [0.25, 0.6]
+    k = float(np.clip(p["grade_contrast"], -1, 1)) * 1.5
+    if abs(k) > 1e-4:
+        L = lab[..., 0]
+        x = np.clip((L - sky) / max(1 - sky, 1e-3), 0, 1)
+        sel = obj[::4, ::4] > 0.5
+        piv = float(np.clip(np.median(x[::4, ::4][sel]) if sel.sum() > 100 else 0.4, 0.25, 0.6))
+        lab[..., 0] = np.where(L > sky, sky + (1 - sky) * (x + k * x * (1 - x) * (x - piv)), L)
+    lab[..., 1], lab[..., 2] = a, b
+    out = oklab_to_rgb(lab)
+    amt = float(np.clip(p["grade_amount"], 0, 1))
+    return (rgb + (out - rgb) * amt).astype(np.float32) if amt < 1 else out
+
+
 def is_narrowband(filter_name: str) -> bool:
     """A dual-band (Ha + OIII) filter: Seestar LP, DWARF Duo-Band, L-eNhance / L-eXtreme, ..."""
     import re
@@ -1925,6 +1993,7 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     tick("Finishing")
     out = curves(out, float(p["black_point"]), float(p["brightness"]))
     out = sharpen(out, float(p["sharpen"]), px_scale)
+    out = color_grade(np.clip(out, 0, 1), p)
     out = np.clip(out, 0, 1).astype(np.float32)
     if return_layers:
         return out, {"starless": sl_s, "mask": smask, "palette": palette}

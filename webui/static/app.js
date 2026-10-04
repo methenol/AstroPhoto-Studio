@@ -149,7 +149,7 @@ async function openDataset(folder) {
     renderCombine();
     const nb = r.status.narrowband;
     $("#datasetInfo").innerHTML = `<span>Object</span><b>${r.status.object || "–"}</b><span>Filter</span><b>${r.status.filter || "–"} ${nb ? "(dual-band → HOO)" : "(broadband RGB)"}</b>${parts.length > 1 ? `<span>Sessions</span><b>${parts.length}</b>` : ""}<span>Frames</span><b>${r.status.n_files}</b>${r.status.telescope ? `<span>Telescope</span><b>${r.status.telescope}</b>` : ""}<span>Calibration</span><b class="small" title="${calibTitle(r.status.calibration)}">${r.status.calibration ? r.status.calibration.summary : "black level from header"}</b><span>Cache</span><b class="small">${r.status.workdir.split("/").slice(-2).join("/")}</b>`;
-    updateSteps(); renderFrames(); loadCalibration();
+    updateSteps(); renderFrames(); loadCalibration(); loadAutofinish();
     if (r.status.stacked) schedulePreview(0); else showPlaceholder(true);
     refreshExports(); refreshDiag();
     attachActiveJob();
@@ -249,6 +249,35 @@ function updateSteps() {
   $("#step-stack").classList.toggle("done", !!st.stacked);
   $("#step-denoise").classList.toggle("done", !!st.denoised);
   $("#step-starnet").classList.toggle("done", !!st.star_remover);
+  $("#step-autofinish").classList.toggle("done", !!st.autofinished);
+}
+
+/* ------------------------------------------------------------ auto-finish */
+const AF_LABELS = { sky_L: "Sky brightness", sky_C: "Sky colour cast", sig_L50: "Object midtones", sig_L90: "Object highlights",
+  detail: "Structure contrast", C50: "Colourfulness", C90: "Colour (vivid parts)", star_frac: "Star coverage", star_C: "Star colour",
+  sky_noise: "Sky grain" };
+function renderAutofinish(res) {
+  const box = $("#afReport");
+  if (!res || !res.report) { box.hidden = true; box.innerHTML = ""; return; }
+  const r = res.report, f = v => v === undefined || v === null ? "–" : (+v).toFixed(3);
+  const rows = Object.keys(AF_LABELS).filter(k => k in (r.stats_reference || {}))
+    .map(k => `<tr><td>${AF_LABELS[k]}</td><td>${f(r.stats_before[k])}</td><td>${f(r.stats_after[k])}</td><td>${f(r.stats_reference[k])}</td></tr>`).join("");
+  const changed = Object.entries(r.changed || {}).map(([k, [a, b]]) => `${k} ${typeof a === "number" ? (+a).toFixed(2) : a} → ${typeof b === "number" ? (+b).toFixed(2) : b}`);
+  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b> · ${esc(r.reference)}</span></div>
+    <div class="afrow muted"><span>distance to the references ${(+r.score_before).toFixed(1)} → <b>${(+r.score_after).toFixed(1)}</b></span><span>${r.renders} renders · ${fmtDur(r.seconds)}</span></div>
+    <details><summary>Measured look</summary><table><tr class="muted"><td></td><td>before</td><td>after</td><td>references</td></tr>${rows}</table>
+    <div class="muted" style="margin-top:4px">${esc(changed.join(" · "))}</div></details>`;
+  box.hidden = false;
+}
+function applyAutofinish(res) {
+  if (!res?.params) return;
+  S.params = { ...S.params, ...res.params };
+  applyParamsToUI(); saveParams(); schedulePreview(0);
+  renderAutofinish(res);
+}
+async function loadAutofinish() {
+  if (!S.folder) return;
+  try { renderAutofinish((await api(`/api/autofinish?folder=${encodeURIComponent(S.folder)}`)).result); } catch { renderAutofinish(null); }
 }
 
 /* ------------------------------------------------------------ settings from an experiment */
@@ -316,6 +345,7 @@ function stackParams() {
     imagemm_n2n: g("imagemm_n2n").checked, network_groups: parseInt(g("network_groups").value) || 0,
     pattern_correction: g("pattern_correction").checked, n2n_split: g("n2n_split").value,
     star_remover_iters: parseInt(g("star_remover_iters").value) || 3000,
+    autofinish: g("autofinish").checked,
   };
 }
 function exportOpts() {
@@ -375,7 +405,7 @@ async function pollJob() {
   const pb = $("#pauseJob");
   pb.hidden = !(j.state === "running" || j.state === "paused");
   pb.textContent = j.state === "paused" ? "Resume" : "Pause";
-  const stepEl = { calibrate: "#step-calibrate", analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet" }[j.kind];
+  const stepEl = { calibrate: "#step-calibrate", analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet", autofinish: "#step-autofinish" }[j.kind];
   $$(".steps li").forEach(li => li.classList.remove("running"));
   if (stepEl && (j.state === "running" || j.state === "paused")) $(stepEl).classList.add("running");
   if (["running", "queued", "paused"].includes(j.state)) { setTimeout(pollJob, j.state === "queued" ? 1500 : 800); return; }
@@ -387,7 +417,9 @@ async function pollJob() {
     if (j.folder === S.folder) {
       const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
       S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
-      if (S.status.stacked) schedulePreview(0);
+      // the settings Auto-finish tuned (alone, or before the export of Run everything) become the sliders'
+      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(`Auto-finish: settings tuned to ${j.result.autofinish.report.reference}`); }
+      else if (S.status.stacked) schedulePreview(0);
       if (["calibrate", "analyse", "all"].includes(j.kind)) loadCalibration();
       if (j.kind === "calibrate" && j.result?.changed_analysis) toast("Calibration changed: the frame analysis was dropped — run Analyse frames again");
       if (j.kind === "export" || j.kind === "all") { refreshExports(); switchTab("export"); }
@@ -627,6 +659,7 @@ function bindUI() {
     try { await api(`/api/jobs/${S.job.id}/${paused ? "resume" : "pause"}`, { method: "POST" }); } catch (e) { toast(e.message, true); }
   };
   $("#exportBtn").onclick = $("#exportBtn2").onclick = () => startJob("export");
+  $("#autofinishBtn").onclick = () => startJob("autofinish");
   $("#resetParams").onclick = () => { S.params = currentDefaults(); applyParamsToUI(); saveParams(); schedulePreview(0); };
   $$(".tab").forEach(t => t.onclick = () => switchTab(t.dataset.tab));
   $$("#framesTable th[data-k]").forEach(th => th.onclick = () => {

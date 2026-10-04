@@ -77,6 +77,9 @@ def main(argv=None):
     r.add_argument("--no-star-remover", action="store_true",
                    help="skip training the AI star remover (star separation then uses the classic mask + inpainting)")
     r.add_argument("--star-remover-iters", type=int, default=STACK_DEFAULTS["star_remover_iters"])
+    r.add_argument("--no-autofinish", action="store_true",
+                   help="export with the given processing settings instead of tuning them (and a colour grade) "
+                        "to reference images of the target")
     r.add_argument("--quality", type=int, default=95)
     r.add_argument("--upscale", type=float, default=1.0)
     r.add_argument("--params", help="JSON file or string with processing parameters")
@@ -160,7 +163,7 @@ def main(argv=None):
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
              "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n, "n2n_split": args.n2n_split,
              "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
-             "star_remover_iters": args.star_remover_iters}
+             "star_remover_iters": args.star_remover_iters, "autofinish": not args.no_autofinish}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)
     print(json.dumps(files, indent=2))
 

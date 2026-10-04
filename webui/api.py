@@ -249,7 +249,8 @@ def submit(body: dict = Body(...)):
     """Queue a job on a session (or several sessions of one target).
 
     body: path | paths, source (images | uploads), kind (default all = analyse, stack, restore,
-    star remover, export), profile (a name from /profiles), stack_params / params (override the
+    star remover, auto-finish, export; stack_params.autofinish = false exports the given settings
+    as they are), profile (a name from /profiles), stack_params / params (override the
     profile and the defaults), preset (a processing preset of the web UI), export (quality,
     upscale, tiff), client_ref (the client's id for this job: submitting it again returns the job
     already queued or done instead of a second one), label (shown in the Jobs panel)."""

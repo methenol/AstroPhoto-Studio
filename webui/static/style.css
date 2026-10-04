@@ -274,3 +274,10 @@ details.adv label input[type=number] { width: 90px; }
 .calib-info b { color: var(--text); font-weight: 500; word-break: break-word; }
 .calib-info .note { grid-column: 1 / -1; color: var(--warn); }
 details.adv label input[type=text] { width: 160px; }
+.af-report { background: #161d2c; border: 1px solid #2f3a52; border-radius: 8px; padding: 8px 10px; margin: 0 0 10px; line-height: 1.45; }
+.af-report b { color: #e6b450; }
+.af-report .afrow { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; }
+.af-report details { margin-top: 4px; }
+.af-report table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.af-report td { padding: 1px 4px; }
+.af-report td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }

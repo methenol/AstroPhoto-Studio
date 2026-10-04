@@ -64,7 +64,9 @@ STACK_DEFAULTS = {
                                # (frame by frame) | dither (whole dither blocks, analysis.half_split)
     "star_remover": True,    # train the AI star remover (starnet.py) after the restoration
     "star_remover_iters": 3000,
-    "network_groups": 0,     # > 0: the network's data term is ImageMM's multi-frame likelihood over
+    "autofinish": True,      # before the export: tune the processing settings and fit a colour grade to
+                             # reference images of the target (autofinish.py)
+    "network_groups": 0,    # > 0: the network's data term is ImageMM's multi-frame likelihood over
                              # this many seeing-group coadds of the other half's subs
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
@@ -263,6 +265,7 @@ class Session:
             "denoised": restoration_done(self.dir),
             "deconvolved": os.path.exists(self._p("sharp.fits")) or os.path.exists(self._p("imagemm.fits")),
             "star_remover": self.star_remover_ready(),
+            "autofinished": os.path.exists(self._p("autofinish.json")),
             "stack_meta": clean_json(self.meta),
             "filter": self.infos[0].filter if self.infos else None,
             "object": self.infos[0].object if self.infos else None,
@@ -968,6 +971,14 @@ class Session:
         return out
 
     def render(self, params: dict, max_size: int | None = 1400, progress=None) -> tuple[np.ndarray, dict]:
+        lin, params, f, info = self.render_inputs(params, max_size, progress)
+        out = nonlinear_stage(lin, params, self.meta.get("filter", ""), px_scale=f, progress=progress)
+        return out, info
+
+    def render_inputs(self, params: dict, max_size: int | None = 1400, progress=None):
+        """What ``render`` gives the non-linear stage: the linear image at the render size, the
+        parameters with the linear stage's references added (noise, starless image, ...), the scale
+        and the linear stage's info.  Auto-finish renders many settings from one of these."""
         lin, info = self.linear(params, progress)
         detect = self._lin_cache[3] if self._lin_cache and len(self._lin_cache) > 3 else None
         resid = self._lin_cache[4] if self._lin_cache and len(self._lin_cache) > 4 else None
@@ -995,8 +1006,7 @@ class Session:
             params["_restored_sigma"] = info.get("restored_sigma", 1.0)
             params["_detect_ref"] = detect
             params["_noise_resid"] = resid
-        out = nonlinear_stage(lin, params, self.meta.get("filter", ""), px_scale=f, progress=progress)
-        return out, info
+        return lin, params, f, info
 
     def render_before(self, params: dict, max_size: int = 1400) -> np.ndarray:
         """Plain auto-stretched stack (same crop) for before/after comparison."""
@@ -1057,9 +1067,29 @@ class Session:
             self.run_denoise(sp, progress)
         if sp["star_remover"]:
             self.train_star_remover(proc_params, sp, progress)
+        fin = None
+        if sp["autofinish"]:
+            fin = self.autofinish(proc_params, progress)
+            proc_params = fin["params"]
         files = self.export(proc_params or {}, progress=progress, **export_kw)
+        if fin:
+            files["autofinish"] = fin
         files["seconds"] = round(time.time() - t0, 1)
         return files
+
+    def autofinish(self, params: dict | None = None, progress=None) -> dict:
+        """Tune the processing settings and fit a colour grade to reference images of the target
+        (autofinish.py): {params, report}, also saved as autofinish.json."""
+        from .autofinish import autofinish
+        with self.lock:
+            return autofinish(self, params, progress)
+
+    def autofinish_result(self) -> dict | None:
+        p = self._p("autofinish.json")
+        try:
+            return json.load(open(p)) if os.path.exists(p) else None
+        except Exception:
+            return None
 
 
 def _resize_to(img: np.ndarray, shape) -> np.ndarray:

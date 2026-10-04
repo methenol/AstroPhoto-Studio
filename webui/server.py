@@ -84,6 +84,14 @@ PARAM_SPEC = [
     {"group": "Detail", "key": "sharpen", "label": "Final sharpening", "type": "range", "min": 0, "max": 1.5, "step": 0.05},
     {"group": "Finish", "key": "black_point", "label": "Black point", "type": "range", "min": 0, "max": 0.2, "step": 0.005},
     {"group": "Finish", "key": "brightness", "label": "Midtones", "type": "range", "min": -1, "max": 1, "step": 0.05},
+    {"group": "Grade", "key": "grade_amount", "label": "Grade strength", "type": "range", "min": 0, "max": 1, "step": 0.05},
+    {"group": "Grade", "key": "grade_temperature", "label": "Temperature (cool – warm)", "type": "range", "min": -1, "max": 1, "step": 0.05},
+    {"group": "Grade", "key": "grade_tint", "label": "Tint (green – magenta)", "type": "range", "min": -1, "max": 1, "step": 0.05},
+    {"group": "Grade", "key": "grade_warm_hue", "label": "Warm hues: shift (magenta – yellow)", "type": "range", "min": -1, "max": 1, "step": 0.05},
+    {"group": "Grade", "key": "grade_warm_sat", "label": "Warm hues: saturation", "type": "range", "min": 0, "max": 2, "step": 0.05},
+    {"group": "Grade", "key": "grade_cool_hue", "label": "Cool hues: shift (green – blue)", "type": "range", "min": -1, "max": 1, "step": 0.05},
+    {"group": "Grade", "key": "grade_cool_sat", "label": "Cool hues: saturation", "type": "range", "min": 0, "max": 2, "step": 0.05},
+    {"group": "Grade", "key": "grade_contrast", "label": "Object contrast (S-curve)", "type": "range", "min": -1, "max": 1, "step": 0.05},
 ]
 
 PRESETS = {
@@ -231,7 +239,7 @@ def thumb(folder: str, name: str, size: int = 360):
 # ------------------------------------------------------------------ jobs
 
 JOB_KINDS = {"calibrate": "Calibrate", "analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore", "starnet": "Train star remover",
-             "all": "Run everything & export", "export": "Export"}
+             "autofinish": "Auto-finish", "all": "Run everything & export", "export": "Export"}
 ACTIVE = ("running", "paused", "queued")
 QUEUE: list[str] = []                     # queued job ids, first to run first
 QUEUE_LOCK = threading.Lock()
@@ -403,6 +411,8 @@ def _run_job(job_id: str):
                 job["result"] = {"ok": True}
             elif kind == "starnet":
                 job["result"] = s.train_star_remover(params, stack_params, progress)
+            elif kind == "autofinish":
+                job["result"] = {"autofinish": s.autofinish(params, progress)}
             elif kind == "all":
                 sp = {**STACK_DEFAULTS, **stack_params}
                 s.run_analysis(sp["sensitivity"], progress)
@@ -411,7 +421,13 @@ def _run_job(job_id: str):
                 s.run_denoise(sp, progress)
                 if sp["star_remover"]:
                     s.train_star_remover(params, sp, progress)
+                fin = None
+                if sp["autofinish"]:                 # the tuned settings are the ones exported
+                    fin = s.autofinish(params, progress)
+                    params = fin["params"]
                 job["result"] = s.export(params, progress=progress, **export_opts)
+                if fin:
+                    job["result"]["autofinish"] = fin
             elif kind == "export":
                 job["result"] = s.export(params, progress=progress, **export_opts)
             job["state"] = "done"
@@ -675,6 +691,12 @@ def preview(body: dict = Body(...)):
     return Response(data, media_type="image/jpeg",
                     headers={"X-Render-Time": f"{time.time() - t0:.2f}", "X-Width": str(img.shape[1]),
                              "X-Height": str(img.shape[0])})
+
+
+@app.get("/api/autofinish")
+def autofinish_result(folder: str):
+    """The last Auto-finish of a dataset: its settings and report (null before the first)."""
+    return JSONResponse(clean_json({"result": get_session(folder).autofinish_result()}))
 
 
 @app.get("/api/linear_info")

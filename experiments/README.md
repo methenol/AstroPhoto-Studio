@@ -443,6 +443,61 @@ Trial 0 is the pipeline's current setting. The "best" trial is the optimum of a 
 objective. With two objectives, it is the Pareto-optimal trial that is best on the first.
 That trial is what *From experiment* applies to the pipeline settings.
 
+## Auto-finish against reference astrophotographs (`autofinish_refs.py`, 2026-10-04)
+
+Auto-finish (`astrophoto/autofinish.py`) tunes the Process sliders and a colour grade so that the
+finished image measures like professional images of the same target. `autofinish_refs.py` builds
+the reference looks: 58 freely licensed images on Wikimedia Commons of 16 targets, curated by eye
+(natural-colour or HOO looks that a one-shot-colour camera can reach; SHO, infrared, Hubble
+close-ups, light-polluted, green-cast and muted images left out). Only statistics and attributions
+are kept (`astrophoto/data/autofinish_refs.json`).
+
+**Validation.** Distance to the references (the objective, lower is better) from the default
+settings to the auto-finished ones, and how the result looked side by side with the nearest
+reference. DWARF 3 datasets are the pipeline's own restorations; Seestar S50 datasets are the
+telescope's own stacks (central 64 %, through the linear and non-linear stages), which gave 10 more
+targets without stacking.
+
+| Dataset | Telescope | Distance | Result |
+|---|---|---|---|
+| M 42 (2 nights) | DWARF 3, Duo-Band | 40.5 → 9.4 | pink-white core, blue Running Man, natural palette instead of Foraxx gold |
+| C 33 Eastern Veil (2 nights) | DWARF 3, Duo-Band | 19.8 → 6.9 | crimson Ha and cyan OIII filaments on a clean sky |
+| C 20 North America (20 min) | DWARF 3, Duo-Band | 85.5 → 4.2 | strong crimson structure; some blue mottle in the body (too little data) |
+| NGC 7000 (315 min) | Seestar S50 | 34.4 → 4.9 | natural pink Ha + Hβ instead of monochrome red |
+| IC 5070 | Seestar S50, LP | 46.1 → 6.7 | magenta-pink Pelican on a dark sky |
+| M 31 | Seestar S50, IRCUT | 35.0 → 10.0 | contrast, dust lanes, neutral sky; core a little hot |
+| NGC 6960 Western Veil | Seestar S50, LP | 31.2 → 8.1 | crisper red and teal filaments |
+| NGC 7635 Bubble | Seestar S50, LP | 39.5 → 21.8 | natural red, bubble brighter |
+| IC 1396 | Seestar S50, LP | 50.4 → 12.3 | red emission brought out (class references) |
+| IC 405 Flaming Star | Seestar S50, LP | 24.7 → 9.2 | towards the pink of the references |
+| M 20 Trifid | Seestar S50, LP | 15.4 → 9.8 | crimson-pink core instead of orange |
+| Sh2-142 | Seestar S50, LP | 19.7 → 7.3 | nearly unchanged (already close) |
+| M 27 (small in the field) | Seestar S50, LP | 6.6 → 5.4 | conservative: punchier object, sky kept clean |
+| M 76 (tiny in the field) | Seestar S50, LP | 45.0 → 28.1 | left almost untouched, sky kept clean |
+
+NGC 281 (DWARF 3, 23 min) was left out: too little data to judge a finish.
+
+**What failed on the way, and why the objective looks as it does:**
+
+- *Matching the references' average.* M 42's and NGC 7000's references differ in style, and the
+  average of their statistics came out dull and muddy. The objective is now a soft minimum over the
+  individual references: the result commits to the nearest style.
+- *A normalised hue histogram is exploitable.* The search desaturated M 42 (saturation 0.8) and used
+  the grade's temperature and tint, both at −1, to tint the near-grey pixels into the references'
+  hues: the histogram matched, the colour was gone. Temperature and tint are now limited to ±0.4,
+  hue weights count only chroma above a floor, and the hue term is robust (logarithmic).
+- *Star coverage is framing dependent.* Veil references are dense Milky Way fields; matching them
+  doubled every star's brightness. Star coverage is now a ceiling only.
+- *Chroma gain on the sky.* The grade's saturation, applied everywhere, turned C 33's sky noise into
+  blue blotches. It now applies to the object only, and sky colour mottle and grain are penalised.
+- *Small objects in wide fields.* M 27 in a Seestar frame was pushed towards the close-up references'
+  brightness, which lifted the sky and its noise. Object statistics now count in proportion to the
+  share of the frame the object covers (from 8 % down to a quarter weight).
+- *Reference sets that do not fit.* IC 1396's two references were close-ups of the globule; one
+  Bubble Nebula reference was SHO. Both were dropped (IC 1396 uses the emission class).
+
+Each run takes 80–200 s on the CPU (about 140 renders at 1000 px plus the grade fit).
+
 ## Literature consulted
 
 * Lehtinen et al. 2018, *Noise2Noise*, arXiv:1803.04189
