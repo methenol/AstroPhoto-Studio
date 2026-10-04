@@ -941,9 +941,13 @@ class Session:
 
     def ml_starless(self, lin: np.ndarray, progress=None) -> np.ndarray:
         """The AI star remover's starless version of the current full-resolution linear image
-        (cached in memory and on disk, keyed by the linear parameters and the model)."""
+        (cached in memory and on disk, keyed by the linear parameters, the model and a sample of the
+        linear image itself: keyed by the parameters alone, a cache made by an earlier version of the
+        linear stage (another pedestal) was reused, and the difference became a grey "star layer"
+        over the whole sky)."""
         from . import starnet
-        key = self._lin_cache[0] + str(os.path.getmtime(self._p("starnet.pt")))
+        key = (self._lin_cache[0] + str(os.path.getmtime(self._p("starnet.pt")))
+               + f"|{float(lin[::97, ::89].astype(np.float64).sum()):.9e}")
         if self._starless_cache and self._starless_cache[0] == key:
             return self._starless_cache[1]
         path = self._p("starless_ml.npz")
@@ -985,7 +989,8 @@ class Session:
                 detect = cv2.resize(detect, size, interpolation=cv2.INTER_AREA)
             if resid is not None:            # averaged down with the image, its noise with it
                 resid = cv2.resize(resid, size, interpolation=cv2.INTER_AREA)
-        params = {**params, "_noise_ref": info.get("noise_ref"), "_starless": starless}
+        params = {**params, "_noise_ref": info.get("noise_ref"), "_noise_proxy": info.get("noise_proxy"),
+                  "_starless": starless}
         if info.get("restoration") == "ImageMM":
             params["_restored_sigma"] = info.get("restored_sigma", 1.0)
             params["_detect_ref"] = detect

@@ -679,6 +679,12 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
         img = img[y0:y1, x0:x1]
         info["crop"] = [int(y0), int(y1), int(x0), int(x1)]
     img = np.ascontiguousarray(img, np.float32)
+    # what the denoise / deconvolution blend took out of the stack (on the sky: its noise), to set the
+    # display pedestal from the stack's noise below
+    removed = None
+    if img is not stack and not restored:
+        y0, y1, x0, x1 = info.get("crop") or [0, stack.shape[0], 0, stack.shape[1]]
+        removed = stack[y0:y1, x0:x1][::4, ::4] - img[::4, ::4]
     if progress:
         progress(1, 4, "Background extraction")
     if restored:
@@ -721,8 +727,13 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
             info["background"] = binfo
         else:
             img = img - np.array([np.median(img[..., c][::4, ::4]) for c in range(3)], np.float32)
-        # background neutralisation: equal, small pedestal in every channel
-        s_bg = [mad_sigma(img[..., c][::4, ::4]) for c in range(3)]
+        # background neutralisation: equal, small pedestal in every channel, 3 x the *stack's* sky noise
+        # whatever the denoise amount.  Measured on the denoised image, the pedestal followed the
+        # denoiser (M 42 at denoise 0.95: 5x lower), and the stretch, which lifts the sky to a target
+        # brightness, became 2.5x as strong: a washed-out, flat, colourless nebula with every
+        # denoise step (the same stack at denoise 0 looked as the user expected)
+        smp = img[::4, ::4] if removed is None else img[::4, ::4] + removed
+        s_bg = [mad_sigma(smp[..., c]) for c in range(3)]
         ped = 3 * max(s_bg)
         use_zero = zero is not None and zero[::4, ::4].sum() > 1000
         for c in range(3):
@@ -804,6 +815,16 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     img = img / sat
     info["pedestal"] = ped / sat
     info["noise_ref"] = float(noise_ref / sat)  # per-pixel noise of the un-denoised stack
+    # ...and at the scale the stretch is solved at (_stretch_proxy), measured there: a stack's noise is
+    # correlated (registration, debayering), so averaging down reduces it less than white noise would
+    # (M 42: 1.08e-4 against 0.79e-4 predicted).  The stretch's black point comes from it: with the
+    # predicted value a denoised render got a 40 % stronger stretch than the plain stack, flat and pale
+    nsrc = clip_ref if (restored and clip_ref is not None) else stack
+    if info.get("crop"):
+        y0, y1, x0, x1 = info["crop"]
+        nsrc = nsrc[y0:y1, x0:x1]
+    Lp = _stretch_proxy(luminance(nsrc))
+    info["noise_proxy"] = float(mad_sigma(Lp - cv2.GaussianBlur(Lp, (0, 0), 1.5)) * 1.6 / sat)
     return img.astype(np.float32), info
 
 
@@ -1090,6 +1111,7 @@ def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.
     out = lin.copy()
     r_core = max(1.5, 1.2 * fw) if core_sigma is None else max(1.5, 2.5 * float(core_sigma))
     r_cap = int(np.clip(0.06 * max(h, w), 40, 400))
+    sky_l = float(np.median(L[::4, ::4]))
     for i in sel:
         x, y = float(objs["x"][i]), float(objs["y"][i])
         # measured reach, never below the former brightness-based estimate
@@ -1115,7 +1137,6 @@ def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.
         bg = np.median(patch[ring_out], axis=0)
         wgt = np.clip((rad - r_core) / r_core, 0, 1) * np.clip((R - rad) / max(R - Rh, 1e-6), 0, 1)
         wgt = strength * wgt
-        W[y0:y1, x0:x1] = np.maximum(W[y0:y1, x0:x1], wgt)
         # the halo is the star's azimuthally symmetric light: per channel, the ring medians minus the
         # local background (robust to the stars, knots and nebula texture inside the rings).  Only
         # its colour - each channel's departure from the halo's luminance - is removed, so everything
@@ -1126,6 +1147,14 @@ def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.
         prof = np.stack([np.asarray(ndimage.median(patch[..., c], labels=lab_, index=np.arange(R))) - bg[c]
                          for c in range(patch.shape[-1])], -1)                      # (R, C)
         prof = np.maximum(prof, 0)
+        # the halo's share of the light at each radius, against the light under it above the sky: a halo
+        # on plain sky is all of it, one on a bright nebula a small part.  The weight (and the map the palette keeps neutral, which treats a
+        # pixel's whole light as halo) used to be geometric only: round a star on M 42 the nebula's
+        # own colour lost its OIII unmixing and gain in a disc ~100 px across
+        p_l = luminance(prof[None])[0]
+        share = p_l / (p_l + max(float(luminance(bg[None, None])[0, 0]) - sky_l, 0.0) + 1e-12)
+        wgt = wgt * share[np.minimum(ri, R - 1)]
+        W[y0:y1, x0:x1] = np.maximum(W[y0:y1, x0:x1], wgt)
         # the halos to fix carry *extra* green / blue light (a dual-band filter's OIII scatter, a
         # refractor's blue focus): remove the G and B excess over R, nothing else.  Pulling every
         # channel to the halo's luminance also "neutralised" red light - a red nebula or the reddish
@@ -1436,6 +1465,13 @@ def _local_sky(x: np.ndarray, px_scale: float, window: float = 96.0) -> np.ndarr
     env = percentile_filter(small, 20, size=k, mode="reflect")
     d0 = 1.5 * float(np.median(med - env))
     sky = np.minimum(med, env + d0)
+    # ...and never far above the frame's own sky: the residual glow this absorbs varies by about as
+    # much as the sky map does over its darker half.  Inside a bright nebula a window's lower envelope
+    # is still nebula (M 42's dark lanes: 15x the sky), and against it every lane that was a local
+    # minimum read as "no line" and was rendered grey, with hard edges (the signal there is thousands
+    # of sigma, so the 2.5-5 sigma ramp crossed over in a step of a few per cent)
+    base = float(np.percentile(sky, 5))
+    sky = np.minimum(sky, base + 6.0 * max(float(np.percentile(sky, 50)) - base, 0.0))
     sky = cv2.GaussianBlur(sky, (0, 0), k / 4)
     return cv2.resize(sky, (w, h), interpolation=cv2.INTER_LINEAR)
 
@@ -1466,10 +1502,19 @@ def _palette_chroma(ha: np.ndarray, oiii: np.ndarray, palette: str, line_s, px_s
 
     c_fine, z_fine = chroma(s_fine)
     c_broad, z_broad = chroma(s_broad)
+    # a third, wider scale for faint extended emission: at the broad scale alone a faint nebula sits
+    # at 2-5 sigma, and the ramp cut it into red blotches with grey holes (IC 405); averaged over a
+    # wider patch the same light is significant, and its colour varies smoothly
+    c_wide, z_wide = chroma(max(6.0, 24.0 * px_scale))
     # (a few sigma: at 1.5 the sky's own residual texture passed for emission, a red/teal speckle)
     w_fine = smoothstep(4.0, 7.0, z_fine)[..., None]
-    w_any = np.maximum(smoothstep(2.5, 5.0, z_broad), w_fine[..., 0])[..., None]
-    return ((c_fine * w_fine + c_broad * (1 - w_fine)) * w_any).astype(np.float32)
+    w_broad = smoothstep(2.5, 5.0, z_broad)[..., None]
+    w_wide = smoothstep(3.0, 6.0, z_wide)[..., None]
+    # the finest scale at which a line is significant gives the colour, coarser ones fill in
+    c = c_wide * (1 - w_broad) + c_broad * w_broad
+    c = c * (1 - w_fine) + c_fine * w_fine
+    w_any = np.maximum(np.maximum(w_wide, w_broad), w_fine)
+    return (c * w_any).astype(np.float32)
 
 
 def _chroma_denoise_lab(lab: np.ndarray, amount: float, px_scale: float) -> np.ndarray:
@@ -1709,7 +1754,7 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
     # the stretch is solved at one fixed scale (_stretch_proxy), with the data's real noise at that
     # scale as the floor of the background's (the coadd's per-pixel noise, averaged down with it)
     f_proxy = min(1.0, _PROXY_SIZE / max(Lsl.shape[:2]))
-    nfloor = float(p.get("_noise_ref") or 0.0) * px_scale * f_proxy
+    nfloor = max(float(p.get("_noise_ref") or 0.0) * px_scale * f_proxy, float(p.get("_noise_proxy") or 0.0))
     sm = p.get("stretch_method", "ghs")
     bp, D, sp = solve_stretch(_stretch_proxy(Lsl), target, b, nfloor, sm)
     # HDR: compress large-scale brightness above a knee (linear, multiplicative, so local
