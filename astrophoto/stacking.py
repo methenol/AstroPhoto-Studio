@@ -116,17 +116,20 @@ def eval_surface(coefs: np.ndarray, h: int, w: int, deg: int = 2) -> np.ndarray:
 
 def _block_median(img: np.ndarray, valid: np.ndarray, block: int, sub: int = 2) -> np.ndarray:
     """Robust (median) level of every ``block`` x ``block`` cell of a (H, W, C) image, NaN where
-    under half of the cell is valid.  Returns (H // block, W // block, C)."""
+    under half of the cell is valid.  ``valid``: (H, W, C) per channel, or (H, W) for all channels.
+    Returns (H // block, W // block, C)."""
     h, w, c = img.shape
     hb, wb = h // block, w // block
     b = block // sub
     small = img[: hb * block: sub, : wb * block: sub]
     vs = valid[: hb * block: sub, : wb * block: sub]
-    arr = np.where(vs[..., None], small, np.nan).reshape(hb, b, wb, b, c).transpose(0, 2, 4, 1, 3).reshape(hb, wb, c, b * b)
+    if vs.ndim == 2:
+        vs = vs[..., None]
+    arr = np.where(vs, small, np.nan).reshape(hb, b, wb, b, c).transpose(0, 2, 4, 1, 3).reshape(hb, wb, c, b * b)
     with np.errstate(all="ignore"):
         med = np.nanmedian(arr, axis=-1)
-    med[vs.reshape(hb, b, wb, b).mean((1, 3)) < 0.5] = np.nan
-    return med.astype(np.float32)
+    frac = vs.reshape(hb, b, wb, b, vs.shape[-1]).mean((1, 3))
+    return np.where(frac < 0.5, np.nan, med).astype(np.float32)
 
 
 def _smooth_fill(m: np.ndarray, sigma: float = 1.0) -> np.ndarray:
@@ -295,10 +298,18 @@ class Integrator:
         return cv2.convertMaps(mx, my, cv2.CV_16SC2)
 
     def _normalise(self, idx, vals, wts, use_gradient: bool):
-        valid = wts[..., 1] > 0
+        # validity per channel.  A Bayer drizzle fills each colour from its own sites, and a sub's
+        # red and blue lattices, rotated against the output grid, leave lines of pixels with no red
+        # (blue) where green has data (~3 % of the pixels at 2x, a different grid in every sub).
+        # Taken from green alone, those empty pixels went into red's and blue's offsets and block
+        # medians, the local normalisation subtracted each sub's grid of lines, smoothed to a block
+        # or two, and the stack summed them into a network of dark bands at every angle the subs
+        # took (NGC 6960, 2x drizzle, 2026-10-06; a 1x demosaic has every colour at every pixel)
+        valid = wts > 0
         if idx not in self.offsets:
-            sub = vals[::8, ::8][valid[::8, ::8]]
-            self.offsets[idx] = np.median(sub, axis=0) if len(sub) else np.zeros(3, np.float32)
+            v8, m8 = vals[::8, ::8], valid[::8, ::8]
+            self.offsets[idx] = np.array([np.median(v8[..., c][m8[..., c]]) if m8[..., c].any() else 0.0
+                                          for c in range(vals.shape[-1])], np.float32)
         vals -= (self.offsets[idx] - self.ref_level).astype(np.float32)[None, None, :]
         if use_gradient and idx in self.gradients:
             vals -= self._background_correction(idx)
@@ -360,8 +371,9 @@ class Integrator:
         # reference background level: the best-weighted frame
         best = int(np.argmax([fr["weight"] for _, fr in self.items]))
         v, w_, _ = self._warp(best)
-        valid = w_[..., 1] > 0
-        self.ref_level = np.median(v[::8, ::8][valid[::8, ::8]], axis=0).astype(np.float32)
+        v8, m8 = v[::8, ::8], w_[::8, ::8] > 0
+        self.ref_level = np.array([np.median(v8[..., c][m8[..., c]]) if m8[..., c].any() else 0.0
+                                   for c in range(v.shape[-1])], np.float32)
         del v, w_
 
         # All per-frame arithmetic below is done in place on the frame's own buffers:
@@ -440,7 +452,7 @@ class Integrator:
                 bad = r > self.sigma_high
                 bad |= r < -self.sigma_low
                 wts[bad] = 0
-                rejected += bad.any(-1) & valid
+                rejected += (bad & valid).any(-1)
             acc_s, acc_w = units[self.groups[k]][self.halves[k]]
             acc_w += wts
             vals *= wts

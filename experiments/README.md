@@ -567,11 +567,19 @@ uniform and on a slider. Checked on NGC 6960 (dark sky, 2× drizzle), IC 1396 (f
 and C 33 (dark sky, bright filaments), at preview size and at 1:1: no patches, no speckle, the sky's
 median chroma at 1:1 is 0.0015 in OKLab on all three.
 
-What is left in NGC 6960's sky is a faint warm large-scale structure that the old code hid by forcing
-the sky grey. It is in the data, not in the colour code: the two line maps differ there by about 2 σ of
-their own noise at the 24 px scale, a low-order polynomial explains only 1–3 % of it, and that stack's
-survey-reference gradient fit left a scatter of 33 and 55 ADU in R and B against 3.8 in G (the 1×
-stack of the same target: 4.3 / 3.1 / 5.1). If it needs to go, it belongs to the gradient removal.
+What was left in NGC 6960's sky after that was not colour at all: a network of dark bands at many
+angles, already in the stack. It came from the integration of a Bayer drizzle (2×). Each sub's red and
+blue lattices, rotated against the output grid, leave lines of output pixels with no red (blue) where
+green has data, about 3 % of them, in a different grid for every sub. The stacker took every channel's
+validity from green, so those empty pixels went into red's and blue's per-sub offsets and the block
+medians of the local normalisation. The normalisation then subtracted each sub's grid of lines, smoothed
+to a block or two, and the stack summed them. A 1× demosaic has every colour at every pixel, which is
+why the earlier 1× stack of the same subs was clean. Validity is now per channel
+(`stacking.Integrator._normalise`). Re-stacking 30 of the subs at 2×, the background's large-scale
+spread (5th to 95th percentile) fell from 186 to 48 ADU in red and from 302 to 46 ADU in blue, the same
+as green (36 ADU, unchanged). The survey-reference gradient fit's large red and blue scatter on that
+stack (33 and 55 ADU against 3.8 in green) was a symptom of the bands, not their cause.
+Regression test: `experiments/test_stacking.py`.
 
 **What the measurements decided, and why that is right:**
 
