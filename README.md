@@ -185,7 +185,7 @@ curl -X POST http://server:8000/api/v1/jobs -H 'content-type: application/json' 
 | **Narrowband (dual-band filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. |
 | **Finishing** | Post-stretch starlet shrinkage on luminance, OKLab chroma noise reduction, wavelet local contrast, perceptual (OKLab) vibrance with background protection, SCNR, curves and masked sharpening. |
 | **Colour grade** | An OKLab grade of the finished image: white balance of the object (temperature, tint), hue and chroma of the warm and the cool hues separately (Ha towards crimson or orange, OIII towards cyan or blue), and an S-curve of the object's lightness. The sky is protected. Neutral until Auto-finish (or you) sets it. |
-| **Auto-finish** (default before every export of *Run everything*) | Tunes the processing settings and fits the colour grade so that the image looks like professional images of the same target (see [Auto-finish](#auto-finish)). |
+| **Auto-finish** (default before every export of *Run everything*) | Sets the sliders one at a time from measurements of the image, the way a finisher does, with reference photographs of the target as the targets and the image's own noise and clipping as the limits; then a natural colour grade for the kind of target (see [Auto-finish](#auto-finish)). |
 
 ## Supported telescopes and cameras
 
@@ -387,40 +387,54 @@ A new restack or restoration makes the trained remover stale, and it has to be t
 ## Auto-finish
 
 **Auto-finish** (the last Pipeline step, the ✨ button under the Process sliders, and part of *Run
-everything* unless *Auto-finish before the export* is unticked) sets the sliders on the right for
-you. It takes 1–3 minutes.
+everything* unless *Auto-finish before the export* is unticked) works through the sliders on the
+right the way a finisher does: one control at a time, in the professional order, watching one
+measurement per control and stopping where the image says stop. Every step and its reason are
+listed above the sliders afterwards, and the sliders land where it left them, so you can carry on
+by hand.
 
-1. It measures the *look* of an image with statistics that hardly depend on the framing: the sky's
-   brightness, colour cast, grain and colour mottle, the object's midtones, brightest structures,
-   structure contrast and colourfulness, the colour mottle on the object, a hue histogram, and the
-   share of the frame the stars take.
-2. The same statistics were measured on reference astrophotographs of each target: 58 freely
-   licensed images on Wikimedia Commons of 16 targets (M 42, M 31, M 27, M 20, M 76, NGC 281,
-   NGC 6960, NGC 6992, NGC 7000, NGC 7635, NGC 7662, IC 405, IC 1318, IC 5070, Sh2-142, LDN 1235),
-   chosen for natural-colour or HOO looks that a one-shot-colour camera, with or without a
-   dual-band filter, can reach. SHO, infrared and poorly processed images were left out. Only the
-   statistics and the attributions are kept, in `astrophoto/data/autofinish_refs.json`.
-   `python experiments/autofinish_refs.py` rebuilds that file. How it was validated on 14 datasets
-   (DWARF 3 and Seestar S50), and what failed on the way: [experiments/README.md](experiments/README.md#auto-finish-against-reference-astrophotographs-autofinish_refspy-2026-10-04).
-3. A pattern search on a 1000 px render tunes the stretch, GHS contrast, HDR, saturation, local
-   contrast, black point, midtones, star brightness and reduction, and the OIII boost. For dual-band
-   data it picks the palette first. The objective is the distance to the **nearest** reference (a
-   soft minimum), not to their average: the references of one target differ in style, and the
-   average of several styles is a muddy compromise. Penalties stop it from clipping highlights,
-   crushing the sky, raising the grain or turning colour noise into blotches, and moving a slider
-   costs a little, so nothing runs to its limit without a real gain. The references frame their
-   object closely, so for a small object in a wide field (M 27 or M 76 in a Seestar frame) the
-   object's statistics count less and the sky is kept clean instead.
-4. The colour grade (the *Grade* sliders) is then fitted on that render.
+| In this order | What it watches | Where it stops |
+|---|---|---|
+| Stretch | the object's midtones | where the reference images put them |
+| Black point | the sky's brightness | the references' sky, but never clipping the sky's noise to black |
+| HDR | the brightest extended structure | the least compression that keeps it off the ceiling |
+| Midtones | the object's midtones again | re-checked after the black point and HDR |
+| GHS focus (contrast) | structure against grain on the object | the focus with the most structure, grain bounded |
+| Fine-grain noise reduction | the sky's grain on a **full-resolution crop** (1:1) | the least that brings it to the references' grain |
+| Colour noise reduction | colour mottle of sky and object | the least that removes it |
+| Local contrast | mid-scale noise and mottle on the faint parts | raised until they would show |
+| Sharpening | fine noise and dark halos on the 1:1 crop | raised until they begin to show |
+| Star reduction | the share of the frame the stars cover | no more than in a typical reference |
+| Star brightness | clipped star cores | the brightest stars just below clipping |
+| Halo suppression | blue excess round bright stars | until it is gone |
+| Saturation | the object's colourfulness | the references' colourfulness, unless the colour mottles, clips or tints the field |
+| OIII boost (dual-band) | the warm / cool balance | the references' balance, unless OIII noise tints the sky |
+| SCNR | the share of green hues | only if it exceeds the references' |
+| Colour grade | hue of the red and of the teal / blue sectors, star colour cast, tonal spread | towards the nearest reference's hues; the star field neutral (broadband); the references' tonal spread |
 
-A target without references of its own uses those of its class (emission nebulae, supernova
-remnants, planetary nebulae, galaxies, dark and reflection nebulae), found from the `OBJECT` header
-and a list of common names. Without a known class it uses all the dual-band or all the broadband
-references. The tuned settings land on the sliders, where you can adjust them further. A report
-above the sliders shows the reference it matched, the distance before and after, and each
-statistic. `autofinish.json` in the session folder keeps the last result. On the CLI,
-`--no-autofinish` turns it off. The objective's constants can be tuned in the Experiments tab
-(task *Auto-finish (finishing look)*).
+The **targets** are not constants in the code. They are the medians of the same measurements over
+reference astrophotographs of the target: 58 freely licensed images on Wikimedia Commons of 16
+targets (M 42, M 31, M 27, M 20, M 76, NGC 281, NGC 6960, NGC 6992, NGC 7000, NGC 7635, NGC 7662,
+IC 405, IC 1318, IC 5070, Sh2-142, LDN 1235), chosen for natural-colour or HOO looks that a one-shot-
+colour camera can reach. Only the statistics and the attributions are kept, in
+`astrophoto/data/autofinish_refs.json`; `python experiments/autofinish_refs.py` rebuilds it. The
+**limits** (where to stop) come from the image itself: its own grain, clipping, colour mottle and
+star coverage, measured on a 1000 px render for the tonal and colour steps and on a 1024 px
+full-resolution crop of the most structured part of the object for noise reduction and sharpening,
+which act below the resolution of a small render. A target without references of its own uses those
+of its class (emission nebulae, supernova remnants, planetary nebulae, galaxies, dark and reflection
+nebulae), found from the `OBJECT` header and a list of common names; without a known class, all the
+dual-band or all the broadband references. For a small object in a wide field (M 27 in a Seestar
+frame) the object's brightness targets count in proportion to the share of the frame it covers.
+
+The finished image is then compared with the nearest reference and that distance is reported,
+before and after. It is a check, not the objective: the earlier Auto-finish searched the sliders to
+minimise this distance and could pay for a match with the wrong trade-offs (desaturating and
+tinting to match a hue histogram, lifting the sky to match a close-up's brightness). The rules of
+thumb it works by (how much grain, clipping and star coverage is acceptable, how strong the grade
+is) are `autofinish.RULES`, tunable in the Experiments tab (task *Auto-finish (finishing look)*).
+`autofinish.json` in the session folder keeps the last result; on the CLI `--no-autofinish` turns the
+step off. About 60 renders, one to two minutes on the CPU.
 
 ## Gradient removal against a sky survey
 

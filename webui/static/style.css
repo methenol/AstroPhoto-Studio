@@ -281,3 +281,5 @@ details.adv label input[type=text] { width: 160px; }
 .af-report table { width: 100%; border-collapse: collapse; font-size: 11px; }
 .af-report td { padding: 1px 4px; }
 .af-report td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+.af-report table.afsteps td { text-align: left; vertical-align: top; }
+.af-report table.afsteps td.mono { white-space: nowrap; font-variant-numeric: tabular-nums; }

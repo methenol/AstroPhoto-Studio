@@ -504,60 +504,75 @@ Trial 0 is the pipeline's current setting. The "best" trial is the optimum of a 
 objective. With two objectives, it is the Pareto-optimal trial that is best on the first.
 That trial is what *From experiment* applies to the pipeline settings.
 
-## Auto-finish against reference astrophotographs (`autofinish_refs.py`, 2026-10-04)
+## Auto-finish: a finisher's procedure, checked against reference astrophotographs (2026-10-06)
 
-Auto-finish (`astrophoto/autofinish.py`) tunes the Process sliders and a colour grade so that the
-finished image measures like professional images of the same target. `autofinish_refs.py` builds
-the reference looks: 58 freely licensed images on Wikimedia Commons of 16 targets, curated by eye
-(natural-colour or HOO looks that a one-shot-colour camera can reach; SHO, infrared, Hubble
-close-ups, light-polluted, green-cast and muted images left out). Only statistics and attributions
-are kept (`astrophoto/data/autofinish_refs.json`).
+Auto-finish (`astrophoto/autofinish.py`) sets the Process sliders one at a time, in the order a
+finisher works, each from one measurement of the render, and stops each where the image says stop.
+The reference photographs (`autofinish_refs.py`: 58 freely licensed Wikimedia Commons images of 16
+targets, measured by `look_stats`, statistics and attributions only in
+`astrophoto/data/autofinish_refs.json`) supply the **targets** - the medians of the sky's
+brightness, the object's midtones and highlights, its colourfulness, the star coverage, the grain -
+and the hue direction of the grade. The **limits** come from the image: its own grain, clipping,
+colour mottle, field tint and star coverage. The procedure, its measurements and its stop rules are
+in the module docstring and the main README; the rules of thumb are `autofinish.RULES`.
 
-**Validation.** Distance to the references (the objective, lower is better) from the default
-settings to the auto-finished ones, and how the result looked side by side with the nearest
-reference. DWARF 3 datasets are the pipeline's own restorations; Seestar S50 datasets are the
-telescope's own stacks (central 64 %, through the linear and non-linear stages), which gave 10 more
-targets without stacking.
+Two kinds of render are used: a 1000 px proxy for the tonal, star and colour steps (1.3 s each on
+the CPU), and a 1024 px **full-resolution crop** of the most structured part of the object for
+fine-grain noise reduction and sharpening, which act below the proxy's resolution: the finisher
+judges them at 1:1, and so does the procedure (`fine_stats`: the sky's grain, the fine noise on the
+faint part of the object, dark overshoot round stars and edges, clipping).
 
-| Dataset | Telescope | Distance | Result |
-|---|---|---|---|
-| M 42 (2 nights) | DWARF 3, Duo-Band | 40.5 → 9.4 | pink-white core, blue Running Man, natural palette instead of Foraxx gold |
-| C 33 Eastern Veil (2 nights) | DWARF 3, Duo-Band | 19.8 → 6.9 | crimson Ha and cyan OIII filaments on a clean sky |
-| C 20 North America (20 min) | DWARF 3, Duo-Band | 85.5 → 4.2 | strong crimson structure; some blue mottle in the body (too little data) |
-| NGC 7000 (315 min) | Seestar S50 | 34.4 → 4.9 | natural pink Ha + Hβ instead of monochrome red |
-| IC 5070 | Seestar S50, LP | 46.1 → 6.7 | magenta-pink Pelican on a dark sky |
-| M 31 | Seestar S50, IRCUT | 35.0 → 10.0 | contrast, dust lanes, neutral sky; core a little hot |
-| NGC 6960 Western Veil | Seestar S50, LP | 31.2 → 8.1 | crisper red and teal filaments |
-| NGC 7635 Bubble | Seestar S50, LP | 39.5 → 21.8 | natural red, bubble brighter |
-| IC 1396 | Seestar S50, LP | 50.4 → 12.3 | red emission brought out (class references) |
-| IC 405 Flaming Star | Seestar S50, LP | 24.7 → 9.2 | towards the pink of the references |
-| M 20 Trifid | Seestar S50, LP | 15.4 → 9.8 | crimson-pink core instead of orange |
-| Sh2-142 | Seestar S50, LP | 19.7 → 7.3 | nearly unchanged (already close) |
-| M 27 (small in the field) | Seestar S50, LP | 6.6 → 5.4 | conservative: punchier object, sky kept clean |
-| M 76 (tiny in the field) | Seestar S50, LP | 45.0 → 28.1 | left almost untouched, sky kept clean |
+**Why the redesign.** The first Auto-finish (2026-10-04) searched the sliders and a colour grade to
+minimise a weighted distance between the render's statistics and the references' (a pattern search,
+140 renders, then a grade fit). It matched numbers, not the finisher's intent, and found the
+cheapest way to match them: it desaturated M 42 and tinted the grey pixels into the references' hue
+histogram; it lifted a wide field's sky to match a close-up's brightness; it doubled every star to
+match dense Milky Way references; it turned the grade's chroma gain on the sky into blue blotches.
+Each was patched with another penalty, and the objective grew to twelve weighted terms, a soft
+minimum and a regulariser - and still could not tune noise reduction or sharpening, whose effect
+the proxy render does not show. The new procedure has no objective to game: every slider answers
+one question, and the distance to the references is only reported afterwards.
 
-NGC 281 (DWARF 3, 23 min) was left out: too little data to judge a finish.
+**Validation** (the same datasets as before; distance to the references reported, not optimised;
+renders and time on the CPU).
 
-**What failed on the way, and why the objective looks as it does:**
+| Dataset | Telescope / data | Distance to the references | Renders, time | What it set (besides the grade) |
+|---|---|---|---|---|
+| C 33 Eastern Veil (2 nights) | DWARF 3, Duo-Band, ImageMM | 19.0 → 14.0 | 70, 128 s | palette foraxx; stretch 0.16→0.18; HDR 0.6→0; focus 2→0; fine NR 0.6→0; colour NR 0.8→0; local contrast 0.5→0.95; sharpen 0.25→0.35; star reduction 0.35→0.1; star brightness 0.9→1.0; halo 0.6→0; saturation 1.5→2.55; OIII 1.0→2.5 |
+| C 20 North America (20 min) | DWARF 3, Duo-Band, ImageMM | 85.7 → 42.6 | 58, 186 s | palette hoo_warm; black point 0.02→0.07 (sky at the references', then clipping stopped it); midtones +0.2; focus 2→0; NR 0; local contrast →1.6; sharpen →0.85; saturation →2.6 (the Ha is faint: C50 0.006) |
+| NGC 281 (23 min) | DWARF 3, Duo-Band, ImageMM | 67.9 → 44.4 | 52, 43 s | palette natural; stretch →0.23, black point →0.065, midtones +0.3; focus 2→0; NR 0; local contrast →1.6; sharpen →1.2; star brightness →1.2; saturation left alone (the slider barely moves so faint an object's colour) |
+| NGC 7000 (315 min) | Seestar S50, network restoration | 43.5 → 20.7 | 61, 62 s | stretch →0.14, black point →0.055, midtones +0.2; focus 2→0; fine NR 0; colour NR →1.0; local contrast →0; sharpen →1.1; star brightness →0.65 (Deneb-class stars clipped); saturation →1.25 (red channel clipping) |
+| M 31 | Seestar S50, IRCUT, plain stack | 27.3 → 23.1 | 66, 109 s | stretch →0.09; focus 2→0; fine NR 0; colour NR →0.85; local contrast →0; sharpen →0; saturation →1.7; HDR re-check 0→0.4 (the grade had pushed the core onto the ceiling) |
 
-- *Matching the references' average.* M 42's and NGC 7000's references differ in style, and the
-  average of their statistics came out dull and muddy. The objective is now a soft minimum over the
-  individual references: the result commits to the nearest style.
-- *A normalised hue histogram is exploitable.* The search desaturated M 42 (saturation 0.8) and used
-  the grade's temperature and tint, both at −1, to tint the near-grey pixels into the references'
-  hues: the histogram matched, the colour was gone. Temperature and tint are now limited to ±0.4,
-  hue weights count only chroma above a floor, and the hue term is robust (logarithmic).
-- *Star coverage is framing dependent.* Veil references are dense Milky Way fields; matching them
-  doubled every star's brightness. Star coverage is now a ceiling only.
-- *Chroma gain on the sky.* The grade's saturation, applied everywhere, turned C 33's sky noise into
-  blue blotches. It now applies to the object only, and sky colour mottle and grain are penalised.
-- *Small objects in wide fields.* M 27 in a Seestar frame was pushed towards the close-up references'
-  brightness, which lifted the sky and its noise. Object statistics now count in proportion to the
-  share of the frame the object covers (from 8 % down to a quarter weight).
-- *Reference sets that do not fit.* IC 1396's two references were close-ups of the globule; one
-  Bubble Nebula reference was SHO. Both were dropped (IC 1396 uses the emission class).
+**What the measurements decided, and why that is right:**
 
-Each run takes 80–200 s on the CPU (about 140 renders at 1000 px plus the grade fit).
+- *GHS focus went to 0 on every dataset*: the softest focus gave 8–39 % more structure against
+  grain than the default 2 (the rule asks for 5 %). A higher focus concentrates contrast near the
+  sky level, where these stacks have noise, not structure.
+- *Fine-grain noise reduction went to 0 on the restorations*: ImageMM's and the network's output
+  has a sky grain far below the references' at 1:1 (C 33: 0.0015 against 0.008 in OKLab L), so a
+  finisher would not blur it further. On M 31 (a plain stack, no restoration) it stayed at a low
+  value for the same reason.
+- *HDR went to 0* where nothing extended reaches 60 % lightness (none of the three has a burning
+  core); it will engage on M 42.
+- *Sharpening is limited by halos, not noise*, on a restoration: the dark overshoot round stars and
+  edges (`fine_stats.overshoot`) doubles between 0 and 0.3 and the rule stops it at about 2.5x the
+  unsharpened value.
+- *The OIII boost is limited by the field's tint*: more OIII put cyan speckle into C 33's sky long
+  before the darkest sky's median colour moved; the 90th-percentile chroma of the field (neither
+  object nor star) catches it, and may not exceed 0.01.
+- *Saturation is limited by colour mottle* only relative to the image's own mottle (a rise of 30 %):
+  a reference's absolute mottle is a JPEG's, and a 63-frame stack cannot reach it without draining
+  its colour, which is what the first run on NGC 7000 did. The same holds for the sky's colour: the
+  limit is the rule or 15 % above what the image already has, whichever is larger. What did bind on
+  NGC 7000 is **colour clipping**: at the default saturation 0.85 % of the frame has its red channel
+  on the ceiling (flat, detail-less red); the rule allows 0.5 %.
+- *A slider that does nothing measurable is left alone*: on NGC 281 (23 min) saturation moves the
+  object's colourfulness by 0.0004 over its whole range, so chasing the references' value would only
+  have run it to a bound.
+- *Halo suppression went to 0 everywhere*: none of these restorations shows a blue excess round
+  bright stars (the restoration packs the halo light back into the cores). It would engage on a
+  plain refractor stack with chromatic halos.
 
 ## Literature consulted
 

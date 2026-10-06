@@ -254,19 +254,24 @@ function updateSteps() {
 
 /* ------------------------------------------------------------ auto-finish */
 const AF_LABELS = { sky_L: "Sky brightness", sky_C: "Sky colour cast", sig_L50: "Object midtones", sig_L90: "Object highlights",
-  detail: "Structure contrast", C50: "Colourfulness", C90: "Colour (vivid parts)", star_frac: "Star coverage", star_C: "Star colour",
-  sky_noise: "Sky grain" };
+  peak_L: "Brightest structure", detail: "Structure contrast", detail_snr: "Structure / grain", C50: "Colourfulness",
+  C90: "Colour (vivid parts)", star_frac: "Star coverage", star_C: "Star colour", sky_noise: "Sky grain",
+  sky_blotch: "Sky colour mottle", obj_blotch: "Object colour mottle" };
 function renderAutofinish(res) {
   const box = $("#afReport");
   if (!res || !res.report) { box.hidden = true; box.innerHTML = ""; return; }
   const r = res.report, f = v => v === undefined || v === null ? "–" : (+v).toFixed(3);
-  const rows = Object.keys(AF_LABELS).filter(k => k in (r.stats_reference || {}))
-    .map(k => `<tr><td>${AF_LABELS[k]}</td><td>${f(r.stats_before[k])}</td><td>${f(r.stats_after[k])}</td><td>${f(r.stats_reference[k])}</td></tr>`).join("");
-  const changed = Object.entries(r.changed || {}).map(([k, [a, b]]) => `${k} ${typeof a === "number" ? (+a).toFixed(2) : a} → ${typeof b === "number" ? (+b).toFixed(2) : b}`);
-  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b> · ${esc(r.reference)}</span></div>
-    <div class="afrow muted"><span>distance to the references ${(+r.score_before).toFixed(1)} → <b>${(+r.score_after).toFixed(1)}</b></span><span>${r.renders} renders · ${fmtDur(r.seconds)}</span></div>
-    <details><summary>Measured look</summary><table><tr class="muted"><td></td><td>before</td><td>after</td><td>references</td></tr>${rows}</table>
-    <div class="muted" style="margin-top:4px">${esc(changed.join(" · "))}</div></details>`;
+  const fv = v => typeof v === "number" ? (+v).toFixed(Math.abs(v) < 0.1 && v !== 0 ? 3 : 2) : esc(v ?? "–");
+  const steps = (r.steps || []).map(st => `<tr><td>${esc(st.step)}</td><td class="mono">${fv(st.from)} → <b>${fv(st.to)}</b></td>` +
+    `<td>${esc(AF_LABELS[st.measured] || st.measured)}: ${f(st.before)} → ${f(st.after)}${st.target !== null && st.target !== undefined ? ` <span class="muted">(aim ${f(st.target)})</span>` : ""}</td>` +
+    `<td class="muted">${esc(st.why)}</td></tr>`).join("");
+  const rows = Object.keys(AF_LABELS).filter(k => k in (r.stats_after || {}))
+    .map(k => `<tr><td>${AF_LABELS[k]}</td><td>${f((r.stats_before || {})[k])}</td><td>${f(r.stats_after[k])}</td><td>${f((r.stats_reference || {})[k])}</td></tr>`).join("");
+  const near = r.nearest ? ` · nearest: <a href="${esc(r.nearest.url)}" target="_blank" rel="noopener">${esc(r.nearest.title)}</a>` : "";
+  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b> · ${esc(r.reference)}${r.class ? " · " + esc(r.class) : ""}</span></div>
+    <div class="afrow muted"><span>distance to the references ${(+r.score_before).toFixed(1)} → <b>${(+r.score_after).toFixed(1)}</b>${near}</span><span>${r.renders} renders · ${fmtDur(r.seconds)}</span></div>
+    <details open><summary>What it did (${(r.steps || []).length} steps)</summary><table class="afsteps"><tr class="muted"><td>step</td><td>setting</td><td>measured</td><td>why it stopped there</td></tr>${steps}</table></details>
+    <details><summary>Measured look</summary><table><tr class="muted"><td></td><td>before</td><td>after</td><td>references</td></tr>${rows}</table></details>`;
   box.hidden = false;
 }
 function applyAutofinish(res) {
@@ -419,7 +424,7 @@ async function pollJob() {
       const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
       S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
       // the settings Auto-finish tuned (alone, or before the export of Run everything) become the sliders'
-      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(`Auto-finish: settings tuned to ${j.result.autofinish.report.reference}`); }
+      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(`Auto-finish: ${(j.result.autofinish.report.steps || []).length} settings set from the image, checked against ${j.result.autofinish.report.reference}`); }
       else if (S.status.stacked) schedulePreview(0);
       if (["calibrate", "analyse", "all"].includes(j.kind)) loadCalibration();
       if (j.kind === "calibrate" && j.result?.changed_analysis) toast("Calibration changed: the frame analysis was dropped — run Analyse frames again");
