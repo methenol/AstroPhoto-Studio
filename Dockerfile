@@ -21,16 +21,21 @@ ENV PYTHONUNBUFFERED=1 \
     # caches of astropy / astroquery / torch go to the output volume: writable by any UID, and kept
     HOME=/data/output/.home
 
-# libgomp: OpenMP for NumPy/SciPy/OpenCV/torch on CPU
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libgomp1 \
- && rm -rf /var/lib/apt/lists/*
+# No apt step: nothing here needs a system package.  The only OpenMP users are torch and
+# scikit-learn, and both Linux wheels carry their own runtime (torch/lib/libgomp.so.1 and
+# scikit_learn.libs/libgomp-*.so.1) and find it through their RPATH, so the former
+# "apt-get install libgomp1" added nothing but a dependency on the Debian mirrors - which is
+# what broke the build when they were unreachable ("E: Unable to locate package libgomp1",
+# after apt-get update had already failed to fetch the indices and still exited 0).
+# If a wheel ever does need a system library, the import check below fails the build here
+# instead of the container failing to start.
 
 WORKDIR /app
 COPY requirements.txt .
 # torch first, from the chosen index, so requirements.txt does not pull the default build
 RUN pip install torch --index-url "${TORCH_INDEX}" \
- && pip install -r requirements.txt
+ && pip install -r requirements.txt \
+ && python -c "import torch, numpy, scipy, cv2, skimage, sklearn, astropy, sep, astroalign; print('native libraries ok:', torch.__version__)"
 
 COPY astrophoto ./astrophoto
 COPY webui ./webui

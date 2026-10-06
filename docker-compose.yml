@@ -45,6 +45,13 @@ services:
     image: astrophoto-studio:cuda
     build:
       context: .
+      # the build runs on the host's network: BuildKit gives build containers the host's
+      # resolv.conf unfiltered, and where that lists only IPv6 nameservers (Comcast and others)
+      # the default build network, which has no IPv6 route, cannot resolve anything - apt
+      # ("Unable to locate package") and pip ("No matching distribution found") both fail.
+      # BUILD_NETWORK=default restores the old behaviour (e.g. a buildx builder without the
+      # network.host entitlement)
+      network: ${BUILD_NETWORK:-host}
       args:
         TORCH_INDEX: "${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
     environment:
@@ -71,6 +78,7 @@ services:
     image: astrophoto-studio:cpu
     build:
       context: .
+      network: ${BUILD_NETWORK:-host}   # see the GPU service
       args:
         TORCH_INDEX: https://download.pytorch.org/whl/cpu
     environment:

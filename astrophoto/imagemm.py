@@ -437,7 +437,8 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
     """Algorithms 1-3 on one cutout.
 
     ``pedestal`` (scalar or (1, C, 1, 1)): a constant added to the exposures and to the initial
-    guess, and taken off the result.  The kernels have unit sum, so the model is unchanged - except
+    guess, and taken off the result.  The kernels must have unit sum (``unit_sum``; any excess e turns
+    into a sky offset of -P e), so the model is unchanged - except
     that the non-negativity then applies to latent + pedestal.  The exposures are sky-subtracted,
     and deconvolution amplifies the sky noise (M 42, DWARF 3: ~35 ADU rms on the latent against
     ~1 on the coadd), so without it half the background pixels of the latent are clipped at 0
@@ -758,7 +759,8 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     idx = es.usable() if idx is None else idx
     Y, V, Mk = es.windows(idx, y0, y1, x0, x1)
     at = ((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2)                # the PSFs where the cutout is
-    k = es.kernels(idx, psf_model, at=at) if kernels is None else kernels
+    # unit sum whatever the source: the sky pedestal below assumes it (``unit_sum``)
+    k = unit_sum(es.kernels(idx, psf_model, at=at) if kernels is None else kernels)
     if n_groups:
         groups = seeing_groups(es.kernels(idx, psf_model, at=at), n_groups)
         Y, V, Mk, k = coadd_groups(Y, V, Mk, k, groups)
@@ -1380,6 +1382,17 @@ def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float =
     return sig, {"requested": float(sigma), "chosen": sig, "peak": peaks}
 
 
+def unit_sum(k: np.ndarray) -> np.ndarray:
+    """Kernels (..., k, k) scaled to unit sum: a PSF conserves flux.  The Eq. 11 solve does not
+    guarantee it - its non-negativity projection adds mass wherever the exact h would go negative,
+    most in the field's corners (M 42, 2026-10-06: sums 1.0002 at the centre to 1.010 in a corner,
+    1.043 for single subs).  A sum of 1 + e scales the whole restoration by 1 / (1 + e), and on the
+    sky pedestal (``mm_restore``) that is a sky offset of -P e, constant over each cutout because
+    its kernels are taken at the cutout's centre: steps of up to 55 ADU between cutouts."""
+    s = k.sum(axis=(-2, -1), keepdims=True)
+    return (k / np.where(s > 0, s, 1.0)).astype(np.float32)
+
+
 def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: str, device=None, progress=None,
                   cache: str | None = None) -> tuple[np.ndarray, dict | None]:
     """Latent-grid kernels of the exposures ``idx`` at the nodes of the field PSF grid
@@ -1389,7 +1402,7 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
     solution (it takes minutes), reused while the exposures, r, sigma and the model match."""
     K = es.node_kernels(idx, psf_model)
     if not (r > 1 or sigma is not None):
-        return K, None
+        return unit_sum(K), None
     sigma = 1.1 if sigma is None else sigma
     # the resolution these PSFs can be restored to (choose_sigma): tried on the kernels of the central
     # node before the full solve
@@ -1408,7 +1421,7 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
             with open(cache, "rb") as f:
                 c = pickle.load(f)
             if c.get("key") == key:
-                return c["kernels"], c["eq11"]
+                return _normalised(c["kernels"], c["eq11"])
         except Exception:
             pass
     kern, mse = superresolved_kernels(K, r, sigma, device=device, progress=progress)
@@ -1418,7 +1431,15 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         with open(cache, "wb") as f:
             pickle.dump({"key": key, "kernels": kern, "eq11": eq11}, f, protocol=4)
-    return kern, eq11
+    return _normalised(kern, eq11)
+
+
+def _normalised(kern: np.ndarray, eq11: dict) -> tuple[np.ndarray, dict]:
+    """The Eq. 11 kernels at unit sum (``unit_sum``), with the correction recorded."""
+    s = kern.sum(axis=(-2, -1))
+    eq11 = {**eq11, "sum_before_normalising": [round(float(s.min()), 5), round(float(np.median(s)), 5),
+                                               round(float(s.max()), 5)]}
+    return unit_sum(kern), eq11
 
 
 def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empirical", n_groups: int = 0,

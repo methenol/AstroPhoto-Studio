@@ -547,17 +547,31 @@ renders and time on the CPU).
 IC 1396 (Seestar S50, LP, 171 subs, network restoration) was added after the fix below: 41.8 → 27.1
 in 63 renders; the class references (emission nebulae) since it has none of its own.
 
-**A defect found on the way, in the processing itself (2026-10-06).** The dual-band palette
-gave the exported IC 1396 red patches with hard edges on an otherwise grey nebula, with any
-restoration preset. `postprocess._palette_chroma` switched the chroma off wherever neither line was
-significant, with ramps against a *local* sky (a 96 px median): a nebula that fills the frame became
-its own sky, only its brighter clumps kept their colour, and 60 % of the pixels had none. Measuring
-significance against the frame's sky (the linear stage has removed the gradients) and weighting the
-chroma smoothly with the signal-to-noise removed the hard edges but still varied the saturation
-across the nebula with the noise ("still pretty splotchy"). The colour is now never faded at all:
-significance only chooses which smoothing scale (1.5, 8 or 24 px) supplies a pixel's colour, and
-the noise stays out of the colour by that smoothing. C 20 had the same patchwork and lost it; the
-Veil's dark sky stays neutral, because the palette gives light at the sky level no colour.
+**A defect found on the way, in the processing itself (2026-10-06).** The dual-band palette gave the
+exported IC 1396 red patches with hard edges on an otherwise grey nebula, with any restoration preset,
+and later gave NGC 6960's background sky a warm pattern where it had been neutral.
+
+One mechanism caused both. `postprocess._palette_chroma` did not use the palette's colour: it rebuilt
+the chroma from the line maps smoothed at three scales, chose a scale per pixel by how *significant* a
+line was there, and zeroed the chroma where neither line was significant, with ramps between 2.5 σ and
+7 σ measured against a *local* sky (a 96 px median). On a nebula that fills the frame that median is
+the nebula, so only its brighter clumps counted as emission: 60 % of IC 1396's pixels came out with no
+colour at all, in patches with hard edges. Measuring significance against the frame's sky and weighting
+the chroma smoothly only turned the patches into a smooth modulation of the saturation, and dropping
+the weight entirely left the scale selection still varying the colour from pixel to pixel while the
+sky's own faint structure took on the palette's hue.
+
+**The whole mechanism is gone.** The palette's colour is now used as it is composed, at full strength,
+identically everywhere. Colour noise is handled by the chroma noise reduction that follows it, which is
+uniform and on a slider. Checked on NGC 6960 (dark sky, 2× drizzle), IC 1396 (frame-filling faint Hα)
+and C 33 (dark sky, bright filaments), at preview size and at 1:1: no patches, no speckle, the sky's
+median chroma at 1:1 is 0.0015 in OKLab on all three.
+
+What is left in NGC 6960's sky is a faint warm large-scale structure that the old code hid by forcing
+the sky grey. It is in the data, not in the colour code: the two line maps differ there by about 2 σ of
+their own noise at the 24 px scale, a low-order polynomial explains only 1–3 % of it, and that stack's
+survey-reference gradient fit left a scatter of 33 and 55 ADU in R and B against 3.8 in G (the 1×
+stack of the same target: 4.3 / 3.1 / 5.1). If it needs to go, it belongs to the gradient removal.
 
 **What the measurements decided, and why that is right:**
 

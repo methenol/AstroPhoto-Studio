@@ -730,11 +730,43 @@ def test_empirical_psf_crowded():
           f"support {extra['support']:.1f} px, wing flux {wing_est:.3f} vs {wing_true:.3f}, max |diff|/peak {err:.3f}")
 
 
+def test_unit_sum_pedestal():
+    """A PSF whose exact Eq. 11 kernel would go negative (a flat-topped core, narrower in its wings
+    than g_sigma allows) gets a non-negative solution with more than unit sum.  On the sky pedestal
+    P that excess e is a sky offset of -P e - per cutout, since each takes its kernels at its centre:
+    the brightness steps between cutouts of M 42 (2026-10-06).  ``unit_sum`` removes it."""
+    from scipy.ndimage import uniform_filter
+    f = uniform_filter(gauss_int(2.2, 25), 3)           # boxy core: h >= 0 cannot reproduce it exactly
+    f = (f / f.sum()).astype(np.float32)
+    h, _ = M.refine_psfs(f[None], 1, 1.0, device=DEV)
+    s_raw = float(h.sum())
+    check("non-negative Eq. 11 kernel of a boxy PSF has more than unit sum", s_raw > 1.0005, f"sum {s_raw:.5f}")
+    ku = M.unit_sum(h)
+    check("unit_sum normalises it", abs(float(ku.sum()) - 1) < 1e-5, f"sum {float(ku.sum()):.6f}")
+    # a flat, sky-subtracted field (truth 0) restored on a pedestal, with each kernel
+    n, d, ks, P = 6, 48, h.shape[-1], 5000.0
+    rng = np.random.default_rng(0)
+    y = torch.from_numpy(rng.normal(0, 10, (n, 3, d, d)).astype(np.float32)).to(DEV)
+    v = torch.full_like(y, 100.0)
+    m = torch.ones_like(y)
+    off = {}
+    for name, kk in (("as solved", h), ("unit sum", ku)):
+        k = torch.from_numpy(np.broadcast_to(kk[0], (n, 3, ks, ks)).copy()).to(DEV)
+        x0 = M.initial_guess(y, m, ks)
+        x, _ = M.mm_restore(y, v, m, k, x0, robust=True, max_iters=400, epsilon=0, pedestal=P)
+        o = ks - 1
+        off[name] = float(x[0, :, o:o + d - o, o:o + d - o].mean())
+    expect = -P * (s_raw - 1) / s_raw
+    check("kernel excess becomes a sky offset of -P e on the pedestal", abs(off["as solved"] - expect) < 0.25 * abs(expect),
+          f"offset {off['as solved']:.1f} ADU, predicted {expect:.1f}")
+    check("unit-sum kernels: no sky offset", abs(off["unit sum"]) < 1.0, f"offset {off['unit sum']:.2f} ADU")
+
+
 if __name__ == "__main__":
     t0 = time.time()
     ALL = [test_operators, test_operator_vs_conv2d, test_stack_forward, test_true_convolution, test_geometry, test_psf_solver, test_restoration,
            test_superresolution, test_superresolved_units, test_batched_psf_solver, test_moffat, test_seeing_groups, test_mf_data_term, test_tiling, test_empirical_psf,
-           test_empirical_psf_crowded, test_field_psf, test_photometric_scale, test_stopping_rules, test_saturated_fill, test_n2n_noise_scale]
+           test_empirical_psf_crowded, test_field_psf, test_photometric_scale, test_stopping_rules, test_saturated_fill, test_n2n_noise_scale, test_unit_sum_pedestal]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

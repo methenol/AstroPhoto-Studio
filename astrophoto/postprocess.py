@@ -1459,64 +1459,6 @@ def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0, neu
     return ha, oiii.astype(np.float32)
 
 
-def _line_significance(x: np.ndarray, sigma: float, sky: float) -> np.ndarray:
-    """Signal of a linear line map above the sky, in units of its own noise after a Gaussian blur
-    of ``sigma`` px (noise from the fine-scale residual of the faint pixels)."""
-    xb = cv2.GaussianBlur(x, (0, 0), sigma)
-    d = xb - sky
-    faint = d[::4, ::4] <= 0
-    resid = (xb - cv2.GaussianBlur(xb, (0, 0), 2 * sigma))[::4, ::4][faint]
-    return d / max(mad_sigma(resid), 1e-12)
-
-
-def _line_sky(x: np.ndarray, sigma: float) -> float:
-    """The sky level of a line map: the 10th percentile of the map smoothed at the widest chroma
-    scale.  One level for the whole frame.  The linear stage has already removed the gradients
-    (against a sky survey where the field was solved), so the sky is flat; a *local* sky (a median
-    over ~100 px, used before) followed a nebula that fills the frame and declared most of it
-    "sky": only its brighter clumps kept their colour and the rest went grey, in patches with
-    hard edges (IC 1396, 2026-10-06)."""
-    xb = cv2.GaussianBlur(x, (0, 0), sigma)[::4, ::4]
-    return float(np.percentile(xb, 10))
-
-
-def _snr_weight(z: np.ndarray, z0: float) -> np.ndarray:
-    """Smooth weight of a line's significance: z² / (z² + z0²) - 0.5 at z0, 0.8 at 2 z0, never a
-    step.  Used to choose between the colour scales, not to fade the colour."""
-    zz = np.clip(z, 0, None)
-    return (zz * zz / (zz * zz + z0 * z0))[..., None].astype(np.float32)
-
-
-def _palette_chroma(ha: np.ndarray, oiii: np.ndarray, palette: str, line_s, px_scale: float) -> np.ndarray:
-    """OKLab a/b of the narrowband palette from noise-suppressed line maps (see nonlinear_stage).
-
-    The colour of each pixel is the palette's colour of the line maps smoothed at the finest of
-    three scales (1.5, 8 and 24 px, scaled) at which a line is significant there; where neither
-    is, at the widest.  Noise is kept out of the colour by the smoothing, not by desaturating:
-    the chroma is never faded or switched off.  (Gating it by significance - off where no line
-    was significant, ramps in between - cut a faint nebula into coloured and grey patches
-    wherever its significance crossed the ramp, and weighting it smoothly still varied the
-    saturation across the nebula with the noise; IC 1396, 2026-10-06.)  At the widest scale the
-    sky's own texture is a fraction of its noise, and the palette gives light at the sky level no
-    colour, so the sky stays neutral without a gate."""
-    s_fine, s_broad, s_wide = max(1.0, 1.5 * px_scale), max(3.0, 8.0 * px_scale), max(6.0, 24.0 * px_scale)
-    sky_h, sky_o = _line_sky(ha, s_wide), _line_sky(oiii, s_wide)
-
-    def chroma(sig):
-        hb, ob = cv2.GaussianBlur(ha, (0, 0), sig), cv2.GaussianBlur(oiii, (0, 0), sig)
-        lab = rgb_to_oklab(palette_compose(line_s(hb), line_s(ob), palette))
-        z = np.maximum(_line_significance(ha, sig, sky_h), _line_significance(oiii, sig, sky_o))
-        return lab[..., 1:], z
-
-    c_fine, z_fine = chroma(s_fine)
-    c_broad, z_broad = chroma(s_broad)
-    c_wide, _ = chroma(s_wide)
-    w_fine, w_broad = _snr_weight(z_fine, 5.0), _snr_weight(z_broad, 3.5)
-    c = c_wide * (1 - w_broad) + c_broad * w_broad
-    c = c * (1 - w_fine) + c_fine * w_fine
-    return c.astype(np.float32)
-
-
 def _chroma_denoise_lab(lab: np.ndarray, amount: float, px_scale: float) -> np.ndarray:
     """Smooth chrominance (OKLab a/b) while keeping luminance detail untouched."""
     if amount <= 0:
@@ -1860,14 +1802,14 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
         bpn, Dn, spn = solve_stretch(_stretch_proxy(ha), target, b, nfloor, sm)
         line_s = lambda x: tone_fast(np.clip((x - bpn) / (1 - bpn), 0, 1), Dn, b, spn, sm)
         pal = palette_compose(line_s(ha), line_s(oiii), palette)
-        # Colour comes from noise-suppressed line maps.  Built pixel by pixel, the palette turned the
-        # independent noise of the Ha and OIII pixels into red / cyan colour wherever there is no line
-        # signal - the whole sky - and the synthetic luminance below kept that chroma at full strength.
-        # Chroma is taken at a fine scale where a line is significant there, at a broad scale where it
-        # is only significant when averaged, and is neutral where neither line is significant at all.
-        lab_c = _palette_chroma(ha, oiii, palette, line_s, px_scale)
+        # The colour is the palette's own colour, everywhere, at full strength: nothing is
+        # desaturated and no region is treated differently from another.  (Until 2026-10-06 the
+        # chroma was taken from the line maps at one of three smoothing scales chosen per pixel by
+        # how significant a line was there, and zeroed where neither was.  That is what turned a
+        # frame-filling nebula into coloured and grey patches, and a faint sky into a coloured
+        # pattern.  Colour noise belongs to the colour noise reduction below, which treats every
+        # pixel alike and is on a slider.)
         lab_p = rgb_to_oklab(pal)
-        lab_p[..., 1:] = lab_c
         # LRGB-style: palette provides chrominance, the stretched all-channel image
         # provides lightness (synthetic luminance = best SNR, perceptually balanced)
         lm = float(p["synthetic_luminance"])
