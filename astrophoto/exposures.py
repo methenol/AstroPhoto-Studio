@@ -176,8 +176,8 @@ def star_catalog(img: np.ndarray, sat: float, fwhm: float, thresh: float = 10.0)
     d, j = tree.query(np.stack([objs["x"], objs["y"]], 1), k=2)
     nn = d[:, 1]                                        # [:, 0] is the source itself
     near = tree.query_ball_point(np.stack([objs["x"], objs["y"]], 1), 8 * fwhm)
-    nflux = np.array([max([allobj["flux"][q] for q in lst if np.hypot(allobj["x"][q] - x0, allobj["y"][q] - y0) > 1.0],
-                          default=0.0) for lst, x0, y0 in zip(near, objs["x"], objs["y"])])
+    me = np.where(d[:, 0] <= max(1.0, fwhm), j[:, 0], -1)  # the source's own 3-sigma detection (see _psf_star_table)
+    nflux = np.array([max([allobj["flux"][q] for q in lst if q != s], default=0.0) for lst, s in zip(near, me)])
     good = (objs["flag"] == 0) & (wflag == 0) & (peak_rgb < 0.5 * sat)
     return {"x": wx[good], "y": wy[good], "flux": objs["flux"][good], "peak": objs["peak"][good],
             "nn": nn[good], "nflux": nflux[good] / np.maximum(objs["flux"][good], 1e-12),
@@ -366,7 +366,7 @@ def _psf_star_table(cat: dict, fwhm: float, half: int) -> list:
     size, so it is built once and shared by every exposure and channel."""
     from scipy.spatial import cKDTree
     tables = cat.setdefault("_psf_tables", {})
-    key = (len(cat["x"]), round(float(fwhm), 3), int(half))
+    key = (len(cat["x"]), round(float(fwhm), 3), int(half), "self-fwhm")   # (tables cached before the self-match fix are not reused)
     if key in tables:
         return tables[key]
     rc = max(3.0, 2.0 * fwhm)
@@ -384,7 +384,7 @@ def _psf_star_table(cat: dict, fwhm: float, half: int) -> list:
             r_light = np.where(peak > thr, alpha * np.sqrt(np.maximum((peak / max(thr, 1e-30)) ** (1 / beta) - 1, 0)),
                                0.0)
         rn = np.maximum(r_light, 3 * np.asarray(cat["all_a"], float))
-        tree = cKDTree(np.stack([ax, ay], 1))
+        tree = self_tree = cKDTree(np.stack([ax, ay], 1))
         reach = pad * np.sqrt(2) + rn.max()
     else:                                                # no neighbour list: nearest-neighbour distances only
         tree = None
@@ -393,7 +393,13 @@ def _psf_star_table(cat: dict, fwhm: float, half: int) -> list:
         ix, iy = int(round(x[i])), int(round(y[i]))
         m = np.zeros(yy.shape, bool)
         if tree is not None:
-            nb = [j for j in tree.query_ball_point([x[i], y[i]], reach) if np.hypot(ax[j] - x[i], ay[j] - y[i]) > 1.0]
+            # the star's own 3-sigma detection: the nearest one within a FWHM.  Its isophotal barycentre is not
+            # the windowed centroid (cat x, y): on a bright DWARF 3 star the halo, off-centre by 1-2 px, pulls it
+            # 1.0-1.1 px away, and a fixed 1 px match made every bright star its own bright neighbour - the
+            # PSF was then measured from faint stars only (71 of 71 bright unsaturated stars left out on M 42)
+            d0, j0 = self_tree.query([x[i], y[i]])
+            me = j0 if d0 <= max(1.0, fwhm) else -1
+            nb = [j for j in tree.query_ball_point([x[i], y[i]], reach) if j != me]
             if nb:
                 d = np.hypot(ax[nb] - x[i], ay[nb] - y[i])
                 if np.any(d <= rc + rn[nb]):             # a neighbour's light reaches the core
@@ -497,10 +503,44 @@ def _support_radius(mu: np.ndarray, se: np.ndarray, half: int, nsig: float) -> f
     return float(half)
 
 
-def _finish_psf(mu: np.ndarray, rsup: float) -> np.ndarray:
-    """Cut at the support radius, negative pixels to 0, unit sum."""
+def _finish_psf(mu: np.ndarray, rsup: float, fwhm: float | None = None, harmonics: int = 4) -> np.ndarray:
+    """Cut at the support radius, negative pixels to 0, unit sum.  With ``fwhm``, the wings beyond
+    2 FWHM are first replaced by their low-order angular expansion: in each 1-px ring the least-squares
+    fit of a_0 + sum_{m<=harmonics} (a_m cos m theta + b_m sin m theta), the coefficients interpolated
+    linearly in r at each pixel.  Clipped pixel by pixel, the zero-mean noise of the far wings becomes
+    a positive pedestal (on M 42, DWARF 3, the kernel held 2.5-3x the measured wing at 12-18 px and
+    ImageMM took that much light out of the sky round every bright star); a ring's few coefficients
+    average tens to hundreds of pixels, so they are near noise-free and are clipped at 0 without that
+    bias.  The expansion keeps the wings' real asymmetry - the DWARF 3's halo is centred 1-2 px off the
+    core: an azimuthal average (m = 0 alone) erased it, and the restoration put the missing halo light
+    into the latent as an arc beside each bright star, with a dark gap opposite."""
     n = mu.shape[-1]
-    rr = np.hypot(*np.mgrid[:n, :n] - n // 2)
+    yy, xx = np.mgrid[:n, :n] - n // 2
+    rr = np.hypot(yy, xx)
+    th = np.arctan2(yy, xx)
+    mu = np.asarray(mu, np.float64)
+    if fwhm:
+        flat = mu.reshape(-1, n * n)
+        ri = np.minimum(rr.astype(int), n).ravel()
+        cols = [np.ones(n * n)] + [f(m * th.ravel()) for m in range(1, harmonics + 1) for f in (np.cos, np.sin)]
+        Bm = np.stack(cols, 1)                                       # (n^2, 1 + 2 harmonics)
+        nb = int(ri.max()) + 1
+        coef = np.full((nb, Bm.shape[1], len(flat)), np.nan)
+        rmean = np.full(nb, np.nan)
+        for k in range(nb):
+            q = ri == k
+            if not q.any():
+                continue
+            rmean[k] = rr.ravel()[q].mean()
+            mm = Bm.shape[1] if q.sum() >= 4 * Bm.shape[1] else 1       # small rings: the mean only
+            coef[k, :mm] = np.linalg.lstsq(Bm[q, :mm], flat[:, q].T, rcond=None)[0]
+            coef[k, mm:] = 0.0
+        ok = np.isfinite(rmean)
+        r_ = rr.ravel()
+        C = np.stack([np.stack([np.interp(r_, rmean[ok], coef[ok, j, i]) for j in range(Bm.shape[1])], 1)
+                      for i in range(len(flat))])                     # (kernels, n^2, terms)
+        wing = (C * Bm[None]).sum(-1).reshape(mu.shape)
+        mu = np.where(rr > 2 * float(fwhm), np.maximum(wing, 0.0), mu)
     psf = np.clip(np.where(rr <= rsup, mu, 0.0), 0, None)
     return (psf / np.maximum(psf.sum((-2, -1), keepdims=True), 1e-300)).astype(np.float32)
 
@@ -569,7 +609,7 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
         keep = new
     se = np.where(neff > 1, sd / np.sqrt(np.maximum(neff, 1)), np.inf)
     rsup = _support_radius(mu, se, half, nsig)
-    psf = _finish_psf(mu, rsup)
+    psf = _finish_psf(mu, rsup, fwhm)
     if return_error:
         n = mu.shape[0]
         rr = np.hypot(*np.mgrid[:n, :n] - n // 2)
@@ -580,7 +620,14 @@ def empirical_psf(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, clip
     return psf, len(S)
 
 
-def psf_nodes(H: int, W: int, spacing: float = 900.0) -> tuple[np.ndarray, np.ndarray]:
+PSF_FIELD_DEG = 3            # degree of the field PSF polynomial (empirical_psf_field)
+PSF_NODE_SPACING = 450.0     # px between the field PSF nodes.  M 42's cluster (DWARF 3, lower part of the
+                             # frame): degree 2 on 900 px nodes missed the stars' coma by 2.7 % of the core
+                             # flux (light above the core against below), and the restoration grew a small
+                             # crescent above every star; degree 3 on 450 px: 1.5 %
+
+
+def psf_nodes(H: int, W: int, spacing: float = PSF_NODE_SPACING) -> tuple[np.ndarray, np.ndarray]:
     """Node positions (reference-grid rows, columns) of the field PSF grid: evenly spaced from
     edge to edge, at most ``spacing`` pixels apart, at least 2 per axis."""
     ny = max(2, int(math.ceil((H - 1) / spacing)) + 1)
@@ -589,8 +636,8 @@ def psf_nodes(H: int, W: int, spacing: float = 900.0) -> tuple[np.ndarray, np.nd
 
 
 def empirical_psf_field(img: np.ndarray, valid: np.ndarray, cat: dict, half: int, fwhm: float,
-                        nodes: tuple[np.ndarray, np.ndarray], deg: int = 2, clip: float = 3.0,
-                        min_stars: int = 10, nsig: float = 2.0, max_stars: int = 1000) -> dict | None:
+                        nodes: tuple[np.ndarray, np.ndarray], deg: int = PSF_FIELD_DEG, clip: float = 3.0,
+                        min_stars: int = 10, nsig: float = 2.0, max_stars: int = 1000, cutouts=None) -> dict | None:
     """Field-dependent empirical PSF of one background-subtracted channel (as PSFEx, Bertin
     2011, and the HSC pipeline model it): every PSF pixel is a polynomial of degree ``deg`` in
     the field position, fitted by weighted least squares to the cut-outs of ``empirical_psf``
@@ -614,7 +661,7 @@ def empirical_psf_field(img: np.ndarray, valid: np.ndarray, cat: dict, half: int
     support, "se": (n, n) standard error of the field mean on that scale, "support", "deg",
     "n_stars", "psf": field-mean kernel}."""
     fwhm = math.ceil(float(fwhm) * 10 - 1e-9) / 10
-    S, w, noises, px, py = _psf_cutouts(img, valid, cat, half, fwhm, max_stars)
+    S, w, noises, px, py = cutouts if cutouts is not None else _psf_cutouts(img, valid, cat, half, fwhm, max_stars)
     if len(S) < min_stars:
         return None
     H, W = img.shape
@@ -641,8 +688,14 @@ def empirical_psf_field(img: np.ndarray, valid: np.ndarray, cat: dict, half: int
         A = np.einsum("ip,iq,ij->jpq", B, B, ww)           # normal equations per pixel
         A += ridge[None] * np.maximum(np.trace(A, axis1=1, axis2=2), 1e-300)[:, None, None]
         rhs = np.einsum("ip,ij->jp", B, ww * Sf)
-        coef = np.linalg.solve(A, rhs[..., None])[..., 0]  # (n^2, P)
-        res = Sf - B @ coef.T
+        Ainv = np.linalg.inv(A)                            # (n^2, P, P)
+        coef = np.einsum("jpq,jq->jp", Ainv, rhs)          # (n^2, P)
+        model = B @ coef.T
+        # leave-one-out residuals, res / (1 - leverage): with the bright stars admitted a pixel is
+        # fitted by few effective stars and nearly interpolated, and its plain residual says
+        # nothing about its scatter (the clipping threshold collapsed round the brightest stars)
+        lev = ww * np.einsum("ip,jpq,iq->ij", B, Ainv, B)
+        res = (Sf - model) / np.clip(1.0 - lev, 0.05, None)
         sw = ww.sum(0)
         var = (ww * res ** 2).sum(0) / np.maximum(sw, 1e-300)
         neff = sw ** 2 / np.maximum((ww ** 2).sum(0), 1e-300)
@@ -656,19 +709,23 @@ def empirical_psf_field(img: np.ndarray, valid: np.ndarray, cat: dict, half: int
     # field mean of the model: the mean of the polynomial over the (uniformly covered) field
     gy, gx = np.meshgrid(np.linspace(-1, 1, 9), np.linspace(-1, 1, 9), indexing="ij")
     mu_bar = np.tensordot(poly_terms(gx.ravel(), gy.ravel(), deg).mean(0), coef, 1)
-    rsup = _support_radius(mu_bar, se, half, nsig)
     rr = np.hypot(*np.mgrid[:n, :n] - n // 2)
-    inside = rr <= rsup
     ny_, nx_ = len(nodes[0]), len(nodes[1])
     ny, nx = np.meshgrid(nodes[0], nodes[1], indexing="ij")
     Bn = poly_terms(*uv(nx.ravel(), ny.ravel()), deg)                 # (ny*nx, P)
     mu_n = np.tensordot(Bn, coef, 1)                                    # (ny*nx, n, n)
+    # the wings beyond 2 FWHM: _finish_psf's low-order angular expansion of this model (the
+    # azimuthally averaged power-law tail of the median ring means, _robust_wings, made up for a PSF
+    # measured on faint stars alone - see _psf_star_table - and erased the halo's real asymmetry)
+    rsup = _support_radius(mu_bar, se, half, nsig)
+    inside = rr <= rsup
     tot = np.maximum(np.clip(np.where(inside, mu_n, 0), 0, None).sum((1, 2)), 1e-300)
     tot_bar = max(float(np.clip(np.where(inside, mu_bar, 0), 0, None).sum()), 1e-300)
-    return {"nodes": _finish_psf(mu_n, rsup).reshape(ny_, nx_, n, n),
+    return {"nodes": _finish_psf(mu_n, rsup, fwhm).reshape(ny_, nx_, n, n),
             "mean": (mu_n / tot[:, None, None]).astype(np.float32).reshape(ny_, nx_, n, n),
             "se": np.where(np.isfinite(se), se / tot_bar, 1e30).astype(np.float32),
-            "support": rsup, "deg": deg, "n_stars": int(N), "psf": _finish_psf(mu_bar, rsup)}
+            "support": rsup, "deg": deg, "n_stars": int(N), "psf": _finish_psf(mu_bar, rsup, fwhm),
+            "wings_averaged": True, "wings": "harmonic", "field": [deg, len(nodes[0]), len(nodes[1])]}
 
 
 def _fit_size(a: np.ndarray, n: int, fill: float = 1e30) -> np.ndarray:
@@ -679,6 +736,44 @@ def _fit_size(a: np.ndarray, n: int, fill: float = 1e30) -> np.ndarray:
         return a[o:o + n, o:o + n]
     o = (n - m) // 2
     return np.pad(a, o, constant_values=fill)
+
+
+def warp_psf(K: np.ndarray, A: np.ndarray) -> np.ndarray:
+    """Kernels K (..., N, N) under the linear map A (2 x 2, (y, x) order) about their centre:
+    K_A(p) = K(A^-1 p) / |det A|, clipped at 0 and renormalised to unit sum (same N)."""
+    N = K.shape[-1]
+    c = (N - 1) / 2
+    Ai = np.linalg.inv(np.asarray(A, np.float64))
+    # cv2 works in (x, y): dst (x, y) <- src = Ai (p - c) + c
+    Mxy = np.array([[Ai[1, 1], Ai[1, 0]], [Ai[0, 1], Ai[0, 0]]])
+    off = np.array([c, c]) - Mxy @ np.array([c, c])
+    M_ = np.float32(np.c_[Mxy, off])
+    flat = K.reshape(-1, N, N)
+    out = np.empty_like(flat, dtype=np.float32)
+    for i, k in enumerate(flat):
+        k = np.clip(cv2.warpAffine(k.astype(np.float32), M_, (N, N), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP), 0, None)
+        out[i] = k / max(float(k.sum()), 1e-30)
+    return out.reshape(K.shape)
+
+
+def _weighted_moments(K: np.ndarray, fwhm: float, valid: np.ndarray | None = None) -> np.ndarray:
+    """Second-moment matrix (y, x) of a centred kernel with a Gaussian weight of sigma = FWHM (adaptive
+    moments: the weight keeps the noise of the far wings out)."""
+    N = K.shape[-1]
+    Y, X = np.mgrid[:N, :N] - (N - 1) / 2
+    w = np.exp(-(Y ** 2 + X ** 2) / (2 * fwhm ** 2))
+    if valid is not None:
+        w = w * valid
+    k = K * w
+    t = max(float(k.sum()), 1e-30)
+    my, mx = (k * Y).sum() / t, (k * X).sum() / t
+    return np.array([[(k * (Y - my) ** 2).sum(), (k * (Y - my) * (X - mx)).sum()],
+                     [(k * (Y - my) * (X - mx)).sum(), (k * (X - mx) ** 2).sum()]]) / t
+
+
+def _sqrtm(M: np.ndarray) -> np.ndarray:
+    v, U = np.linalg.eigh(M)
+    return (U * np.sqrt(np.maximum(v, 1e-12))) @ U.T
 
 
 def scale_psf(K: np.ndarray, sc: float) -> np.ndarray:
@@ -695,8 +790,71 @@ def scale_psf(K: np.ndarray, sc: float) -> np.ndarray:
     return out.reshape(K.shape)
 
 
+def fit_seeing_scale(cutouts, ref: dict, nodes, fwhm: float, scales: np.ndarray, shape: np.ndarray | None = None,
+                     r_fit: float = 2.5, max_stars: int = 80) -> tuple[float, float]:
+    """The seeing of one exposure and channel relative to the coadd: the radial scale s of the coadd's
+    field PSF (``ref``, at each star's position; mapped by ``shape`` first) that best fits the
+    exposure's own PSF-star cut-outs (``_psf_cutouts``: centred, flux-normalised, neighbours
+    masked).  Per star an amplitude, a constant and a sub-pixel shift (linearised) are free; the
+    scale is the flux^2-weighted median of the stars' best scales over the brightest ``max_stars``
+    (one contaminated star cannot move it).  Returns (s, summed chi^2 at s).
+
+    Why not the exposure's own field model (empirical_psf_field): a single sub's model is fitted by
+    its few bright stars and nearly interpolates them, so it has no honest standard error to weight
+    a fit with, and before the bright stars were admitted it was the faint stars' blurred stack -
+    M 42's kernels followed the seeing measured on bright stars with a slope of 0.69."""
+    S, w, noises, px, py = cutouts
+    N, n, _ = S.shape
+    if N == 0:
+        return 1.0, np.inf
+    order = np.argsort(-w.reshape(N, -1).max(1))[:max_stars]
+    Kr = np.asarray(ref["nodes"], np.float32)
+    if shape is not None:
+        Kr = warp_psf(Kr, shape)
+    nr = Kr.shape[-1]
+    M = max(n, int(np.ceil(nr * scales.max())) | 1)
+    pad = lambda z, m: np.pad(z, [(0, 0)] * (z.ndim - 2) + [((M - m) // 2, (M - m) // 2)] * 2)
+    Kr = pad(Kr, nr)
+    c = M // 2
+    h = n // 2
+    rr = np.hypot(*np.mgrid[:n, :n] - h)
+    fit = rr <= r_fit * fwhm
+    best, wt, chis = [], [], []
+    for i in order:
+        K0 = interp_nodes(Kr, nodes, float(py[i]), float(px[i]))              # (M, M)
+        m = (w[i] > 0) & fit
+        if m.sum() < 20:
+            continue
+        y = S[i][m]
+        # the shift, linearised about the unscaled kernel: S ~ a K + a dy dK/dy + a dx dK/dx + b
+        k1 = K0[c - h:c + h + 1, c - h:c + h + 1]
+        gy, gx = np.gradient(k1)
+        A = np.stack([k1[m], gy[m], gx[m], np.ones(m.sum())], 1)
+        sol = np.linalg.lstsq(A, y, rcond=None)[0]
+        dy, dx = (sol[1] / sol[0], sol[2] / sol[0]) if sol[0] > 0 else (0.0, 0.0)
+        dy, dx = float(np.clip(dy, -1, 1)), float(np.clip(dx, -1, 1))
+        Ks = fourier_shift(K0, dy, dx) if (abs(dy) > 1e-3 or abs(dx) > 1e-3) else K0
+        chi = np.empty(len(scales))
+        for j, sc in enumerate(scales):
+            k = scale_psf(Ks[None], sc)[0][c - h:c + h + 1, c - h:c + h + 1]
+            A = np.stack([k[m], np.ones(m.sum())], 1)
+            r_ = y - A @ np.linalg.lstsq(A, y, rcond=None)[0]
+            chi[j] = float((r_ ** 2).sum())
+        best.append(float(scales[int(np.argmin(chi))]))
+        wt.append(float(w[i].max()))
+        chis.append(chi)
+    if not best:
+        return 1.0, np.inf
+    best, wt = np.asarray(best), np.asarray(wt)
+    o = np.argsort(best)
+    cw = np.cumsum(wt[o])
+    s_ = float(best[o][int(np.searchsorted(cw, 0.5 * cw[-1]))])
+    chi_tot = float((np.asarray(chis) * wt[:, None]).sum(0)[int(np.argmin(np.abs(scales - s_)))])
+    return s_, chi_tot
+
+
 def hybrid_psf(sub: dict, ref: dict, fwhm: float, r_fit: float = 2.5,
-               scales: np.ndarray = np.round(np.arange(0.60, 1.80001, 0.02), 2)) -> dict:
+               scales: np.ndarray = np.round(np.arange(0.60, 1.80001, 0.02), 2), cutouts=None, nodes=None) -> dict:
     """Per-exposure PSF field: the deep reference coadd's field PSF, radially scaled to the
     exposure's seeing.
 
@@ -719,6 +877,8 @@ def hybrid_psf(sub: dict, ref: dict, fwhm: float, r_fit: float = 2.5,
     ms, se = sub["mean"], sub["se"]                       # (ny, nx, n, n) unclipped; (n, n)
     ny, nx, n, _ = ms.shape
     nr = Kr.shape[-1]
+    if cutouts is not None and nodes is not None:
+        return _hybrid_from_cutouts(sub, ref, fwhm, scales, cutouts, nodes)
     N = max(n, int(np.ceil(nr * scales.max())) | 1)
     pad = lambda z, m: np.pad(z, [(0, 0)] * (z.ndim - 2) + [((N - m) // 2, (N - m) // 2)] * 2)
     Kr, ms = pad(Kr, nr), pad(ms, n)
@@ -740,17 +900,89 @@ def hybrid_psf(sub: dict, ref: dict, fwhm: float, r_fit: float = 2.5,
     inner = (best > 0) & (best < len(scales) - 1)
     q = int(np.round(np.median(best[inner]))) if inner.any() else int(np.argmin(np.abs(scales - 1.0)))
     best = np.full_like(best, q)
+    # the exposure's own shape: its stars are elongated by wind and tracking in a direction of their
+    # own (M 42, DWARF 3: a/b 1.12 - 1.30, median 1.18), which no scaled copy of the round-averaged
+    # coadd PSF has - ImageMM, fitting every exposure's elongated core with a round kernel, emptied
+    # the pixels round each star.  The map A = M_t^1/2 M_c^-1/2 between the second moments of the
+    # exposure's mean star (field mean of its unclipped model, Gaussian-weighted: the noise averages
+    # out) and of the scaled coadd PSF, its eigenvalues limited to 0.75 - 1.33; the overall size then
+    # fitted again with the shape fixed
+    valid = (se < 1e29).astype(np.float64)
+    Mt = _weighted_moments(ms.mean((0, 1)), fwhm, valid)
+    Mc = _weighted_moments(Ks[q].mean((0, 1)), fwhm, valid)
+    shape = np.eye(2)
+    if np.all(np.linalg.eigvalsh(Mt) > 0) and np.all(np.linalg.eigvalsh(Mc) > 0):
+        A_ = _sqrtm(Mt) @ np.linalg.inv(_sqrtm(Mc))
+        U, sv, Vt = np.linalg.svd(A_)
+        sv = np.clip(sv / np.sqrt(sv[0] * sv[1]), 0.75, 1.33)          # shape only: unit determinant
+        shape = (U * sv) @ Vt
+    Kq = warp_psf(Kr, shape)
+    Ks2 = np.stack([scale_psf(Kq, sc) for sc in scales])
+    chi2 = (w * (m - ((w * Ks2[..., fit] * m).sum(-1) / np.maximum((w * Ks2[..., fit] ** 2).sum(-1), 1e-300))[..., None]
+                 * Ks2[..., fit]) ** 2).sum(-1)
+    b2 = np.argmin(chi2, 0)
+    in2 = (b2 > 0) & (b2 < len(scales) - 1)
+    q2 = int(np.round(np.median(b2[in2]))) if in2.any() else q
+    if chi2[q2].sum() < chi[q].sum():                    # keep the shape only where it fits better
+        q, Ks = q2, Ks2
+    else:
+        shape = np.eye(2)
+    best = np.full_like(best, q)
     K = np.take_along_axis(Ks, best[None, ..., None, None], 0)[0]
     # only as large as the scaled support (the range of s left room for up to 1.8 x): the cost of
     # the restoration grows with the square of the kernel size
-    h_ = min(c, int(np.ceil(float(ref["support"]) * scales[q])) + 1)
+    h_ = min(c, int(np.ceil(float(ref["support"]) * scales[q] * max(1.0, float(np.abs(shape).max())))) + 1)
     K = K[..., c - h_:c + h_ + 1, c - h_:c + h_ + 1]
     K = K / np.maximum(K.sum((-2, -1), keepdims=True), 1e-30)
     se = se[c - h_:c + h_ + 1, c - h_:c + h_ + 1]
     out = dict(sub)
     out.update({"nodes": K.astype(np.float32), "mean": K.astype(np.float32), "psf": K.mean((0, 1)).astype(np.float32),
                 "scale": scales[best].astype(np.float32), "support": float(ref["support"]),
+                "shape": shape.astype(np.float32), "own_mean": ms.mean((0, 1)).astype(np.float32),
                 "se": np.where(se < 1e29, se, 1e30).astype(np.float32)})
+    return out
+
+
+def _hybrid_from_cutouts(sub: dict, ref: dict, fwhm: float, scales: np.ndarray, cutouts, nodes) -> dict:
+    """hybrid_psf with the seeing scale and the shape measured on the exposure's PSF-star cut-outs
+    (fit_seeing_scale) instead of on its own field model."""
+    Kr = np.asarray(ref["nodes"], np.float32)
+    ny, nx, nr, _ = Kr.shape
+    S, w, _, _, _ = cutouts
+    N, n, _ = S.shape
+    s1, chi1 = fit_seeing_scale(cutouts, ref, nodes, fwhm, scales)
+    # the exposure's own shape (see hybrid_psf): second moments of its flux^2-weighted mean star
+    # against the scaled coadd PSF's, eigenvalues 0.75 - 1.33, unit determinant
+    wt = w.reshape(N, -1).max(1)
+    Sm = np.tensordot(wt / max(wt.sum(), 1e-30), np.clip(S, 0, None), 1)
+    Mt = _weighted_moments(Sm, fwhm)
+    M = max(n, int(np.ceil(nr * scales.max())) | 1)
+    pad = lambda z, m: np.pad(z, [(0, 0)] * (z.ndim - 2) + [((M - m) // 2, (M - m) // 2)] * 2)
+    Kp = pad(Kr, nr)
+    Mc = _weighted_moments(scale_psf(Kp, s1).mean((0, 1)), fwhm)
+    shape = np.eye(2)
+    if np.all(np.linalg.eigvalsh(Mt) > 0) and np.all(np.linalg.eigvalsh(Mc) > 0):
+        A_ = _sqrtm(Mt) @ np.linalg.inv(_sqrtm(Mc))
+        U, sv, Vt = np.linalg.svd(A_)
+        sv = np.clip(sv / np.sqrt(sv[0] * sv[1]), 0.75, 1.33)
+        shape = (U * sv) @ Vt
+    s_, chi_ = s1, chi1
+    if not np.allclose(shape, np.eye(2)):
+        s2, chi2 = fit_seeing_scale(cutouts, ref, nodes, fwhm, scales, shape=shape)
+        if chi2 < chi1:
+            s_, chi_ = s2, chi2
+        else:
+            shape = np.eye(2)
+    K = scale_psf(warp_psf(Kp, shape) if not np.allclose(shape, np.eye(2)) else Kp, s_)
+    c = M // 2
+    h_ = min(c, int(np.ceil(float(ref["support"]) * s_ * max(1.0, float(np.abs(shape).max())))) + 1)
+    K = K[..., c - h_:c + h_ + 1, c - h_:c + h_ + 1]
+    K = K / np.maximum(K.sum((-2, -1), keepdims=True), 1e-30)
+    out = dict(sub)
+    out.update({"nodes": K.astype(np.float32), "mean": K.astype(np.float32), "psf": K.mean((0, 1)).astype(np.float32),
+                "scale": np.full((ny, nx), s_, np.float32), "support": float(ref["support"]),
+                "shape": shape.astype(np.float32), "own_mean": Sm.astype(np.float32),
+                "se": np.full((2 * h_ + 1, 2 * h_ + 1), 1e30, np.float32), "scale_chi": float(chi_)})
     return out
 
 
@@ -835,7 +1067,181 @@ _PREP_SET = None
 _PREP_COUNTER = None
 
 
-def _prep_worker_init(state: bytes, counter=None):
+def _compact_cutouts(cu, n_keep: int):
+    """The brightest ``n_keep`` cut-outs of ``_psf_cutouts`` as (S float32, flux, mask, noises, px, py)."""
+    S, w, noises, px, py = cu
+    if len(S) == 0:
+        return None
+    fl = w.reshape(len(S), -1).max(1)
+    o = np.argsort(-fl)[:n_keep]
+    return (S[o].astype(np.float32), np.sqrt(fl[o]).astype(np.float32), (w[o] > 0), np.asarray(noises)[o], px[o], py[o])
+
+
+def _expand_cutouts(cc):
+    """Inverse of _compact_cutouts: (S, w, noises, px, py) with w = flux^2 on the unmasked pixels."""
+    S, fl, mask, noises, px, py = cc
+    return S.astype(np.float64), (fl.astype(np.float64) ** 2)[:, None, None] * mask, noises, px, py
+
+
+def _gauss(sigma: float, n: int) -> np.ndarray:
+    """Sampled, unit-sum Gaussian of width ``sigma`` on an n x n grid (n odd)."""
+    yy, xx = np.mgrid[:n, :n] - n // 2
+    g = np.exp(-(yy ** 2 + xx ** 2) / (2 * max(float(sigma), 1e-3) ** 2))
+    return g / g.sum()
+
+
+def seeing_kernel(Q: np.ndarray, sigma: float, shape: np.ndarray | None = None) -> np.ndarray:
+    """One exposure's PSF from the seeing-free PSF ``Q`` (..., n, n): G(sigma) * Q, then - with a
+    ``shape`` (2 x 2) - mapped by it (warp_psf); non-negative, unit sum, same n."""
+    n = Q.shape[-1]
+    g = _gauss(sigma, n).astype(np.float32)
+    flat = Q.reshape(-1, n, n)
+    out = np.stack([cv2.filter2D(k.astype(np.float32), -1, g, borderType=cv2.BORDER_CONSTANT) for k in flat]).reshape(Q.shape)
+    if shape is not None and not np.allclose(shape, np.eye(2)):
+        out = warp_psf(out, shape)
+    out = np.clip(out, 0, None)
+    return (out / np.maximum(out.sum((-2, -1), keepdims=True), 1e-30)).astype(np.float32)
+
+
+def fit_seeing_sigma(cutouts, Q_nodes: np.ndarray, nodes, fwhm: float, shape: np.ndarray | None = None,
+                     bounds: tuple[float, float] = (0.15, 3.0), max_stars: int = 25, r_fit: float = 2.5,
+                     tol: float = 0.01) -> tuple[float, float]:
+    """The seeing of one exposure and channel: the Gaussian width sigma for which G(sigma) * Q, Q the
+    seeing-free field PSF (``Q_nodes``, (ny, nx, n, n), at each star's position), best fits the
+    exposure's brightest ``max_stars`` PSF-star cut-outs (per star an amplitude, a constant and a
+    linearised sub-pixel shift are free; pixels within ``r_fit`` FWHM; stars weighted by 1 / noise^2).
+    Golden-section search in log sigma (the summed chi^2 is unimodal).  Returns (sigma, chi^2).
+
+    Why a Gaussian on a seeing-free PSF rather than the coadd's PSF radially scaled: the coadd's PSF is
+    the mean over exposures of different seeing, and a mixture of Gaussians has a sharper peak and
+    broader shoulders than any one of them - no scaling of it fits a single exposure (M 42, DWARF 3:
+    0.4-0.6 % of a star's flux too much at 4-6 px for every exposure, which ImageMM removed from the
+    sky as a dark ring round every bright star).  With Q the coadd's PSF deconvolved by the mean of
+    the exposures' Gaussians (ExposureSet._fit_exposure_kernels), the mean of the exposures' kernels
+    is the coadd's PSF by construction, and each exposure's shoulder is its own."""
+    S, w, noises, px, py = cutouts
+    N, n, _ = S.shape
+    if N == 0:
+        return float(np.sqrt(bounds[0] * bounds[1])), np.inf
+    fl = w.reshape(N, -1).max(1)
+    order = np.argsort(-fl)[:max_stars]
+    nq = Q_nodes.shape[-1]
+    c, h = nq // 2, n // 2
+    rr = np.hypot(*np.mgrid[:n, :n] - h)
+    fit = rr <= r_fit * fwhm
+    stars = []
+    for i in order:
+        m = (w[i] > 0) & fit
+        if m.sum() < 20:
+            continue
+        Qi = interp_nodes(Q_nodes, nodes, float(py[i]), float(px[i]))
+        if shape is not None and not np.allclose(shape, np.eye(2)):
+            Qi = warp_psf(Qi[None], shape)[0]
+        stars.append((Qi.astype(np.float32), m, S[i][m], 1.0 / max(float(noises[i]), 1e-12) ** 2))
+    if not stars:
+        return float(np.sqrt(bounds[0] * bounds[1])), np.inf
+
+    def chi2(log_sig):
+        g = _gauss(math.exp(log_sig), nq).astype(np.float32)
+        tot = 0.0
+        for Qi, m, y, wt in stars:
+            k = cv2.filter2D(Qi, -1, g, borderType=cv2.BORDER_CONSTANT)[c - h:c + h + 1, c - h:c + h + 1]
+            k = k / max(float(k.sum()), 1e-30)
+            gy, gx = np.gradient(k)
+            A = np.stack([k[m], gy[m], gx[m], np.ones(int(m.sum()))], 1)
+            sol, res, *_ = np.linalg.lstsq(A, y, rcond=None)
+            r_ = y - A @ sol
+            tot += wt * float(r_ @ r_)
+        return tot
+
+    a, b = math.log(bounds[0]), math.log(bounds[1])
+    gr = (math.sqrt(5) - 1) / 2
+    x1, x2 = b - gr * (b - a), a + gr * (b - a)
+    f1, f2 = chi2(x1), chi2(x2)
+    while (b - a) > math.log(1 + tol):
+        if f1 < f2:
+            b, x2, f2 = x2, x1, f1
+            x1 = b - gr * (b - a)
+            f1 = chi2(x1)
+        else:
+            a, x1, f1 = x1, x2, f2
+            x2 = a + gr * (b - a)
+            f2 = chi2(x2)
+    x = x1 if f1 < f2 else x2
+    return float(math.exp(x)), float(min(f1, f2))
+
+
+def _sigma_task(args):
+    """One exposure's seeing per channel (fit_seeing_sigma) against the current Q."""
+    cuts, Qs, nodes, fwhm = args
+    out = []
+    for cc, Q in zip(cuts, Qs):
+        if cc is None or Q is None:
+            out.append((np.nan, np.inf))
+        else:
+            out.append(fit_seeing_sigma(_expand_cutouts(cc), Q, nodes, fwhm))
+    return out
+
+
+def _kernel_task(args):
+    """One exposure's final kernels per channel: G(sigma) * Q at every node, its own shape (elongation)
+    where that fits its cut-outs better, cut to the support, plus the summary entries."""
+    fields, refs, fwhm, cuts, sigmas, nodes = args
+    out = []
+    for f, r, cc, sig in zip(fields, refs, cuts, sigmas):
+        if f is None or r is None or cc is None or not np.isfinite(sig):
+            out.append(f)
+            continue
+        Q = np.asarray(r["Q"], np.float32)
+        ny, nx, nq, _ = Q.shape
+        cu = _expand_cutouts(cc)
+        S, w = cu[0], cu[1]
+        # the exposure's shape: second moments of its flux^2-weighted mean star against the model's
+        wt = w.reshape(len(S), -1).max(1)
+        Sm = np.tensordot(wt / max(wt.sum(), 1e-30), np.clip(S, 0, None), 1)
+        Km = seeing_kernel(Q.mean((0, 1)), sig)
+        shape = np.eye(2)
+        Mt, Mc = _weighted_moments(_fit_size(Sm, nq, 0.0), fwhm), _weighted_moments(Km, fwhm)
+        if np.all(np.linalg.eigvalsh(Mt) > 0) and np.all(np.linalg.eigvalsh(Mc) > 0):
+            A_ = _sqrtm(Mt) @ np.linalg.inv(_sqrtm(Mc))
+            U, sv, Vt = np.linalg.svd(A_)
+            sv = np.clip(sv / np.sqrt(sv[0] * sv[1]), 0.75, 1.33)
+            shape = (U * sv) @ Vt
+        sig_, chi_ = sig, None
+        if not np.allclose(shape, np.eye(2)):
+            _, chi0 = fit_seeing_sigma(cu, Q, nodes, fwhm, bounds=(sig * 0.999, sig * 1.001))
+            sig1, chi1 = fit_seeing_sigma(cu, Q, nodes, fwhm, shape=shape)
+            if chi1 < chi0:
+                sig_, chi_ = sig1, chi1
+            else:
+                shape = np.eye(2)
+        K = seeing_kernel(Q, sig_, shape)
+        c = nq // 2
+        h_ = min(c, int(math.ceil(float(r["support"]) + 3 * sig_ * max(1.0, float(np.abs(shape).max())))) + 1)
+        K = K[..., c - h_:c + h_ + 1, c - h_:c + h_ + 1]
+        K = K / np.maximum(K.sum((-2, -1), keepdims=True), 1e-30)
+        g = {k: v for k, v in f.items() if k not in ("mean", "se", "nodes")}    # the exposure's own field model, summarised
+        g.update({"nodes": K.astype(np.float32), "psf": K.mean((0, 1)).astype(np.float32), "own_psf": f.get("psf"),
+                  "sigma": float(sig_), "shape": shape.astype(np.float32), "support": float(r["support"]),
+                  "scale": np.ones((ny, nx), np.float32), "model": "mixture", "own_mean": Sm.astype(np.float32)})
+        out.append(g)
+    return out
+
+
+def _hybrid_task(args):
+    """ExposureSet.prepare's second stage for one exposure: its kernels from the coadd's PSF and its
+    own cut-outs (hybrid_psf), per channel."""
+    fields, refs, fwhm, cuts, nodes = args
+    out = []
+    for f, r, cc in zip(fields, refs, cuts):
+        if f is None or r is None or cc is None:
+            out.append(f)
+        else:
+            out.append(hybrid_psf(f, r, fwhm, cutouts=_expand_cutouts(cc), nodes=nodes))
+    return out
+
+
+def _prep_worker_init(state: bytes, counter=None, acc=None):
     """Worker process of ExposureSet.prepare: the set (reference, catalogue with its PSF-star
     tables, masks) once.  One thread per process: the processes already use every core, and
     OpenCV's own thread pool in each of them would oversubscribe the CPU.  The worker keeps only
@@ -852,6 +1258,13 @@ def _prep_worker_init(state: bytes, counter=None):
         sys.modules["torch"].set_num_threads(1)
     _PREP_SET = pickle.loads(state)
     _PREP_SET._raw_cache_frames = 1
+    if acc is not None:                   # the exposures' coadd, summed in shared memory (ExposureSet.prepare)
+        from multiprocessing import shared_memory
+        global _PREP_SHM
+        name_s, name_w, shape, lock = acc
+        _PREP_SHM = (shared_memory.SharedMemory(name=name_s), shared_memory.SharedMemory(name=name_w))
+        _PREP_SET._acc = (np.ndarray(shape + (3,), np.float32, buffer=_PREP_SHM[0].buf),
+                          np.ndarray(shape, np.float32, buffer=_PREP_SHM[1].buf), lock)
 
 
 def _prep_worker_run(k0: int, k1: int):
@@ -878,6 +1291,8 @@ class ExposureSet:
         self.defects = defects if defects is not None else np.zeros((self.H0, self.W0), bool)
         self.sat = float(sat)                     # saturation in bias-subtracted ADU
         self.ref = ref.astype(np.float32)         # reference coadd on the reference (1x) grid
+        self.coadd = None                         # the exposures' own coadd (prepare), sky included
+        self._acc = None
         # threads for window extraction (I/O, OpenCV and NumPy release the interpreter lock)
         from .resources import workers_for
         frame = 4.0 * self.W0 * self.H0
@@ -974,11 +1389,15 @@ class ExposureSet:
         ybs = y / T[None, None, :] - surf - self.sky_ref
         half = int(math.ceil(3.5 * max(fwhm, self.fwhm_ref)))
         fe = max(fwhm, self.fwhm_ref)
-        fields = [empirical_psf_field(ybs[..., c], hard, self.cat, half, fe, self.nodes) for c in range(3)]
-        fields = [hybrid_psf(f, r, fe) if f is not None and r is not None else f for f, r in zip(fields, self.psf_ref)]
+        fe_ = math.ceil(fe * 10 - 1e-9) / 10                 # (empirical_psf_field rounds the FWHM the same way)
+        cuts = [_psf_cutouts(ybs[..., c], hard, self.cat, half, fe_, 1000) for c in range(3)]
+        fields = [empirical_psf_field(ybs[..., c], hard, self.cat, half, fe, self.nodes, cutouts=cu) for c, cu in enumerate(cuts)]
+        # the brightest PSF stars' cut-outs, kept for the seeing fit against the coadd's PSF once every
+        # exposure has gone into that coadd (prepare); compact: flux and mask instead of the weight map
         return {"refine": refine, "residual": final, "T": T, "T_err": T_err, "surf": coefs,
                 "psf": [f["psf"] if f else None for f in fields], "psf_field": fields,
                 "psf_stars": [f["n_stars"] if f else 0 for f in fields], "fwhm": fwhm,
+                "cuts": [_compact_cutouts(cu, 60) for cu in cuts],
                 "valid_frac": float(valid.mean()), "_y": y, "_valid": valid, "_surf": surf}
 
     # ------------------------------------------------------------- the pass
@@ -991,11 +1410,13 @@ class ExposureSet:
         self.fwhm_ref = self.fwhm_med
         self.cat = star_catalog(ref_bs, self.sat, self.fwhm_ref)
         self.smask = star_mask(self.ref.shape[:2], self.cat, self.fwhm_ref)
-        # the coadd's own field PSF: the high-SNR wings of every exposure's PSF (hybrid_psf)
-        say("ImageMM: PSF of the reference coadd")
+        # The reference PSF is measured after the pass, on the plain mean of the registered exposures
+        # as window() delivers them (summed below): the pipeline's stack (self.ref) is resampled and
+        # combined differently and its stars differ from the exposures' (M 42, DWARF 3: 3 % of a star's
+        # flux at 2-4 px in green), so a PSF measured on it was the wrong PSF for the data ImageMM fits -
+        # the latent emptied a ring round every bright star (green only) to make up the difference.
+        self.psf_ref = [None] * 3
         half_ref = int(math.ceil(3.5 * self.fwhm_max))
-        self.psf_ref = [empirical_psf_field(ref_bs[..., c], np.ones(ref_bs.shape[:2], bool), self.cat, half_ref,
-                                            self.fwhm_ref, self.nodes) for c in range(3)]
         n = len(self.items)
         self.params = [None] * n
         acc = {"X": [], "v": [], "n": []}        # photon-transfer bins
@@ -1024,11 +1445,24 @@ class ExposureSet:
             import multiprocessing as mp
             ctx = mp.get_context("spawn")
             counter = ctx.Value("i", 0)            # subs prepared so far, over all workers
+            state = pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+            from multiprocessing import shared_memory
+            shm = (shared_memory.SharedMemory(create=True, size=self.H0 * self.W0 * 12),
+                   shared_memory.SharedMemory(create=True, size=self.H0 * self.W0 * 4))
+            acc_S = np.ndarray((self.H0, self.W0, 3), np.float32, buffer=shm[0].buf)
+            acc_W = np.ndarray((self.H0, self.W0), np.float32, buffer=shm[1].buf)
+            acc_S[:] = 0
+            acc_W[:] = 0
+            lock = ctx.Lock()
             ex = ProcessPoolExecutor(max_workers=nproc, mp_context=ctx, initializer=_prep_worker_init,
-                                     initargs=(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL), counter))
+                                     initargs=(state, counter, (shm[0].name, shm[1].name, (self.H0, self.W0), lock)))
             submit = lambda c: ex.submit(_prep_worker_run, *c)
         else:
             import threading as _th
+            shm = None
+            acc_S = np.zeros((self.H0, self.W0, 3), np.float32)
+            acc_W = np.zeros((self.H0, self.W0), np.float32)
+            self._acc = (acc_S, acc_W, _th.Lock())
             counter = type("C", (), {"value": 0, "get_lock": lambda self_: _th.Lock()})()
             ex = ThreadPoolExecutor(max_workers=1)
             submit = lambda c: ex.submit(self.prepare_run, *c, tick=lambda: setattr(counter, "value", counter.value + 1))
@@ -1065,8 +1499,92 @@ class ExposureSet:
                     acc[kk].extend(own[kk])
                 if progress:
                     progress(k1, n, f"ImageMM: preparing exposures {k1}/{n}")
+        # the exposures' coadd (sky included, as self.ref), the pipeline's stack where no exposure covers
+        seen = acc_W > 0
+        self.coadd = np.where(seen[..., None], acc_S / np.maximum(acc_W, 1)[..., None], self.ref).astype(np.float32)
+        self._acc = None
+        if shm is not None:
+            for m in shm:
+                m.close()
+                m.unlink()
         self.ptc = self._ptc_fit(acc)
+        say("ImageMM: PSF of the exposures' coadd")
+        cbs = self.coadd - self.sky_ref
+        self.psf_ref = [empirical_psf_field(cbs[..., c], seen, self.cat, half_ref, self.fwhm_ref, self.nodes)
+                        for c in range(3)]
+        for r in self.psf_ref:
+            if r is not None:
+                r["source"] = "subs"
+        self._fit_exposure_kernels(nproc, progress, cancel)
         return self
+
+    def _fit_exposure_kernels(self, nproc: int, progress=None, cancel=None, max_rounds: int = 12, tol: float = 0.01):
+        """Second stage of prepare: the seeing-mixture PSF model.  Every exposure's kernel is
+        G(sigma_t) * Q, Q the seeing-free field PSF (per channel and node) and sigma_t its seeing
+        (fit_seeing_sigma on its retained PSF-star cut-outs).  The coadd's PSF is the mean over the
+        exposures of their kernels, so Q = f_coadd deconvolved by mean_t G(sigma_t) (Eq. 11's solver,
+        refine_psfs, with that mixture as the kernel) - the two are found by alternation, starting from
+        Q = f_coadd, until the median seeing changes by less than ``tol`` px.  Then every exposure's
+        kernels are built (and its elongation fitted, _kernel_task) and its cut-outs dropped."""
+        from concurrent.futures import ProcessPoolExecutor
+        from .imagemm import refine_psfs
+        todo = [k for k, p in enumerate(self.params) if p is not None and p.get("cuts") is not None
+                and any(f is not None for f in p["psf_field"])]
+        say = (lambda msg: progress(0, 1, msg)) if progress else (lambda msg: None)
+        if not todo or all(r is None for r in self.psf_ref):
+            for p in self.params:
+                if p is not None:
+                    p.pop("cuts", None)
+            return
+        fwhm_of = lambda k: max(float(self.params[k]["fwhm"]), self.fwhm_ref)
+        f_nodes = [None if r is None else np.asarray(r["nodes"], np.float32) for r in self.psf_ref]
+        Q = [None if f is None else f.copy() for f in f_nodes]
+        sig = np.full((len(self.params), 3), np.nan)
+
+        def run(fn, args_of):
+            if nproc > 1 and len(todo) > 1:
+                import multiprocessing as mp
+                with ProcessPoolExecutor(max_workers=nproc, mp_context=mp.get_context("spawn")) as ex:
+                    return list(ex.map(fn, (args_of(k) for k in todo), chunksize=4))
+            return [fn(args_of(k)) for k in todo]
+
+        for rnd in range(max_rounds):
+            say(f"ImageMM: exposure seeing, round {rnd + 1}")
+            res = run(_sigma_task, lambda k: (self.params[k]["cuts"], Q, self.nodes, fwhm_of(k)))
+            new = sig.copy()
+            for k, r in zip(todo, res):
+                new[k] = [v[0] for v in r]
+            ok = np.isfinite(new) & np.isfinite(sig)
+            step = float(np.median(np.abs(new - sig)[ok])) if ok.any() else np.inf
+            sig = new
+            if cancel and cancel():
+                raise RuntimeError("cancelled")
+            if step < tol:
+                break
+            # Q per channel: the coadd's PSF deconvolved by the exposures' mean Gaussian
+            for c in range(3):
+                if f_nodes[c] is None:
+                    continue
+                sc = sig[:, c][np.isfinite(sig[:, c])]
+                if len(sc) == 0:
+                    continue
+                n = f_nodes[c].shape[-1]
+                mix = np.mean([_gauss(v, 2 * n - 1) for v in sc], 0)
+                h, _ = refine_psfs(f_nodes[c].reshape(-1, n, n), 1, 1.0, g=mix)
+                Q[c] = np.clip(h.reshape(f_nodes[c].shape), 0, None).astype(np.float32)
+        for c, r in enumerate(self.psf_ref):
+            if r is not None:
+                r.update({"Q": Q[c], "model": "mixture", "sigma_median": float(np.nanmedian(sig[:, c])),
+                          "rounds": rnd + 1, "sigma_step": step})
+        say("ImageMM: exposure kernels")
+        res = run(_kernel_task, lambda k: (self.params[k]["psf_field"], self.psf_ref, fwhm_of(k), self.params[k]["cuts"],
+                                           list(sig[k]), self.nodes))
+        for k, fields in zip(todo, res):
+            self.params[k]["psf_field"] = fields
+        for p in self.params:
+            if p is not None:
+                p.pop("cuts", None)
+                p["psf"] = [f["psf"] if f else None for f in p["psf_field"]]
 
     def prepare_run(self, k0: int, k1: int, tick=None):
         """prepare_one for subs k0 .. k1-1 and the photon-transfer bins of each consecutive usable
@@ -1089,6 +1607,13 @@ class ExposureSet:
                 if prev is not None:
                     self._ptc_pair(prev, p, acc)
                 prev = {kk: p[kk] for kk in ("_y", "_valid", "_surf", "T")}
+                if getattr(self, "_acc", None) is not None:
+                    S_, W_, lock = self._acc
+                    yb = (p["_y"] / p["T"][None, None, :] - p["_surf"]).astype(np.float32)
+                    v = p["_valid"].astype(np.float32)
+                    with lock:
+                        S_ += yb * v[..., None]
+                        W_ += v
             params.append({kk: v for kk, v in p.items() if not kk.startswith("_")})
         return params, acc
 
@@ -1154,14 +1679,21 @@ class ExposureSet:
         return {"c0": c0, "c1": c1, "chi2_red": red, "bins": int(len(v))}
 
     # ------------------------------------------------------------- persistence
-    _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask", "nodes", "psf_ref")
+    _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask", "nodes", "psf_ref", "coadd")
     # bumped whenever the preparation changes what it produces; an older cache is prepared again
     # (2: crowded-field PSF stars - with 1, most subs of a Milky Way field had no PSF;
     #  3: PSF cut-outs must agree with each other - with 2, bright non-point sources set the wings)
     #  4: field-dependent PSFs (empirical_psf_field) with the coadd's wings (hybrid_psf), least-squares
     #     photometric scales)
     #  7: per-exposure PSFs = the coadd's field PSF scaled to the exposure's seeing (hybrid_psf)
-    PREP_VERSION = 7
+    #  8: ... and mapped to the exposure's own shape (elongation and its direction)
+    #  9: PSF stars include the bright ones (_psf_star_table's self-match): the exposures' seeing scales
+    #     were fitted on faint stars only (M 42: slope 0.69 against the scale measured on bright stars)
+    # 10: the exposures' seeing scale and shape fitted on their PSF-star cut-outs (fit_seeing_scale)
+    # 11: the reference PSF measured on the exposures' own coadd, not the pipeline's stack
+    # 12: seeing-mixture kernels, G(sigma_t) * Q (fit_seeing_sigma, _fit_exposure_kernels)
+    PREP_VERSION = 12
+    SEEING_NORM = "channel"    # normalise_seeing: channel | shared | off (ASTROPHOTO_SEEING_NORM overrides)
 
     def save(self, path: str):
         import pickle
@@ -1194,53 +1726,113 @@ class ExposureSet:
         a too-compact core and unable to put negative light on the sky, emptied a disc round every
         star to fit the data.
 
-        So per channel the exposures keep their relative seeing (s_t / s_u, which the fits measure
-        well) but share one factor lambda, the one for which the mean of their kernels K(s_t /
-        lambda) best matches the coadd's (least squares over the coadd PSF's support, field means),
-        and every exposure's node kernels are rebuilt from the coadd's at s_t / lambda.  Done once
-        (recorded per channel as "seeing_norm"); returns the factors."""
+        So per channel the exposures keep their relative seeing (s_t / s_u, which the fits measure well)
+        but share one factor lambda >= 1, the one for which the mean of their kernels K(s_t / lambda) best
+        matches the coadd's (least squares over the coadd PSF's support, field means), and every
+        exposure's node kernels are rebuilt from the coadd's at s_t / lambda.  Per channel, because the
+        bias differs between them (M 42: 1.22 / 1.13 / 1.31; one shared 1.21 left green kernels too
+        narrow, and a green halo round every star).  lambda < 1 is not applied (see below; per channel
+        and unclamped, M 31's 0.89 / 0.94 / 0.88 made its stars 7 % less red than the coadd's).
+        ``SEEING_NORM`` (or the environment variable ASTROPHOTO_SEEING_NORM): "channel" (default),
+        "shared" (one factor for the three) or "off" (lambda = 1, the kernels still rebuilt from the
+        coadd's PSF).  Done once per mode (recorded per channel as
+        "seeing_norm"); returns the factors."""
         out = []
         idx = [k for k, p in enumerate(self.params) if p is not None]
+        if self.psf_ref and all(r is None or r.get("model") == "mixture" for r in self.psf_ref):
+            # the seeing-mixture model (prepare): the mean of the exposures' kernels is the coadd's PSF
+            # by construction, there is no factor to fit
+            self.seeing_norm = [1.0, 1.0, 1.0]
+            return self.seeing_norm
+        # a preparation made before the robust wings (_robust_wings): the coadd's PSF is measured
+        # again (a minute; the exposures need no new preparation), and every exposure's kernels below
+        # are rebuilt from it
+        nodes_now = psf_nodes(self.H0, self.W0)
+        if self.psf_ref and any(r is not None and (r.get("wings") != "harmonic" or "field" not in r
+                                                  or r.get("source") != "subs"
+                                                  or len(self.nodes[0]) != len(nodes_now[0])
+                                                  or len(self.nodes[1]) != len(nodes_now[1])) for r in self.psf_ref) \
+                and getattr(self, "coadd", None) is not None:
+            self.nodes = nodes_now                        # (the exposures' kernels below follow the new grid)
+            ref_bs = self.coadd - self.sky_ref
+            half_ref = max(int(np.asarray(r["nodes"]).shape[-1]) // 2 for r in self.psf_ref if r is not None)
+            self.psf_ref = [empirical_psf_field(ref_bs[..., c], np.ones(ref_bs.shape[:2], bool), self.cat, half_ref,
+                                                self.fwhm_ref, self.nodes) for c in range(3)]
+            for r in self.psf_ref:
+                if r is not None:
+                    r["source"] = "subs"
+            for p in self.params:                         # the exposures' kernels are rebuilt below
+                if p is not None:
+                    for f in p["psf_field"]:
+                        if f is not None:
+                            f.pop("seeing_norm", None)
+        mode = os.environ.get("ASTROPHOTO_SEEING_NORM", self.SEEING_NORM)
+        plan = []                                         # per channel: (subs, st, scaled, N, sup, errors)
         for c in range(3):
             ref = self.psf_ref[c] if self.psf_ref else None
             subs = [k for k in idx if self.params[k]["psf_field"][c] is not None and "scale" in self.params[k]["psf_field"][c]]
             if ref is None or len(subs) < 3:
-                out.append(1.0)
+                plan.append(None)
                 continue
-            if all(self.params[k]["psf_field"][c].get("seeing_norm") is not None for k in subs):
-                out.append(float(self.params[subs[0]]["psf_field"][c]["seeing_norm"]))
+            if all(self.params[k]["psf_field"][c].get("seeing_norm") is not None
+                   and self.params[k]["psf_field"][c].get("seeing_mode") == mode for k in subs):
+                plan.append(float(self.params[subs[0]]["psf_field"][c]["seeing_norm"]))
                 continue
             Kr = np.asarray(ref["nodes"], np.float32)                     # (ny, nx, nr, nr), unit sum
             nr = Kr.shape[-1]
-            st = np.array([float(np.median(self.params[k]["psf_field"][c]["scale"])) for k in subs])
+            # (the fitted scales: "scale" holds the normalised one once this has run)
+            st = np.array([float(np.median(self.params[k]["psf_field"][c].get("scale_fit", self.params[k]["psf_field"][c]["scale"])))
+                           for k in subs])
             N = int(np.ceil(nr * max(st.max() / lams.min(), 1.0))) | 1
             o = (N - nr) // 2
             Kp = np.pad(Kr, [(0, 0), (0, 0), (o, o), (o, o)])
             Km = Kp.mean((0, 1))                                          # the coadd's field-mean PSF
             cache: dict = {}
 
-            def scaled(sc):
+            def scaled(sc, Kp=Kp, cache=cache):
                 sc = round(float(sc), 3)
                 if sc not in cache:
                     cache[sc] = scale_psf(Kp, sc)
                 return cache[sc]
 
-            def mean_kernel(lam):
+            def mean_kernel(lam, st=st, scaled=scaled):
                 q, n = np.unique(np.round(st / lam, 3), return_counts=True)
                 return sum(nn * scaled(sc).mean((0, 1)) for sc, nn in zip(q, n)) / len(st)
-            err = [float(((mean_kernel(l) - Km) ** 2).sum()) for l in lams]
-            lam = float(lams[int(np.argmin(err))])
-            sup = float(ref["support"])
+            err = np.array([float(((mean_kernel(l) - Km) ** 2).sum()) / max(float((Km ** 2).sum()), 1e-30) for l in lams]) \
+                if mode != "off" else None
+            plan.append((subs, st, scaled, N, float(ref["support"]), err))
+        # the factor: per channel, one shared by the channels (their relative widths - the colour of a
+        # restored star - kept as measured; per channel, M 31's restored stars came out 7 % less red in
+        # aperture photometry than the coadd), or none (the kernels still rebuilt from the coadd's PSF)
+        errs = [q[5] for q in plan if isinstance(q, tuple)]
+        # Only lambda > 1 is applied: it undoes the broadening noise gives a short sub's fitted seeing.
+        # lambda < 1 means the exposures are sharper than the coadd they make up - registration jitter
+        # broadens the coadd, and the exposures' kernels rightly leave it out (M 31: 0.91, and applying
+        # it deepened the rings round its stars: -4 ADU at 4-12 px against -1 with lambda 1)
+        lam_shared = max(float(lams[int(np.argmin(np.sum(errs, 0)))]), 1.0) if mode == "shared" and errs else 1.0
+        for c, q in enumerate(plan):
+            if q is None:
+                out.append(1.0)
+                continue
+            if not isinstance(q, tuple):
+                out.append(q)
+                continue
+            subs, st, scaled, N, sup, err = q
+            lam = max(float(lams[int(np.argmin(err))]), 1.0) if mode == "channel" else lam_shared
             for k in subs:
                 f = self.params[k]["psf_field"][c]
-                sc = float(np.median(f["scale"])) / lam
+                fit = f.get("scale_fit", f["scale"])
+                sc = float(np.median(fit)) / lam
                 K = scaled(sc)
+                if f.get("shape") is not None and not np.allclose(f["shape"], np.eye(2)):
+                    K = warp_psf(K, np.asarray(f["shape"], np.float64))
                 h = min(N // 2, int(np.ceil(sup * sc)) + 1)
                 K = K[..., N // 2 - h:N // 2 + h + 1, N // 2 - h:N // 2 + h + 1]
                 K = K / np.maximum(K.sum((-2, -1), keepdims=True), 1e-30)
                 f2 = dict(f)
                 f2.update({"nodes": K.astype(np.float32), "mean": K.astype(np.float32), "psf": K.mean((0, 1)).astype(np.float32),
                            "scale": np.full_like(np.asarray(f["scale"], np.float32), sc), "seeing_norm": lam,
+                           "seeing_mode": mode, "scale_fit": fit,
                            "se": _fit_size(np.asarray(f["se"], np.float32), K.shape[-1])})
                 self.params[k]["psf_field"][c] = f2
                 self.params[k]["psf"][c] = f2["psf"]

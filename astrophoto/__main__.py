@@ -70,6 +70,9 @@ def main(argv=None):
                    help="plain MM iterations (default: Biggs-Andrews acceleration, same result, ~2x faster)")
     r.add_argument("--imagemm-n2n", action=argparse.BooleanOptionalAction, default=STACK_DEFAULTS["imagemm_n2n"],
                    help="ImageMM on the two halves of the subs, combined by a Noise2Noise pass (default on; --no-imagemm-n2n: all subs at once)")
+    r.add_argument("--imagemm-background", action=argparse.BooleanOptionalAction,
+                   default=STACK_DEFAULTS["imagemm_background"],
+                   help="restore on a sky pedestal, so the latent's sky keeps its noise instead of being clipped at 0")
     r.add_argument("--n2n-split", default=STACK_DEFAULTS["n2n_split"], choices=["alternate", "dither"],
                    help="how the subs are split into the Noise2Noise halves: alternate frames or whole dither blocks")
     r.add_argument("--network-groups", type=int, default=STACK_DEFAULTS["network_groups"],
@@ -161,7 +164,8 @@ def main(argv=None):
              "imagemm_delta": args.imagemm_delta, "imagemm_kappa": args.imagemm_kappa,
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
-             "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n, "n2n_split": args.n2n_split,
+             "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
+             "imagemm_background": args.imagemm_background, "n2n_split": args.n2n_split,
              "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
              "star_remover_iters": args.star_remover_iters, "autofinish": not args.no_autofinish}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)

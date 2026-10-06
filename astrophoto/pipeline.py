@@ -15,6 +15,7 @@ import os
 import pickle
 import re
 import shutil
+import sys
 import threading
 import time
 from datetime import datetime
@@ -60,6 +61,8 @@ STACK_DEFAULTS = {
     "imagemm_accelerate": True,  # Biggs & Andrews extrapolation (not in the paper): the converged
                                  # result in half the time of the plain run
     "imagemm_n2n": True,     # ImageMM on the two halves of the subs + Noise2Noise pass
+    "imagemm_background": True,  # restore on a sky pedestal (imagemm.mm_restore): the exposures are
+                                 # sky-subtracted and non-negativity would clip half the latent's sky at 0
     "n2n_split": "alternate",  # how the subs are split into the two Noise2Noise halves (half stacks,
                                # ImageMM's N2N pass, the network's multi-frame targets): alternate
                                # (frame by frame) | dither (whole dither blocks, analysis.half_split)
@@ -580,8 +583,8 @@ class Session:
         if os.path.exists(path):
             try:
                 es.load(path)
-            except Exception:
-                pass
+            except RuntimeError as e:                 # another frame selection, or an older preparation
+                print(f"ImageMM: preparing the exposures again ({e})", file=sys.stderr)
             else:
                 es.normalise_seeing()
                 return self._apply_sky_model(es)
@@ -667,6 +670,7 @@ class Session:
                     accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
                     n2n_iters=int(p["denoise_iters"]), device=p["device"], progress=progress,
                     halves=self.halves(p.get("n2n_split", "alternate")) if p.get("imagemm_n2n") else None,
+                    background=bool(p.get("imagemm_background", True)),
                     kernel_cache=self._p(f"imagemm/kernels_r{r_}_s{sigma}_{p['imagemm_psf']}.pkl"),
                     cancel=self.checkpoint)
                 cov = info.pop("coverage").mean(-1)

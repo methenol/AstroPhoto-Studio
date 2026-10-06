@@ -82,6 +82,8 @@
           <input id="sp-imagemm_accelerate" type="checkbox" checked> Biggs–Andrews acceleration</label>
         <label class="check" title="Restore the two halves of the subs separately (disjoint data, independent noise; split as set by Noise2Noise halves) and combine them with a Noise2Noise network trained on that pair (unbiased linear-domain loss). Twice the ImageMM time plus training.">
           <input id="sp-imagemm_n2n" type="checkbox" checked> Noise2Noise pass</label>
+        <label class="check" title="Model the smooth diffuse light (from the coadd: a lower envelope wider than a star and its halo) as a separate term of the fit, y = H(x + b), and restore only what is above it. Without it the non-negative fit folds the faint sky next to every bright star into the star and leaves a dark collar round it.">
+          <input id="sp-imagemm_background" type="checkbox" checked> Sky pedestal</label>
         </fieldset>
         <label title="AI network only: replace its data term by ImageMM's multi-frame likelihood (Huber) over this many seeing-group coadds of the other half's subs, each with its own PSF and exact variances. 0 = the single-PSF half-stack loss.">Multi-frame loss groups <input id="sp-network_groups" type="number" step="1" min="0" value="0"></label>
         <label title="Training steps of the AI star remover (Train star remover step).">Star remover training steps <input id="sp-star_remover_iters" type="number" step="250" min="250" value="3000"></label>

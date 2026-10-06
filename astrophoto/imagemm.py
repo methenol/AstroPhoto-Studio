@@ -431,8 +431,52 @@ class BiggsAndrews:
 def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: torch.Tensor,
                x0: torch.Tensor, r: int = 1, kappa: float = 2.0, robust: bool = True, delta: float = 2.0,
                max_iters: int = 1000, epsilon: float = 1e-6, mu: float = 0.1, chunk: int | None = None,
-               accelerate: bool = False, stop: str = "c15", min_iters: int = 0, log=None) -> tuple[torch.Tensor, dict]:
+               accelerate: bool = False, stop: str = "c15", min_iters: int = 0, log=None,
+               bg: torch.Tensor | None = None, stars: dict | None = None, smooth: float = 0.0,
+               smooth_sigma: float = 1.0, pedestal=0.0) -> tuple[torch.Tensor, dict]:
     """Algorithms 1-3 on one cutout.
+
+    ``pedestal`` (scalar or (1, C, 1, 1)): a constant added to the exposures and to the initial
+    guess, and taken off the result.  The kernels have unit sum, so the model is unchanged - except
+    that the non-negativity then applies to latent + pedestal.  The exposures are sky-subtracted,
+    and deconvolution amplifies the sky noise (M 42, DWARF 3: ~35 ADU rms on the latent against
+    ~1 on the coadd), so without it half the background pixels of the latent are clipped at 0
+    (a biased, textured sky) and any slight excess of a kernel's wing over a star's is paid for
+    by emptying the sky round the star to 0 instead of by a shallow dip.  The stopping rule
+    measures the flux of the latent without the pedestal.
+
+    ``bg`` (1, C, X, Y) >= 0, optional: a fixed smooth background on the latent grid.  The model is
+    then y(t) ~ D H(t) (x + bg) and the multiplicative update applies to x alone, u = H^T(W y) /
+    H^T(W H (x + bg)) - the majorization of the same objective for x >= 0 with a known non-negative
+    background (Lanteri et al. 2001; the point-source + smooth-background split of MCS, Magain et
+    al. 1998).  Returns x; the restoration is x + bg (``restore_cutout``).
+
+    ``stars``, optional: point sources as explicit components (Magain, Courbin & Sohy 1998, ApJ 494,
+    472, Eq. 5): {"stamps": (K, ss, ss) unit-sum g_sigma profiles at each star's sub-pixel position,
+    "iy", "ix": (K,) latent index of each stamp's top-left corner, "a": (K, C) initial amplitudes}.
+    The model is then y(t) = D H(t) (x + bg + sum_k a_k s_k): through Eq. 11 each star is the exposure's
+    own PSF f(t) at its sub-pixel position, a point source correctly sampled at the restoration's
+    resolution.  A pixel latent alone cannot hold one between pixel centres: it concentrates the star
+    into a few pixels and empties the pixels round it to keep the model close to the data - the
+    shrunken star and the dark ring of every positivity-constrained deconvolution (MCS Sec. 2).  The
+    amplitudes get the same majorization as the pixels (a linear model with non-negative coefficients):
+    a_k <- a_k <s_k, H^T(W y)> / <s_k, H^T(W H(model))>, from the two adjoint images the pixel update
+    already computes.  Returned in info["star_a"]; the restoration adds sum_k a_k s_k.
+
+    ``stars["halo"]`` (optional, (K, C, hh, hh) with "hy", "hx" the top-left exposure-window pixel): each
+    bright star's own PSF residual per unit amplitude in the exposures (MCS: the PSF of the image is an
+    analytic model plus a numerical part measured on its own stars), a fixed term of the model scaled by
+    the star's amplitude.  The PSF light of a star that the kernels lack - on M 42 every bright star's halo
+    sits 2 - 3 px off its core, more than the field model's and by a different amount for each - is then
+    the star's, not restored into the image as a coloured arc beside it with an empty gap.
+
+    ``smooth`` > 0 (with ``stars``): MCS's regularisation of the pixel channel, R(x) = 1/2 ||x - g * x||^2
+    with g the Gaussian of the restoration's resolution (``smooth_sigma``, latent pixels; Magain et al.
+    1998 Eq. 7): structure finer than the resolution costs the pixel channel, so a star's light goes to
+    its point-source component - near a point source the split between the two channels is otherwise
+    arbitrary (Cantale et al. 2016, Firedec).  Applied by Green's (1990) one-step-late rule,
+    u = H^T(W y) / (H^T(W H model) + lambda dR/dx), lambda = ``smooth`` x the data term's curvature
+    per pixel (the median of sum_t m / v over the latent).
 
     y, var, mask: (n, C, d, d) exposures y(t), variances v(t), masks m(t) in {0, 1};
     kernels: (n, C, ks, ks) PSFs on the latent grid (f(t), or h(t) of Eq. 11);
@@ -447,6 +491,12 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
     (max 3.5 %, rms 0.2 %).  Or after max_iters.
     Returns (x, info)."""
     n = y.shape[0]
+    ped = torch.as_tensor(pedestal, device=x0.device, dtype=x0.dtype)
+    if ped.ndim == 0:
+        ped = ped.view(1, 1, 1, 1)
+    if bool((ped > 0).any()):
+        y = y + ped
+        x0 = x0 + ped
     if chunk is None:
         chunk = auto_chunk(n, y.shape[1], y.shape[-1], y.device)
     ops = Operators(kernels, r, chunk)
@@ -472,16 +522,87 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         # than the plain run stopped at epsilon
         epsilon = epsilon / 100
     x = x0.clone()
+    if smooth > 0:
+        curv = torch.zeros_like(x0)
+        for a, b in ops.ranges():
+            curv += ops.adjoint_sum(W_(a, b), a, b)
+        lam = smooth * float(curv[curv > 0].median()) if (curv > 0).any() else 0.0
+        gk = int(2 * np.ceil(3 * smooth_sigma) + 1)
+        g1 = torch.exp(-((torch.arange(gk, device=x0.device, dtype=x0.dtype) - gk // 2) ** 2) / (2 * smooth_sigma ** 2))
+        g1 = g1 / g1.sum()
+
+        def G_(z):                                        # separable Gaussian blur, reflect padding
+            p = gk // 2
+            zz = F.pad(z, (p, p, p, p), mode="reflect")
+            zz = F.conv2d(zz.reshape(-1, 1, *zz.shape[-2:]), g1.view(1, 1, 1, -1))
+            zz = F.conv2d(zz, g1.view(1, 1, -1, 1))
+            return zz.reshape(z.shape)
+    if stars is not None:
+        C_ = x0.shape[1]
+        st_a = torch.as_tensor(stars["a"], device=x0.device, dtype=x0.dtype).clamp_min(1e-6).clone()  # (K, C)
+        st_iy, st_ix = list(map(int, stars["iy"])), list(map(int, stars["ix"]))
+        ss = int(stars["stamps"].shape[-1]); hs = ss // 2
+        sig_ = float(stars.get("sigma", 1.0))
+        # each star's sub-pixel position per channel, relative to its stamp's centre pixel (``point_sources``
+        # fits them on the coadd: each colour of a star sits slightly elsewhere)
+        off_ = np.asarray(stars["off"], np.float64)
+        if off_.ndim == 2:
+            off_ = np.repeat(off_[:, None, :], C_, 1)
+        st_off = torch.as_tensor(off_, device=x0.device, dtype=torch.float64)                         # (K, C, 2)
+        st_off0 = st_off.clone()
+        e_ = torch.arange(-hs, hs + 2, device=x0.device, dtype=torch.float64) - 0.5
+
+        def render(off):            # unit-sum g_sigma integrated over pixels, (K, C, ss, ss)
+            gy = torch.diff(torch.erf((e_[None, None, :] - off[..., 0:1]) / (math.sqrt(2) * sig_)), dim=-1)
+            gx = torch.diff(torch.erf((e_[None, None, :] - off[..., 1:2]) / (math.sqrt(2) * sig_)), dim=-1)
+            st_ = gy[..., :, None] * gx[..., None, :]
+            return (st_ / st_.sum((-2, -1), keepdim=True)).to(x0.dtype)
+        st_stamps = render(st_off)
+
+        if stars.get("halo") is not None:
+            ha_ = torch.as_tensor(stars["halo"], device=x0.device, dtype=x0.dtype)            # (K, C, hh, hh)
+            hy_, hx_ = list(map(int, stars["hy"])), list(map(int, stars["hx"]))
+            hh_ = ha_.shape[-1]
+
+            def halo_image(a_):      # sum_k a_k halo_k on the exposure window, (C, d, d)
+                img = torch.zeros(y.shape[1:], device=x0.device, dtype=x0.dtype)
+                d0, d1 = img.shape[-2:]
+                for q in range(len(hy_)):
+                    ya, xa = hy_[q], hx_[q]
+                    y_lo, x_lo = max(ya, 0), max(xa, 0)
+                    y_hi, x_hi = min(ya + hh_, d0), min(xa + hh_, d1)
+                    if y_hi <= y_lo or x_hi <= x_lo:
+                        continue
+                    img[:, y_lo:y_hi, x_lo:x_hi] += a_[q][:, None, None] * ha_[q][:, y_lo - ya:y_hi - ya, x_lo - xa:x_hi - xa]
+                return img
+
+        def star_image(a_):
+            img = torch.zeros_like(x0)
+            for q in range(len(st_iy)):
+                img[0, :, st_iy[q]:st_iy[q] + ss, st_ix[q]:st_ix[q] + ss] += a_[q][:, None, None] * st_stamps[q]
+            return img
+
+        def star_dot(z, stamps=None):  # <s_k, z> per star and channel -> (K, C)
+            stamps = st_stamps if stamps is None else stamps
+            return torch.stack([(z[0, :, st_iy[q]:st_iy[q] + ss, st_ix[q]:st_ix[q] + ss] * stamps[q]).sum((-2, -1))
+                                for q in range(len(st_iy))])
     u_prev, hist, converged, k = None, [], False, 0
     loss_prev, losses = float("inf"), []
     for k in range(1, max_iters + 1):
         xe = acc.extrapolate(x) if acc is not None else x
+        xm = xe if bg is None else xe + bg                  # the model's sky: restored part + background
+        if stars is not None:
+            xm = xm + star_image(st_a)
         if robust:
             num = torch.zeros_like(x0)
         den = torch.zeros_like(x0)
         loss = 0.0                     # float64 accumulation of float32 chunk sums (MPS has no float64)
+        if stars is not None and stars.get("halo") is not None:
+            E_ = halo_image(st_a)
         for a, b in ops.ranges():
-            fx = ops.forward(xe, a, b)
+            fx = ops.forward(xm, a, b)
+            if stars is not None and stars.get("halo") is not None:
+                fx = fx + E_[None]
             Wk = W_(a, b)
             z = (y[a:b] - fx) / var[a:b].clamp_min(1e-30).sqrt()
             za = z.abs()
@@ -502,14 +623,28 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             loss_prev = float("inf")
             continue
         loss_prev = loss
+        if smooth > 0:                                     # one-step-late MCS smoothing of the pixel channel
+            d_ = xe - G_(xe)
+            den = (den + lam * (d_ - G_(d_))).clamp_min(1e-3 * den.clamp_min(0) + 1e-30)
         u = torch.where(den > 0, num / den.clamp_min(1e-30), torch.ones_like(den))      # Eq. 8 / 16
         u = u.clamp(1.0 / kappa, kappa)                                                 # Eq. 9
+        if stars is not None:
+            ua = star_dot(num) / star_dot(den).clamp_min(1e-30)
+            a_prev = st_a
+            st_a = st_a * ua.clamp(1.0 / kappa, kappa)
         x_new = xe * u                                                                  # Eq. 7
         if acc is not None:
             acc.update(x, xe, x_new)
         if stop == "flux":
-            # flux-weighted relative change of the image, sum |x_k - x_{k-1}| / sum x_k over m~
-            crit = float((m_eff * (x_new - x).abs()).sum()) / max(float((m_eff * x_new).sum()), 1e-30)
+            # flux-weighted relative change of the image, sum |x_k - x_{k-1}| / sum x_k over m~ (with point
+            # sources: of the pixel channel and the stars together - stopping on the pixels alone left the
+            # star amplitudes short, data - model +10 to +25 sigma over every star core)
+            dx = float((m_eff * (x_new - x).abs()).sum())
+            tot = float((m_eff * (x_new - ped)).abs().sum())
+            if stars is not None:
+                dx += float((st_a - a_prev).abs().sum())
+                tot += float(st_a.sum())
+            crit = dx / max(tot, 1e-30)
         elif u_prev is not None:
             xi = u / u_prev
             if stop == "c15":
@@ -527,7 +662,12 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
                 converged = True
                 break
         u_prev = u
+    if stars is not None:
+        x = x + star_image(st_a)                            # the restoration includes its point sources
+    x = x - ped
     return x, {"iterations": k, "converged": converged, "criterion": hist, "loss": losses,
+               "star_a": None if stars is None else st_a.cpu().numpy(),
+               "star_off": None if stars is None else (st_off - st_off0).cpu().numpy(),
                "restarts": acc.restarts if acc is not None else 0, "effective_mask": m_eff,
                "coverage": frac / n, "chunk": chunk}
 
@@ -602,9 +742,13 @@ def coadd_groups(Y, V, Mk, K, groups):
 # ----------------------------------------------------------------- one cutout of a session
 def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None = None, r: int = 1,
                    kernels: np.ndarray | None = None, robust: bool = True, psf_model: str = "empirical",
-                   n_groups: int = 0, device=None, **kw):
+                   n_groups: int = 0, device=None, background: bool = False, **kw):
     """ImageMM (Algorithm 3 by default) of the prepared exposures ``es``
     (exposures.ExposureSet) on the reference-grid window [y0, y1) x [x0, x1).
+
+    ``background``: restore on a pedestal (``mm_restore``: 50 x the exposures' median pixel noise
+    per channel, added to the data and taken off the result), so that the latent's sky keeps its
+    noise instead of being clipped at 0.
 
     ``kernels``: latent-grid kernels for super-resolution (Eq. 11), aligned with ``idx``;
     default: the exposures' PSFs f(t) (``psf_model`` "empirical" or "moffat").
@@ -622,12 +766,19 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     kt = torch.from_numpy(k).to(device)
     ks = k.shape[-1]
     x0_ = initial_guess(yt, mt, ks, r)
-    x, info = mm_restore(yt, vt, mt, kt, x0_, r=r, robust=robust, **kw)
     # output sample j sits at exposure coordinate j / r: latent index exposure_origin + j (an
     # integer for r = 1 with odd, and r = 2 with even, kernels)
     o = exposure_origin(ks, r)
     assert abs(o - round(o)) < 1e-9
     o = int(round(o))
+    ped = 0.0
+    if background:
+        sd = vt.clamp_min(0).sqrt()
+        ped = torch.stack([50.0 * sd[:, c][mt[:, c] > 0].median() if bool((mt[:, c] > 0).any()) else sd.new_tensor(0.0)
+                           for c in range(vt.shape[1])]).view(1, -1, 1, 1)
+    x, info = mm_restore(yt, vt, mt, kt, x0_, r=r, robust=robust, pedestal=ped, **kw)
+    if background:
+        info["pedestal"] = [float(v) for v in ped.flatten()]
     h, w = (y1 - y0) * r, (x1 - x0) * r
     out = x[0, :, o:o + h, o:o + w].permute(1, 2, 0).cpu().numpy()
     info["n_exposures"] = len(idx)
@@ -722,6 +873,345 @@ def saturated_fill(x: np.ndarray, cov: np.ndarray, ref: np.ndarray, fwhm: float,
     return (x * (1 - w) + ref * w).astype(np.float32), int(keep.sum())
 
 
+def local_psf_correction(es, window: tuple[int, int, int, int], margin: int = 128, R: int = 16,
+                         min_stars: int = 3) -> np.ndarray | None:
+    """Radial correction C(r) (3, R + 1) of the field PSF model for a cutout, from the cutout's own stars
+    in the coadd (Magain et al. 1998 and Cantale et al. 2016 build the PSF from the stars of the image
+    being deconvolved).  The field model is a polynomial over PSF stars from the whole frame; where few
+    of them are (M 42's cluster, on the brightest nebula) its wing came out 10 - 40 % too strong at
+    2 - 14 px against the stars actually there, and ImageMM, whose model then already exceeded the data
+    round every bright star, emptied the latent there: the dark disc round every star.
+
+    Each bright unsaturated star within ``margin`` of the window: coadd stamp = a K + plane (the nebula
+    gradient), K the field model at the star; the ratio of its ring means (plane removed, / a) to K's,
+    per channel; C = the flux-weighted median over the stars, 1 within 1 px (the core sets a), smoothed
+    over 3 rings and limited to 0.3 - 2.  None with fewer than ``min_stars`` stars."""
+    from .exposures import interp_nodes
+    y0, y1, x0, x1 = window
+    cat = es.cat
+    ref = (es.ref - es.sky_ref).astype(np.float32)
+    H, W = ref.shape[:2]
+    xs, ys = np.asarray(cat["x"], float), np.asarray(cat["y"], float)
+    sel = (xs > x0 - margin) & (xs < x1 + margin) & (ys > y0 - margin) & (ys < y1 + margin)
+    sel &= (xs > R + 1) & (xs < W - R - 2) & (ys > R + 1) & (ys < H - R - 2)
+    peak = np.asarray(cat["peak"], float)
+    sel &= peak < 0.5 * float(es.sat)
+    if sel.sum() == 0:
+        return None
+    sel &= peak >= np.percentile(peak[sel], 50)             # the brighter half: their wings rise out of the noise
+    yy, xx = np.mgrid[-R:R + 1, -R:R + 1]
+    ri = np.minimum(np.round(np.hypot(yy, xx)).astype(int), R)
+    cnt = np.bincount(ri.ravel(), minlength=R + 1)
+    ratios, wts = [[], [], []], []
+    for x, y in zip(xs[sel], ys[sel]):
+        iy, ix = int(round(y)), int(round(x))
+        st = ref[iy - R:iy + R + 1, ix - R:ix + R + 1]
+        w_ = None
+        for c in range(3):
+            K = interp_nodes(np.asarray(es.psf_ref[c]["nodes"]), es.nodes, y, x)
+            h = K.shape[-1] // 2
+            if h < R:
+                K = np.pad(K, R - h); h = R
+            K = K[h - R:h + R + 1, h - R:h + R + 1]
+            sh = np.float32([[1, 0, x - ix], [0, 1, y - iy]])
+            K = cv2.warpAffine(K.astype(np.float32), sh, K.shape[::-1], flags=cv2.INTER_CUBIC)
+            A = np.stack([K.ravel(), np.ones(K.size), yy.ravel(), xx.ravel()], 1)
+            coef, *_ = np.linalg.lstsq(A, st[..., c].ravel(), rcond=None)
+            if coef[0] <= 0:
+                break
+            d = (st[..., c] - (coef[1] + coef[2] * yy + coef[3] * xx)) / coef[0]
+            pd = np.bincount(ri.ravel(), d.ravel(), minlength=R + 1) / cnt
+            pk = np.bincount(ri.ravel(), K.ravel(), minlength=R + 1) / cnt
+            ratios[c].append(pd / np.maximum(pk, 1e-12))
+            w_ = coef[0] if w_ is None else w_ + coef[0]
+        else:
+            wts.append(w_)
+            continue
+        for c in range(3):                                   # a channel failed: drop the star in all
+            if len(ratios[c]) > len(wts):
+                ratios[c].pop()
+    if len(wts) < min_stars:
+        return None
+    wts = np.asarray(wts)
+    C = np.ones((3, R + 1))
+    for c in range(3):
+        Rm = np.asarray(ratios[c])
+        order = np.argsort(Rm, 0)                        # flux-weighted median per ring
+        cw = np.cumsum(wts[order], 0)
+        j = np.argmax(cw >= 0.5 * wts.sum(), 0)
+        cols = np.arange(Rm.shape[1])
+        med = Rm[order[j, cols], cols]
+        med[:2] = 1.0
+        C[c] = np.clip(np.convolve(np.r_[med[0], med, med[-1]], np.ones(3) / 3, "valid"), 0.3, 2.0)
+        C[c, :2] = 1.0
+    return C
+
+
+def local_psf_residual(es, window: tuple[int, int, int, int], margin: int = 256, R: int = 16,
+                       min_stars: int = 3) -> np.ndarray | None:
+    """The numerical part of the PSF at a cutout (Magain et al. 1998: the PSF is an analytic profile plus a
+    numerical residual from the stars of the image itself): per channel, the flux-weighted median over
+    the bright unsaturated stars within ``margin`` of the window of (coadd stamp - plane) / amplitude - K,
+    K the field model at each star (sub-pixel centred), fitted as stamp = a K + plane.  Returns
+    (3, 2R + 1, 2R + 1) to add to the kernels at their centre (``apply_psf_residual``), or None."""
+    from .exposures import interp_nodes
+    y0, y1, x0, x1 = window
+    cat = es.cat
+    ref = (es.ref - es.sky_ref).astype(np.float32)
+    H, W = ref.shape[:2]
+    xs, ys = np.asarray(cat["x"], float), np.asarray(cat["y"], float)
+    peak = np.asarray(cat["peak"], float)
+    sel = (xs > x0 - margin) & (xs < x1 + margin) & (ys > y0 - margin) & (ys < y1 + margin)
+    sel &= (xs > R + 1) & (xs < W - R - 2) & (ys > R + 1) & (ys < H - R - 2) & (peak < 0.5 * float(es.sat))
+    if sel.sum() < min_stars:
+        return None
+    sel &= peak >= np.percentile(peak[sel], 50)
+    yy, xx = np.mgrid[-R:R + 1, -R:R + 1]
+    res, wts = [], []
+    cyw, cxw = (y0 + y1) / 2, (x0 + x1) / 2
+    # the halo's asymmetry changes over the field (M 42, DWARF 3: displaced 2 - 3 px from the core, more in
+    # blue and to the lower right): nearer stars count more (Gaussian of the window's size)
+    scale = max(y1 - y0, x1 - x0)
+    for x, y in zip(xs[sel], ys[sel]):
+        iy, ix = int(round(y)), int(round(x))
+        st = ref[iy - R:iy + R + 1, ix - R:ix + R + 1]
+        one, w_ = [], 0.0
+        for c in range(3):
+            K = interp_nodes(np.asarray(es.psf_ref[c]["nodes"]), es.nodes, y, x)
+            h = K.shape[-1] // 2
+            if h < R:
+                K = np.pad(K, R - h); h = R
+            K = K[h - R:h + R + 1, h - R:h + R + 1]
+            # the model at the star's sub-pixel position; the residual is taken in the kernel's frame
+            sh = np.float32([[1, 0, x - ix], [0, 1, y - iy]])
+            Ks = cv2.warpAffine(K.astype(np.float32), sh, K.shape[::-1], flags=cv2.INTER_CUBIC)
+            A = np.stack([Ks.ravel(), np.ones(Ks.size), yy.ravel(), xx.ravel()], 1)
+            coef, *_ = np.linalg.lstsq(A, st[..., c].ravel(), rcond=None)
+            if coef[0] <= 0:
+                break
+            d = (st[..., c] - (coef[1] + coef[2] * yy + coef[3] * xx)) / coef[0] - Ks
+            back = np.float32([[1, 0, -(x - ix)], [0, 1, -(y - iy)]])
+            one.append(cv2.warpAffine(d.astype(np.float32), back, d.shape[::-1], flags=cv2.INTER_CUBIC))
+            w_ += coef[0]
+        else:
+            res.append(one); wts.append(w_ * np.exp(-((y - cyw) ** 2 + (x - cxw) ** 2) / (2 * scale ** 2)))
+    if len(wts) < min_stars:
+        return None
+    res, wts = np.asarray(res), np.asarray(wts)                 # (S, 3, n, n)
+    order = np.argsort(res, 0)
+    cw = np.cumsum(wts[order], 0)
+    j = np.argmax(cw >= 0.5 * wts.sum(), 0)
+    return np.take_along_axis(res, np.take_along_axis(order, j[None], 0), 0)[0]
+
+
+def apply_psf_residual(kernels: np.ndarray, D: np.ndarray) -> np.ndarray:
+    """Kernels (n, 3, k, k) plus the numerical residual D (3, m, m) at their centre; clipped at 0, unit sum."""
+    out = kernels.copy()
+    k = kernels.shape[-1]; m = D.shape[-1]
+    if m > k:
+        o = (m - k) // 2; D = D[:, o:o + k, o:o + k]; m = k
+    o = (k - m) // 2
+    out[:, :, o:o + m, o:o + m] += D[None].astype(out.dtype)
+    out = np.clip(out, 0, None)
+    return out / np.maximum(out.sum((-2, -1), keepdims=True), 1e-30)
+
+
+def apply_psf_correction(kernels: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """Kernels (n, 3, k, k) times the radial correction C (3, R + 1) (1 beyond R), unit sum again."""
+    n_, nc, k, _ = kernels.shape
+    R = C.shape[-1] - 1
+    rr = np.hypot(*np.mgrid[:k, :k] - k // 2)
+    out = np.empty_like(kernels)
+    for c in range(nc):
+        m = np.interp(rr, np.arange(R + 1), C[c], right=C[c, -1] if C[c, -1] < 1 else 1.0)
+        kc = kernels[:, c] * m
+        out[:, c] = kc / np.maximum(kc.sum((-2, -1), keepdims=True), 1e-30)
+    return out
+
+
+def point_sources(es, r: int, sigma: float, window: tuple[int, int, int, int], origin: float, shape: tuple[int, int],
+                  min_flux: float = 0.0, halo: bool = True) -> dict | None:
+    """The stars of a cutout as point-source components for ``mm_restore`` (Magain, Courbin & Sohy 1998):
+    each a unit-sum g_sigma (the restoration's own resolution, latent pixels) integrated over the
+    latent pixels at the star's sub-pixel position, with its initial amplitude per channel from the
+    coadd (aperture of 2 FWHM less the local level).  The stars: the catalogue's (WINPOS centroids),
+    and the saturated ones from the full detection list (their cores are masked in the exposures; the
+    amplitude comes from the unsaturated wings).  ``window``: (y0, y1, x0, x1) on the reference grid;
+    latent index = r (reference - window origin) + ``origin``."""
+    from scipy.special import erf
+    y0, y1, x0, x1 = window
+    cat = es.cat
+    xs, ys = list(np.asarray(cat["x"], float)), list(np.asarray(cat["y"], float))
+    if "all_x" in cat and len(cat["all_x"]):
+        ax, ay = np.asarray(cat["all_x"], float), np.asarray(cat["all_y"], float)
+        ix, iy = np.clip(np.round(ax).astype(int), 0, es.ref.shape[1] - 1), np.clip(np.round(ay).astype(int), 0, es.ref.shape[0] - 1)
+        sat = es.ref[iy, ix].max(-1) >= 0.5 * float(es.sat)
+        known = np.c_[ys, xs] if xs else np.zeros((0, 2))
+        for x, y in zip(ax[sat], ay[sat]):
+            if not len(known) or np.hypot(*(known - [y, x]).T).min() > 2:
+                xs.append(x); ys.append(y)
+    xs, ys = np.array(xs), np.array(ys)
+    pad = 2
+    inside = (xs >= x0 - pad) & (xs < x1 + pad) & (ys >= y0 - pad) & (ys < y1 + pad)
+    xs, ys = xs[inside], ys[inside]
+    if not len(xs):
+        return None
+    fw = float(getattr(es, "fwhm_ref", 4.0))
+    ref = (es.ref - es.sky_ref).astype(np.float32)
+    h = int(np.ceil(4 * sigma)) + 1
+    ss = 2 * h + 1
+    stamps, iys, ixs, amps, offs, halos = [], [], [], [], [], []
+    HR = 16
+    yyH, xxH = np.mgrid[-HR:HR + 1, -HR:HR + 1]
+    rrH = np.hypot(yyH, xxH)
+    taper = np.clip((HR - rrH) / 3, 0, 1) * np.clip((rrH - 1.5) / 1.0, 0, 1)
+
+    def star_halo(x, y):
+        """A bright star's own PSF residual on the coadd, per unit amplitude: (stamp - plane) / a - K,
+        between 2 and 16 px (tapered), kept where it is significant; K the field PSF at the star."""
+        iy, ix = int(round(y)), int(round(x))
+        if iy < HR + 1 or ix < HR + 1 or iy > ref.shape[0] - HR - 2 or ix > ref.shape[1] - HR - 2:
+            return None
+        if ref[iy, ix].max() >= 0.5 * float(es.sat):
+            return None
+        out = np.zeros((3, 2 * HR + 1, 2 * HR + 1), np.float32)
+        for c in range(3):
+            K = interp_nodes(np.asarray(es.psf_ref[c]["nodes"]), es.nodes, y, x)
+            h = K.shape[-1] // 2
+            if h < HR:
+                K = np.pad(K, HR - h); h = HR
+            K = cv2.warpAffine(K[h - HR:h + HR + 1, h - HR:h + HR + 1].astype(np.float32),
+                               np.float32([[1, 0, x - ix], [0, 1, y - iy]]), (2 * HR + 1, 2 * HR + 1), flags=cv2.INTER_CUBIC)
+            st_ = ref[iy - HR:iy + HR + 1, ix - HR:ix + HR + 1, c]
+            A = np.stack([K.ravel(), np.ones(K.size), yyH.ravel(), xxH.ravel()], 1)
+            coef, *_ = np.linalg.lstsq(A, st_.ravel(), rcond=None)
+            if coef[0] <= 0:
+                return None
+            d = st_ - (coef[1] + coef[2] * yyH + coef[3] * xxH) - coef[0] * K
+            noise = 1.4826 * np.median(np.abs(d[rrH > HR - 2]))
+            d = cv2.GaussianBlur(d, (0, 0), 1.0)
+            out[c] = np.where(np.abs(d) > 2 * noise / 2.5, d, 0) * taper / coef[0]
+        return out
+
+    ra = 2 * fw
+    from .exposures import interp_nodes
+    yyR, xxR = np.mgrid[-6:7, -6:7]
+
+    def fit_pos(x, y):
+        """Per-channel sub-pixel position of a star on the coadd (MCS: positions are free parameters):
+        stamp = a K(. - d) + plane, K the field PSF, d by Gauss-Newton.  Each colour of a star sits
+        slightly elsewhere - atmospheric dispersion and lateral colour; on M 42 red above and blue below
+        the luminance position by 0.05 - 0.1 px - and one position for all three left a coloured cap on
+        one side of every bright star.  Saturated stars (no core) keep the catalogue position."""
+        iy, ix = int(round(y)), int(round(x))
+        if iy < 7 or ix < 7 or iy > ref.shape[0] - 8 or ix > ref.shape[1] - 8 or ref[iy, ix].max() >= 0.5 * float(es.sat):
+            return np.tile([y, x], (3, 1))
+        out = []
+        for c in range(3):
+            K = interp_nodes(np.asarray(es.psf_ref[c]["nodes"]), es.nodes, y, x).astype(np.float32)
+            h = K.shape[-1] // 2
+            D = ref[iy - 6:iy + 7, ix - 6:ix + 7, c]
+            d = np.array([y - iy, x - ix], float)
+            for _ in range(6):
+                def model(dd):
+                    Ks = cv2.warpAffine(K, np.float32([[1, 0, dd[1]], [0, 1, dd[0]]]), K.shape[::-1], flags=cv2.INTER_CUBIC)
+                    return Ks[h - 6:h + 7, h - 6:h + 7]
+                M0 = model(d)
+                J = [(model(d + e) - model(d - e)) / 0.1 for e in (np.array([0.05, 0]), np.array([0, 0.05]))]
+                A = np.stack([M0.ravel(), np.ones(M0.size), yyR.ravel(), xxR.ravel()], 1)
+                coef, *_ = np.linalg.lstsq(A, D.ravel(), rcond=None)
+                res = D.ravel() - A @ coef
+                Jm = np.stack([coef[0] * J[0].ravel(), coef[0] * J[1].ravel()], 1)
+                step, *_ = np.linalg.lstsq(Jm, res, rcond=None)
+                d = d + np.clip(step, -0.3, 0.3)
+                if np.abs(step).max() < 1e-3:
+                    break
+            d = np.clip(d, np.array([y - iy, x - ix]) - 1, np.array([y - iy, x - ix]) + 1)
+            out.append([iy + d[0], ix + d[1]])
+        return np.array(out)
+
+    kept = []
+    for x, y in zip(xs, ys):
+        pos_c = fit_pos(x, y)                                  # (3, 2) per-channel (y, x)
+        ly, lx = r * (y - y0) + origin, r * (x - x0) + origin
+        cy, cx = int(round(ly)), int(round(lx))
+        if cy - h < 0 or cx - h < 0 or cy + h + 1 > shape[0] or cx + h + 1 > shape[1]:
+            continue
+        e = np.arange(-h, h + 2) - 0.5                    # pixel edges relative to the stamp centre
+        gy = np.diff(erf((e + cy - ly) / (np.sqrt(2) * sigma)))
+        gx = np.diff(erf((e + cx - lx) / (np.sqrt(2) * sigma)))
+        st = np.outer(gy, gx); st /= st.sum()
+        iy_, ix_ = int(round(y)), int(round(x))
+        R = int(np.ceil(ra)) + 3
+        w = ref[max(iy_ - R, 0):iy_ + R + 1, max(ix_ - R, 0):ix_ + R + 1]
+        yy, xx = np.mgrid[:w.shape[0], :w.shape[1]]
+        rr = np.hypot(yy - (y - max(iy_ - R, 0)), xx - (x - max(ix_ - R, 0)))
+        lvl = np.median(w[rr > ra + 1], 0) if (rr > ra + 1).any() else 0
+        flux = np.maximum((w[rr <= ra] - lvl).sum(0), 1.0)
+        if flux.sum() < min_flux:
+            continue
+        stamps.append(st.astype(np.float32)); iys.append(cy - h); ixs.append(cx - h); amps.append(flux.astype(np.float32))
+        kept.append((y, x))
+        offs.append([(r * (pc[0] - y0) + origin - cy, r * (pc[1] - x0) + origin - cx) for pc in pos_c])
+        hal = star_halo(x, y) if r == 1 and halo else None
+        halos.append(hal)
+    if not stamps:
+        return None
+    out = {"stamps": np.stack(stamps), "iy": np.array(iys), "ix": np.array(ixs), "a": np.stack(amps),
+           "off": np.array(offs), "sigma": float(sigma)}
+    if any(h_ is not None for h_ in halos):
+        hal = np.stack([h_ if h_ is not None else np.zeros((3, 2 * HR + 1, 2 * HR + 1), np.float32) for h_ in halos])
+        # exposure-window pixel of each halo's top-left corner: star at window (y - y0, x - x0)
+        cyx = [(int(round(y_ - y0)) - HR, int(round(x_ - x0)) - HR) for y_, x_ in kept]
+        out.update({"halo": hal, "hy": np.array([c_[0] for c_ in cyx]), "hx": np.array([c_[1] for c_ in cyx])})
+    return out
+
+
+def smooth_background(es, r: int, origin: tuple[float, float], shape: tuple[int, int], fwhm: float) -> np.ndarray:
+    """The smooth diffuse light for ImageMM's background term, (shape, 3) on the latent grid whose
+    sample (0, 0) is at reference coordinate ``origin`` (sample j at origin + j / r).
+
+    Plain ImageMM drives faint diffuse light to zero where the data cannot tell it from the wings
+    of a nearby star: the fit folds it into the star's core and leaves the sky round every bright
+    star empty.  On M 42 (DWARF 3) the restored sky sat 3-6 ADU below its surroundings out to 18 px
+    round each bright star - a dark collar, in the null space of the blur (the restoration seen
+    through its PSF matched the coadd within 2 ADU there).  Modelled as a separate smooth term, that
+    light no longer competes with the stars.
+
+    From the coadd with its sky model removed (the exposures' zero point), smoothed against its noise
+    (Gaussian, 0.5 FWHM): the 25th percentile in cells 8 FWHM across (a 3 x 3 median over the cells
+    against outliers), interpolated bicubically.  Stars and their halos cover a minority of a cell,
+    so the percentile is the diffuse light under them, at or below the local level - it does not add
+    light the data do not have; anything finer than a cell (stars, knots, filaments) stays entirely
+    in the restored part.  Masking the stars and filling the holes instead left seams at the masks'
+    edges, and an opening kept the bright stars' seeing halos (a glow round each)."""
+    H0, W0 = es.ref.shape[:2]
+    cell = max(int(round(8 * fwhm)), 8)
+    pad = 2 * cell
+    oy, ox = origin
+    hy, wx = shape[0] / r, shape[1] / r
+    ya, yb = int(np.floor(oy)) - pad, int(np.ceil(oy + hy)) + pad
+    xa, xb = int(np.floor(ox)) - pad, int(np.ceil(ox + wx)) + pad
+    src = (es.ref - es.sky_ref).astype(np.float32)
+    win = np.stack([np.pad(src[max(ya, 0):min(yb, H0), max(xa, 0):min(xb, W0), c],
+                           ((max(0, -ya), max(0, yb - H0)), (max(0, -xa), max(0, xb - W0))), mode="reflect")
+                    for c in range(src.shape[-1])], -1)
+    hh, ww = win.shape[0] // cell, win.shape[1] // cell
+    out = np.empty_like(win)
+    for c in range(win.shape[-1]):
+        z = cv2.GaussianBlur(win[..., c], (0, 0), max(0.5 * fwhm, 0.5))
+        grid = np.percentile(z[:hh * cell, :ww * cell].reshape(hh, cell, ww, cell), 25, axis=(1, 3)).astype(np.float32)
+        grid = cv2.medianBlur(grid, 3) if min(hh, ww) >= 3 else grid
+        # cell centres at (i + 0.5) cell: resize maps them there with pixel-centre alignment
+        full = cv2.resize(grid, (ww * cell, hh * cell), interpolation=cv2.INTER_CUBIC)
+        out[..., c] = np.pad(full, ((0, win.shape[0] - hh * cell), (0, win.shape[1] - ww * cell)), mode="edge")
+    out = np.maximum(out, 0)
+    # onto the latent grid: sample j at reference oy + j / r, i.e. window pixel (oy - ya) + j / r
+    M_ = np.float32([[1.0 / r, 0, ox - xa], [0, 1.0 / r, oy - ya]])
+    return cv2.warpAffine(out, M_, (shape[1], shape[0]), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REFLECT)
+
+
 def reference_on_latent(es, r: int, region: tuple[int, int, int, int]) -> np.ndarray:
     """The background-subtracted reference coadd on the latent grid of ``region`` (latent sample j
     at reference coordinate region origin + j / r; Lanczos resampling for r > 1)."""
@@ -768,6 +1258,14 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
             on = sig > thr
         d = (a - b)[on] if on.any() else (a - b).ravel()
         s[c] = 1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2)
+        # floor: a tenth of the scale on the brightest tenth of the pixels, which always carry signal.
+        # With ImageMM's background term the restored part is 0 on >90 % of the pixels and most pixels
+        # "with signal" in both halves were at the threshold, so the MAD came out 0 (M 42, red and
+        # blue), k ~ 0, and the network's output ran to the clamp - 24 000 pixels above 1e5 ADU
+        bright = sig >= np.percentile(sig, 90)
+        db = (a - b)[bright]
+        s_b = 1.4826 * np.median(np.abs(db - np.median(db))) / np.sqrt(2)
+        s[c] = max(s[c], 0.1 * s_b)
         if not s[c] > 0:
             s[c] = float(np.std(a - b)) / np.sqrt(2)
     s = np.maximum(s, 1e-12)
@@ -885,7 +1383,7 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
             robust: bool = True, delta: float = 2.0, kappa: float = 2.0, epsilon: float = 1e-6,
             max_iters: int = 1000, accelerate: bool = False, stop: str = "c15", tile: int = 384, device: str = "auto",
             n2n: bool = False, n2n_iters: int = 2000, min_iters: int = 0, kernel_cache: str | None = None,
-            halves: np.ndarray | None = None,
+            halves: np.ndarray | None = None, background: bool = False,
             region: tuple[int, int, int, int] | None = None, progress=None, cancel=None) -> tuple[np.ndarray, dict]:
     """ImageMM over the whole field of the prepared exposures ``es`` (exposures.ExposureSet).
 
@@ -956,6 +1454,8 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         sub_idx = [idx[i] for i in sel]
         out = np.zeros((H0 * r, W0 * r, 3), np.float32)
         acc = np.zeros((H0 * r, W0 * r, 1), np.float32)
+        if part == 0 and background:
+            bgmap = np.zeros((H0 * r, W0 * r, 3), np.float32)
         for y0 in ys:
             for x0 in xs:
                 if cancel and cancel():
@@ -966,12 +1466,14 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                 x, info = restore_cutout(es, RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1, idx=sub_idx, r=r, kernels=sub_kern, robust=robust,
                                          psf_model=psf_model, n_groups=n_groups, device=dev, delta=delta,
                                          kappa=kappa, epsilon=epsilon, max_iters=max_iters, accelerate=accelerate,
-                                         stop=stop, min_iters=min_iters, log=_iteration_check)
+                                         stop=stop, min_iters=min_iters, log=_iteration_check, background=background)
                 wy = _edge_weights((y1 - y0) * r, overlap * r, y0 > 0, y1 < H0)
                 wx = _edge_weights((x1 - x0) * r, overlap * r, x0 > 0, x1 < W0)
                 wgt = np.outer(wy, wx)[..., None]
                 sl = (slice(y0 * r, y1 * r), slice(x0 * r, x1 * r))
                 out[sl] += x * wgt
+                if part == 0 and background and "background" in info:
+                    bgmap[sl] += info["background"] * wgt
                 cov[sl] += info["coverage"] * wgt / len(sets)
                 acc[sl] += wgt
                 tiles.append({"set": part, "window": [RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1], "iterations": info["iterations"],
@@ -983,6 +1485,8 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         outs.append(out / np.maximum(acc, 1e-12))
         if part == 0:
             acc0 = acc
+            if background:
+                bgmap /= np.maximum(acc, 1e-12)
     cov /= np.maximum(acc0, 1e-12)
     # saturated stars: no data in their cores, the coadd's profile instead (saturated_fill)
     n_sat = 0
@@ -993,8 +1497,15 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
             outs[i], n_sat = saturated_fill(outs[i], cov, ref_lat, fw)
         del ref_lat
     n2n_info, resid = None, None
+    if not background:
+        bgmap = None
     if n2n:
-        out, n2n_info = n2n_pass(outs[0], outs[1], iters=n2n_iters, device=dev, progress=progress, cancel=cancel)
+        # on the restored part only: the background term is the same map in both halves, so their
+        # difference - the noise scale the pass is normalised by - collapsed to ~0 wherever it
+        # dominated, and the network returned garbage (M 42: 1e5 ADU over the whole region)
+        b_ = bgmap if background else 0.0
+        out, n2n_info = n2n_pass(outs[0] - b_, outs[1] - b_, iters=n2n_iters, device=dev, progress=progress, cancel=cancel)
+        out = out + b_
         resid = n2n_info.pop("residual")
     else:
         out = outs[0]
