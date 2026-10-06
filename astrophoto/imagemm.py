@@ -1348,6 +1348,38 @@ def superresolved_kernels(K: np.ndarray, r: int, sigma: float, device=None, prog
     return h.reshape(*lead, r * d, r * d) / r ** 2, mse
 
 
+def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float = 0.1, max_sigma: float = 2.5,
+                 min_peak: float = 0.9) -> tuple[float, dict]:
+    """The latent resolution actually usable for these PSFs: the smallest sigma >= ``sigma`` (in steps
+    of ``step``) at which the Eq. 11 kernels h of a sample of the PSFs ``K`` (n, C, k, k) are
+    peaked - median over the sample and every channel of h(centre) / max(h) >= ``min_peak``.
+
+    Why: Eq. 11 asks for h >= 0 with D(h * g_sigma) = f.  When the PSF's core is flatter than the
+    Gaussian g_sigma (a boxy core: the M 31 set's optical low-pass / sampling response, centre /
+    first ring 1.2 against a Gaussian's 1.3-1.6), the only non-negative solution is a ring-shaped
+    h - zero at the centre, its weight at r = 1 - and the restoration then carries that ring round
+    every star and a 2-px texture over the whole field (M 31 at sigma = 1: rings to 50 px; at 1.3
+    clean).  The paper's sigma = 1 presumes PSFs broader and smoother than that; a sharper or boxy
+    PSF cannot be restored to it.  Returns (sigma, {"requested", "chosen", "peak": per-channel
+    centre/max at the chosen sigma})."""
+    n, C = K.shape[:2]
+    pick = np.linspace(0, n - 1, min(n, 24)).round().astype(int)
+    Ks = K[pick]
+    sig = float(sigma)
+    peaks = None
+    while True:
+        h, _ = superresolved_kernels(Ks, r, sig, device=device)
+        k = h.shape[-1]
+        c = k // 2
+        centre = h[..., c, c]
+        mx = h.reshape(*h.shape[:2], -1).max(-1)
+        peaks = [float(np.median(centre[:, ch] / np.maximum(mx[:, ch], 1e-30))) for ch in range(C)]
+        if min(peaks) >= min_peak or sig + step > max_sigma + 1e-9:
+            break
+        sig = round(sig + step, 3)
+    return sig, {"requested": float(sigma), "chosen": sig, "peak": peaks}
+
+
 def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: str, device=None, progress=None,
                   cache: str | None = None) -> tuple[np.ndarray, dict | None]:
     """Latent-grid kernels of the exposures ``idx`` at the nodes of the field PSF grid
@@ -1359,6 +1391,15 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
     if not (r > 1 or sigma is not None):
         return K, None
     sigma = 1.1 if sigma is None else sigma
+    # the resolution these PSFs can be restored to (choose_sigma): tried on the kernels of the central
+    # node before the full solve
+    ny, nx = K.shape[2], K.shape[3]
+    if progress:
+        progress(0, 1, f"ImageMM: checking the latent resolution (sigma = {sigma})")
+    sigma_eff, chosen = choose_sigma(K[:, :, ny // 2, nx // 2], r, sigma, device=device)
+    if progress and sigma_eff != sigma:
+        progress(0, 1, f"ImageMM: latent resolution raised to sigma = {sigma_eff} (the PSF's core is flatter than g_{sigma})")
+    sigma = sigma_eff
     import hashlib
     import pickle
     key = hashlib.sha1(np.ascontiguousarray(K).tobytes() + f"{r}|{sigma}".encode()).hexdigest()
@@ -1371,7 +1412,8 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
         except Exception:
             pass
     kern, mse = superresolved_kernels(K, r, sigma, device=device, progress=progress)
-    eq11 = {"sigma": sigma, "mse_max": float(mse.max()), "mse_median": float(np.median(mse))}
+    eq11 = {"sigma": sigma, "sigma_requested": chosen["requested"], "kernel_peak": chosen["peak"],
+            "mse_max": float(mse.max()), "mse_median": float(np.median(mse))}
     if cache:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         with open(cache, "wb") as f:

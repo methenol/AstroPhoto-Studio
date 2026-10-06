@@ -1292,6 +1292,7 @@ class ExposureSet:
         self.sat = float(sat)                     # saturation in bias-subtracted ADU
         self.ref = ref.astype(np.float32)         # reference coadd on the reference (1x) grid
         self.coadd = None                         # the exposures' own coadd (prepare), sky included
+        self.coverage = None                      # exposures with a valid pixel, per pixel (prepare)
         self._acc = None
         # threads for window extraction (I/O, OpenCV and NumPy release the interpreter lock)
         from .resources import workers_for
@@ -1502,6 +1503,7 @@ class ExposureSet:
         # the exposures' coadd (sky included, as self.ref), the pipeline's stack where no exposure covers
         seen = acc_W > 0
         self.coadd = np.where(seen[..., None], acc_S / np.maximum(acc_W, 1)[..., None], self.ref).astype(np.float32)
+        self.coverage = acc_W.astype(np.float32).copy()   # exposures with a valid pixel, per pixel
         self._acc = None
         if shm is not None:
             for m in shm:
@@ -1510,7 +1512,8 @@ class ExposureSet:
         self.ptc = self._ptc_fit(acc)
         say("ImageMM: PSF of the exposures' coadd")
         cbs = self.coadd - self.sky_ref
-        self.psf_ref = [empirical_psf_field(cbs[..., c], seen, self.cat, half_ref, self.fwhm_ref, self.nodes)
+        psf_valid = seen
+        self.psf_ref = [empirical_psf_field(cbs[..., c], psf_valid, self.cat, half_ref, self.fwhm_ref, self.nodes)
                         for c in range(3)]
         for r in self.psf_ref:
             if r is not None:
@@ -1679,7 +1682,7 @@ class ExposureSet:
         return {"c0": c0, "c1": c1, "chi2_red": red, "bins": int(len(v))}
 
     # ------------------------------------------------------------- persistence
-    _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask", "nodes", "psf_ref", "coadd")
+    _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask", "nodes", "psf_ref", "coadd", "coverage")
     # bumped whenever the preparation changes what it produces; an older cache is prepared again
     # (2: crowded-field PSF stars - with 1, most subs of a Milky Way field had no PSF;
     #  3: PSF cut-outs must agree with each other - with 2, bright non-point sources set the wings)
@@ -1692,7 +1695,9 @@ class ExposureSet:
     # 10: the exposures' seeing scale and shape fitted on their PSF-star cut-outs (fit_seeing_scale)
     # 11: the reference PSF measured on the exposures' own coadd, not the pipeline's stack
     # 12: seeing-mixture kernels, G(sigma_t) * Q (fit_seeing_sigma, _fit_exposure_kernels)
-    PREP_VERSION = 12
+    # 13: (withdrawn: PSF stars restricted by coverage left too few)
+    # 14: the exposures' coverage kept in the state
+    PREP_VERSION = 14
     SEEING_NORM = "channel"    # normalise_seeing: channel | shared | off (ASTROPHOTO_SEEING_NORM overrides)
 
     def save(self, path: str):
@@ -1712,7 +1717,7 @@ class ExposureSet:
         if st.get("prep_version", 1) != self.PREP_VERSION:
             raise RuntimeError("the prepared exposures were made by an older version of the preparation")
         for k in self._STATE:
-            setattr(self, k, st[k])
+            setattr(self, k, st.get(k))              # (entries added later, e.g. "coverage", may be missing)
         return self
 
     def normalise_seeing(self, lams: np.ndarray = np.round(np.arange(0.80, 1.50001, 0.01), 2)) -> list[float]:
@@ -1756,7 +1761,9 @@ class ExposureSet:
             self.nodes = nodes_now                        # (the exposures' kernels below follow the new grid)
             ref_bs = self.coadd - self.sky_ref
             half_ref = max(int(np.asarray(r["nodes"]).shape[-1]) // 2 for r in self.psf_ref if r is not None)
-            self.psf_ref = [empirical_psf_field(ref_bs[..., c], np.ones(ref_bs.shape[:2], bool), self.cat, half_ref,
+            cov = getattr(self, "coverage", None)
+            psf_valid = cov > 0 if cov is not None else np.ones(ref_bs.shape[:2], bool)
+            self.psf_ref = [empirical_psf_field(ref_bs[..., c], psf_valid, self.cat, half_ref,
                                                 self.fwhm_ref, self.nodes) for c in range(3)]
             for r in self.psf_ref:
                 if r is not None:
