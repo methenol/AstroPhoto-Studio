@@ -1459,41 +1459,9 @@ def extract_ha_oiii(lin: np.ndarray, unmix: bool = True, boost: float = 1.0, neu
     return ha, oiii.astype(np.float32)
 
 
-def _local_sky(x: np.ndarray, px_scale: float, window: float = 96.0) -> np.ndarray:
-    """Robust local sky level of a line map: a median over ~``window`` px (scaled), so stars and
-    filaments do not lift it but the large-scale background does.  96 px: the sky's residual cloud
-    glow comes in patches 50-200 px across, and against a wider window every one of them counted as
-    line emission and was painted red or teal; the Veil's filaments are far narrower."""
-    from scipy.ndimage import median_filter, percentile_filter
-    f = 8
-    h, w = x.shape
-    small = cv2.resize(x, (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA)
-    k = max(5, int(round(window * px_scale / f)) | 1)
-    # the window's median where it is sky, its lower envelope where a nebula fills part of it: there
-    # the median is nebula, and its diffuse light measured as "sky" was rendered grey between red
-    # clumps.  (The envelope everywhere coloured the plain sky again: sky sits above its own 20th
-    # percentile.)  A window is "nebula" when median - envelope exceeds what plain sky gives.
-    med = median_filter(small, size=k, mode="reflect")
-    env = percentile_filter(small, 20, size=k, mode="reflect")
-    d0 = 1.5 * float(np.median(med - env))
-    sky = np.minimum(med, env + d0)
-    # ...and never far above the frame's own sky: the residual glow this absorbs varies by about as
-    # much as the sky map does over its darker half.  Inside a bright nebula a window's lower envelope
-    # is still nebula (M 42's dark lanes: 15x the sky), and against it every lane that was a local
-    # minimum read as "no line" and was rendered grey, with hard edges (the signal there is thousands
-    # of sigma, so the 2.5-5 sigma ramp crossed over in a step of a few per cent)
-    base = float(np.percentile(sky, 5))
-    sky = np.minimum(sky, base + 6.0 * max(float(np.percentile(sky, 50)) - base, 0.0))
-    sky = cv2.GaussianBlur(sky, (0, 0), k / 4)
-    return cv2.resize(sky, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-def _line_significance(x: np.ndarray, sigma: float, sky: np.ndarray) -> np.ndarray:
-    """Signal of a linear line map above its local sky, in units of its own noise after a
-    Gaussian blur of ``sigma`` px (noise from the fine-scale residual of the faint pixels).
-    Measured against the *local* sky: against one global level, every large-scale patch of
-    background (a residual of cloud glow a few ADU strong) counted as line emission, and the
-    palette painted the sky in red and teal blotches."""
+def _line_significance(x: np.ndarray, sigma: float, sky: float) -> np.ndarray:
+    """Signal of a linear line map above the sky, in units of its own noise after a Gaussian blur
+    of ``sigma`` px (noise from the fine-scale residual of the faint pixels)."""
     xb = cv2.GaussianBlur(x, (0, 0), sigma)
     d = xb - sky
     faint = d[::4, ::4] <= 0
@@ -1501,10 +1469,38 @@ def _line_significance(x: np.ndarray, sigma: float, sky: np.ndarray) -> np.ndarr
     return d / max(mad_sigma(resid), 1e-12)
 
 
+def _line_sky(x: np.ndarray, sigma: float) -> float:
+    """The sky level of a line map: the 10th percentile of the map smoothed at the widest chroma
+    scale.  One level for the whole frame.  The linear stage has already removed the gradients
+    (against a sky survey where the field was solved), so the sky is flat; a *local* sky (a median
+    over ~100 px, used before) followed a nebula that fills the frame and declared most of it
+    "sky": only its brighter clumps kept their colour and the rest went grey, in patches with
+    hard edges (IC 1396, 2026-10-06)."""
+    xb = cv2.GaussianBlur(x, (0, 0), sigma)[::4, ::4]
+    return float(np.percentile(xb, 10))
+
+
+def _snr_weight(z: np.ndarray, z0: float) -> np.ndarray:
+    """Smooth weight of a line's significance: z² / (z² + z0²) - 0.5 at z0, 0.8 at 2 z0, never a
+    step.  Used to choose between the colour scales, not to fade the colour."""
+    zz = np.clip(z, 0, None)
+    return (zz * zz / (zz * zz + z0 * z0))[..., None].astype(np.float32)
+
+
 def _palette_chroma(ha: np.ndarray, oiii: np.ndarray, palette: str, line_s, px_scale: float) -> np.ndarray:
-    """OKLab a/b of the narrowband palette from noise-suppressed line maps (see nonlinear_stage)."""
-    s_fine, s_broad = max(1.0, 1.5 * px_scale), max(3.0, 8.0 * px_scale)
-    sky_h, sky_o = _local_sky(ha, px_scale), _local_sky(oiii, px_scale)
+    """OKLab a/b of the narrowband palette from noise-suppressed line maps (see nonlinear_stage).
+
+    The colour of each pixel is the palette's colour of the line maps smoothed at the finest of
+    three scales (1.5, 8 and 24 px, scaled) at which a line is significant there; where neither
+    is, at the widest.  Noise is kept out of the colour by the smoothing, not by desaturating:
+    the chroma is never faded or switched off.  (Gating it by significance - off where no line
+    was significant, ramps in between - cut a faint nebula into coloured and grey patches
+    wherever its significance crossed the ramp, and weighting it smoothly still varied the
+    saturation across the nebula with the noise; IC 1396, 2026-10-06.)  At the widest scale the
+    sky's own texture is a fraction of its noise, and the palette gives light at the sky level no
+    colour, so the sky stays neutral without a gate."""
+    s_fine, s_broad, s_wide = max(1.0, 1.5 * px_scale), max(3.0, 8.0 * px_scale), max(6.0, 24.0 * px_scale)
+    sky_h, sky_o = _line_sky(ha, s_wide), _line_sky(oiii, s_wide)
 
     def chroma(sig):
         hb, ob = cv2.GaussianBlur(ha, (0, 0), sig), cv2.GaussianBlur(oiii, (0, 0), sig)
@@ -1514,19 +1510,11 @@ def _palette_chroma(ha: np.ndarray, oiii: np.ndarray, palette: str, line_s, px_s
 
     c_fine, z_fine = chroma(s_fine)
     c_broad, z_broad = chroma(s_broad)
-    # a third, wider scale for faint extended emission: at the broad scale alone a faint nebula sits
-    # at 2-5 sigma, and the ramp cut it into red blotches with grey holes (IC 405); averaged over a
-    # wider patch the same light is significant, and its colour varies smoothly
-    c_wide, z_wide = chroma(max(6.0, 24.0 * px_scale))
-    # (a few sigma: at 1.5 the sky's own residual texture passed for emission, a red/teal speckle)
-    w_fine = smoothstep(4.0, 7.0, z_fine)[..., None]
-    w_broad = smoothstep(2.5, 5.0, z_broad)[..., None]
-    w_wide = smoothstep(3.0, 6.0, z_wide)[..., None]
-    # the finest scale at which a line is significant gives the colour, coarser ones fill in
+    c_wide, _ = chroma(s_wide)
+    w_fine, w_broad = _snr_weight(z_fine, 5.0), _snr_weight(z_broad, 3.5)
     c = c_wide * (1 - w_broad) + c_broad * w_broad
     c = c * (1 - w_fine) + c_fine * w_fine
-    w_any = np.maximum(np.maximum(w_wide, w_broad), w_fine)
-    return (c * w_any).astype(np.float32)
+    return c.astype(np.float32)
 
 
 def _chroma_denoise_lab(lab: np.ndarray, amount: float, px_scale: float) -> np.ndarray:

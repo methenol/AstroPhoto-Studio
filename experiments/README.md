@@ -538,11 +538,26 @@ renders and time on the CPU).
 
 | Dataset | Telescope / data | Distance to the references | Renders, time | What it set (besides the grade) |
 |---|---|---|---|---|
-| C 33 Eastern Veil (2 nights) | DWARF 3, Duo-Band, ImageMM | 19.0 → 14.0 | 70, 128 s | palette foraxx; stretch 0.16→0.18; HDR 0.6→0; focus 2→0; fine NR 0.6→0; colour NR 0.8→0; local contrast 0.5→0.95; sharpen 0.25→0.35; star reduction 0.35→0.1; star brightness 0.9→1.0; halo 0.6→0; saturation 1.5→2.55; OIII 1.0→2.5 |
-| C 20 North America (20 min) | DWARF 3, Duo-Band, ImageMM | 85.7 → 42.6 | 58, 186 s | palette hoo_warm; black point 0.02→0.07 (sky at the references', then clipping stopped it); midtones +0.2; focus 2→0; NR 0; local contrast →1.6; sharpen →0.85; saturation →2.6 (the Ha is faint: C50 0.006) |
+| C 33 Eastern Veil (2 nights) | DWARF 3, Duo-Band, ImageMM | 18.2 → 12.4 | 76, 137 s | palette foraxx; stretch 0.16→0.18; HDR 0.6→0; focus 2→0; fine NR 0.6→0; colour NR 0.8→0; local contrast 0.5→0.95; sharpen 0.25→0.35; star reduction 0.35→0.1; star brightness 0.9→1.0; halo 0.6→0; saturation 1.5→2.55; OIII 1.0→2.5 |
+| C 20 North America (20 min) | DWARF 3, Duo-Band, ImageMM | 74.8 → 34.5 | 63, 109 s | palette hoo_warm; black point 0.02→0.07 (sky at the references', then clipping stopped it); midtones +0.2; focus 2→0; NR 0; local contrast →1.6; sharpen →0.85; saturation →2.6 (the Ha is faint: C50 0.006) |
 | NGC 281 (23 min) | DWARF 3, Duo-Band, ImageMM | 67.9 → 44.4 | 52, 43 s | palette natural; stretch →0.23, black point →0.065, midtones +0.3; focus 2→0; NR 0; local contrast →1.6; sharpen →1.2; star brightness →1.2; saturation left alone (the slider barely moves so faint an object's colour) |
 | NGC 7000 (315 min) | Seestar S50, network restoration | 43.5 → 20.7 | 61, 62 s | stretch →0.14, black point →0.055, midtones +0.2; focus 2→0; fine NR 0; colour NR →1.0; local contrast →0; sharpen →1.1; star brightness →0.65 (Deneb-class stars clipped); saturation →1.25 (red channel clipping) |
 | M 31 | Seestar S50, IRCUT, plain stack | 27.3 → 23.1 | 66, 109 s | stretch →0.09; focus 2→0; fine NR 0; colour NR →0.85; local contrast →0; sharpen →0; saturation →1.7; HDR re-check 0→0.4 (the grade had pushed the core onto the ceiling) |
+
+IC 1396 (Seestar S50, LP, 171 subs, network restoration) was added after the fix below: 41.8 → 27.1
+in 63 renders; the class references (emission nebulae) since it has none of its own.
+
+**A defect found on the way, in the processing itself (2026-10-06).** The dual-band palette
+gave the exported IC 1396 red patches with hard edges on an otherwise grey nebula, with any
+restoration preset. `postprocess._palette_chroma` switched the chroma off wherever neither line was
+significant, with ramps against a *local* sky (a 96 px median): a nebula that fills the frame became
+its own sky, only its brighter clumps kept their colour, and 60 % of the pixels had none. Measuring
+significance against the frame's sky (the linear stage has removed the gradients) and weighting the
+chroma smoothly with the signal-to-noise removed the hard edges but still varied the saturation
+across the nebula with the noise ("still pretty splotchy"). The colour is now never faded at all:
+significance only chooses which smoothing scale (1.5, 8 or 24 px) supplies a pixel's colour, and
+the noise stays out of the colour by that smoothing. C 20 had the same patchwork and lost it; the
+Veil's dark sky stays neutral, because the palette gives light at the sky level no colour.
 
 **What the measurements decided, and why that is right:**
 

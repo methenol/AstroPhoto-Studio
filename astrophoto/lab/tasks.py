@@ -1107,3 +1107,7 @@ class AutofinishTask(Task):
         return {"distance": dist, "sky_noise": st["sky_noise"], "detail_snr": st["detail_snr"],
                 "sky_blotch": st["sky_blotch"], "obj_blotch": st["obj_blotch"], "star_frac": st["star_frac"],
                 "seconds": dt, "palette": q.get("palette"), "nearest": (rep.get("nearest") or {}).get("title")}, img
+
+
+TASKS = {t.name: t for t in (ImageMMTask(), DenoiseTask(), NetworkTask(), StackTask(), StarSeparationTask(),
+                             StarRemoverTask(), BackgroundTask(), AutofinishTask())}
