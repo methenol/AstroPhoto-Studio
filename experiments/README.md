@@ -97,6 +97,66 @@ shares a pointing with A, under either split. On synthetic data the truth decide
 Reproduce: Experiments tab → *Noise2Noise denoiser*, tune `split`, grid sampler. Synthetic datasets:
 `dither_every: 6`, `fixed_pattern_e: 12`.
 
+### Training objective: is the asinh-domain MSE biased? (`exp_denoise_loss.py`, 2026-10-06)
+
+**Question.** The production denoiser is trained with MSE in the variance-stabilised domain
+g(x) = asinh((x − bg)/3σ). Its minimiser is E[g(B) | A], not g(E[B]): a nonlinear transform
+leaves a Jensen-gap bias (Tinits & Mann 2025, arXiv:2512.24794), and heteroscedastic-noise work
+favours inverse-variance χ² losses over MSE (Ye et al. 2026, arXiv:2609.21350). Same U-Net, patches,
+seed and 1000 steps for five objectives (`astrophoto.denoise.make_n2n_loss`):
+`asinh_mse` (production), `asinh_unbiased` (the network's output is read as the clean image and its
+*expected* transformed noisy value under the measured noise, by Gauss–Hermite quadrature, is matched
+to the target: the Jensen gap removed exactly for Gaussian noise), `lin_mse` (ImageMM's N2N pass),
+`lin_chi2`, `lin_huber` (robust χ², δ = 3σ).
+
+**Scores.** Held-out lin / str as above; on a synthetic twin of each crop (`bench.synthetic`: truth
+= the lightly smoothed full stack, two halves with Gaussian noise following the variance-vs-level law
+measured from A − B) the rms error and the *signed bias by true signal level* (`bench.bias_metrics`),
+plus AstroSURE-style detection rate / false-alarm rate at one common absolute threshold of 2σ
+(`bench.detection_metrics`, arXiv:2604.16793) and STAR-style aperture flux error against the truth or
+half B (`bench.flux_metrics`, arXiv:2507.16385). Deepest 1536² crops of M 42 (duo-band, 204 subs) and
+M 31 (IRCUT, 565 subs), single seed.
+
+| M 31 | lin dB | str dB | synthetic rms (σ) | bias 1–8σ above sky (σ) | bias ≥ 64σ (star cores) | faint DR | flux err |
+|---|---|---|---|---|---|---|---|
+| raw half A | +0.2 | 0 | 1.00 | 0.00 | +0.03 | 0.74 | 0.018 |
+| **asinh_mse (production)** | +10.5 | **+12.1** | 0.345 | −0.06 … −0.09 | −0.5 … −0.9 | 0.69 | **0.021** |
+| asinh_unbiased | +10.7 | +11.9 | 0.326 | **−0.01 … −0.02** | −0.7 … −1.1 | **0.71** | **0.019** |
+| lin_mse | +10.1 | +10.7 | 0.303 | −0.01 … −0.03 | **0.00** | 0.62 | 0.030 |
+| lin_chi2 | +11.1 | +11.6 | 0.301 | −0.01 … −0.03 | **0.00** | 0.62 | 0.029 |
+| lin_huber | **+11.2** | +11.7 | **0.300** | −0.01 … −0.02 | **0.00** | 0.62 | 0.028 |
+
+M 42 agrees on every column where it has enough pixels (lin: linear losses best by 0.3–0.5 dB; str:
+asinh losses best; synthetic rms 0.29 σ linear vs 0.33 σ asinh); its bins above 32 σ hold under 200
+pixels and the measured variance law there is dominated by registration differences between the
+halves, so its bright-end biases are not quoted.
+
+**Verdict: the bias exists and is small; no objective beats the production one.** (`results_denoise_loss.json`)
+- The production loss does bias faint signal, by **−0.05 … −0.09 σ ≈ 1 ADU** at 1–8 σ above the sky.
+  `asinh_unbiased` removes it (−0.01 … −0.02 σ, the same floor every learned method shows at the sky
+  level), but over three seeds it costs 0.25 dB of stretched-domain error on M 31 (below). It is the
+  option if a photometric use ever needs the faint end unbiased.
+- The large bias is elsewhere: both asinh objectives undershoot **star cores by 0.5–1 σ** (≈ 1 % of a
+  100 σ peak) because the transform compresses them out of the loss. Linear losses remove it and win
+  the linear score and the exact rms, but they **over-smooth the faint end**: 7 % fewer faint sources
+  recovered, flux error 50 % worse, and 0.4–1.4 dB worse in the stretched domain, which is what the
+  final image shows. χ² weighting or Huber makes no difference to this (the noise is nearly
+  homoscedastic after stacking: measured slope 0 on M 31).
+- The stretched-domain score, the one that matters for a picture, still favours the production
+  objective. The pipeline's stars are restored by ImageMM / the deconvolution network from the raw
+  halves, not by the denoiser, so the star-core undershoot does not reach the output.
+
+**Three seeds for the two asinh objectives** (`results_denoise_loss_seed{1,2}.json`), to decide the
+default. M 31 stretched-domain score: production 12.1 / 12.2 / 12.1 dB against 11.9 / 12.0 / 11.8 dB for
+`asinh_unbiased`, a consistent −0.25 dB; on the M 31 twin the unbiased variant also had the larger exact
+rms in two seeds of three (0.33 / 0.40 / 0.41 σ against 0.35 / 0.34 / 0.37 σ), 4–9 % fewer faint sources
+and twice the flux error. On M 42 the two are within seed noise either way. Removing a 1 ADU bias
+is not worth 0.25 dB of faint-structure error, so **`asinh_mse` stays the default**.
+
+The objective is a pipeline setting: `n2n_loss` (`--n2n-loss`, *Denoiser objective* in the web UI, the
+lab denoiser task's *Training objective*), used by the Noise2Noise + deconvolution-network restoration
+(`n2n-network`); ImageMM's own Noise2Noise pass is a different network and keeps its linear MSE.
+
 ## Deconvolution (`exp_deconv.py`)
 
 Every method gets the N2N-denoised half A and per-channel PSFs measured from the

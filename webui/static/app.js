@@ -344,7 +344,7 @@ function stackParams() {
     imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
     imagemm_n2n: g("imagemm_n2n").checked, imagemm_background: g("imagemm_background").checked,
     network_groups: parseInt(g("network_groups").value) || 0,
-    pattern_correction: g("pattern_correction").checked, n2n_split: g("n2n_split").value,
+    pattern_correction: g("pattern_correction").checked, n2n_split: g("n2n_split").value, n2n_loss: g("n2n_loss").value,
     star_remover_iters: parseInt(g("star_remover_iters").value) || 3000,
     autofinish: g("autofinish").checked,
   };

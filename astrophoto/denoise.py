@@ -153,12 +153,92 @@ def _to_t(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))[None]
 
 
+N2N_LOSSES = ("asinh_mse", "asinh_unbiased", "lin_mse", "lin_chi2", "lin_huber")
+
+
+def make_n2n_loss(kind: str, stab: "Stabiliser", device, delta: float = 3.0):
+    """Noise2Noise training objectives for a network that predicts in the stabilised domain.
+
+    Returns ``loss(pred, tgt, var)`` for stabilised-domain tensors ``pred``, ``tgt`` (B, C, H, W)
+    and ``var``, the noise variance of ONE half-stack in linear units² (B, C, H, W; a local
+    estimate independent of the pixel's own noise, e.g. the smoothed (A-B)²/2).  Writing
+    s = k·sigma and x̂ = sinh(pred)·s + bg for the linear estimate:
+
+    * ``asinh_mse``: MSE in the stabilised domain (production).  Its minimiser is
+      E[asinh((B-bg)/s) | A], which differs from asinh((x-bg)/s) by the Jensen gap of the
+      transform (second order: ½ g''(u) var/s²).
+    * ``asinh_unbiased``: nonlinear Noise2Noise with the gap removed (cf. Tinits & Mann,
+      arXiv:2512.24794): ``pred`` is read as the clean image and its *expected* stabilised
+      noisy value E_n[asinh((x̂ + n - bg)/s)] under Gaussian noise of variance ``var``
+      (Gauss-Hermite, 7 nodes) is matched to the target by MSE.  The fixed point is pred =
+      asinh((x-bg)/s) exactly for Gaussian noise.
+    * ``lin_mse``: MSE in linear units (the loss of ImageMM's N2N pass), scaled by mean(var).
+    * ``lin_chi2``: inverse-variance weighted MSE in linear units (Ye et al., arXiv:2609.21350).
+    * ``lin_huber``: Huber loss of the normalised linear residual with threshold ``delta``
+      (quadratic within ±delta sigma, linear beyond: robust to cosmic rays and defects left in
+      one half only).
+    """
+    if kind not in N2N_LOSSES:
+        raise ValueError(f"unknown N2N loss {kind!r}, expected one of {N2N_LOSSES}")
+    s = torch.tensor(stab.k * stab.sigma, dtype=torch.float32, device=device).view(1, -1, 1, 1)
+    bg = torch.tensor(stab.bg, dtype=torch.float32, device=device).view(1, -1, 1, 1)
+    cap = 60.0                                    # sinh(60) ~ 5.7e25: keeps float32 finite
+
+    def lin(g):
+        return torch.sinh(g.clamp(-cap, cap)) * s + bg
+
+    if kind == "asinh_mse":
+        def loss(pred, tgt, var=None):
+            return F.mse_loss(pred, tgt)
+        return loss
+
+    if kind == "asinh_unbiased":
+        t, w = np.polynomial.hermite.hermgauss(7)
+        nodes = torch.tensor(t * np.sqrt(2.0), dtype=torch.float32, device=device)
+        wts = torch.tensor(w / np.sqrt(np.pi), dtype=torch.float32, device=device)
+
+        def loss(pred, tgt, var):
+            u = torch.sinh(pred.clamp(-cap, cap))                  # clean estimate in units of s
+            sd = torch.sqrt(var.clamp_min(1e-12)) / s              # noise sigma in the same units
+            exp = 0
+            for ti, wi in zip(nodes, wts):
+                exp = exp + wi * torch.asinh(u + ti * sd)
+            return F.mse_loss(exp, tgt)
+        return loss
+
+    if kind == "lin_mse":
+        def loss(pred, tgt, var):
+            return ((lin(pred) - lin(tgt)) ** 2).mean() / var.mean().clamp_min(1e-12)
+        return loss
+
+    if kind == "lin_chi2":
+        def loss(pred, tgt, var):
+            return ((lin(pred) - lin(tgt)) ** 2 / var.clamp_min(1e-12)).mean()
+        return loss
+
+    def loss(pred, tgt, var):                      # lin_huber
+        r = (lin(pred) - lin(tgt)) / torch.sqrt(var.clamp_min(1e-12))
+        a = r.abs()
+        return torch.where(a <= delta, r * r, 2 * delta * a - delta * delta).mean()
+    return loss
+
+
 def train_n2n(ga: np.ndarray, gb: np.ndarray, iters: int = 2000, patch: int = 128, batch: int = 16,
               device=None, progress=None, cancel=None, seed: int = 0, sample_mask: np.ndarray | None = None,
-              max_lr: float = 1e-3, base: int = 32) -> UNet:
+              max_lr: float = 1e-3, base: int = 32, loss: str = "asinh_mse", stab: "Stabiliser | None" = None,
+              var: np.ndarray | None = None, delta: float = 3.0) -> UNet:
     """Noise2Noise (Lehtinen et al. 2018) U-Net on the stabilised half-stacks; one-cycle
-    schedule (Smith & Topin 2019) peaking at ``max_lr``; ``base`` = first-level channels."""
+    schedule (Smith & Topin 2019) peaking at ``max_lr``; ``base`` = first-level channels.
+
+    ``loss``: training objective (``make_n2n_loss``); every choice but the default needs the
+    ``stab`` the halves were transformed with and ``var``, the per-pixel noise variance of
+    one half in linear units² (h, w, 3), sampled with the same patches.  Ablation:
+    experiments/exp_denoise_loss.py."""
     device = device or pick_device()
+    if loss != "asinh_mse" and (stab is None or var is None):
+        raise ValueError("train_n2n: this loss needs stab and var")
+    loss_fn = make_n2n_loss(loss, stab, device, delta) if loss != "asinh_mse" else None
+    tv = torch.from_numpy(np.ascontiguousarray(var.transpose(2, 0, 1))) if loss_fn else None
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
     net = UNet(base=base).to(device)
@@ -191,7 +271,7 @@ def train_n2n(ga: np.ndarray, gb: np.ndarray, iters: int = 2000, patch: int = 12
             ys = rng.integers(0, h - patch, batch)
             xs = rng.integers(0, w - patch, batch)
         swap = rng.random(batch) < 0.5
-        inp, tgt = [], []
+        inp, tgt, aux = [], [], []
         for y, x, s in zip(ys, xs, swap):
             pa = ta[:, y:y + patch, x:x + patch]
             pb = tb[:, y:y + patch, x:x + patch]
@@ -199,15 +279,22 @@ def train_n2n(ga: np.ndarray, gb: np.ndarray, iters: int = 2000, patch: int = 12
                 pa, pb = pb, pa
             k = int(rng.integers(0, 4))
             pa, pb = torch.rot90(pa, k, (1, 2)), torch.rot90(pb, k, (1, 2))
-            if rng.random() < 0.5:
+            fl = rng.random() < 0.5
+            if fl:
                 pa, pb = pa.flip(2), pb.flip(2)
             inp.append(pa)
             tgt.append(pb)
+            if tv is not None:
+                pv = torch.rot90(tv[:, y:y + patch, x:x + patch], k, (1, 2))
+                aux.append(pv.flip(2) if fl else pv)
         inp = torch.stack(inp).to(device)
         tgt = torch.stack(tgt).to(device)
         with _autocast(device):
             pred = net(inp)
-        loss = F.mse_loss(pred.float(), tgt)
+        if loss_fn is None:
+            loss = F.mse_loss(pred.float(), tgt)
+        else:
+            loss = loss_fn(pred.float(), tgt, torch.stack(aux).to(device))
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -539,11 +626,13 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
                 coverage: np.ndarray | None = None, deconvolve: bool = True,
                 deconv_iters: int | None = None, sat: float = 63471.0,
                 px_scale: float = 1.0, save_path: str | None = None,
-                mf: dict | None = None) -> tuple[np.ndarray, np.ndarray | None, dict]:
+                mf: dict | None = None, loss: str = "asinh_mse") -> tuple[np.ndarray, np.ndarray | None, dict]:
     """Train on the half-stacks; return (denoised, deconvolved-or-None, info), all linear.
 
     ``mf``: the ImageMM multi-frame data term for the deconvolution network (see
     ``train_n2n_deconv``); its kernels may be numpy arrays (moved to the device here).
+    ``loss``: the denoiser's training objective (``make_n2n_loss``; ablation in
+    experiments/README.md).
 
     High-SNR pixels (bright star cores, > ~80 sigma) are rare in training data
     and noise there is invisible, so the denoiser smoothly hands them back to the
@@ -569,8 +658,12 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
     tta = 8 if dev.type != "cpu" else 2
     if dev.type == "cpu":
         iters = min(iters, 600)
+    # per-pixel noise variance of one half (also the deconvolution network's chi² weights)
+    var = cv2.GaussianBlur(0.5 * (half_a - half_b) ** 2, (0, 0), 10 * px_scale)
+    var = np.maximum(var, np.percentile(var[::4, ::4], 1, axis=(0, 1)) * 0.5).astype(np.float32)
+    info["n2n_loss"] = loss
     net = train_n2n(ga, gb, iters=iters, batch=batch, device=dev, progress=progress, cancel=cancel,
-                    sample_mask=mask)
+                    sample_mask=mask, loss=loss, stab=stab, var=var)
     if progress:
         progress(0, 2, "Denoising half-stack A")
     da = infer(net, ga, tile=tile, tta=tta)
@@ -599,8 +692,6 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
             ksize = int(psfs["kernels"].shape[-1])
             info["psf_size"] = ksize
             info["psf_field"] = {"nodes": [len(psfs["nodes"][0]), len(psfs["nodes"][1])], "fallback": psfs["n_fallback"]}
-            var = cv2.GaussianBlur(0.5 * (half_a - half_b) ** 2, (0, 0), 10 * px_scale)
-            var = np.maximum(var, np.percentile(var[::4, ::4], 1, axis=(0, 1)) * 0.5).astype(np.float32)
             unsat = (full.max(-1) < 0.5 * sat).astype(np.uint8)
             weight = cv2.erode(unsat, np.ones((9, 9), np.uint8)).astype(np.float32)
             sky = _sky_map(full, int(64 * px_scale))

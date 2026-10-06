@@ -75,6 +75,10 @@ def main(argv=None):
                    help="restore on a sky pedestal, so the latent's sky keeps its noise instead of being clipped at 0")
     r.add_argument("--n2n-split", default=STACK_DEFAULTS["n2n_split"], choices=["alternate", "dither"],
                    help="how the subs are split into the Noise2Noise halves: alternate frames or whole dither blocks")
+    r.add_argument("--n2n-loss", default=STACK_DEFAULTS["n2n_loss"],
+                   choices=["asinh_mse", "asinh_unbiased", "lin_mse", "lin_chi2", "lin_huber"],
+                   help="Noise2Noise denoiser objective: MSE in the asinh domain (default), the same without the "
+                        "transform's bias, or linear MSE / chi2 / Huber (experiments/README.md)")
     r.add_argument("--network-groups", type=int, default=STACK_DEFAULTS["network_groups"],
                    help="deconvolution network: ImageMM multi-frame likelihood over N seeing groups (0 = off)")
     r.add_argument("--no-star-remover", action="store_true",
@@ -165,7 +169,7 @@ def main(argv=None):
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
              "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
-             "imagemm_background": args.imagemm_background, "n2n_split": args.n2n_split,
+             "imagemm_background": args.imagemm_background, "n2n_split": args.n2n_split, "n2n_loss": args.n2n_loss,
              "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
              "star_remover_iters": args.star_remover_iters, "autofinish": not args.no_autofinish}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)

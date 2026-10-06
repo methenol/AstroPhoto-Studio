@@ -183,10 +183,12 @@ def patch_sampler(mask, h, w, patch):
 
 
 def train(net, ga, gb, mask, iters=2000, patch=128, batch=16, device=None, lr=1e-3, seed=0,
-          loss_fn=None, log_every=500, tag=""):
+          loss_fn=None, log_every=500, tag="", aux=None):
     """Noise2Noise training A<->B on patches fully inside ``mask``.
 
-    ``loss_fn(pred, tgt, inp)`` defaults to MSE.
+    ``loss_fn(pred, tgt, inp)`` defaults to MSE.  ``aux`` (h, w, k): a per-pixel side input
+    (e.g. the noise variance) cut and augmented with the same patches; the loss is then
+    called as ``loss_fn(pred, tgt, inp, aux_patch)``.
     """
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -196,27 +198,37 @@ def train(net, ga, gb, mask, iters=2000, patch=128, batch=16, device=None, lr=1e
     h, w, _ = ga.shape
     ta = torch.from_numpy(ga.transpose(2, 0, 1)).contiguous()
     tb = torch.from_numpy(gb.transpose(2, 0, 1)).contiguous()
+    tv = torch.from_numpy(np.ascontiguousarray(aux.transpose(2, 0, 1))) if aux is not None else None
     cand = patch_sampler(mask, h, w, patch)
     t0 = time.time()
     for it in range(iters):
         pick = cand[rng.integers(0, len(cand), batch)]
-        inp, tgt = [], []
+        inp, tgt, ax = [], [], []
         for (y, x), s in zip(pick, rng.random(batch) < 0.5):
             pa, pb = ta[:, y:y + patch, x:x + patch], tb[:, y:y + patch, x:x + patch]
             if s:
                 pa, pb = pb, pa
             k = int(rng.integers(0, 4))
             pa, pb = torch.rot90(pa, k, (1, 2)), torch.rot90(pb, k, (1, 2))
-            if rng.random() < 0.5:
+            fl = rng.random() < 0.5
+            if fl:
                 pa, pb = pa.flip(2), pb.flip(2)
             inp.append(pa)
             tgt.append(pb)
+            if tv is not None:
+                pv = torch.rot90(tv[:, y:y + patch, x:x + patch], k, (1, 2))
+                ax.append(pv.flip(2) if fl else pv)
         inp = torch.stack(inp).to(device)
         tgt = torch.stack(tgt).to(device)
         with _autocast(device):
             pred = net(inp)
         pred = pred.float()
-        loss = loss_fn(pred, tgt, inp) if loss_fn else F.mse_loss(pred, tgt)
+        if loss_fn is None:
+            loss = F.mse_loss(pred, tgt)
+        elif tv is not None:
+            loss = loss_fn(pred, tgt, inp, torch.stack(ax).to(device))
+        else:
+            loss = loss_fn(pred, tgt, inp)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)

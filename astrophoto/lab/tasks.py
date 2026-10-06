@@ -342,6 +342,9 @@ class DenoiseTask(Task):
          "default": 32, "tune": False},
         {"name": "tta", "label": "Self-ensemble (rotations / flips)", "type": "categorical", "choices": [1, 8],
          "default": 8, "tune": False},
+        {"name": "loss", "label": "Training objective", "type": "categorical",
+         "choices": ["asinh_mse", "asinh_unbiased", "lin_mse", "lin_chi2", "lin_huber"], "default": "asinh_mse",
+         "tune": True, "pipeline": "n2n_loss"},
     ]
     metrics = {
         "blocks_lin": {"label": "Error vs held-out dither blocks, linear (× reference var.)", "direction": "minimize"},
@@ -431,9 +434,11 @@ class DenoiseTask(Task):
         stab = Stabiliser(a, b)
         _, tile = _batch_and_tile(dev)
         t = time.time()
+        loss = p.get("loss", "asinh_mse")
+        var = MX.NoiseModel(a, b).v if loss != "asinh_mse" else None
         net = train_n2n(stab.fwd(a), stab.fwd(b), iters=int(p["iters"]), patch=int(p["patch"]), batch=int(p["batch"]),
                         device=dev, progress=_prog(log, 250), cancel=cancel.is_set, sample_mask=ctx["train"],
-                        max_lr=float(p["max_lr"]), base=int(p["base"]))
+                        max_lr=float(p["max_lr"]), base=int(p["base"]), loss=loss, stab=stab, var=var)
         xa = stab.inv(infer(net, stab.fwd(a), tile=tile, tta=int(p["tta"])))
         dt = time.time() - t
         out = MX.halfstack_score(xa, a, b, ctx["test"], ctx["valid"], stab, MX.NoiseModel(a, b).v)

@@ -66,6 +66,11 @@ STACK_DEFAULTS = {
     "n2n_split": "alternate",  # how the subs are split into the two Noise2Noise halves (half stacks,
                                # ImageMM's N2N pass, the network's multi-frame targets): alternate
                                # (frame by frame) | dither (whole dither blocks, analysis.half_split)
+    "n2n_loss": "asinh_mse",  # the Noise2Noise denoiser's training objective (denoise.make_n2n_loss):
+                              # asinh_mse (MSE in the stabilised domain) | asinh_unbiased (the same with the
+                              # transform's Jensen-gap bias removed, ~1 ADU at faint levels) | lin_mse |
+                              # lin_chi2 | lin_huber (linear units: exact star cores, softer faint end).
+                              # Ablation 2026-10-06, experiments/README.md: asinh_mse kept
     "star_remover": True,    # train the AI star remover (starnet.py) after the restoration
     "star_remover_iters": 3000,
     "autofinish": True,      # before the export: tune the processing settings and fit a colour grade to
@@ -695,7 +700,7 @@ class Session:
                     a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
                     progress=progress, cancel=self.checkpoint, deconvolve=method == "network",
                     sat=self.meta.get("saturation", 63471.0), px_scale=float(self.meta.get("scale", 1.0)),
-                    save_path=self._p("restore_nets.pt"), mf=mf)
+                    save_path=self._p("restore_nets.pt"), mf=mf, loss=p.get("n2n_loss", "asinh_mse"))
                 del a, b
                 _save_fits(self._p("denoised.fits"), den)
                 if sharp is not None:
