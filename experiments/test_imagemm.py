@@ -10,6 +10,7 @@ import os
 import sys
 import time
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -650,26 +651,6 @@ def test_stopping_rules():
           f"({ifl['restarts']} restarts), {dist(xfl):.3f}")
 
 
-def test_saturated_fill():
-    """saturated_fill: a star whose core is masked in every exposure (coverage ~0) takes the
-    coadd's profile there, blended out to where the coverage recovers; elsewhere nothing
-    changes, and a large low-coverage area (an obstruction, not a star) is left alone."""
-    H = W = 200
-    yy, xx = np.mgrid[:H, :W].astype(np.float64)
-    r = np.hypot(yy - 100, xx - 60)
-    ref = np.repeat((1e4 * np.exp(-r ** 2 / (2 * 2.0 ** 2)))[..., None], 3, -1).astype(np.float32)
-    x = ref.copy()
-    x[r < 6] = 0.0                                            # the restoration's hole
-    cov = np.ones((H, W, 3), np.float32)
-    cov[r < 7] = 0.02
-    cov[(r >= 7) & (r < 12)] = np.clip((r[(r >= 7) & (r < 12)] - 7) / 5, 0.02, 1)[..., None]
-    cov[:, 150:] = 0.3                                        # a large obstructed strip at the edge
-    out, n = M.saturated_fill(x, cov, ref, fwhm=4.5)
-    check("saturated fill: the hole takes the coadd profile, the rest is unchanged",
-          n == 1 and np.abs(out[r < 6] - ref[r < 6]).max() < 1e-3 and np.array_equal(out[r > 20], x[r > 20]),
-          f"{n} star(s) filled, max |out - ref| in the hole {np.abs(out[r < 6] - ref[r < 6]).max():.2e}")
-
-
 def test_n2n_noise_scale():
     """n2n_pass's noise scale on restorations whose sky is ~0 (ImageMM's): of the order of the
     true noise of the signal pixels, not the ~1e-4 x that a scale over the sky gave."""
@@ -762,11 +743,91 @@ def test_unit_sum_pedestal():
     check("unit-sum kernels: no sky offset", abs(off["unit sum"]) < 1.0, f"offset {off['unit sum']:.2f} ADU")
 
 
+def test_saturated_whyte():
+    """Saturated stars under the paper's method (x >= 0, Eq. C15, x0 the median of the exposures, Huber) with
+    the binary masks alone and with Whyte, Sivic & Zisserman's update for saturated images (mm_restore's
+    ``whyte``).  The PSF has a DWARF 3-like halo: ~12 % of the light in a broad component ~3 px above the core.
+    With the update there is no deficit above the star (M 42's dark crescents, 2026-10-07: on the real data
+    the masks alone left one; this synthetic field does not reproduce it, so it is not asserted), round it
+    the measured light is kept (their "more blur around saturated regions"), and the image away from it is
+    no worse."""
+    rng = np.random.default_rng(3)
+    H = W = 112; n = 40; SAT = 30000.0; KS = 31
+    col = np.array([0.55, 1.0, 0.75])
+
+    def moffat(fw, size, beta=3.0, e=0.0, th=0.0, dy=0.0, sub=5):
+        a = fw / (2 * np.sqrt(2 ** (1 / beta) - 1))
+        g = (np.arange(size * sub) + 0.5) / sub - size / 2
+        yy, xx = np.meshgrid(g, g, indexing="ij")
+        yy = yy - dy
+        c, s_ = np.cos(th), np.sin(th)
+        u, v = c * xx + s_ * yy, (-s_ * xx + c * yy) / (1 - e)
+        k = ((1 + (u * u + v * v) / a ** 2) ** (-beta)).reshape(size, sub, size, sub).mean((1, 3))
+        c_ = np.arange(size) - (size - 1) / 2
+        rr = np.hypot(*np.meshgrid(c_, c_, indexing="ij"))
+        R0, R1 = 0.6 * (size // 2), size // 2
+        k = k * 0.5 * (1 + np.cos(np.pi * np.clip((rr - R0) / (R1 - R0), 0, 1)))
+        return k / k.sum()
+    yy, xx = np.mgrid[:H, :W]
+    truth = (60 * np.exp(-((yy - 70) ** 2 + (xx - 50) ** 2) / (2 * 28 ** 2)))[None] * np.array([1.0, 0.5, 0.6])[:, None, None]
+    truth[:, 40, 40] += 6e7 * col                               # saturated in every exposure
+    truth[:, 44, 76] += 7.5e5 * col                             # saturated in the sharpest ~45 %
+    for (py, px, fl) in ((80, 30, 2e4), (86, 84, 6e4), (20, 90, 1e4)):
+        truth[:, py, px] += fl * col
+    ys, ms, ks_ = [], [], []
+    for t in range(n):
+        fw = rng.uniform(3.0, 5.5)
+        f = 0.88 * moffat(fw, KS, e=rng.uniform(0, 0.12), th=rng.uniform(0, 3)) + 0.12 * moffat(2.2 * fw, KS, dy=-3.0)
+        f = f / f.sum()
+        clean = np.stack([cv2.filter2D(truth[c], -1, f, borderType=cv2.BORDER_CONSTANT) for c in range(3)])
+        y = clean + rng.normal(size=clean.shape) * np.sqrt(15.0 ** 2 + np.maximum(clean, 0))
+        sat = cv2.dilate((y >= SAT).any(0).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        ys.append(np.minimum(y, SAT)); ms.append(np.repeat((~sat)[None], 3, 0)); ks_.append(np.repeat(f[None], 3, 0))
+    Y, Mk, K = (np.stack(a).astype(np.float32) for a in (ys, ms, ks_))
+    coadd = Y.mean(0)
+    V = np.repeat((15.0 ** 2 + np.maximum(coadd, 0))[None], n, 0).astype(np.float32)
+    h, _ = M.refine_psfs(K.reshape(-1, KS, KS), 1, 1.0, device=DEV)
+    h = M.unit_sum(h.reshape(n, 3, KS, KS))
+    yt, vt, mt, kt = (torch.from_numpy(a).to(DEV) for a in (Y, V, Mk, h))
+    x0 = M.initial_guess(yt, torch.ones_like(mt), KS, 1)            # the paper's x0: median of the exposures
+    o = int(round(M.exposure_origin(KS, 1)))
+    g = M.gaussian_psf_mc(1.0, 9)
+    tgt = np.stack([cv2.filter2D(truth[c], -1, g, borderType=cv2.BORDER_CONSTANT) for c in range(3)])
+    rr = np.hypot(yy - 40, xx - 40); ang = np.degrees(np.arctan2(-(yy - 40), xx - 40)) % 360
+    above = (rr >= 8) & (rr <= 16) & (ang >= 50) & (ang <= 130)
+    far = (rr > 30) & (yy > 12) & (yy < H - 12) & (xx > 12) & (xx < W - 12) & (np.hypot(yy - 44, xx - 76) > 30)
+    whyte = {"level": np.full((n, 3), SAT, np.float32), "saturated": (1 - mt).clone(), "phi": 0.9, "a": 50.0,
+             "erode": 3, "soft": 3.0, "support": 15.0}
+    res = {}
+    for name, w_ in (("masks alone", None), ("Whyte et al.", whyte)):
+        x, info = M.mm_restore(yt, vt, mt, kt, x0, r=1, robust=True, delta=2.0, kappa=2.0, epsilon=1e-6, stop="c15",
+                               max_iters=2000, accelerate=False, whyte=w_)
+        est = x[0, :, o:o + H, o:o + W].cpu().numpy()
+        res[name] = (float((est - tgt)[:, above].mean()), float(np.sqrt(((est - tgt)[:, far] ** 2).mean())), info["iterations"])
+    print("   ", {k_: tuple(round(v, 1) for v in val) for k_, val in res.items()}, "(deficit above the star, far rms, iterations)")
+    check("Whyte et al.: no deficit above it (within 3 x the sky noise of 15 ADU)", res["Whyte et al."][0] > -45,
+          f"mean est - truth 8-16 px above {res['Whyte et al.'][0]:.1f} ADU")
+    check("Whyte et al.: the image away from the star no worse", res["Whyte et al."][1] <= 1.1 * res["masks alone"][1] + 1,
+          f"far rms {res['Whyte et al.'][1]:.1f} against {res['masks alone'][1]:.1f} ADU")
+    # no saturated star: the update must be the paper's exactly (same data, same start, deterministic sums aside)
+    t2 = truth.copy(); t2[:, 40, 40] = t2[:, 40, 41]; t2[:, 44, 76] = t2[:, 44, 77]
+    Y2 = np.stack([np.stack([cv2.filter2D(t2[c], -1, K[t, c], borderType=cv2.BORDER_CONSTANT) for c in range(3)]) for t in range(n)])
+    Y2 = (Y2 + rng.normal(size=Y2.shape) * 15.0).astype(np.float32)
+    y2 = torch.from_numpy(Y2).to(DEV); m2 = torch.ones_like(y2)
+    x02 = M.initial_guess(y2, m2, KS, 1)
+    x1, i1 = M.mm_restore(y2, vt, m2, kt, x02, r=1, robust=True, epsilon=1e-6, stop="c15", max_iters=300,
+                          whyte={**whyte, "saturated": torch.zeros_like(m2)})
+    x2, i2 = M.mm_restore(y2, vt, m2, kt, x02, r=1, robust=True, epsilon=1e-6, stop="c15", max_iters=300)
+    d_ = (x1 - x2)[0, :, o:o + H, o:o + W].abs().max(); m_ = x2[0, :, o:o + H, o:o + W].abs().max()
+    check("no saturated pixel: the update is the paper's", i1["iterations"] == i2["iterations"] and float(d_) < 1e-3 * float(m_),
+          f"iterations {i1['iterations']} / {i2['iterations']}, max |difference| {float(d_):.3g} of {float(m_):.3g}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
     ALL = [test_operators, test_operator_vs_conv2d, test_stack_forward, test_true_convolution, test_geometry, test_psf_solver, test_restoration,
            test_superresolution, test_superresolved_units, test_batched_psf_solver, test_moffat, test_seeing_groups, test_mf_data_term, test_tiling, test_empirical_psf,
-           test_empirical_psf_crowded, test_field_psf, test_photometric_scale, test_stopping_rules, test_saturated_fill, test_n2n_noise_scale, test_unit_sum_pedestal]
+           test_empirical_psf_crowded, test_field_psf, test_photometric_scale, test_stopping_rules, test_n2n_noise_scale, test_unit_sum_pedestal, test_saturated_whyte]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

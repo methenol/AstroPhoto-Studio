@@ -342,7 +342,7 @@ function stackParams() {
     local_norm: g("local_norm").checked, denoise_iters: parseInt(g("denoise_iters").value), device: g("device").value,
     deconv_method: g("deconv_method").value, ai_deconvolution: g("deconv_method").value !== "none",
     imagemm_r: parseInt(g("imagemm_r").value), imagemm_sigma: parseFloat(g("imagemm_sigma").value) || 0,
-    imagemm_robust: g("imagemm_robust").checked, imagemm_epsilon: parseFloat(g("imagemm_epsilon").value) || 1e-4,
+    imagemm_robust: g("imagemm_robust").checked, imagemm_epsilon: parseFloat(g("imagemm_epsilon").value) || 1e-6,
     imagemm_stop: g("imagemm_stop").value,
     imagemm_delta: parseFloat(g("imagemm_delta").value) || 2, imagemm_kappa: parseFloat(g("imagemm_kappa").value) || 2,
     imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 2000, imagemm_psf: g("imagemm_psf").value,

@@ -433,8 +433,24 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
                max_iters: int = 1000, epsilon: float = 1e-6, mu: float = 0.1, chunk: int | None = None,
                accelerate: bool = False, stop: str = "c15", min_iters: int = 0, log=None,
                bg: torch.Tensor | None = None, stars: dict | None = None, smooth: float = 0.0,
-               smooth_sigma: float = 1.0, pedestal=0.0) -> tuple[torch.Tensor, dict]:
+               smooth_sigma: float = 1.0, pedestal=0.0,
+               whyte: dict | None = None) -> tuple[torch.Tensor, dict]:
     """Algorithms 1-3 on one cutout.
+
+    ``whyte`` (r = 1), optional: the update of Whyte, Sivic & Zisserman for images with saturated pixels
+    ("Deblurring shaken and partially saturated images", IJCV 110:185, 2014, Algorithm 1), in this multi-
+    frame form: {"level": (n, C) each exposure's saturation in its units, "saturated": (n, C, d, d) its pixels
+    whose resampling uses a saturated raw sample (their recorded values in ``y``), "phi": 0.9, "a": 50,
+    "erode": 3, "soft": 3}.  Every iteration the latent is split (their Eqs. 23-25, Sec. 5.5) into the pixels
+    U at most phi x the saturation level, eroded by a disk of "erode" px, and the rest S; the mask of U
+    blurred by a Gaussian of "soft" px.  U is updated from the valid measurements S cannot reach - outside S
+    dilated by the kernels' non-zero footprint (their V) - each pixel by the share of its footprint V holds,
+    1 for the rest (Eq. 18); S from all the data through the smooth saturation response
+    R(x) = x - log(1 + exp(a (x/L - 1))) L / a, L the exposure's saturation (Eqs. 19-22): a measurement the
+    model saturates no longer pulls.  A bright latent pixel behind saturation is estimated from incomplete
+    data, and its errors, spread by the blur, rang round every saturated star - dark crescents, rings, a
+    plateau - even with the saturated pixels discarded (their Secs. 3-4; M 42, 2026-10-07).
+
 
     ``pedestal`` (scalar or (1, C, 1, 1)): a constant added to the exposures and to the initial
     guess, and taken off the result.  The kernels must have unit sum (``unit_sum``; any excess e turns
@@ -511,7 +527,7 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
     m_eff = (frac / n > mu).float()
     M_eff = float(m_eff.sum())
     num = None
-    if not robust:                     # Eq. 8: the numerator does not depend on x
+    if not robust and whyte is None:   # Eq. 8: the numerator does not depend on x
         num = torch.zeros_like(x0)
         for a, b in ops.ranges():
             num += ops.adjoint_sum(W_(a, b) * y[a:b], a, b)
@@ -587,6 +603,36 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             stamps = st_stamps if stamps is None else stamps
             return torch.stack([(z[0, :, st_iy[q]:st_iy[q] + ss, st_ix[q]:st_ix[q] + ss] * stamps[q]).sum((-2, -1))
                                 for q in range(len(st_iy))])
+    if whyte is not None and (r != 1 or not bool((whyte["saturated"] > 0).any())):
+        whyte = None                   # (the update is for data with saturated pixels; without any it is the paper's)
+    if whyte is not None:
+        w_L = torch.as_tensor(np.asarray(whyte["level"], np.float32), device=x0.device).view(n, -1, 1, 1)
+        w_sat = whyte["saturated"]
+        w_phi, w_a = float(whyte.get("phi", 0.9)), float(whyte.get("a", 50.0))
+        w_er = int(whyte.get("erode", 3))
+        dd_ = torch.arange(-w_er, w_er + 1, device=x0.device, dtype=x0.dtype)
+        w_disk = ((dd_[:, None] ** 2 + dd_[None, :] ** 2) <= w_er ** 2).to(x0.dtype)[None, None]
+        if whyte.get("support"):            # the PSF's measured support (beyond it the kernels hold numerical residue)
+            sr_ = int(np.ceil(float(whyte["support"])))
+            dd2 = torch.arange(-sr_, sr_ + 1, device=x0.device, dtype=x0.dtype)
+            w_foot = ((dd2[:, None] ** 2 + dd2[None, :] ** 2) <= sr_ ** 2).to(x0.dtype)[None, None]
+        else:
+            w_foot = (kernels.abs().amax((0, 1)) > 0).to(x0.dtype)[None, None]           # the kernels' non-zeros
+        o_e = int(round(exposure_origin(kernels.shape[-1], 1)))
+        ws_ = float(whyte.get("soft", 3.0))
+        wk_ = int(2 * np.ceil(3 * ws_) + 1)
+        wg1 = torch.exp(-((torch.arange(wk_, device=x0.device, dtype=x0.dtype) - wk_ // 2) ** 2) / (2 * ws_ ** 2))
+        wg1 = wg1 / wg1.sum()
+        w_Lmin = w_L.amin(0, keepdim=True)                                                 # (1, C, 1, 1)
+
+        def w_blur(z):
+            p_ = wk_ // 2
+            zz = F.pad(z, (p_, p_, p_, p_), mode="replicate")
+            return F.conv2d(F.conv2d(zz, wg1.view(1, 1, 1, -1)), wg1.view(1, 1, -1, 1))
+
+        def w_R(fx, L):                                     # smooth min(fx, L) and its derivative (Eqs. 21-22)
+            t = (w_a * (fx / L - 1.0)).clamp(-60, 60)
+            return fx - torch.log1p(torch.exp(t)) * L / w_a, 1.0 / (1.0 + torch.exp(t))
     u_prev, hist, converged, k = None, [], False, 0
     loss_prev, losses = float("inf"), []
     for k in range(1, max_iters + 1):
@@ -594,9 +640,22 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         xm = xe if bg is None else xe + bg                  # the model's sky: restored part + background
         if stars is not None:
             xm = xm + star_image(st_a)
-        if robust:
+        if robust or whyte is not None:
             num = torch.zeros_like(x0)
         den = torch.zeros_like(x0)
+        split = None
+        if whyte is not None:
+            # U: latent pixels at most phi x the saturation (any channel above it: S), eroded (Eqs. 23, 29)
+            Sb = ((xe - ped) > w_phi * w_Lmin).any(1, keepdim=True).to(x0.dtype)
+            if bool(Sb.any()):
+                Sb = (F.conv2d(Sb, w_disk, padding=w_er) > 0).to(x0.dtype)
+                u_soft = (1.0 - w_blur(Sb)).clamp(0, 1)
+                kh = w_foot.shape[-1] // 2
+                reach = (F.conv2d(Sb, w_foot, padding=kh) > 0).to(x0.dtype)
+                V_exp = (1.0 - reach)[0, :, o_e:o_e + y.shape[-2], o_e:o_e + y.shape[-1]]   # (1, d, d): their V
+                num_S, den_S = torch.zeros_like(x0), torch.zeros_like(x0)
+                fV, fA = torch.zeros_like(x0), torch.zeros_like(x0)
+                split = True
         loss = 0.0                     # float64 accumulation of float32 chunk sums (MPS has no float64)
         if stars is not None and stars.get("halo") is not None:
             E_ = halo_image(st_a)
@@ -612,6 +671,22 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             loss += float((rho * (mask[a:b] > 0)).sum())
             if robust:                 # Eq. 17: W_rho = m / v * psi(r),  r = (y - D H x) / sigma  (Eq. 13)
                 Wk = Wk * huber_psi(z, delta)
+            if split is not None:
+                # S (Eq. 20): every measurement, the saturated ones included, through R
+                Rf, dR = w_R(fx, w_L[a:b])
+                allm = ((mask[a:b] > 0) | (w_sat[a:b] > 0)).to(fx.dtype)
+                WS = allm / var[a:b].clamp_min(1e-30) * dR
+                if robust:
+                    zS = (y[a:b] - Rf) / var[a:b].clamp_min(1e-30).sqrt()
+                    WS = WS * huber_psi(zS, delta)
+                num_S += ops.adjoint_sum(WS * y[a:b], a, b)
+                den_S += ops.adjoint_sum(WS * Rf, a, b)
+                del Rf, dR, allm, WS
+                # U (Eq. 18): the valid measurements outside S's reach, and the share of each footprint they hold
+                fA += ops.adjoint_sum(Wk, a, b)
+                Wk = Wk * V_exp[None]
+                fV += ops.adjoint_sum(Wk, a, b)
+            if robust or whyte is not None:
                 num += ops.adjoint_sum(Wk * y[a:b], a, b)
             den += ops.adjoint_sum(Wk * fx, a, b)
             del fx, Wk, z, za, rho
@@ -629,6 +704,18 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             den = (den + lam * (d_ - G_(d_))).clamp_min(1e-3 * den.clamp_min(0) + 1e-30)
         u = torch.where(den > 0, num / den.clamp_min(1e-30), torch.ones_like(den))      # Eq. 8 / 16
         u = u.clamp(1.0 / kappa, kappa)                                                 # Eq. 9
+        if split is not None:
+            # Eq. 18: A^T(v g / A f) + 1 - A^T v - the ratio over V weighted by the share of each pixel's
+            # (weighted) footprint V holds, 1 for the rest; Eq. 20 for S; combined through the blurred mask of U
+            share = torch.where(fA > 0, fV / fA.clamp_min(1e-30), torch.zeros_like(fA)).clamp(0, 1)
+            uS = torch.where(den_S > 0, num_S / den_S.clamp_min(1e-30), torch.ones_like(den_S)).clamp(1.0 / kappa, kappa)
+            u = u_soft * (share * u + (1.0 - share)) + (1.0 - u_soft) * uS
+            # the stopping rule over the pixels the data update (held pixels' u is 1 by construction and would
+            # make the mean look converged: 37 iterations instead of ~110 on a synthetic field, far rms doubled)
+            m_crit = m_eff * ((u_soft * share) > 0.5).to(m_eff.dtype)
+            del num_S, den_S, fV, fA
+        else:
+            m_crit = m_eff
         if stars is not None:
             ua = star_dot(num) / star_dot(den).clamp_min(1e-30)
             a_prev = st_a
@@ -640,18 +727,19 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             # flux-weighted relative change of the image, sum |x_k - x_{k-1}| / sum x_k over m~ (with point
             # sources: of the pixel channel and the stars together - stopping on the pixels alone left the
             # star amplitudes short, data - model +10 to +25 sigma over every star core)
-            dx = float((m_eff * (x_new - x).abs()).sum())
-            tot = float((m_eff * (x_new - ped)).abs().sum())
+            dx = float((m_crit * (x_new - x).abs()).sum())
+            tot = float((m_crit * (x_new - ped)).abs().sum())
             if stars is not None:
                 dx += float((st_a - a_prev).abs().sum())
                 tot += float(st_a.sum())
             crit = dx / max(tot, 1e-30)
         elif u_prev is not None:
             xi = u / u_prev
+            M_c = max(float(m_crit.sum()), 1.0)
             if stop == "c15":
-                crit = abs(float((m_eff * xi).sum()) / max(M_eff, 1.0) - 1.0)            # Eq. C15
+                crit = abs(float((m_crit * xi).sum()) / M_c - 1.0)                       # Eq. C15
             else:
-                crit = float((m_eff * (xi - 1).abs()).sum()) / max(M_eff, 1.0)
+                crit = float((m_crit * (xi - 1).abs()).sum()) / M_c
         else:
             crit = None
         x = x_new
@@ -743,9 +831,20 @@ def coadd_groups(Y, V, Mk, K, groups):
 # ----------------------------------------------------------------- one cutout of a session
 def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None = None, r: int = 1,
                    kernels: np.ndarray | None = None, robust: bool = True, psf_model: str = "empirical",
-                   n_groups: int = 0, device=None, background: bool = False, **kw):
+                   n_groups: int = 0, device=None, background: bool = False, saturated: str = "whyte",
+                   init: str = "exposures", **kw):
     """ImageMM (Algorithm 3 by default) of the prepared exposures ``es``
     (exposures.ExposureSet) on the reference-grid window [y0, y1) x [x0, x1).
+
+    ``init``: "exposures" (default) - x0 the median of the exposures, every recorded value (Sec. 4.1: "the
+    mean or median of the input exposures", non-positive pixels replaced); "valid" - the median over the
+    valid measurements only.  A saturated star's core is masked in every exposure: started from the valid
+    ones it began at the floor - a black disc ringed by its own light on M 42 (2026-10-07).
+
+    ``saturated``: "whyte" (default) - Whyte, Sivic & Zisserman's update for saturated images
+    (``mm_restore``'s ``whyte``) where the window has saturated pixels; "mask" - the paper's binary masks
+    alone, under which every saturated star of M 42 had a dark crescent above it (its errors in the
+    bright, saturated latent pixels spread by the blur).
 
     ``background``: restore on a pedestal (``mm_restore``: 50 x the exposures' median pixel noise
     per channel, added to the data and taken off the result), so that the latent's sky keeps its
@@ -757,7 +856,14 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     Returns (latent image cropped to the window on the latent grid, info)."""
     device = device or pick_device()
     idx = es.usable() if idx is None else idx
-    Y, V, Mk = es.windows(idx, y0, y1, x0, x1)
+    import inspect
+    use_w = (saturated == "whyte" and r == 1 and not n_groups and hasattr(es, "sat")
+             and "censored" in inspect.signature(es.windows).parameters)
+    if use_w:          # the pixels whose resampling used a saturated raw sample, with their recorded values
+        Y, V, Mk, Cs = es.windows(idx, y0, y1, x0, x1, censored=True)
+    else:
+        Y, V, Mk = es.windows(idx, y0, y1, x0, x1)
+        Cs = None
     at = ((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2)                # the PSFs where the cutout is
     # unit sum whatever the source: the sky pedestal below assumes it (``unit_sum``)
     k = unit_sum(es.kernels(idx, psf_model, at=at) if kernels is None else kernels)
@@ -767,7 +873,15 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     yt, vt, mt = (torch.from_numpy(z).to(device) for z in (Y, V, Mk))
     kt = torch.from_numpy(k).to(device)
     ks = k.shape[-1]
-    x0_ = initial_guess(yt, mt, ks, r)
+    x0_ = initial_guess(yt, torch.ones_like(mt) if init == "exposures" else mt, ks, r)
+    whyte = None
+    if Cs is not None and Cs.any():
+        T = np.stack([np.asarray(es.params[k_]["T"], np.float64) for k_ in idx])          # (n, C)
+        support = [float(es.psf_ref[c].get("support") or 0) for c in range(3) if es.psf_ref and es.psf_ref[c] is not None]
+        whyte = {"level": (float(es.sat) / T).astype(np.float32),     # each exposure's saturation in its units
+                 "saturated": torch.from_numpy(Cs).to(device), "phi": 0.9, "a": 50.0, "erode": 3, "soft": 3.0,
+                 "support": max(support) if support and max(support) > 0 else None}
+    del Cs
     # output sample j sits at exposure coordinate j / r: latent index exposure_origin + j (an
     # integer for r = 1 with odd, and r = 2 with even, kernels)
     o = exposure_origin(ks, r)
@@ -778,7 +892,8 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
         sd = vt.clamp_min(0).sqrt()
         ped = torch.stack([50.0 * sd[:, c][mt[:, c] > 0].median() if bool((mt[:, c] > 0).any()) else sd.new_tensor(0.0)
                            for c in range(vt.shape[1])]).view(1, -1, 1, 1)
-    x, info = mm_restore(yt, vt, mt, kt, x0_, r=r, robust=robust, pedestal=ped, **kw)
+    x, info = mm_restore(yt, vt, mt, kt, x0_, r=r, robust=robust, pedestal=ped, whyte=whyte, **kw)
+    info["saturated_pixels"] = 0 if whyte is None else int((whyte["saturated"].amax(0) > 0).sum())
     if background:
         info["pedestal"] = [float(v) for v in ped.flatten()]
     h, w = (y1 - y0) * r, (x1 - x0) * r
@@ -841,40 +956,6 @@ def stack_forward(x: torch.Tensor, kernels: torch.Tensor, s: int) -> tuple[torch
 
 
 # ----------------------------------------------------------------- saturated stars
-def saturated_fill(x: np.ndarray, cov: np.ndarray, ref: np.ndarray, fwhm: float, lo: float = 0.5,
-                   hi: float = 0.97) -> tuple[np.ndarray, int]:
-    """Give saturated stars the coadd's profile.
-
-    A saturated star's core is masked in every exposure (with the demosaic and Lanczos supports
-    around it), so the latent there has no data: ImageMM leaves a hole, widest in the channel that
-    saturates most - on IC 405's AE Aur the red core came out at 120 against 3352 / 16461 in green /
-    blue, a cyan donut.  No restoration can recover it, so, as the network path does, those stars
-    get the (background-subtracted) coadd ``ref`` instead: with c the restoration's coverage (the
-    PSF-weighted fraction of valid measurements per latent pixel, lowest channel), weight 1 where
-    c <= ``lo`` and ramping to 0 at c = ``hi``, applied within 3 FWHM of a compact low-coverage core
-    (not one touching the border - the frames' footprint - nor larger than ~64 x 64 FWHM^2 / 16,
-    which would be an obstructed part of the field rather than a star).
-    x, ref: (H, W, C) on the same grid; cov (H, W, C); ``fwhm`` in pixels of that grid.
-    Returns (x with the stars filled, number of stars filled)."""
-    c = cov.min(-1)
-    core = (c < lo).astype(np.uint8)
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
-    H, W = c.shape
-    keep = np.zeros(n, bool)
-    lim = (16 * fwhm) ** 2
-    for i in range(1, n):
-        x0, y0, w, h, area = stats[i]
-        keep[i] = area <= lim and x0 > 0 and y0 > 0 and x0 + w < W and y0 + h < H
-    if not keep.any():
-        return x, 0
-    near = keep[lab].astype(np.uint8)
-    R = int(math.ceil(3 * fwhm))
-    near = cv2.dilate(near, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * R + 1, 2 * R + 1)))
-    w = np.clip((hi - c) / (hi - lo), 0, 1) * near
-    w = np.maximum(w, cv2.GaussianBlur(w.astype(np.float32), (0, 0), max(fwhm / 3, 0.5)) * near)[..., None]
-    return (x * (1 - w) + ref * w).astype(np.float32), int(keep.sum())
-
-
 def local_psf_correction(es, window: tuple[int, int, int, int], margin: int = 128, R: int = 16,
                          min_stars: int = 3) -> np.ndarray | None:
     """Radial correction C(r) (3, R + 1) of the field PSF model for a cutout, from the cutout's own stars
@@ -1214,19 +1295,6 @@ def smooth_background(es, r: int, origin: tuple[float, float], shape: tuple[int,
                           borderMode=cv2.BORDER_REFLECT)
 
 
-def reference_on_latent(es, r: int, region: tuple[int, int, int, int]) -> np.ndarray:
-    """The background-subtracted reference coadd on the latent grid of ``region`` (latent sample j
-    at reference coordinate region origin + j / r; Lanczos resampling for r > 1)."""
-    y0, y1, x0, x1 = region
-    ref = (es.ref - es.sky_ref)[y0:y1, x0:x1].astype(np.float32)
-    if r == 1:
-        return ref
-    M_ = np.float32([[1.0 / r, 0, 0], [0, 1.0 / r, 0]])            # dst(j) = src(j / r)
-    return cv2.warpAffine(ref, M_, ((x1 - x0) * r, (y1 - y0) * r), flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
-                          borderMode=cv2.BORDER_REFLECT)
-
-
-# ----------------------------------------------------------------- Noise2Noise pass
 def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128, batch: int = 16,
              device=None, progress=None, cancel=None, seed: int = 0) -> tuple[np.ndarray, dict]:
     """Noise2Noise (Lehtinen et al. 2018) on two ImageMM restorations of disjoint sets of
@@ -1329,6 +1397,18 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     # has the variance of 1/2 (f(x_A) + f(x_B))'s error, and its structure (correlated, after the
     # deconvolution and the network).  The display's denoising is calibrated on it (postprocess).
     resid = (0.5 * (fa - fb)).astype(np.float32)
+    # where the network had no training signal - the loss weight 1 / (1 + (x/k)^2) is ~0 far above the
+    # noise: star cores - the plain mean of the two restorations instead of its output (their noise is
+    # independent, so the mean already halves it, and it is negligible at that signal), as the stack's
+    # denoiser hands its bright pixels back (denoise.n2n_restore, the same ramp in asinh units of 3 sigma:
+    # ~50 to ~220 sigma).  Untrained there, the network's output was arbitrary: M 42's bright cores came
+    # out ~35 % too green against both halves (2026-10-07), cyan in the HOO palette
+    from scipy.ndimage import maximum_filter
+    mean = 0.5 * (xa + xb)
+    g = maximum_filter(np.abs(np.arcsinh(mean / k)).max(-1, keepdims=True), size=(5, 5, 1))
+    keep = np.clip((g - 3.5) / 1.5, 0, 1).astype(np.float32)
+    out = out * (1 - keep) + mean * keep
+    resid = (resid * (1 - keep) + 0.5 * (xa - xb) * keep).astype(np.float32)
     return out.astype(np.float32), {"noise_scale": s.tolist(), "iters": iters, "residual": resid}
 
 
@@ -1540,7 +1620,7 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                 cov[sl] += info["coverage"] * wgt / len(sets)
                 acc[sl] += wgt
                 tiles.append({"set": part, "window": [RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1], "iterations": info["iterations"],
-                              "converged": info["converged"]})
+                              "converged": info["converged"], "saturated_pixels": info.get("saturated_pixels", 0)})
                 if progress:
                     done = len(tiles)
                     progress(done, ntot, f"ImageMM: cutout {done}/{ntot} "
@@ -1551,14 +1631,6 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
             if background:
                 bgmap /= np.maximum(acc, 1e-12)
     cov /= np.maximum(acc0, 1e-12)
-    # saturated stars: no data in their cores, the coadd's profile instead (saturated_fill)
-    n_sat = 0
-    if hasattr(es, "ref") and hasattr(es, "sky_ref"):
-        ref_lat = reference_on_latent(es, r, (RY0, RY1, RX0, RX1))
-        fw = float(getattr(es, "fwhm_ref", 4.0)) * r
-        for i in range(len(outs)):
-            outs[i], n_sat = saturated_fill(outs[i], cov, ref_lat, fw)
-        del ref_lat
     n2n_info, resid = None, None
     if not background:
         bgmap = None
@@ -1583,6 +1655,6 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                  "robust": robust, "delta": delta, "kappa": kappa, "epsilon": epsilon, "stop": stop, "r": r, "eq11": eq11,
                  "psf_model": psf_model, "n_groups": n_groups, "accelerate": accelerate, "n2n": n2n_info,
                  "n_exposures": len(idx), "psf_size": ks, "tiles": tiles, "coverage": cov, "residual": resid,
-                 "saturated_stars": n_sat,
+                 "saturated_pixels": int(sum(t.get("saturated_pixels", 0) for t in tiles)),
                  "fwhm": float(getattr(es, "fwhm_ref", (ks / r - 1) / 7)) * r,      # seeing FWHM, latent pixels
                  "seconds": round(time.time() - t0, 1)}

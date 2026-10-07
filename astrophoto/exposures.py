@@ -154,6 +154,48 @@ def warp_window(raw: np.ndarray, sat: np.ndarray, rep: np.ndarray, pattern: str,
     return out, valid, hard
 
 
+def warp_window_saturated(raw: np.ndarray, sat: np.ndarray, rep: np.ndarray, pattern: str, mx: np.ndarray, my: np.ndarray,
+                          rep_tol: float = 0.5):
+    """``warp_window``, with the pixels it masks for saturation marked per channel instead of only masked: the
+    output pixels whose demosaic + Lanczos support holds a saturated raw sample of that channel (a clipped red
+    sample says nothing about green), with their recorded (resampled) values.  For ImageMM's update for
+    saturated images (``imagemm.mm_restore``'s ``whyte``: Whyte, Sivic & Zisserman 2014), which uses them
+    through a saturating response.  Returns (rgb, valid, saturated) on the window, valid and saturated
+    (h, w, 3) bool, disjoint."""
+    H, W = raw.shape
+    m = 3 + LANCZOS_R
+    sx0 = int(max(0, math.floor(np.nanmin(mx)) - m)) // 2 * 2
+    sy0 = int(max(0, math.floor(np.nanmin(my)) - m)) // 2 * 2
+    sx1 = int(min(W, math.ceil(np.nanmax(mx)) + m + 1))
+    sy1 = int(min(H, math.ceil(np.nanmax(my)) + m + 1))
+    if sx1 <= sx0 + 2 * m or sy1 <= sy0 + 2 * m:
+        return None, None, None
+    rgb = bilinear_demosaic(raw[sy0:sy1, sx0:sx1], pattern, (sy0, sx0))
+    lx, ly = mx - sx0, my - sy0
+    out = cv2.remap(rgb, lx, ly, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    ok = ((mx >= 1 + LANCZOS_R) & (mx <= W - 2 - LANCZOS_R) &
+          (my >= 1 + LANCZOS_R) & (my <= H - 2 - LANCZOS_R))
+    r_ = rep[sy0:sy1, sx0:sx1]
+    if r_.any():
+        wdem = bilinear_demosaic(r_.astype(np.float32), pattern, (sy0, sx0))
+        wout = cv2.remap(wdem, lx, ly, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        ok &= wout.max(-1) <= rep_tol
+    valid = np.repeat(ok[..., None], 3, -1)
+    satd = np.zeros_like(valid)
+    s_ = sat[sy0:sy1, sx0:sx1]
+    if s_.any():
+        dem = bilinear_demosaic(s_.astype(np.float32), pattern, (sy0, sx0)) > 0       # demosaic uses a saturated sample
+        k_l = np.ones((2 * LANCZOS_R + 2,) * 2, np.uint8)                               # + the Lanczos support
+        for c in range(3):
+            d_ = dem[..., c].astype(np.uint8)
+            if d_.any():
+                pl = cv2.remap(cv2.dilate(d_, k_l), lx, ly, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT,
+                               borderValue=1) > 0
+                valid[..., c] &= ~pl
+                satd[..., c] = pl & ok
+    return out, valid, satd
+
+
 # ----------------------------------------------------------------- stars
 def star_catalog(img: np.ndarray, sat: float, fwhm: float, thresh: float = 10.0):
     """Sources of a background-subtracted RGB coadd (luminance): WINPOS centroids, flux,
@@ -1952,36 +1994,50 @@ class ExposureSet:
                 "groups": [[idx[int(t)] for t in g] for g in groups],
                 "fwhm": [float(_fwhm(k.mean(0))) for k in Kg]}
 
-    def windows(self, idx: list[int], y0: int, y1: int, x0: int, x1: int):
-        """Stacked y, v, m of the chosen exposures on a window: (n, 3, h, w) float32 each."""
+    def windows(self, idx: list[int], y0: int, y1: int, x0: int, x1: int, censored: bool = False):
+        """Stacked y, v, m of the chosen exposures on a window: (n, 3, h, w) float32 each.  ``censored``:
+        also c, the pixels whose resampling used a saturated sample (``warp_window_saturated``), with their recorded values."""
         n, h, w = len(idx), y1 - y0, x1 - x0
         Y = np.empty((n, 3, h, w), np.float32)
         V = np.empty_like(Y)
         Mk = np.empty_like(Y)
+        Cn = np.empty_like(Y) if censored else None
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            for a, (yy, vv, mm) in enumerate(ex.map(lambda k: self.window(k, y0, y1, x0, x1), idx)):
-                Y[a], V[a], Mk[a] = (np.moveaxis(z, -1, 0) for z in (yy, vv, mm))
-        return Y, V, Mk
+            for a, res in enumerate(ex.map(lambda k: self.window(k, y0, y1, x0, x1, censored), idx)):
+                Y[a], V[a], Mk[a] = (np.moveaxis(z, -1, 0) for z in res[:3])
+                if censored:
+                    Cn[a] = np.moveaxis(res[3], -1, 0)
+        return (Y, V, Mk, Cn) if censored else (Y, V, Mk)
 
-    def window(self, k: int, y0: int, y1: int, x0: int, x1: int):
-        """y(t), v(t), m(t) of exposure k on the reference-grid window (float32, HxWx3)."""
+    def window(self, k: int, y0: int, y1: int, x0: int, x1: int, censored: bool = False):
+        """y(t), v(t), m(t) of exposure k on the reference-grid window (float32, HxWx3); with ``censored``
+        also c(t), the pixels whose resampling used a saturated sample."""
         from .stacking import eval_surface
         info, fr = self.items[k]
         p = self.params[k]
         raw, sat, rep = self._raw(info)
         mx, my = window_maps(fr, self.W0, self.H0, y0, y1, x0, x1, p["refine"])
-        y, valid, _ = warp_window(raw, sat, rep, self.pattern, mx, my)
+        if censored:
+            y, valid, cens = warp_window_saturated(raw, sat, rep, self.pattern, mx, my)
+        else:
+            y, valid, _ = warp_window(raw, sat, rep, self.pattern, mx, my)
         h, w = y1 - y0, x1 - x0
         if y is None:
             z = np.zeros((h, w, 3), np.float32)
-            return z, np.ones_like(z), z
+            return (z, np.ones_like(z), z, z) if censored else (z, np.ones_like(z), z)
         obs = self._obstruction(fr, y0, y1, x0, x1)
         if obs is not None:
-            valid &= obs
+            if censored:
+                valid &= obs[..., None]
+                cens &= obs[..., None]
+            else:
+                valid &= obs
         surf = eval_surface(p["surf"], self.H0, self.W0)[y0:y1, x0:x1]
         T = p["T"][None, None, :]
         ybs = y / T - surf - self.sky_ref[y0:y1, x0:x1]
         level = np.maximum(T * (self.ref[y0:y1, x0:x1] + surf), 0)            # expected exposure level, ADU
         var = (self.ptc["c0"][None, None, :] + self.ptc["c1"][None, None, :] * level) / T ** 2
+        if censored:
+            return ybs.astype(np.float32), var.astype(np.float32), valid.astype(np.float32), cens.astype(np.float32)
         m = np.repeat(valid[..., None], 3, -1).astype(np.float32)
         return ybs.astype(np.float32), var.astype(np.float32), m

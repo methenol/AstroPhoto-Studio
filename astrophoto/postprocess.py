@@ -820,9 +820,15 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     else:
         img, dinfo = deconvolve(img, float(p["deconvolution"]), sat, noise_ref=noise_ref)
     info["deconvolution"] = dinfo
-    # normalise to [0, 1] against the sensor's white level (a restoration may exceed it)
+    # normalise to [0, 1] against the sensor's white level - a restoration's extended structure may
+    # exceed it (M 42's core), and so it is raised to that; compact star cores above it are left above 1
+    # (white on display, as in any image).  Raised to the image's maximum instead, one deconvolved star core
+    # set the scale of everything: ImageMM restores a saturated star's core (Whyte et al.'s update) to ~3x
+    # the sensor's saturation on M 42 (45 Ori: ~190 000 ADU against 62 415), and the whole render went dark
     if restored:
-        sat = max(sat, float(img.max()))
+        Lx = np.ascontiguousarray(img.max(-1), np.float32)
+        ext = cv2.morphologyEx(Lx, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        sat = max(sat, float(ext.max()))
         info["white_level"] = sat
     img = img / sat
     info["pedestal"] = ped / sat

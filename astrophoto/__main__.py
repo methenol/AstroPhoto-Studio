@@ -60,19 +60,19 @@ def main(argv=None):
                    help="clipping of the multiplicative update")
     r.add_argument("--imagemm-epsilon", type=float, default=STACK_DEFAULTS["imagemm_epsilon"], help="stopping tolerance")
     r.add_argument("--imagemm-stop", default=STACK_DEFAULTS["imagemm_stop"], choices=["flux", "c15", "elementwise"],
-                   help="stopping rule: flux-weighted relative change of the image (default, epsilon ~1e-4), "
-                        "Eq. C15 (the paper, epsilon 1e-4 ... 1e-6) or elementwise mean |u'_k/u'_k-1 - 1|")
+                   help="stopping rule: Eq. C15 (the paper, default, epsilon 1e-6), flux-weighted relative change "
+                        "of the image (epsilon ~1e-4) or elementwise mean |u'_k/u'_k-1 - 1|")
     r.add_argument("--imagemm-max-iters", type=int, default=STACK_DEFAULTS["imagemm_max_iters"])
     r.add_argument("--imagemm-psf", default=STACK_DEFAULTS["imagemm_psf"], choices=["empirical", "moffat"])
     r.add_argument("--imagemm-groups", type=int, default=STACK_DEFAULTS["imagemm_groups"],
                    help="0: every sub (the paper); N: N seeing-group coadds")
-    r.add_argument("--no-imagemm-accelerate", action="store_true",
-                   help="plain MM iterations (default: Biggs-Andrews acceleration, same result, ~2x faster)")
+    r.add_argument("--imagemm-accelerate", action=argparse.BooleanOptionalAction, default=STACK_DEFAULTS["imagemm_accelerate"],
+                   help="Biggs-Andrews acceleration (not in the paper; default off)")
     r.add_argument("--imagemm-n2n", action=argparse.BooleanOptionalAction, default=STACK_DEFAULTS["imagemm_n2n"],
                    help="ImageMM on the two halves of the subs, combined by a Noise2Noise pass (default on; --no-imagemm-n2n: all subs at once)")
     r.add_argument("--imagemm-background", action=argparse.BooleanOptionalAction,
                    default=STACK_DEFAULTS["imagemm_background"],
-                   help="restore on a sky pedestal, so the latent's sky keeps its noise instead of being clipped at 0")
+                   help="restore on a sky pedestal (not in the paper; default off: the latent is non-negative)")
     r.add_argument("--n2n-split", default=STACK_DEFAULTS["n2n_split"], choices=["alternate", "dither"],
                    help="how the subs are split into the Noise2Noise halves: alternate frames or whole dither blocks")
     r.add_argument("--n2n-loss", default=STACK_DEFAULTS["n2n_loss"],
@@ -168,7 +168,7 @@ def main(argv=None):
              "imagemm_delta": args.imagemm_delta, "imagemm_kappa": args.imagemm_kappa,
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
-             "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
+             "imagemm_accelerate": args.imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
              "imagemm_background": args.imagemm_background, "n2n_split": args.n2n_split, "n2n_loss": args.n2n_loss,
              "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
              "star_remover_iters": args.star_remover_iters, "autofinish": not args.no_autofinish}

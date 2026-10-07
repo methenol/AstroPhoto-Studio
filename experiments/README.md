@@ -611,6 +611,50 @@ Regression test: `experiments/test_stacking.py`.
   bright stars (the restoration packs the halo light back into the cores). It would engage on a
   plain refractor stack with chromatic halos.
 
+## ImageMM: saturated stars (2026-10-07)
+
+**Complaint.** On the full M 42 run (DWARF 3, 204 subs): a flat-topped "hat", a cyan halo and a dark crescent
+above medium-bright saturated stars (HIP 26197/26199, 45 Ori, HD 37058), as if the texture round them were raised.
+
+**Measured on the real data** (crops restored from all subs, rendered with the export's settings next to the stack):
+
+| Artefact | Cause |
+|---|---|
+| Hat | `saturated_fill` pasted the pipeline's stack, clipped flat at saturation, into the cores (removed) |
+| Dark crescent | ImageMM's masks drop every pixel whose resampling touches a saturated raw sample (no sub kept a pixel within 6 px of 45 Ori); the bright latent pixels behind them are estimated from incomplete data and their errors spread through the blur (Whyte et al. 2014, Secs. 3-4). The pipeline's departures from the paper made it worse: a flux stopping rule with acceleration ran 2000 iterations (the paper converges in under 100; the crescent deepened from -114 ADU at 1000 to -240 at 8000) and a sky pedestal let the latent go 50 sigma below the sky |
+| Cyan halo | the Noise2Noise pass's asinh loss, tried as a default this session, doubled the glow round saturated stars (712 against 351 ADU at 13 px from 45 Ori); the weighted-linear loss keeps it (347) |
+| Cyan cores | the Noise2Noise network has no training signal far above its range (45 Ori's green core 71 000 against 52 000 in both halves): such pixels are the halves' mean |
+
+Ruled out on the way: the PSF (convolved to the target resolution, the kernels match the per-sub PSFs and the
+coadd's to ~1 %, and bright unsaturated stars to ~3 %); a brightness-dependent halo (the residual above stars fitted
+with the field PSF is +2 % of the PSF for faint stars, +0.4 % for saturated ones).
+
+**Fix, from the literature.** Whyte, Sivic & Zisserman, "Deblurring shaken and partially saturated images" (IJCV 110,
+2014), Algorithm 1, in `mm_restore`'s `whyte` (multi-frame: each sub's own saturation level): every iteration the
+latent is split at 0.9 x saturation (eroded 3 px, mask blurred 3 px); the bright pixels are updated from all the data
+through a smooth saturation response (their Eqs. 19-22), the rest only from valid measurements outside the bright
+pixels grown by the PSF's support (Eq. 18, weighted by each pixel's share of such data); the stopping rule is taken
+over the updated pixels. With the paper's own settings - x >= 0, Eq. C15 (epsilon 1e-6), no acceleration, x0 the
+median of the exposures - now the pipeline's defaults.
+
+| G channel, ADU above the local sky | above 45 Ori, 14-17 px | HIP pair, 14-16 px | iterations per cutout |
+|---|---|---|---|
+| stack (the data) | 668 | 764 | - |
+| full run, old settings | -33 | -28 | 2000 |
+| paper's settings, masks alone | -29 | - | 76 |
+| paper's settings + Whyte et al., denoised | 595 | 535 | 14-157 |
+
+No crescent, no hat; the pair resolves into its two stars; the glow round a saturated star is the measured light
+(their "more blur around saturated regions"), falling smoothly to the sky. Left: at the edge of that zone, ~25-30 px
+from the brightest stars, the restored field's fine grain begins (a step of a few ADU, against the -130 ADU crescent).
+Synthetic test: `test_saturated_whyte` (no deficit above a saturated star, the field away from it unchanged, the
+paper's update exactly when nothing is saturated).
+
+Tried and dropped this session (each left a visible artefact on M 42, or put light there that was not measured): the
+subs' coadd blended round saturated stars; saturated stars as point sources with a smoothness prior; per-star PSF
+wing fits; one-sided (censored) likelihoods with bilinear, minimum or exact-Lanczos bounds; holding the zone at the
+background. Patches of them are in the session scratchpad, not in the code.
+
 ## Literature consulted
 
 * Lehtinen et al. 2018, *Noise2Noise*, arXiv:1803.04189

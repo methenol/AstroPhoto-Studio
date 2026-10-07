@@ -50,19 +50,23 @@ STACK_DEFAULTS = {
     "imagemm_robust": True,  # Algorithm 3 (Huber, delta = 2) instead of the L2 loss
     "imagemm_delta": 2.0,    # Huber threshold delta of Algorithm 3 (the paper: 2)
     "imagemm_kappa": 2.0,    # clipping of the multiplicative update, kappa (the paper: 2)
-    "imagemm_epsilon": 1e-4,  # stopping tolerance: flux rule ~1e-4; Eq. C15 (the paper) 1e-4 ... 1e-6
-    "imagemm_stop": "flux",  # flux (sum |x_k - x_k-1| / sum x_k) | c15 (Eq. C15, the paper) | elementwise
+    "imagemm_epsilon": 1e-6,  # stopping tolerance: Eq. C15 (the paper) 1e-4 ... 1e-6; flux rule ~1e-4
+    "imagemm_stop": "c15",   # c15 (Eq. C15, the paper; default since 2026-10-07) | flux (sum |x_k - x_k-1| / sum x_k)
+                             # | elementwise.  On M 42 the paper's rule converged in 24 - 150 iterations per cutout
+                             # (the paper: "under 100"); the flux rule with acceleration ran 2000 and deepened
+                             # the dark crescents above saturated stars (-114 ADU at 1000, -240 at 8000)
                              # (mean |u'_k/u'_k-1 - 1|).  C15 stops far from the fixed point on sky-dominated
                              # cutouts (pixels clamped at kappa in two successive iterations have a ratio of
                              # exactly 1, and ratios above and below 1 cancel): 2 - 23 iterations on IC 405
     "imagemm_max_iters": 2000,
     "imagemm_psf": "empirical",  # empirical | moffat
     "imagemm_groups": 0,     # 0 = every exposure (the paper); N = N seeing-group coadds
-    "imagemm_accelerate": True,  # Biggs & Andrews extrapolation (not in the paper): the converged
-                                 # result in half the time of the plain run
+    "imagemm_accelerate": False,  # Biggs & Andrews extrapolation (not in the paper): faster, but taken
+                                  # with the flux rule far past the paper's convergence (see imagemm_stop)
     "imagemm_n2n": True,     # ImageMM on the two halves of the subs + Noise2Noise pass
-    "imagemm_background": True,  # restore on a sky pedestal (imagemm.mm_restore): the exposures are
-                                 # sky-subtracted and non-negativity would clip half the latent's sky at 0
+    "imagemm_background": False,  # restore on a sky pedestal (imagemm.mm_restore; not in the paper, whose
+                                  # latent is non-negative): it let the latent go 50 sigma below the sky, room
+                                  # for the dark crescents above M 42's saturated stars (2026-10-07)
     "n2n_split": "alternate",  # how the subs are split into the two Noise2Noise halves (half stacks,
                                # ImageMM's N2N pass, the network's multi-frame targets): alternate
                                # (frame by frame) | dither (whole dither blocks, analysis.half_split)
@@ -670,12 +674,12 @@ class Session:
                     es, r=int(p["imagemm_r"]), sigma=sigma, psf_model=p["imagemm_psf"],
                     n_groups=int(p["imagemm_groups"]), robust=bool(p["imagemm_robust"]),
                     delta=float(p.get("imagemm_delta", 2.0)), kappa=float(p.get("imagemm_kappa", 2.0)),
-                    epsilon=float(p["imagemm_epsilon"]), stop=p.get("imagemm_stop", "flux"),
+                    epsilon=float(p["imagemm_epsilon"]), stop=p.get("imagemm_stop", STACK_DEFAULTS["imagemm_stop"]),
                     max_iters=int(p["imagemm_max_iters"]),
                     accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
                     n2n_iters=int(p["denoise_iters"]), device=p["device"], progress=progress,
                     halves=self.halves(p.get("n2n_split", "alternate")) if p.get("imagemm_n2n") else None,
-                    background=bool(p.get("imagemm_background", True)),
+                    background=bool(p.get("imagemm_background", STACK_DEFAULTS["imagemm_background"])),
                     kernel_cache=self._p(f"imagemm/kernels_r{r_}_s{sigma}_{p['imagemm_psf']}.pkl"),
                     cancel=self.checkpoint)
                 cov = info.pop("coverage").mean(-1)
