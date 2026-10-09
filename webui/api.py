@@ -158,7 +158,7 @@ def _profiles() -> dict:
     return {name: {"label": p.get("label", name), "stack_params": p.get("stack_params", {}),
                    "params": p.get("params", {}),
                    "effective": {k: {**STACK_DEFAULTS, **p.get("stack_params", {})}[k]
-                                 for k in ("deconv_method", "ai_deconvolution", "imagemm_n2n", "star_remover")}}
+                                 for k in ("deconv_method", "ai_deconvolution", "imagemm_n2n", "star_remover", "scale")}}
             for name, p in PROFILES.items()}
 
 

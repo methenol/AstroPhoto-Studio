@@ -84,6 +84,13 @@ STACK_DEFAULTS = {
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
 
+def default_scale(deconv_method: str) -> float:
+    """The stack scale a restoration runs at unless set: 2x drizzle for the Noise2Noise restorations
+    (network, none = Richardson-Lucy), native for ImageMM, whose own super-resolution (imagemm_r) is
+    best on a 1x stack."""
+    return 1.0 if deconv_method == "imagemm" else 2.0
+
+
 # Named restoration recipes for clients that choose one by name instead of setting every option
 # (the /api/v1 job API).  Each holds only what differs from
 # STACK_DEFAULTS, so "default" always follows STACK_DEFAULTS as it changes.
@@ -95,9 +102,10 @@ PROFILES = {
                     "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-network": {"label": "Noise2Noise denoiser + self-supervised deconvolution network (conv2d U-Net); "
                              "much faster than ImageMM",
-                    "stack_params": {"deconv_method": "network", "ai_deconvolution": True}},
+                    "stack_params": {"deconv_method": "network", "ai_deconvolution": True,
+                                     "scale": default_scale("network")}},
     "n2n-rl": {"label": "Noise2Noise denoiser, Richardson-Lucy (TV) deconvolution when rendering",
-               "stack_params": {"deconv_method": "none", "ai_deconvolution": False}},
+               "stack_params": {"deconv_method": "none", "ai_deconvolution": False, "scale": default_scale("none")}},
 }
 
 LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree", "bg_smoothing", "bg_correction",

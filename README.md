@@ -156,7 +156,7 @@ curl -X POST http://server:8000/api/v1/jobs -H 'content-type: application/json' 
 - **profile** picks a restoration recipe. The default, `default`, is `STACK_DEFAULTS` (ImageMM with
   its Noise2Noise pass). `imagemm` is ImageMM on all subs at once, without the pass. `n2n-network`
   (Noise2Noise + the deconvolution network) is the fast one, and `n2n-rl` uses Noise2Noise with
-  Richardson–Lucy. `stack_params`, `params` and `preset` override single settings on top of the
+  Richardson–Lucy (the UI's *Noise2Noise + Richardson-Lucy*); both stack at 2× drizzle (`"stack_params": {"scale": 1}` for native). `stack_params`, `params` and `preset` override single settings on top of the
   profile. `GET /api/v1/profiles` lists them with their settings.
 - **client_ref** makes a submission idempotent: sending it again returns the job already queued
   or finished, so a client can safely retry after a lost reply.

@@ -330,9 +330,13 @@ function resetStackParams() {
 }
 
 /* ------------------------------------------------------------ jobs */
-// ImageMM options only matter for the ImageMM restoration
+// ImageMM options only matter for the ImageMM restoration.  Choosing a restoration also sets its
+// default stack scale (pipeline.default_scale: 2x drizzle for the Noise2Noise restorations, native for
+// ImageMM); only on the user's own choice, so a reset or an applied experiment keeps the scale it set.
 document.addEventListener("change", e => {
-  if (e.target.id === "sp-deconv_method") $("#imagemm-opts").hidden = e.target.value !== "imagemm";
+  if (e.target.id !== "sp-deconv_method") return;
+  $("#imagemm-opts").hidden = e.target.value !== "imagemm";
+  if (e.isTrusted) $("#sp-scale").value = e.target.value === "imagemm" ? "1" : "2";
 });
 function stackParams() {
   const g = id => $("#sp-" + id);

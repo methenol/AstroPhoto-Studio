@@ -34,7 +34,7 @@ def _progress():
 
 
 def main(argv=None):
-    from .pipeline import DEFAULTS, STACK_DEFAULTS, Session
+    from .pipeline import DEFAULTS, STACK_DEFAULTS, Session, default_scale
 
     ap = argparse.ArgumentParser(prog="astrophoto", description="Astrophotography pipeline for raw FITS subs")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -42,7 +42,8 @@ def main(argv=None):
     r.add_argument("folder", nargs="+", help="folder(s) of subs; several (one per night) are stacked together")
     r.add_argument("--workdir", default="output")
     r.add_argument("--mode", default=STACK_DEFAULTS["mode"], choices=["auto", "drizzle", "demosaic"])
-    r.add_argument("--scale", type=float, default=STACK_DEFAULTS["scale"])
+    r.add_argument("--scale", type=float, default=None,
+                   help="stack scale (default: 2 for the Noise2Noise restorations, 1 for ImageMM)")
     r.add_argument("--sensitivity", type=float, default=STACK_DEFAULTS["sensitivity"])
     r.add_argument("--device", default="auto", help="auto | cuda | cuda:N | mps | cpu")
     r.add_argument("--denoise-iters", type=int, default=STACK_DEFAULTS["denoise_iters"])
@@ -159,10 +160,11 @@ def main(argv=None):
         v = getattr(args, k, None)
         if v is not None:
             proc[k] = v
-    stack = {"mode": args.mode, "scale": args.scale, "sensitivity": args.sensitivity,
+    deconv = "none" if args.no_ai_deconv else args.deconv
+    stack = {"mode": args.mode, "scale": args.scale if args.scale is not None else default_scale(deconv), "sensitivity": args.sensitivity,
              "device": args.device, "denoise_iters": args.denoise_iters,
              "ai_deconvolution": not args.no_ai_deconv,
-             "deconv_method": "none" if args.no_ai_deconv else args.deconv,
+             "deconv_method": deconv,
              "imagemm_r": args.imagemm_r, "imagemm_sigma": args.imagemm_sigma, "imagemm_robust": not args.imagemm_l2,
              "imagemm_epsilon": args.imagemm_epsilon, "imagemm_stop": args.imagemm_stop,
              "imagemm_delta": args.imagemm_delta, "imagemm_kappa": args.imagemm_kappa,
