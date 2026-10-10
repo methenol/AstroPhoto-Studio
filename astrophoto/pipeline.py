@@ -79,6 +79,14 @@ STACK_DEFAULTS = {
     "star_remover_iters": 3000,
     "autofinish": True,      # before the export: tune the processing settings and fit a colour grade to
                              # reference images of the target (autofinish.py)
+    "deconv_target_fwhm": 0.0,  # deconvolution network: the round target PSF (FWHM, stack px) it restores to
+                                # (a Moffat, beta 4.765: Magain, Courbin & Sohy 1998, Trujillo et al. 2001;
+                                # denoise.split_target / moffat_target); 0 = auto (1.25 native px, >= 2 stack
+                                # px: 2.5 px on a 2x stack), < 0 = towards points (before 2026-10-09)
+    "deconv_iters": 6000,   # deconvolution network training steps (the denoiser: denoise_iters); 6000 against
+                            # 2000: rounder, sharper stars on C 33 (ellipticity 0.072 -> 0.053, FWHM 3.47 -> 3.31 px)
+    "deconv_sources": 1.0,  # weight of its simulated-source term (stars and nebular shapes with the stack's
+                            # own PSF and noise, denoise._StarTerm); 0 = off
     "network_groups": 0,    # > 0: the network's data term is ImageMM's multi-frame likelihood over
                              # this many seeing-group coadds of the other half's subs
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
@@ -712,7 +720,10 @@ class Session:
                     a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
                     progress=progress, cancel=self.checkpoint, deconvolve=method == "network",
                     sat=self.meta.get("saturation", 63471.0), px_scale=float(self.meta.get("scale", 1.0)),
-                    save_path=self._p("restore_nets.pt"), mf=mf, loss=p.get("n2n_loss", "asinh_mse"))
+                    save_path=self._p("restore_nets.pt"), mf=mf, loss=p.get("n2n_loss", "asinh_mse"),
+                    deconv_iters=int(p.get("deconv_iters") or STACK_DEFAULTS["deconv_iters"]),
+                    target_fwhm=float(p.get("deconv_target_fwhm", STACK_DEFAULTS["deconv_target_fwhm"]) or 0.0),
+                    sources=float(p.get("deconv_sources", STACK_DEFAULTS["deconv_sources"])))
                 del a, b
                 _save_fits(self._p("denoised.fits"), den)
                 if sharp is not None:
@@ -841,7 +852,11 @@ class Session:
                     # colour is whichever channel spiked highest (red after white balance).  It is
                     # shown, like an ImageMM restoration, through a Gaussian of "restored_resolution"
                     # px: flux-conserving, Nyquist-sampled cores, the same profile in every channel
-                    sharp = restored_view_sigma(sharp, float(p.get("restored_resolution", 1.0)), {})
+                    # (a network trained with a target resolution, "target_fwhm", already outputs that
+                    # Gaussian's sky: only the excess is applied)
+                    tf_ = float(self._restore_info().get("target_fwhm") or 0.0)
+                    sharp = restored_view_sigma(sharp, float(p.get("restored_resolution", 1.0)),
+                                                {"eq11": {"sigma": tf_ / 2.3548}} if tf_ > 0 else {})
                 lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
                                          progress=progress, sharp=sharp, ref_stars=self._ref_stars(p),
                                          sky_reference=self.sky_reference() if survey else None)

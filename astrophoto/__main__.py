@@ -80,6 +80,14 @@ def main(argv=None):
                    choices=["asinh_mse", "asinh_unbiased", "lin_mse", "lin_chi2", "lin_huber"],
                    help="Noise2Noise denoiser objective: MSE in the asinh domain (default), the same without the "
                         "transform's bias, or linear MSE / chi2 / Huber (experiments/README.md)")
+    r.add_argument("--deconv-iters", type=int, default=STACK_DEFAULTS["deconv_iters"],
+                   help="deconvolution network training steps (default 6000)")
+    r.add_argument("--deconv-target-fwhm", type=float, default=STACK_DEFAULTS["deconv_target_fwhm"],
+                   help="deconvolution network: FWHM (stack px) of the round target PSF it restores to; 0 = auto "
+                        "(1.25 native px, >= 2 px), < 0 = towards points")
+    r.add_argument("--deconv-sources", type=float, default=STACK_DEFAULTS["deconv_sources"],
+                   help="deconvolution network: weight of the simulated-source term (stars and nebular shapes with "
+                        "the stack's own PSF and noise; 0 = off)")
     r.add_argument("--network-groups", type=int, default=STACK_DEFAULTS["network_groups"],
                    help="deconvolution network: ImageMM multi-frame likelihood over N seeing groups (0 = off)")
     r.add_argument("--no-star-remover", action="store_true",
@@ -172,7 +180,9 @@ def main(argv=None):
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
              "imagemm_accelerate": args.imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
              "imagemm_background": args.imagemm_background, "n2n_split": args.n2n_split, "n2n_loss": args.n2n_loss,
-             "network_groups": args.network_groups, "star_remover": not args.no_star_remover,
+             "network_groups": args.network_groups, "deconv_target_fwhm": args.deconv_target_fwhm,
+             "deconv_iters": args.deconv_iters,
+             "deconv_sources": args.deconv_sources, "star_remover": not args.no_star_remover,
              "star_remover_iters": args.star_remover_iters, "autofinish": not args.no_autofinish}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)
     print(json.dumps(files, indent=2))

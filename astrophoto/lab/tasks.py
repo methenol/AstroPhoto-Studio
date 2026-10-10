@@ -465,10 +465,14 @@ class NetworkTask(Task):
     params = [
         {"name": "iters", "label": "Denoiser training steps", "type": "int", "low": 250, "high": 8000, "log": True,
          "default": 2000, "tune": True, "pipeline": "denoise_iters"},
-        {"name": "deconv_iters", "label": "Deconvolution training steps", "type": "int", "low": 250, "high": 8000,
-         "log": True, "default": 2000, "tune": True},
+        {"name": "deconv_iters", "label": "Deconvolution training steps", "type": "int", "low": 250, "high": 12000,
+         "log": True, "default": 6000, "tune": True, "pipeline": "deconv_iters"},
         {"name": "groups", "label": "Multi-frame loss groups (0 = half-stack loss)", "type": "int", "low": 0,
          "high": 16, "default": 0, "tune": True, "pipeline": "network_groups"},
+        {"name": "target_fwhm", "label": "Target star FWHM (stack px; 0 = auto, < 0 = points)", "type": "float",
+         "low": -1.0, "high": 6.0, "default": 0.0, "tune": True, "pipeline": "deconv_target_fwhm"},
+        {"name": "sources", "label": "Simulated-source weight (0 = off)", "type": "float", "low": 0.0, "high": 4.0,
+         "default": 1.0, "tune": True, "pipeline": "deconv_sources"},
         {"name": "max_lr", "label": "Denoiser peak learning rate", "type": "float", "low": 1e-4, "high": 5e-3,
          "log": True, "default": 1e-3, "tune": False},
     ]
@@ -509,7 +513,8 @@ class NetworkTask(Task):
         return ctx
 
     def run(self, ctx, p, log, cancel):
-        from ..denoise import _batch_and_tile, _sky_map, channel_psf_field, infer, train_n2n, train_n2n_deconv
+        from ..denoise import (_batch_and_tile, _sky_map, deconv_setup, has_target, infer, scale_target, split_target,
+                               train_n2n, train_n2n_deconv, widen_input)
         dev, es, s = ctx["device"], ctx["es"], ctx["sc"]
         y0, y1, x0, x1 = ctx["window"]
         Y0, X0 = ctx["off"]
@@ -525,7 +530,9 @@ class NetworkTask(Task):
         da, db = infer(net, ctx["ga"], tile=tile, tta=8), infer(net, ctx["gb"], tile=tile, tta=8)
         stab = ctx["stab"]
         den = stab.inv(0.5 * (da + db))
-        psfs = channel_psf_field(den, ctx["sat"], spacing=900.0 * s)
+        multi = bool(int(p["groups"]))
+        psfs, tf, stars = deconv_setup(full, a, b, ctx["sat"], s, mask, -1.0 if multi else float(p.get("target_fwhm", 0.0)),
+                                       0.0 if multi else float(p.get("sources", 1.0)), net)
         if psfs is None:
             raise RuntimeError("not enough isolated stars to measure the PSF")
         var = cv2.GaussianBlur(0.5 * (a - b) ** 2, (0, 0), 10 * s)
@@ -549,19 +556,24 @@ class NetworkTask(Task):
                 T2["kernels"] = torch.as_tensor(T_["kernels"], dtype=torch.float32, device=dev)
                 sets.append(T2)
             mf = {**mf, "sets": sets}
-        dnet = train_n2n_deconv(copy.deepcopy(net), da, db, a, b, stab, psfs, var, weight, sky,
+        dnet = train_n2n_deconv(widen_input(copy.deepcopy(net), 3), da, db, a, b, stab, psfs, var, weight, sky,
                                 iters=int(p["deconv_iters"]), batch=max(4, batch * 3 // 4), device=dev,
-                                sample_mask=mask, mf=mf, progress=_prog(log, 250), cancel=cancel.is_set)
+                                sample_mask=mask, mf=mf, progress=_prog(log, 250), cancel=cancel.is_set,
+                                target_fwhm=tf, stars=stars, lowfreq=1.0 if stars is not None else 0.0,
+                                raw=(ctx["ga"], ctx["gb"]))
         ctxp = 64 * s
         Ya, Yb, Xa, Xb = wy0 - ctxp, wy1 + ctxp, wx0 - ctxp, wx1 + ctxp
         if Ya < 0 or Xa < 0 or Yb > a.shape[0] or Xb > a.shape[1]:
             raise RuntimeError("the window needs 64 px of context inside the training region")
-        x = stab.inv(infer(dnet, da[Ya:Yb, Xa:Xb], tile=tile, tta=8))[ctxp:-ctxp, ctxp:-ctxp]
+        x = stab.inv(infer(dnet, np.concatenate([da[Ya:Yb, Xa:Xb], ctx["ga"][Ya:Yb, Xa:Xb]], -1), tile=tile,
+                           tta=8))[ctxp:-ctxp, ctxp:-ctxp]
         if s > 1:
             x = x.reshape((y1 - y0), s, (x1 - x0), s, 3).mean((1, 3))
         x = x - es.sky_ref[y0:y1, x0:x1]
         dt = time.time() - t
         kb = es.kernels(ctx["idx_b"], "empirical", at=((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2))
+        if has_target(tf):  # x is the sky through the target PSF: forward model through s, s * r = PSF (1x grid)
+            kb = split_target(kb, scale_target(tf, 1.0 / s))[0]
         ch = MX.heldout_chi2(es, ctx["idx_b"], x, 1, kb, ctx["window"], ctx["smask"], dev)
         out = {"heldout_src": _mean(ch["src"]), "heldout_sky": _mean(ch["sky"]), "heldout_src_rgb": ch["src"],
                "heldout_sky_rgb": ch["sky"], "seconds": dt}
