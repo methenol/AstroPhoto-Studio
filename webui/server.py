@@ -888,10 +888,14 @@ def lab_datasets():
     import json as _json
     real = []
     for d in datasets()["datasets"]:
-        if d["cached"]["stacked"] or d["cached"]["analysed"]:
-            real.append({"kind": "real", "folder": d["path"], "name": d.get("object") or d["name"],
-                         "stacked": d["cached"]["stacked"], "analysed": d["cached"]["analysed"],
-                         "n_fits": d["n_fits"]})
+        # every session of the target, analysed or not: the drop-down keeps the ones a study can
+        # read (analysed/stacked), the "nights of one target" box lists them all - what counts for
+        # a combination is the cache of the combination itself, which the form checks separately
+        real.append({"kind": "real", "folder": d["path"], "name": d.get("object") or d["name"],
+                     "object": d.get("object"), "date": d.get("date"), "filter": d.get("filter"),
+                     "exptime": d.get("exptime"), "total_min": d.get("total_min"),
+                     "stacked": d["cached"]["stacked"], "analysed": d["cached"]["analysed"],
+                     "n_fits": d["n_fits"]})
     syn = []
     root = _lab("synthetic")
     for name in sorted(os.listdir(root)):
@@ -904,7 +908,17 @@ def lab_datasets():
         except Exception:
             pass
         syn.append({"kind": "synthetic", "dir": d, "name": name, "spec": spec, "status": _read_status(d)})
-    return clean_json({"real": real, "synthetic": syn})
+    return clean_json({"real": real, "synthetic": syn, "sep": os.pathsep})
+
+
+@app.get("/api/lab/dataset_state")
+def lab_dataset_state(folder: str):
+    """What is cached for a dataset selection (several nights joined with os.pathsep included):
+    the Experiments tab shows whether the combined session still needs Analyse / Register."""
+    d = os.path.join(CONFIG["workdir"], dataset_slug(split_folders(folder)))
+    return {"analysed": os.path.exists(os.path.join(d, "analysis.pkl")),
+            "stacked": os.path.exists(os.path.join(d, "stack.fits")),
+            "denoised": restoration_done(d)}
 
 
 @app.post("/api/lab/synthetic")
@@ -945,6 +959,18 @@ def lab_create(body: dict = Body(...)):
         raise HTTPException(400, "unknown task")
     if not cfg.get("objectives"):
         raise HTTPException(400, "choose an objective")
+    ds = cfg.get("dataset") or {}
+    if ds.get("kind") == "real":
+        # a real dataset is one session or several nights of one target joined with os.pathsep
+        # (the same form the Process tab's "stack together with" selection sends)
+        given = split_folders(ds.get("folder") or "")
+        if not given:
+            raise HTTPException(400, "No dataset folder given")
+        missing = [f for f in given if not os.path.isdir(f)]
+        if missing:
+            raise HTTPException(400, f"Folder not found: {', '.join(missing)}")
+        ds["folder"] = os.pathsep.join(given)
+        ds["name"] = ds.get("name") or os.path.basename(os.path.normpath(given[0]))
     sid = time.strftime("%Y%m%d-%H%M%S") + "_" + _safe_name(cfg.get("name") or cfg["task"])
     d = os.path.join(_lab("studies"), sid)
     os.makedirs(d)

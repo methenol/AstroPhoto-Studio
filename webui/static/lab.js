@@ -1,6 +1,6 @@
 /* Experiments tab: configure, dispatch, monitor and review Optuna studies (vanilla JS) */
 const Lab = (() => {
-  const L = { tasks: null, byName: {}, data: null, space: {}, sel: null, detail: null, trialSel: null, timer: 0, synthDefaults: null };
+  const L = { tasks: null, byName: {}, data: null, space: {}, sel: null, detail: null, trialSel: null, timer: 0, synthDefaults: null, sep: ":", combine: null };
   const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const f4 = v => v === null || v === undefined || Number.isNaN(v) ? "–" : (typeof v === "number" ? (Math.abs(v) >= 1000 || (Math.abs(v) < 1e-3 && v !== 0) ? v.toExponential(2) : +v.toPrecision(4)) : String(v));
   const RUNNING = ["starting", "preparing", "running"];
@@ -22,7 +22,7 @@ const Lab = (() => {
       (dev.gpus || []).map(g => `<option value="${g.id}">${esc(g.name)}</option>`).join("") + `<option value="cpu">CPU</option>`;
     buildSynthForm();
     $("#lbTask").onchange = buildTask;
-    $("#lbData").onchange = buildObjectives;
+    $("#lbData").onchange = () => { buildCombine(); buildObjectives(); };
     $("#lbGo").onclick = start;
     $("#lbRefresh").onclick = () => { loadData(); loadStudies(); };
     $("#lbSynthGo").onclick = synth;
@@ -31,19 +31,81 @@ const Lab = (() => {
 
   async function loadData() {
     L.data = await api("/api/lab/datasets");
+    L.sep = L.data.sep || ":";
     const cur = $("#lbData").value;
-    const real = L.data.real.map(d => `<option value='${esc(JSON.stringify({ kind: "real", folder: d.folder, name: d.name }))}' ${d.stacked ? "" : "data-unstacked=1"}>${esc(d.name)} — ${d.n_fits} subs${d.stacked ? "" : " (analysed, not stacked)"}</option>`).join("");
+    // only sessions the pipeline has read into a cache can back a study on their own; the
+    // "nights of one target" box below still lists the unprocessed ones of the same target
+    const real = L.data.real.filter(d => d.analysed || d.stacked).map(d => `<option value='${esc(JSON.stringify({ kind: "real", folder: d.folder, name: d.name }))}' ${d.stacked ? "" : "data-unstacked=1"}>${esc(d.name)} — ${d.n_fits} subs${d.stacked ? "" : " (analysed, not stacked)"}</option>`).join("");
     const syn = L.data.synthetic.map(d => {
       const ok = d.status.state === "done";
       return `<option value='${esc(JSON.stringify({ kind: "synthetic", dir: d.dir, name: d.name }))}' ${ok ? "" : "disabled"}>${esc(d.name)} — ${d.spec.n_subs || "?"} subs ${d.spec.width}×${d.spec.height}${ok ? "" : ` (${esc(d.status.state)}: ${esc(d.status.message || "")})`}</option>`;
     }).join("");
     $("#lbData").innerHTML = `<optgroup label="Real sessions">${real || "<option disabled>none stacked yet</option>"}</optgroup><optgroup label="Synthetic (with ground truth)">${syn || "<option disabled>none yet</option>"}</optgroup>`;
     if (cur && [...$("#lbData").options].some(o => o.value === cur && !o.disabled)) $("#lbData").value = cur;
+    buildCombine();
     buildObjectives();
     // keep polling while a dataset is being generated
     if (L.data.synthetic.some(d => ["running", "new"].includes(d.status.state))) { clearTimeout(L.dataTimer); L.dataTimer = setTimeout(loadData, 4000); }
   }
-  const dataset = () => { try { return JSON.parse($("#lbData").value); } catch { return null; } };
+  const selDataset = () => { try { return JSON.parse($("#lbData").value); } catch { return null; } };
+  // the study's dataset: a real selection with several nights ticked runs on all of them together,
+  // exactly like the Process tab stacking them (paths joined with the server's separator)
+  const dataset = () => {
+    const d = selDataset();
+    if (d && d.kind === "real" && L.combine && L.combine.length > 1)
+      return { kind: "real", folder: L.combine.join(L.sep), name: `${d.name} · ${L.combine.length} nights` };
+    return d;
+  };
+
+  /* ---------------------------------------------------------------- nights of one target */
+  // Like the Process tab's "Stack together with other sessions": the study is tuned on the
+  // sessions the pipeline will actually stack, so e.g. the registration trial sees every night.
+  function buildCombine() {
+    const box = $("#lbCombine");
+    const ds = selDataset();
+    const real = L.data ? L.data.real : [];
+    const primary = ds && ds.kind === "real" ? real.find(d => d.folder === ds.folder) : null;
+    const key = primary ? String(primary.object || "").toLowerCase().replace(/[^a-z0-9]/g, "") : "";
+    const same = key ? real.filter(d => String(d.object || "").toLowerCase().replace(/[^a-z0-9]/g, "") === key) : [];
+    if (!primary || same.length < 2) { box.hidden = true; box.innerHTML = ""; L.combine = null; return; }
+    if (!L.combine || !L.combine.includes(primary.folder)) L.combine = [primary.folder];
+    const dates = same.map(d => d.date);
+    const row = d => {
+      const isPrimary = d.folder === primary.folder;
+      const label = d.date && dates.filter(x => x === d.date).length === 1 ? d.date : d.name;
+      const filt = d.filter !== primary.filter
+        ? ` <span class="warn" title="Another filter than ${esc(primary.filter || "the first session")}: only the subs of the filter with the most exposure time are stacked">⚠ ${esc(d.filter || "no filter")}</span>` : "";
+      return `<label class="${isPrimary ? "primary" : ""}" title="${esc(d.folder)}"><input type="checkbox" data-path="${esc(d.folder)}"
+        ${L.combine.includes(d.folder) || isPrimary ? "checked" : ""} ${isPrimary ? "disabled" : ""}>
+        <span>${esc(label)} · ${d.n_fits}× ${d.exptime ?? "?"}s · ${d.total_min ?? "?"} min${filt}</span></label>`;
+    };
+    const sel = same.filter(d => L.combine.includes(d.folder));
+    box.innerHTML = `<div class="ctitle">Run the study on these nights of ${esc(primary.object)}:</div>` + same.map(row).join("") +
+      (sel.length > 1 ? `<div class="ctotal">${sel.length} sessions · ${sel.reduce((a, d) => a + d.n_fits, 0)} subs · ${sel.reduce((a, d) => a + (d.total_min || 0), 0).toFixed(1)} min</div>` : "") +
+      `<div class="ctotal" id="lbCombineState"></div>`;
+    box.hidden = false;
+    $$("input:not([disabled])", box).forEach(cb => cb.onchange = () => {
+      L.combine = $$("input:checked", box).map(c => c.dataset.path);
+      if (!L.combine.includes(primary.folder)) L.combine.unshift(primary.folder);
+      buildCombine();
+    });
+    updateCombineState();
+  }
+
+  // what the pipeline has already cached for this exact selection of nights (its own cache key):
+  // a combination never processed together yet needs one Analyse + Register run in the Process tab
+  async function updateCombineState() {
+    const el = $("#lbCombineState");
+    if (!el) return;
+    const ds = dataset();
+    if (!ds || ds.kind !== "real") return;
+    let st;
+    try { st = await api(`/api/lab/dataset_state?folder=${encodeURIComponent(ds.folder)}`); } catch { return; }
+    const multi = (L.combine || []).length > 1;
+    el.innerHTML = st.stacked ? `<span style="color:var(--good)">✓ analysed and stacked${multi ? " together" : ""}</span>${st.denoised ? " · ✓ restored" : ""}`
+      : st.analysed ? `Analysed, <b>not stacked${multi ? " together" : ""} yet</b>: open this selection in the Process tab and run Register &amp; integrate once first.`
+      : `<b>Not analysed${multi ? " together" : ""} yet</b>: open this selection in the Process tab and run the pipeline once first (the studies read its caches).`;
+  }
 
   /* ---------------------------------------------------------------- form */
   function buildSynthForm() {

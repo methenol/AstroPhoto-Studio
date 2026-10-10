@@ -30,10 +30,12 @@ from . import synthetic as SY
 
 # ----------------------------------------------------------------------------- datasets
 class Dataset:
-    """A real session (``{"kind": "real", "folder": <subs>}``) or a generated synthetic one
-    (``{"kind": "synthetic", "dir": <output/lab/synthetic/name>}``)."""
+    """A real session (``{"kind": "real", "folder": <subs>}``, several nights of one target
+    joined with ``os.pathsep`` like the pipeline's own multi-session datasets) or a generated
+    synthetic one (``{"kind": "synthetic", "dir": <output/lab/synthetic/name>}``)."""
 
     def __init__(self, spec: dict, workdir: str):
+        from ..pipeline import split_folders
         self.spec = spec
         self.kind = spec["kind"]
         if self.kind == "synthetic":
@@ -42,9 +44,15 @@ class Dataset:
             self.workdir = os.path.join(self.dir, "work")
         else:
             self.dir = None
-            self.folder = spec["folder"]
+            self.folder = os.pathsep.join(split_folders(spec["folder"]))
             self.workdir = workdir
-        self.name = spec.get("name") or os.path.basename(os.path.normpath(self.dir or self.folder))
+        if self.spec.get("name"):
+            self.name = self.spec["name"]
+        elif self.dir:
+            self.name = os.path.basename(os.path.normpath(self.dir))
+        else:
+            parts = split_folders(self.folder)
+            self.name = os.path.basename(os.path.normpath(parts[0])) + (f" (+{len(parts) - 1} nights)" if len(parts) > 1 else "")
 
     @property
     def synthetic(self) -> bool:
