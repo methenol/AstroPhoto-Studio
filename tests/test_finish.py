@@ -104,7 +104,7 @@ def test_curve_position_mapping():
     assert finish.curve_position("ghs", 0.0) == 0.0
     assert finish.curve_position("asinh", 0.6) == pytest.approx(1.6)
     assert finish.curve_position("log", 1.5) == 2.0                      # clamped
-    assert finish.curve_position("nonsense", 0.4) == pytest.approx(0.4)
+    assert finish.curve_position("nonsense", 0.4) == 0.0
 
 
 def test_adapted_target_small_objects_get_a_darker_sky():
@@ -133,35 +133,49 @@ def test_unscreen_reconstructs_the_stars():
     assert np.allclose(finish.unscreen(full, starless), stars, atol=1e-4)
 
 
-def test_star_stretch_is_bounded_and_noise_free():
+def test_star_stretch_is_the_seti_rational_and_bounded():
     lin = synthetic_linear(noise=0.0)
-    starless = np.full_like(lin, 0.02)
-    stars = np.maximum(lin - starless, 0)
-    stars = stars * (stars > 0.004)
-    out, info = finish.stretch_stars(stars, dual_band=False)
-    assert out.min() >= 0 and out.max() <= 1
-    assert 3.0 <= info["asinh_factor"] <= 6000.0 and info["factor_from"] == "percentile"
-    assert float(out[:, :, :].mean()) < 0.5
-    gentle, ginfo = finish.stretch_stars(stars, dual_band=True)
-    assert ginfo["target_q"] < info["target_q"]                          # dual-band: gentler
+    g = np.maximum(lin[1] - 0.02, 0)
+    stars = np.stack([0.3 * g * (g > 0.004)] * 3)                     # grey stars: the saturated-core whitening changes nothing
+    out, info = finish.stretch_stars(stars, color_preservation=0.0, halo_suppress=0.0, amount=5.0)
+    assert out.min() >= 0 and out.max() <= 1 and info["amount"] == 5.0
+    x = np.clip(stars - info["black_point"], 0, None)
+    k = 3.0 ** 5.0
+    assert np.allclose(out, np.clip(k * x / ((k - 1) * x + 1), 0, 1), atol=1e-3)       # Seti Astro Star Stretch: k x / ((k - 1) x + 1)
+    weak, _ = finish.stretch_stars(stars, halo_suppress=0.0, amount=2.0)
+    assert weak.mean() < out.mean()
 
 
-def test_star_factor_follows_the_starless_stretch_in_dual_band_too():
-    lin = synthetic_linear(noise=0.0)
-    stars = np.maximum(lin - 0.02, 0)
-    out, info = finish.stretch_stars(stars, dual_band=False, factor=2000.0)
-    assert info["asinh_factor"] == 2000.0 and info["factor_from"] == "starless stretch"
-    _, dinfo = finish.stretch_stars(stars, dual_band=True, factor=2000.0)
-    assert dinfo["asinh_factor"] == 2000.0 * finish.GENTLE_DUAL_FACTOR      # no halving: the faint stars must stay visible
+def test_star_stretch_amount_sends_the_median_star_to_the_aim():
+    stars = np.zeros((3, 300, 300), np.float32)
+    rng = np.random.default_rng(3)
+    peaks = 10 ** rng.uniform(-3.3, -1.0, 60)
+    for i, a in enumerate(peaks):
+        stars[:, 20 + 4 * (i // 15) * 20 // 4 + 0, 10 + (i % 15) * 19] = a
+    stars = np.stack([cv2.GaussianBlur(stars[c], (0, 0), 1.0) * 6.0 for c in range(3)])
+    amount, info = finish.star_stretch_amount(stars, 1e-5)
+    assert finish.STAR_STRETCH_RANGE[0] <= amount <= finish.STAR_STRETCH_RANGE[1]
+    assert info["median_after"] == pytest.approx(finish.STAR_MEDIAN_AIM, abs=0.03)
+    assert finish.star_stretch_amount(stars, 0.0) == (finish.STAR_STRETCH, {"stars": 0, "median_peak": None})   # no noise reference: the script's default
 
 
-def test_render_stars_use_the_starless_beta():
+def test_render_stars_take_the_star_stretch_setting():
     lin = synthetic_linear(noise=0.001, nstars=15)
     starless = np.minimum(lin, np.float32(0.03))
     stars = np.maximum(lin - starless, 0)
-    p = {**post.DEFAULTS, "star_reduction": 0.0}
+    p = {**post.DEFAULTS, "star_reduction": 0.0, "star_stretch": 3.5}
     _, info = finish.render_layers(starless, stars, p, dual_band=False)
-    assert info["stars"]["factor_from"] == "starless stretch" and info["stars"]["asinh_factor"] > 100
+    assert info["stars"]["amount"] == 3.5
+
+
+def test_core_chroma_keeps_lightness_and_takes_colour_in_the_highlights():
+    main = np.zeros((3, 64, 64), np.float32) + np.array([0.9, 0.9, 0.9], np.float32)[:, None, None]
+    main[:, :, :32] = 0.1
+    alt = np.zeros_like(main) + np.array([0.7, 0.3, 0.3], np.float32)[:, None, None]
+    out, info = finish.core_chroma(main, alt)
+    assert np.allclose(finish.luminance(out)[:, 50:], finish.luminance(main)[:, 50:], atol=0.03)   # lightness of the main stretch
+    assert (out[0, :, 50:] - out[1, :, 50:]).mean() > 0.1                                           # the red of the lower stretch arrives
+    assert np.allclose(out[:, :, :10], main[:, :, :10])                                              # dark regions untouched
 
 
 def test_count_stars_uses_the_sky_noise():
@@ -178,8 +192,8 @@ def test_count_stars_uses_the_sky_noise():
 def test_halo_suppression_tightens_stars():
     lin = synthetic_linear(noise=0.0, nstars=10)
     stars = np.maximum(lin - 0.02, 0)
-    loose, _ = finish.stretch_stars(stars, dual_band=False, halo_suppress=0.0)
-    tight, _ = finish.stretch_stars(stars, dual_band=False, halo_suppress=1.0)
+    loose, _ = finish.stretch_stars(stars, halo_suppress=0.0)
+    tight, _ = finish.stretch_stars(stars, halo_suppress=1.0)
     assert (tight > 0.01).sum() < (loose > 0.01).sum()
 
 
@@ -487,3 +501,38 @@ def test_subtract_star_wings_reassigns_only_the_psf_wing():
     assert abs(out[1][ring].mean() - sky) < 4e-4                         # and mostly gone after
     assert np.allclose(lin, out + stars_out, atol=1e-5)                  # photons reassigned: starless + stars = linear
     assert out.min() >= 0
+
+
+# ---- second dual-band quality round: highlight shoulder, faint stars -------------------------------------------
+
+def test_hdr_shoulder_is_monotone_keeps_the_sky_and_lowers_the_core():
+    x = np.concatenate([[0.0], np.geomspace(1e-8, 1.0, 20000)]).astype(np.float32)
+    for m in (1e-3, 1e-2, 0.05):
+        plain, full = finish.Curve(m, 0.25, 0.0), finish.Curve(m, 0.25, 0.0, shoulder=1.0)
+        y = full(x)
+        assert np.diff(y).min() >= -1e-6                                   # HDR_KNEE is the highest knee that stays monotone
+        assert float(full(np.array([m], np.float32))[0]) == pytest.approx(0.25, abs=2e-3)   # the sky level does not move
+        assert float(full(np.array([0.5], np.float32))[0]) < float(plain(np.array([0.5], np.float32))[0]) - 0.01
+
+
+def test_curve_shoulder_only_for_the_rational_methods():
+    assert finish.curve_shoulder("ghs", 0.6) == pytest.approx(0.5)
+    assert finish.curve_shoulder("ghs", 5.0) == 1.0 and finish.curve_shoulder("asinh", 0.6) == 0.0
+
+
+def test_reduce_stars_keeps_isolated_faint_stars():
+    st = np.zeros((3, 80, 120), np.float32)
+    st[:, 20, 20] = 0.06                                                    # faint isolated star
+    st[:, 50:53, 90:93] = 0.9                                               # bright star with a wing
+    st[:, 49:54, 89:94] = np.maximum(st[:, 49:54, 89:94], 0.1)
+    out, _ = finish.reduce_stars(st, 0.4, 1.0)
+    gain = 1.0 - 0.4 ** 3
+    assert out[0, 20, 20] == pytest.approx(0.06 * gain, rel=0.02)           # untouched except for the fade
+    assert out[0, 49, 89] < st[0, 49, 89] * gain                            # the bright star's footprint shrank
+
+
+def test_stretch_stars_faint_star_not_cut_by_a_fixed_floor():
+    st = np.zeros((3, 64, 64), np.float32)
+    st[:, 32, 32] = 8e-4                                                    # M 27's faint stars peak at ~5e-4 .. 3e-3
+    out, info = finish.stretch_stars(st, amount=5.0)
+    assert out[:, 32, 32].max() > 0.15 and info["black_point"] < 1e-4

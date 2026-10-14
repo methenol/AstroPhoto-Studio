@@ -71,6 +71,11 @@ IGNORED_KEYS = ("crop", "crop_threshold", "restored_resolution", "grade_amount",
                 "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast")
 
 
+# Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount, written by autofinish
+# (finish.STAR_STRETCH when absent).
+EXTRA_KEYS = ("star_stretch",)
+
+
 def _R(group, key, label, lo, hi, step):
     return {"group": group, "key": key, "label": label, "type": "range", "min": lo, "max": hi, "step": step}
 
@@ -806,9 +811,10 @@ def _stretched_star_removal(layers: _Layers, p: dict, dual: bool, work: str, sp:
     """StarNet2 on the stretched image (its network expects non-linear data): stretch -> remove stars -> the star
     layer is the unscreened difference.  Returns (starless stretched, stars stretched) or (None, None)."""
     pos = finish.curve_position(p["stretch_method"], float(p["hdr"]))
+    shd = finish.curve_shoulder(p["stretch_method"], float(p["hdr"]))
     cov = finish.object_coverage(finish.luminance(layers.base))
     target = finish.adapted_target(float(p["stretch"]), cov, bool(p["auto_stretch"]))
-    full, _ = finish.stretch_rgb(layers.base, target, position=pos, color_preservation=float(p["color_preservation"]))
+    full, _ = finish.stretch_rgb(layers.base, target, position=pos, shoulder=shd, color_preservation=float(p["color_preservation"]))
     src, dst = os.path.join(work, "sn_in.fits"), os.path.join(work, "sn_out.fits")
     fitsio.write_rgb(src, full, layers.header)
     try:
@@ -942,7 +948,7 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
         "steps": steps.records, "render_seconds": info["render_seconds"], "seconds": round(time.time() - t_all, 1),
         "siril_tools": sorted({r["tool"] for r in steps.records if r["status"] == "done"}),
     }
-    ignored = sorted(k for k in given if k in IGNORED_KEYS or k not in DEFAULTS)
+    ignored = sorted(k for k in given if k in IGNORED_KEYS or (k not in DEFAULTS and k not in EXTRA_KEYS))
     files = export_mod.write_outputs(session_dir, disp, meta=meta, params_full=p, linear_info=linear_info,
                                      quality=int(opts["quality"]), upscale=float(opts["upscale"] or 1.0),
                                      tiff=bool(opts["tiff"]), ignored=ignored)

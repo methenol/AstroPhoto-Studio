@@ -552,18 +552,6 @@ class Session:
             self._invalidate_after_stack()
             return clean_json(meta)
 
-    def _full_scale(self, rows: list[dict], inc: list[int]) -> float | None:
-        """ADC full scale (Siril normalised units) from the largest raw value in a few subs of the dataset."""
-        from astropy.io import fits
-        pick = inc[:: max(1, len(inc) // 6)][:6]
-        best = 0.0
-        for i in pick:
-            try:
-                best = max(best, float(np.max(fits.getdata(self._local.get(rows[i]["path"], rows[i]["path"])))))
-            except Exception:
-                continue
-        return stackpost.full_scale_norm(best) if best > 0 else None
-
     def _stack_hdr(self, runner: SirilRunner, seq: str, rows: list[dict], inc: list[int], groups: list[int], rs: dict,
                    rej: dict, progress):
         """Stack each exposure group of the one registered sequence, then blend them (workflows.md 9.2).
@@ -596,8 +584,16 @@ class Session:
             headers.append(h)
             exps.append(float(rows[members[0]]["exptime"]))
             gidx.append(g)
-            info["groups"].append({"exptime": exps[-1], "n": len(members), "reference": rows[best]["name"]})
+            info["groups"].append({"group": g, "exptime": exps[-1], "n": len(members), "reference": rows[best]["name"]})
         return self._blend_groups(stacks, headers, exps, gidx, rows, inc, rs, info)
+
+    def _aperture(self, rs: dict) -> float:
+        """Photometry aperture radius (stack px) for the group gain: ~3 FWHM of the registered subs."""
+        try:
+            fw = [r["fwhm"] for r in self._load_rows() if r.get("included") and r.get("fwhm")]
+            return float(np.clip(3.0 * statistics.median(fw) * float(rs.get("scale", 1.0)), 6.0, 16.0))
+        except Exception:
+            return 8.0
 
     def _blend_groups(self, stacks: list[np.ndarray], headers: list, exps: list[float], gidx: list[int],
                       rows: list[dict], inc: list[int], rs: dict, info: dict):
@@ -628,8 +624,17 @@ class Session:
             info["groups"][k]["offset"] = offs[k]
             info["groups"][k]["residual_shift"] = [rx, ry]
         valids = [stackpost.valid_mask(p) for p in placed]
-        blend, rep = stackpost.hdr_blend(placed, exps, valids, full_scale=self._full_scale(rows, inc))
+        sats = [[stackpost.saturation_level(p[c], v) for c in range(p.shape[0])] for p, v in zip(placed, valids)]   # before any resampling
+        for k in range(len(placed)):                    # sub-pixel (per channel) registration + PSF matching onto the longest
+            if k == ref:
+                continue
+            placed[k], valids[k], info["groups"][k]["subpixel"] = stackpost.align_to_reference(
+                placed[ref], placed[k], valids[ref], valids[k], sats[ref], sats[k])
+            placed[k], valids[k], info["groups"][k]["psf_sigma"] = stackpost.match_psf(
+                placed[ref], placed[k], valids[ref], valids[k], sats[ref], sats[k])
+        blend, rep = stackpost.hdr_blend(placed, exps, valids, radius=self._aperture(rs), saturation=sats)
         bg_valid = np.any(np.stack(valids), axis=0)
+        self._hdr_footprint = np.logical_and.reduce(valids)       # where every group has data (the crop stays inside)
         info["rgb_equal"] = stackpost.equalize_backgrounds(blend, bg_valid & stackpost.valid_mask(blend))
         info["blend"] = rep
         hdr = headers[ref].copy()
@@ -646,16 +651,18 @@ class Session:
         H, W = arr.shape[1:]
         do_crop = bool(sp.get("crop", True))
         thr = float(sp.get("crop_threshold", 0.3) or 0.3)
+        hgroups = None
         if hdr_info and hdr_info.get("groups"):          # HDR: crop to where every group has data, else a seam (M 45: 15 s group alone) shows
-            ns = [int(g["n"]) for g in hdr_info["groups"]]
-            thr = max(thr, (max(ns) + 1) / max(sum(ns), 1))
+            hgroups = [[rows[i]["H"] for i in inc if rows[i].get("group", 0) == g["group"] and rows[i].get("H")]
+                       for g in hdr_info["groups"]]
         f0 = self.fs.first
         info: dict = {"method": "off"}
         box = (0, 0, W, H)
         if do_crop:
             hm = [rows[i]["H"] for i in inc if rows[i].get("H")]
             box, info = stackpost.auto_crop(arr, hm if len(hm) == len(inc) else None, (f0.width, f0.height),
-                                            float(rs.get("scale", 1.0)), thr)
+                                            float(rs.get("scale", 1.0)), thr, hgroups,
+                                            getattr(self, "_hdr_footprint", None) if hdr_info else None)
         x, y, w, h = box
         out = np.ascontiguousarray(arr[:, y:y + h, x:x + w])
         scale = float(rs.get("scale", 1.0))

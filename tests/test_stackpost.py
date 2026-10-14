@@ -162,18 +162,96 @@ def test_hdr_blend_calibrates_pedestal_and_gain_so_single_group_areas_show_no_st
     assert abs(np.median(out2[1, :, 20:100]) / np.median(out2[1, :, 300:380]) - 1.0) > 0.025   # a step without it
 
 
-def test_hdr_blend_full_scale_taper_replaces_clipped_cores():
-    rng = np.random.default_rng(6)
-    H, W = 200, 300
-    truth = _sky_with_stars(rng, H, W, n=300, sky=5.0, top=1.5)
-    truth[90:110, 140:160] = 150.0                               # bright: 9000 ADU in 60 s clips the long stack
-    full = 4095.0 / 65535.0
+def test_saturation_level_finds_the_stack_plateau_not_the_full_scale():
+    rng = np.random.default_rng(7)
+    img = rng.normal(0.003, 0.0005, (400, 400)).astype(np.float32)
+    img[100:104, 100:150] = rng.normal(0.0715, 0.0004, (4, 50))         # clipped cores of a normalised stack
+    img[10, 10] = 0.0732                                              # a hot pixel above the plateau
+    assert abs(sp.saturation_level(img) - 0.0715) < 5e-4
+    img2 = rng.normal(0.003, 0.0005, (400, 400)).astype(np.float32)
+    img2[50, 50:60] = np.linspace(0.02, 0.05, 10)
+    assert sp.saturation_level(img2) is None                          # bright but unclipped
+
+
+def test_star_gain_is_psf_independent():
+    rng = np.random.default_rng(8)
+    H, W = 400, 500
+    yy, xx = np.mgrid[-14:15, -14:15]
+
+    def render(sig, gain, pos, fl):
+        im = np.full((H, W), 5.0, np.float32)
+        for (y, x), f in zip(pos, fl):
+            im[y - 14:y + 15, x - 14:x + 15] += gain * f * np.exp(-(xx**2 + yy**2) / (2 * sig**2)) / (2 * np.pi * sig**2)
+        return im + rng.normal(0, 0.05, im.shape).astype(np.float32)
+    pos = [(int(y), int(x)) for y, x in zip(rng.integers(20, H - 20, 60), rng.integers(20, W - 20, 60))]
+    fl = 10 ** rng.uniform(2.5, 3.5, 60)
+    ref = render(2.2, 1.0, pos, fl)                                   # broad PSF (long night)
+    img = render(1.4, 1.17, pos, fl)                                  # sharp PSF, gain 1.17
+    g, n = sp.star_gain(ref, img, np.ones((H, W), bool), radius=9.0)
+    assert abs(g - 1.17) < 0.02 and n >= 8
+
+
+def test_hdr_blend_core_is_not_hollow_when_both_groups_clip_and_gain_differs():
+    """Stars clipped in the long stack, clipped later in the short one (whose clip level is 1.15x the long one's in
+    stack units: another normalisation): the blend must peak at the star centre."""
+    rng = np.random.default_rng(9)
+    H, W = 300, 300
+    yy, xx = np.mgrid[0:H, 0:W]
+    truth = np.full((H, W), 5.0, np.float32)
+    for y, x, f in [(80, 80, 30000.0), (200, 150, 60000.0), (120, 230, 600.0), (230, 60, 1500.0)] + [
+            (int(a), int(b), 40.0) for a, b in zip(rng.integers(10, 290, 80), rng.integers(10, 290, 80))]:
+        truth += f * np.exp(-((yy - y)**2 + (xx - x)**2) / (2 * 1.8**2)) / (2 * np.pi * 1.8**2)
     t_s, t_l = 15.0, 60.0
-    long_ = np.minimum((truth * t_l + rng.normal(0, 8, truth.shape)) / 65535.0, full).astype(np.float32)
-    short = np.minimum((truth * t_s + rng.normal(0, 4, truth.shape)) / 65535.0, full).astype(np.float32)
+    sat_l, sat_s = 0.06, 0.069
+    long_ = np.minimum((truth * t_l / 65535.0 + rng.normal(0, 1e-5, truth.shape)) * 1.0, sat_l).astype(np.float32)
+    short = np.minimum((1.15 * truth * t_s / 65535.0 + rng.normal(0, 1e-5, truth.shape)), sat_s).astype(np.float32)
+    long_[long_ > 0.0535] = sat_l * np.where(long_[long_ > 0.0535] > 0.0535, rng.uniform(0.985, 1.0, long_[long_ > 0.0535].shape), 1)   # partial clip in the stack
     valid = np.ones((H, W), bool)
-    out, rep = sp.hdr_blend([np.stack([short] * 3), np.stack([long_] * 3)], [t_s, t_l], [valid, valid], full_scale=full)
-    k = out[1, 95:105, 145:155].mean() / out[1, 20:60, 20:60].mean()
-    true_ratio = truth[95:105, 145:155].mean() / truth[20:60, 20:60].mean()
-    assert abs(k / true_ratio - 1.0) < 0.2                      # the clipped long stack alone would give ~0.1 of it
-    assert sp.full_scale_norm(4095) == 4095 / 65535 and sp.full_scale_norm(65535) == 1.0 and sp.full_scale_norm(14000) == 16383 / 65535
+    out, rep = sp.hdr_blend([np.stack([short] * 3), np.stack([long_] * 3)], [t_s, t_l], [valid, valid], radius=8.0)
+    assert abs(rep["inputs"][0]["gain_offset"][1][0] - 1.15) < 0.05
+    assert abs(rep["inputs"][1]["saturation"][1] - sat_l) < 0.004 and abs(rep["inputs"][0]["saturation"][1] - sat_s) < 0.004
+    for y, x in [(200, 150), (80, 80)]:
+        prof = [out[1][(np.hypot(yy - y, xx - x) >= r - .5) & (np.hypot(yy - y, xx - x) < r + .5)].mean() for r in range(0, 8)]
+        assert all(prof[i] >= prof[i + 1] * 0.97 for i in range(7)), prof     # monotone: no donut
+
+
+def test_auto_crop_with_groups_keeps_only_area_every_group_covers():
+    W, H = 400, 300
+    hm_a = [[1, 0, 2.0 * i, 0, 1, 0, 0, 0, 1] for i in range(10)]            # group A drifts in x (0..18)
+    hm_b = [[1, 0, 60.0 + 2.0 * i, 0, 1, 0, 0, 0, 1] for i in range(10)]     # group B starts 60 px further
+    hm = hm_a + hm_b
+    cw = int(W + 78)
+    stack = np.ones((3, H, cw), np.float32)
+    box, info = sp.auto_crop(stack, hm, (W, H), 1.0, 0.3, [hm_a, hm_b])
+    box0, _ = sp.auto_crop(stack, hm, (W, H), 1.0, 0.3)
+    assert info.get("groups_all_cover") and box[0] >= 60 - 4
+    assert box0[0] < box[0]                                                   # the plain crop keeps the A-only strip
+
+
+def _stars_img(shape, pos, fl, sig, shift=(0.0, 0.0), sky=5.0):
+    H, W = shape
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    im = np.full(shape, sky, np.float32)
+    for (y, x), f in zip(pos, fl):
+        im += f * np.exp(-((yy - y - shift[1])**2 + (xx - x - shift[0])**2) / (2 * sig**2)) / (2 * np.pi * sig**2)
+    return im
+
+
+def test_psf_match_and_subpixel_alignment_make_groups_agree():
+    rng = np.random.default_rng(11)
+    H, W = 320, 420
+    pos = [(int(y), int(x)) for y, x in zip(rng.integers(25, H - 25, 90), rng.integers(25, W - 25, 90))]
+    fl = 10 ** rng.uniform(2.5, 3.3, 90)
+    ref = _stars_img((H, W), pos, fl, 2.6)                                  # broad stars, long night
+    img = _stars_img((H, W), pos, fl, 1.5, shift=(-1.3, 0.6))               # sharp, displaced by 1.3 / 0.6 px
+    ref3, img3 = np.stack([ref] * 3) / 1e3, np.stack([img] * 3) / 1e3
+    v = np.ones((H, W), bool)
+    img3, vi, rep = sp.align_to_reference(ref3, img3, v, v, [None] * 3, [None] * 3)
+    assert abs(rep[1]["dx"] + 1.3) < 0.1 and abs(rep[1]["dy"] - 0.6) < 0.1
+    img3, vi, sig = sp.match_psf(ref3, img3, v, vi, [None] * 3, [None] * 3)
+    assert abs(sig[1] - np.sqrt(2.6**2 - 1.5**2)) < 0.4
+    m = vi & v
+    m[:20] = m[-20:] = False
+    m[:, :20] = m[:, -20:] = False
+    d = (img3[1] - ref3[1])[m]
+    assert np.abs(d).max() < 0.06 * ref3[1].max() and np.median(np.abs(d)) < 1e-3

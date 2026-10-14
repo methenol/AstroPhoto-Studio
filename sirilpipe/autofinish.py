@@ -8,6 +8,8 @@ after, target, why``).  Rules (DESIGN section 4 "Autofinish"):
 * **stretch**: target sky median by how much of the frame holds signal (object coverage);
 * **star_reduction / star_intensity**: from the star density (stars per megapixel, measured when the
   stars were removed);
+* **star_stretch**: the Seti Astro Star Stretch amount that sends the median detected star of the full-resolution star layer to
+  display level 0.3 (finish.star_stretch_amount);
 * **hdr**: the smallest highlight protection (0, 0.3, 0.6, 0.9, 1.2) that keeps the object's cores below 0.3 %
   clipped pixels in a trial render;
 * **saturation**: raised until the object's mean colour saturation reaches the aim (never lowered: the
@@ -31,6 +33,13 @@ from . import finish
 
 # Aims of the rules (documented constants, not tuned per image).
 STRETCH_RULE = ((0.15, 0.10), (0.30, 0.13), (0.60, 0.16), (1.00, 0.20))      # (coverage, target median) breakpoints
+# Dual-band (Ha / OIII) nebulae are stretched the community way: the statistical stretch's median target is 0.25 for an object that fills
+# the frame and ~0.11-0.15 for a small one (Statistical_Stretch / Under South West Skies, workflows.md 7.4), then the black point brings the
+# SKY down to 0.10 (the aim below).  A frame-filling target of 0.25 followed by that black point is what lifts the faint outer nebulosity (the
+# stretch's slope at the sky grows with the target); the 0.13-0.20 of the broadband rule left the wings at the noise (measured on M 42 and C 33), so even small objects start from 0.20 (community: 0.11-0.15 for small objects, but with a sky left at that level).
+STRETCH_RULE_DUAL = ((0.15, 0.20), (0.30, 0.25), (0.60, 0.25), (1.00, 0.25))
+SKY_AIM = 0.10                     # display level of the sky after the black point (0.08-0.12: dark grey, not black) -- dual-band
+HEADROOM_LEVEL, HEADROOM_LIMIT = 0.8, 0.015   # dual-band: at most 1.5 % of the object's pixels may lie above 0.8 in the starless render (room for the stars / the Trapezium; a larger plateau is a flat white core)
 STAR_DENSITY = ((150.0, 0.25, 1.0), (600.0, 0.30, 1.0))                       # per MP: sparse, normal; dense above
 CLIP_LIMIT = 0.0005                # fraction of pixels allowed at >= 0.985 in the starless render (a white core of a few hundred pixels is allowed)
 HDR_LADDER = (0.0, 0.3, 0.6, 0.9, 1.2)       # 0 = the plain statistical (midtones) stretch: the most contrast in the highlights
@@ -39,15 +48,25 @@ OIII_TO_HA = 0.7                   # OIII lifted to at least 0.7 x the Ha signal
 GRADIENT_LIMIT = 0.03              # display units: a visible sky gradient
 
 
-def target_for_coverage(c: float) -> float:
-    """Piecewise-linear target sky median over the breakpoints of ``STRETCH_RULE`` (0.10 for a small object on empty
-    sky up to 0.20 for a nebula that fills the frame; 0.16 = the default at 60 % coverage)."""
-    pts = ((0.0, STRETCH_RULE[0][1]),) + STRETCH_RULE
+def target_for_coverage(c: float, dual: bool = False) -> float:
+    """Piecewise-linear target median over the breakpoints of ``STRETCH_RULE`` (0.10 for a small object on empty
+    sky up to 0.20 for a nebula that fills the frame; 0.16 = the default at 60 % coverage), or of ``STRETCH_RULE_DUAL``
+    (0.12 ... 0.25, followed by the black point that puts the sky at ``SKY_AIM``)."""
+    rule = STRETCH_RULE_DUAL if dual else STRETCH_RULE
+    pts = ((0.0, rule[0][1]),) + rule
     c = float(np.clip(c, 0, 1))
     for (c0, t0), (c1, t1) in zip(pts, pts[1:]):
         if c <= c1:
             return t0 + (t1 - t0) * (c - c0) / max(c1 - c0, 1e-9)
     return pts[-1][1]
+
+
+def sky_level(img: np.ndarray) -> float:
+    """Display level of the sky: the median of the darkest 45 % of the smoothed luminance (the nebula and the stars sit above it;
+    the whole-frame median of a nebula that fills a third of the frame is lifted by the nebula)."""
+    lum = cv2.GaussianBlur(np.ascontiguousarray(finish.luminance(img)), (0, 0), 2.0)
+    s = finish.sample(lum, valid_only=False)
+    return float(np.median(s[s <= np.percentile(s, 45)]))
 
 
 def star_settings(per_mp: float) -> tuple[float, float, str]:
@@ -136,9 +155,11 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     # 1. stretch target from the object coverage
     tick("object coverage")
     cov = finish.object_coverage(lum_lin)
-    target = round(target_for_coverage(cov), 3)
+    target = round(target_for_coverage(cov, dual), 3)
     decide("stretch", target, "object_frac", round(cov, 3), None,
-           f"the object covers {cov * 100:.0f} % of the frame: sky median {target} (0.10 small object ... 0.20 fills the frame)")
+           f"the object covers {cov * 100:.0f} % of the frame: median target {target} "
+           + ("(0.12 small object ... 0.25 fills the frame; the black point below puts the sky at 0.10)" if dual
+              else "(0.10 small object ... 0.20 fills the frame)"))
     decide("auto_stretch", False, "object_frac", round(cov, 3), None, "the coverage rule above replaces the automatic adaptation")
 
     # 2. stars
@@ -150,6 +171,11 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         decide("star_reduction", round(red, 2), "star_frac", star_info["per_megapixel"], None,
                f"{star_info['per_megapixel']:.0f} stars per megapixel ({cls_stars} field)")
         decide("star_intensity", round(inten, 2), "star_frac", star_info["per_megapixel"], None, f"{cls_stars} star field")
+        amount, sa = _star_stretch(session, p0)
+        if sa.get("median_peak") is not None:
+            decide("star_stretch", amount, "median_star_peak", sa["median_peak"], finish.STAR_MEDIAN_AIM,
+                   f"the median of {sa['stars']} detected stars peaks at {sa['median_peak']:.4g} (linear): amount {amount} puts it at "
+                   f"{sa['median_after']}, the brightest unsaturated stars ({sa['bright_peak']:.3g}) at {sa['bright_after']}")
 
     # trial renders (numpy, 1000 px): stats before = the given params, after = the tuned ones
     tick("trial render")
@@ -158,18 +184,26 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     stats_before = measure(img0)
     p1 = {**p0, **tuned}
 
-    # 3. highlight protection: the lowest hdr whose starless render keeps the cores below the clip limit
+    # 3. highlight protection: the lowest hdr whose starless render keeps the cores below the clip limit (dual-band: and leaves
+    #    headroom above the cores for the stars: an HOO core is white by construction, Ha and OIII both saturate)
     tick("highlights")
     chosen = HDR_LADDER[0]
-    clip_seen = None
+    clip_seen, crowd = None, 0.0
     for h in HDR_LADDER:
-        pt = {**p1, "hdr": h, "star_reduction": 1.0}
-        st = measure(post._render(layers, pt, dual, fast=True)[0])
+        pt = {**p1, "hdr": h, "star_reduction": 1.0, "black_point": 0.0}
+        im = post._render(layers, pt, dual, fast=True)[0]
+        st = measure(im)
         clip_seen, chosen = st["clip_frac"], h
-        if st["clip_frac"] <= CLIP_LIMIT:
+        crowd = 0.0
+        if dual:
+            lum = finish.luminance(im)
+            obj = cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), 2.0) > sky_level(im) + 0.08
+            crowd = float((lum >= HEADROOM_LEVEL).sum()) / max(float(obj.sum()), 1.0)
+        if st["clip_frac"] <= CLIP_LIMIT and crowd <= HEADROOM_LIMIT:
             break
     decide("hdr", chosen, "peak_L", clip_seen, CLIP_LIMIT,
-           f"{(clip_seen or 0) * 100:.2f} % of the starless render is clipped at hdr {chosen} (limit {CLIP_LIMIT * 100:.2f} %)")
+           f"{(clip_seen or 0) * 100:.2f} % of the starless render is clipped at hdr {chosen} (limit {CLIP_LIMIT * 100:.2f} %)"
+           + (f"; {crowd * 100:.2f} % of the object above {HEADROOM_LEVEL} (limit {HEADROOM_LIMIT * 100:.1f} %)" if dual else ""))
     p1["hdr"] = chosen
 
     # 4. dual-band: OIII boost
@@ -189,6 +223,15 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     decide("saturation", round(sat, 2), "C50", s0, aim, f"object colourfulness {s0:.2f} at saturation 1.0, aim {aim}")
     p1["saturation"] = round(sat, 2)
 
+    # 5b. dual-band: black point that puts the sky at SKY_AIM after the (higher) stretch target
+    if dual:
+        im = post._render(layers, {**p1, "black_point": 0.0, "star_reduction": 1.0}, dual, fast=True)[0]
+        sky = sky_level(im)
+        bp = float(np.clip(round((sky - SKY_AIM) / (1.0 - SKY_AIM), 3), 0.0, 0.5))
+        decide("black_point", bp, "sky_L", round(sky, 3), SKY_AIM,
+               f"the stretched sky sits at {sky:.3f}: black point {bp} puts it at {SKY_AIM} (dark grey, the faint nebulosity keeps its contrast)")
+        p1["black_point"] = bp
+
     # 6. gradient residual (report only)
     tick("gradient check")
     grad = gradient_residual(lum_lin, target, finish.lower_half_sigma(finish.sample(lum_lin)))
@@ -201,10 +244,11 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     for s in steps:
         s["after"] = {"stretch": stats_after["sky_L"], "hdr": stats_after["clip_frac"], "saturation": stats_after["C50"]}.get(s["step"])
     tuned_full = {**p0, **tuned, "saturation": p1["saturation"], "hdr": p1["hdr"]}
+    tuned_full["black_point"] = p1["black_point"]
     cls = ("dual-band " if dual else "broadband ") + ("nebula" if cov > 0.0 and cov < 0.8 else "field")
     report = {
         "reference": "measured statistics (fixed rules, no reference image)", "class": cls,
-        "score_before": score(stats_before, p0["stretch"]), "score_after": score(stats_after, target),
+        "score_before": score(stats_before, SKY_AIM if dual else p0["stretch"]), "score_after": score(stats_after, SKY_AIM if dual else target),
         "nearest": None, "renders": 5, "seconds": round(time.time() - t0, 1), "steps": steps,
         "stats_before": stats_before, "stats_after": stats_after,
         "gradient": {**grad, "limit": GRADIENT_LIMIT, "note": grad_note},
@@ -239,13 +283,25 @@ def _star_density(layers, session: str, full_mp: float) -> dict | None:
     return {"count": n, "per_megapixel": n / max(full_mp, 1e-6)}
 
 
+def _star_stretch(session: str, p: dict) -> tuple[float, dict]:
+    """Star Stretch amount from the FULL-resolution star layer (a reduced layer averages the peaks down) and the sky noise of the
+    starless layer."""
+    from . import post
+    full = post._Layers(session, p, None)
+    if full.stars is None:
+        return finish.STAR_STRETCH, {"stars": 0, "median_peak": None}
+    noise = finish.lower_half_sigma(finish.sample(finish.luminance(full.base)))
+    return finish.star_stretch_amount(full.stars, noise)
+
+
 def _oiii_boost(base: np.ndarray, p: dict, target: float) -> tuple[float | None, float]:
     """OIII boost so the stretched OIII signal over the sky equals ``OIII_TO_HA`` x the Ha signal (both
     channels are stretched to the same sky median, so the signal is the excess above it, in the object)."""
     pos = finish.curve_position(p["stretch_method"], float(p["hdr"]))
+    shd = finish.curve_shoulder(p["stretch_method"], float(p["hdr"]))
     ha, oiii, _ = finish.extract_ha_oiii(base, bool(p["oiii_unmix"]))
-    h_st, _ = finish.stretch_channel(ha, target, position=pos)
-    o_st, _ = finish.stretch_channel(oiii, target, position=pos)
+    h_st, _ = finish.stretch_channel(ha, target, position=pos, shoulder=shd)
+    o_st, _ = finish.stretch_channel(oiii, target, position=pos, shoulder=shd)
     obj = cv2.GaussianBlur(h_st, (0, 0), 2.0) > target + 0.08
     if obj.sum() < 200:
         return None, 0.0

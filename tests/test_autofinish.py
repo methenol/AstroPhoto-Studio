@@ -109,3 +109,10 @@ def test_dense_star_field_gets_more_reduction(session):
               open(os.path.join(session, "starnet_meta.json"), "w"))
     out = af.run(session, {}, {}, None, None)
     assert out["params"]["star_reduction"] > 0.30 and out["params"]["star_intensity"] >= 0.9
+
+
+def test_dual_band_target_is_the_community_one_and_the_sky_aim_is_dark_grey():
+    assert af.target_for_coverage(1.0, dual=True) == pytest.approx(0.25)
+    assert af.target_for_coverage(0.3, dual=True) == pytest.approx(0.25)
+    assert af.target_for_coverage(0.05, dual=True) >= 0.12
+    assert 0.08 <= af.SKY_AIM <= 0.12
