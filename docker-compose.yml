@@ -69,6 +69,7 @@ services:
       args:
         GRAXPERT_EXTRA: cuda
         STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
+        IMAGEMM: "${IMAGEMM:-off}"       # off | cuda | cpu: torch for the optional ImageMM restoration
     environment:
       ASTROPHOTO_DEVICE: "${ASTROPHOTO_DEVICE:-auto}"
       PUID: "${PUID:-}"
@@ -98,6 +99,7 @@ services:
       args:
         GRAXPERT_EXTRA: cpuonly
         STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
+        IMAGEMM: "${IMAGEMM:-off}"
     environment:
       ASTROPHOTO_DEVICE: cpu
       PUID: "${PUID:-}"

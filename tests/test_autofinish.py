@@ -26,8 +26,8 @@ def test_stretch_target_rises_with_coverage():
 def test_star_settings_by_density():
     assert af.star_settings(50)[2] == "sparse" and af.star_settings(300)[2] == "normal" and af.star_settings(2000)[2] == "dense"
     assert af.star_settings(50)[0] < af.star_settings(300)[0] < af.star_settings(2000)[0]
-    assert af.star_settings(5000)[0] <= 0.65
-    assert af.star_settings(2000)[1] < af.star_settings(50)[1]
+    assert af.star_settings(5000)[0] <= 0.40                                       # a dense field keeps its faint stars
+    assert af.star_settings(2000)[1] >= 0.9
 
 
 def test_gradient_residual_flags_a_tilted_sky():
@@ -69,7 +69,7 @@ def test_run_writes_report_with_a_measurement_per_decision(session):
     assert set(p) >= set(post.DEFAULTS)                                       # full parameter set for the sliders
     assert 0.10 <= p["stretch"] <= 0.20 and p["auto_stretch"] is False
     assert p["saturation"] >= 1.0                                              # never desaturates
-    assert p["star_reduction"] == pytest.approx(0.35) and p["star_intensity"] == pytest.approx(0.90)   # 450 stars / MP: normal
+    assert p["star_reduction"] == pytest.approx(0.30) and p["star_intensity"] == pytest.approx(1.0)   # 450 stars / MP: normal
     assert p["hdr"] in af.HDR_LADDER
     assert p["grade_temperature"] == 0 and p["grade_contrast"] == 0           # grade stays neutral
     steps = {s["step"]: s for s in rep["steps"]}
@@ -108,4 +108,4 @@ def test_dense_star_field_gets_more_reduction(session):
     json.dump({"tool": "starnet2", "stage": "linear", "stars": {"count": 9000, "per_megapixel": 2500.0}},
               open(os.path.join(session, "starnet_meta.json"), "w"))
     out = af.run(session, {}, {}, None, None)
-    assert out["params"]["star_reduction"] > 0.35 and out["params"]["star_intensity"] < 0.9
+    assert out["params"]["star_reduction"] > 0.30 and out["params"]["star_intensity"] >= 0.9

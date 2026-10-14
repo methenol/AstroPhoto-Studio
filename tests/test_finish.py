@@ -146,15 +146,13 @@ def test_star_stretch_is_bounded_and_noise_free():
     assert ginfo["target_q"] < info["target_q"]                          # dual-band: gentler
 
 
-def test_star_factor_follows_the_starless_stretch_and_dual_band_is_gentler():
+def test_star_factor_follows_the_starless_stretch_in_dual_band_too():
     lin = synthetic_linear(noise=0.0)
     stars = np.maximum(lin - 0.02, 0)
     out, info = finish.stretch_stars(stars, dual_band=False, factor=2000.0)
     assert info["asinh_factor"] == 2000.0 and info["factor_from"] == "starless stretch"
     _, dinfo = finish.stretch_stars(stars, dual_band=True, factor=2000.0)
-    assert dinfo["asinh_factor"] == 1000.0
-    gentle, _ = finish.stretch_stars(stars, dual_band=True, factor=2000.0)
-    assert gentle.mean() < out.mean()
+    assert dinfo["asinh_factor"] == 2000.0 * finish.GENTLE_DUAL_FACTOR      # no halving: the faint stars must stay visible
 
 
 def test_render_stars_use_the_starless_beta():
@@ -242,7 +240,7 @@ def test_dual_band_render_has_no_scnr_and_oiii_boost_works():
 
 
 def test_resolve_palette():
-    assert finish.resolve_palette("auto", True) == "foraxx"
+    assert finish.resolve_palette("auto", True) == "hoo"
     assert finish.resolve_palette("auto", False) == "natural"
     assert finish.resolve_palette("hoo", True) == "hoo"
     assert finish.resolve_palette("bogus", True) == "natural"
@@ -436,3 +434,56 @@ def test_spcc_arguments_mapping():
     assert "-oscsensor=Sony IMX999" in args and "-oscfilter=Baader UV/IR Cut" in args
     with pytest.raises(ValueError):
         post.spcc_arguments({"TELESCOP": "Mystery"}, {}, post.DEFAULTS)
+
+
+def test_resolve_palette_foraxx_only_when_asked():
+    assert finish.resolve_palette("foraxx", True) == "foraxx"
+
+
+def test_star_color_balance_neutralises_the_median_star():
+    stars = np.zeros((3, 120, 120), np.float32)
+    rng = np.random.default_rng(3)
+    for _ in range(40):
+        y, x = rng.integers(10, 110, 2)
+        stars[:, y, x] = np.array([0.05, 0.1, 0.09]) * rng.uniform(0.5, 3)      # cyan-ish: R at half of G
+    stars = np.stack([cv2.GaussianBlur(stars[c], (0, 0), 1.2) for c in range(3)])
+    out, info = finish.star_color_balance(stars)
+    assert info["gains"][0] > 1.5 and info["gains"][1] == 1.0
+    assert out.sum((1, 2))[0] == pytest.approx(out.sum((1, 2))[1], rel=0.2)
+
+
+def test_reduce_stars_shrinks_and_one_is_starless():
+    st = np.clip(np.random.default_rng(1).uniform(0, 1, (3, 20, 20)), 0, 1).astype(np.float32)
+    none, g0 = finish.reduce_stars(st, 0.0, 1.0)
+    assert np.allclose(none, st) and g0 == 1.0
+    half, g = finish.reduce_stars(st, 0.5, 1.0)
+    assert half.mean() < st.mean() and half.max() < 1.0 + 1e-6 and 0 < g < 1
+    gone, _ = finish.reduce_stars(st, 1.0, 1.0)
+    assert gone.max() == 0.0
+
+
+def test_subtract_star_wings_reassigns_only_the_psf_wing():
+    rng = np.random.default_rng(5)
+    h = w = 700
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+
+    def wing(cy, cx, amp):
+        r = np.hypot(yy - cy, xx - cx)
+        return (amp / (1.0 + (r / 25.0) ** 2.2)).astype(np.float32)
+
+    sky = np.float32(0.02)
+    stars_true = np.zeros((3, h, w), np.float32)
+    for cy, cx, f in ((200, 200, 1.0), (450, 480, 0.8), (300, 560, 0.1)):
+        core = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.5 ** 2)).astype(np.float32)
+        stars_true += (f * core)[None]
+    wings = sum(wing(cy, cx, 0.02 * f) for cy, cx, f in ((200, 200, 1.0), (450, 480, 0.8), (300, 560, 0.1)))
+    starless_in = (sky + wings[None] + rng.normal(0, 5e-5, (3, h, w))).astype(np.float32)   # StarNet-like: wings kept
+    lin = starless_in + stars_true
+    stars_in = np.maximum(lin - starless_in, 0)
+    out, info, stars_out = finish.subtract_star_wings(lin, starless_in, stars_in)
+    assert info["stars"] >= 2
+    ring = (np.hypot(yy - 200, xx - 200) > 40) & (np.hypot(yy - 200, xx - 200) < 120)
+    assert starless_in[1][ring].mean() - sky > 1e-3                      # the wing is there before
+    assert abs(out[1][ring].mean() - sky) < 4e-4                         # and mostly gone after
+    assert np.allclose(lin, out + stars_out, atol=1e-5)                  # photons reassigned: starless + stars = linear
+    assert out.min() >= 0

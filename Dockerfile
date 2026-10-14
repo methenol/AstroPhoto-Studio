@@ -8,6 +8,10 @@
 #   STARNET_ACCEPT_LICENSE  "yes" = you accept the StarNet2 licence and the image downloads the official zip
 #                           from download.starnetastro.com (not redistributable otherwise); empty = skipped,
 #                           the app offers the download at run time into $HOME/tools/starnet2.
+#   IMAGEMM                 off (default) | cuda | cpu - installs torch into the app environment for the optional
+#                           ImageMM restoration (deconv_method = imagemm): cuda = the cu128 wheels (~7 GB with the
+#                           NVIDIA libraries), cpu = the CPU wheels (~0.3 GB, slow).  off: the image has no torch and
+#                           a request for ImageMM falls back to BlurXTerminator / Siril RL (recorded in restore_meta.json).
 #   vendor/rc-astro-cli-*-linux-x64.sh   user-supplied RC-Astro installer (gitignored); optional.
 # Nothing is taken from the host; no licence/config of any tool is ever baked in.
 
@@ -121,7 +125,17 @@ RUN if [ "${GRAXPERT_EXTRA}" = "cuda" ]; then \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt \
- && python -c "import numpy, scipy, cv2, skimage, astropy, tifffile, PIL, fastapi, uvicorn; print('native libraries ok')"
+ && python -c "import numpy, scipy, cv2, astropy, tifffile, PIL, fastapi, uvicorn; print('native libraries ok')"
+
+# optional ImageMM: torch from the matching PyTorch index (its own layer, before the app code, so code changes
+# do not reinstall it)
+ARG IMAGEMM=off
+RUN case "${IMAGEMM}" in \
+      cuda) pip install torch --index-url https://download.pytorch.org/whl/cu128 ;; \
+      cpu)  pip install torch --index-url https://download.pytorch.org/whl/cpu ;; \
+      off|"") echo "IMAGEMM=off: torch not installed (deconv_method=imagemm falls back to BXT / RL)" ;; \
+      *) echo "IMAGEMM must be cuda, cpu or off (got '${IMAGEMM}')"; exit 1 ;; \
+    esac
 
 COPY sirilpipe ./sirilpipe
 COPY astrophoto ./astrophoto

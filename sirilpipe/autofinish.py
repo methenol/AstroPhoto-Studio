@@ -8,11 +8,11 @@ after, target, why``).  Rules (DESIGN section 4 "Autofinish"):
 * **stretch**: target sky median by how much of the frame holds signal (object coverage);
 * **star_reduction / star_intensity**: from the star density (stars per megapixel, measured when the
   stars were removed);
-* **hdr**: the smallest highlight protection (0.6, 0.9, 1.2) that keeps the object's cores below 0.3 %
+* **hdr**: the smallest highlight protection (0, 0.3, 0.6, 0.9, 1.2) that keeps the object's cores below 0.3 %
   clipped pixels in a trial render;
 * **saturation**: raised until the object's mean colour saturation reaches the aim (never lowered: the
   palette's own colour is kept);
-* **oiii_boost** (dual-band): so the OIII signal over the sky is 0.6 x the Ha signal;
+* **oiii_boost** (dual-band): so the OIII signal over the sky is at least 0.7 x the Ha signal (never reduced);
 * **gradient check**: the residual large-scale gradient after the restoration, in display units, reported
   (changing it needs the linear stage to run again, so it is not a setting here).
 
@@ -31,11 +31,11 @@ from . import finish
 
 # Aims of the rules (documented constants, not tuned per image).
 STRETCH_RULE = ((0.15, 0.10), (0.30, 0.13), (0.60, 0.16), (1.00, 0.20))      # (coverage, target median) breakpoints
-STAR_DENSITY = ((150.0, 0.25, 0.95), (600.0, 0.35, 0.90))                      # per MP: sparse, normal; dense above
-CLIP_LIMIT = 0.003                 # fraction of pixels allowed at >= 0.985 in the starless render
-HDR_LADDER = (0.6, 0.9, 1.2)
-SATURATION_AIM = {"broadband": 0.32, "dual-band": 0.45}                        # mean HSV saturation of the object
-OIII_TO_HA = 0.6                   # DESIGN: OIII ~ 0.6 x Ha
+STAR_DENSITY = ((150.0, 0.25, 1.0), (600.0, 0.30, 1.0))                       # per MP: sparse, normal; dense above
+CLIP_LIMIT = 0.0005                # fraction of pixels allowed at >= 0.985 in the starless render (a white core of a few hundred pixels is allowed)
+HDR_LADDER = (0.0, 0.3, 0.6, 0.9, 1.2)       # 0 = the plain statistical (midtones) stretch: the most contrast in the highlights
+SATURATION_AIM = {"broadband": 0.32, "dual-band": 0.30}                        # mean HSV saturation of the object
+OIII_TO_HA = 0.7                   # OIII lifted to at least 0.7 x the Ha signal (never lowered: a strong OIII is the data, e.g. the M 42 core)
 GRADIENT_LIMIT = 0.03              # display units: a visible sky gradient
 
 
@@ -56,7 +56,9 @@ def star_settings(per_mp: float) -> tuple[float, float, str]:
         return STAR_DENSITY[0][1], STAR_DENSITY[0][2], "sparse"
     if per_mp <= STAR_DENSITY[1][0]:
         return STAR_DENSITY[1][1], STAR_DENSITY[1][2], "normal"
-    return float(min(0.65, 0.35 + (per_mp - STAR_DENSITY[1][0]) / 1500.0 * 0.30)), 0.80, "dense"
+    # a dense field keeps its faint stars (the Seestar's own picture of M 27 shows 4000 per MP): reduction only trims the bright
+    # stars' footprints (finish.reduce_stars), never the count; 0.65 / 0.8 removed 90 % of them
+    return float(min(0.40, 0.30 + (per_mp - STAR_DENSITY[1][0]) / 3000.0 * 0.10)), 0.95, "dense"
 
 
 def gradient_residual(lum_lin: np.ndarray, target: float, noise_sigma: float) -> dict:
@@ -167,7 +169,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         if st["clip_frac"] <= CLIP_LIMIT:
             break
     decide("hdr", chosen, "peak_L", clip_seen, CLIP_LIMIT,
-           f"{(clip_seen or 0) * 100:.2f} % of the starless render is clipped at hdr {chosen} (limit {CLIP_LIMIT * 100:.1f} %)")
+           f"{(clip_seen or 0) * 100:.2f} % of the starless render is clipped at hdr {chosen} (limit {CLIP_LIMIT * 100:.2f} %)")
     p1["hdr"] = chosen
 
     # 4. dual-band: OIII boost
@@ -252,4 +254,4 @@ def _oiii_boost(base: np.ndarray, p: dict, target: float) -> tuple[float | None,
     if s_h <= 1e-3:
         return None, 0.0
     ratio = max(s_o, 1e-3) / s_h
-    return float(np.clip(round(OIII_TO_HA / ratio / 0.05) * 0.05, 0.7, 3.0)), round(ratio, 3)
+    return float(np.clip(round(OIII_TO_HA / ratio / 0.05) * 0.05, 1.0, 3.0)), round(ratio, 3)

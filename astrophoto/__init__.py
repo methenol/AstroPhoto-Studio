@@ -1,18 +1,4 @@
-"""AstroPhoto Studio: an end-to-end astrophotography pipeline for raw one-shot-colour FITS subs
-(smart telescopes such as the ZWO Seestar and DWARFLAB DWARF 3, or any astronomy camera).
-
-Stages
-------
-1. ``frames``      discovery, FITS/CFA handling, cosmetic (hot pixel) correction
-   ``instruments`` telescope profiles: header values the telescope does not write
-   ``calibration`` bias / dark / flat masters (a DWARF's CALI_FRAME, darks/ flats/ biases/)
-2. ``analysis``    per-frame star metrics, registration, obstruction & cloud detection,
-                   statistical + ML (IsolationForest) frame rejection and weighting
-3. ``stacking``    streaming 3-pass integration: local normalization, weighted
-                   sigma-clipping, optional CFA (Bayer) drizzle, split half-stacks
-4. ``denoise``     self-supervised Noise2Noise CNN trained on the two half-stacks
-5. ``postprocess`` gradient removal, colour calibration, deconvolution, star
-                   separation, stretching, narrowband palettes, local contrast
-"""
-
-__version__ = "1.0.0"
+"""Legacy helpers kept only for the optional ImageMM stage (``sirilpipe/imagemm_stage.py``):
+``imagemm`` (the restoration), ``exposures`` (per-sub registration, photometry, PSF field),
+``frames`` / ``instruments`` / ``calibration`` (raw FITS reading), ``denoise`` (U-Net + tiled inference),
+``resources`` (worker / memory limits)."""

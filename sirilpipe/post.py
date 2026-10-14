@@ -343,7 +343,11 @@ class Restorer:
         self.steps = _Steps(7, progress, checkpoint)
         self.work = _p(session, "process", "restore")
         os.makedirs(self.work, exist_ok=True)
-        self.arr, self.header = fitsio.read_rgb(_p(session, "stack.fits"))
+        # session.py may point the restore at another file with stack.fits' grid (ImageMM's imagemm.fits)
+        self.source = str((meta or {}).get("restore_source") or "stack.fits")
+        if not os.path.exists(_p(session, self.source)):
+            self.source = "stack.fits"
+        self.arr, self.header = fitsio.read_rgb(_p(session, self.source))
         if not export_mod.bottom_up(self.header):                    # one row order for everything downstream (Siril's)
             self.arr = np.ascontiguousarray(self.arr[:, ::-1])
             self.header["ROWORDER"] = "BOTTOM-UP"
@@ -438,7 +442,10 @@ class Restorer:
         consistent).  Only when BXT is licensed and deconvolution is wanted; otherwise nothing runs here."""
         s, p = self.steps, self.p
         s.begin("PSF correction")
-        if float(p["deconvolution"]) <= 0 or (self.sp.get("deconv_method") or "imagemm") == "none":
+        if self.source == "imagemm.fits":
+            s.add("psf-correction", "none", "skipped", note="deconvolution by ImageMM")
+            return
+        if float(p["deconvolution"]) <= 0 or (self.sp.get("deconv_method") or "auto") == "none":
             s.add("psf-correction", "none", "skipped", note="deconvolution off")
             return
         t0 = time.time()
@@ -499,8 +506,11 @@ class Restorer:
     def deconvolve(self) -> None:
         s, p = self.steps, self.p
         s.begin("Deconvolution")
+        if self.source == "imagemm.fits":
+            s.add("deconvolution", "imagemm", "skipped", note="deconvolution by ImageMM")
+            return
         d = float(np.clip(p["deconvolution"], 0, 1))
-        method = (self.sp.get("deconv_method") or "imagemm")
+        method = (self.sp.get("deconv_method") or "auto")
         if d <= 0 or method == "none":
             s.add("deconvolution", "none", "skipped", note="deconvolution=0" if d <= 0 else "deconv_method=none")
             return
@@ -508,9 +518,13 @@ class Restorer:
         try:                                                         # BlurXTerminator sharpening (auto PSF)
             tools.rcastro.require("bxt")
             ss, sn = 0.25 + 0.25 * d, 0.5 + 0.4 * d                  # DESIGN section 4; AstroPipe: ss 0.25, sn 0.60, halos 0
-            self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=0.0)
+            extra: dict = {}
+            fwhm = float(self.meta.get("fwhm_px") or 0)
+            if p.get("bxt_manual_psf") and 1.0 < fwhm:                 # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
+                extra = {"ansp": False, "nsd": min(8.0, fwhm)}
+            self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=0.0, **extra)
             s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, ss=round(ss, 3), sn=round(sn, 3),
-                  flags=meta.get("flags"))
+                  flags=meta.get("flags"), **extra)
             return
         except Cancelled:
             raise
@@ -693,6 +707,10 @@ def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params:
         starless, _ = fitsio.read_rgb(starless_path)
         starless = np.clip(np.nan_to_num(starless), 0, 1).astype(np.float32)
         stars = np.maximum(lin - starless, 0).astype(np.float32)
+        if meta["tool"] == "starnet2":              # StarNet leaves the scattered-light wings of bright stars in the starless layer
+            t_w = time.time()
+            starless, winfo, stars = finish.subtract_star_wings(lin, starless, stars)
+            meta["wing_subtraction"] = {**winfo, "seconds": round(time.time() - t_w, 1)}
         fitsio.write_rgb(starless_path, starless, header)
         fitsio.write_rgb(_p(session_dir, "stars.fits"), stars, header)
         sky_noise = finish.lower_half_sigma(finish.sample(finish.luminance(starless)))
@@ -727,7 +745,9 @@ class _Layers:
                 self.base = fitsio.read_rgb(sl)[0]
                 self.stars = fitsio.read_rgb(st)[0]
                 self.separate = True
+        self.fwhm_px = float(_load_json(_p(session, "stack_meta.json")).get("fwhm_px") or 3.0)
         if max_side:
+            self.fwhm_px *= min(1.0, max_side / max(self.base.shape[1:]))
             self.base = _reduce(self.base, max_side)
             if self.stars is not None:
                 self.stars = _reduce(self.stars, max_side)
@@ -775,6 +795,7 @@ def _render(layers: _Layers, p: dict, dual: bool, fast: bool, hooks: dict | None
         pre = st_stretched = stars is not None
         if stars is None:
             base = layers.base
+    p = {**p, "_fwhm_px": layers.fwhm_px}
     img, info = finish.render_layers(base, stars, p, dual_band=dual, pre_stretched=pre, stars_stretched=st_stretched,
                                      hooks=hooks, tick=tick)
     info["star_layer"] = "separate" if stars is not None else "none"
@@ -861,7 +882,7 @@ class _ExportHooks:
         return None
 
     def final_color(self, img: np.ndarray, p: dict, dual: bool):
-        """satu / rmgreen / black point + midtones through Siril (numpy twin on failure)."""
+        """satu / rmgreen on the starless layer through Siril (numpy twin on failure); black point + midtones are applied after the star blend, in numpy."""
         t0 = time.time()
         lines = []
         amount = float(p["saturation"]) - 1.0
@@ -869,9 +890,6 @@ class _ExportHooks:
             lines.append(f"satu {amount:.3f}")
         if not dual and float(p["scnr"]) > 0:                     # no SCNR on dual-band: the green is the OIII
             lines.append(f"rmgreen 0 {float(np.clip(p['scnr'], 0, 1)):.3f}")
-        bp, mid = float(p["black_point"]), finish.brightness_to_mid(float(p["brightness"]))
-        if bp > 0 or abs(mid - 0.5) > 1e-4:
-            lines.append(f"mtf {bp:.4f} {mid:.4f} 1")
         if not lines:
             return None
         try:

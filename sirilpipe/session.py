@@ -33,6 +33,8 @@ from .util import (Cancelled, clean_json, dataset_slug, read_json, restoration_d
 log = logging.getLogger("sirilpipe")
 
 SESSION_FORMAT = 1
+SWAP_NAME = "stack_original.fits"        # stack.fits while post.restore reads imagemm.fits in its place
+_IMAGEMM_WARNED = False                  # log "ImageMM unavailable" once per process
 STAGES = ["Scanning frames", "Calibrating", "Registering (pass 1/2)", "Registering (pass 2/2)",
           "Applying registration", "Stacking", "Cropping", "Plate solving"]
 
@@ -644,6 +646,9 @@ class Session:
         H, W = arr.shape[1:]
         do_crop = bool(sp.get("crop", True))
         thr = float(sp.get("crop_threshold", 0.3) or 0.3)
+        if hdr_info and hdr_info.get("groups"):          # HDR: crop to where every group has data, else a seam (M 45: 15 s group alone) shows
+            ns = [int(g["n"]) for g in hdr_info["groups"]]
+            thr = max(thr, (max(ns) + 1) / max(sum(ns), 1))
         f0 = self.fs.first
         info: dict = {"method": "off"}
         box = (0, 0, W, H)
@@ -696,7 +701,8 @@ class Session:
 
     def _invalidate_after_stack(self) -> None:
         """A new stack makes every later product stale (restore, star removal, auto-finish)."""
-        for f in ("linear.fits", "starless.fits", "stars.fits", "restore_meta.json", "starnet_meta.json", "autofinish.json"):
+        for f in ("linear.fits", "starless.fits", "stars.fits", "restore_meta.json", "starnet_meta.json", "autofinish.json",
+                  "imagemm.fits", "imagemm_meta.json"):
             if os.path.exists(self._p(f)):
                 os.remove(self._p(f))
 
@@ -750,10 +756,107 @@ class Session:
 
     # ------------------------------------------------------------------ post-stack stages (sirilpipe.post)
     def run_denoise(self, stack_params: dict | None = None, progress=None, params: dict | None = None) -> dict:
-        """"Restore": linear post-processing -> linear.fits (gradient, colour calibration, deconvolution, denoise)."""
+        """"Restore": linear post-processing -> linear.fits (gradient, colour calibration, deconvolution, denoise).
+
+        ``deconv_method`` "imagemm" (explicit choice; "auto" = BlurXTerminator when licensed, else Siril RL):
+        the registered frames are restored jointly by ``imagemm_stage`` first (``imagemm.fits``, same grid as
+        stack.fits) and ``post.restore`` then works on that instead of stack.fits - without its own
+        deconvolution, ImageMM being one.  Without torch, or if ImageMM fails, the normal chain runs and
+        restore_meta.json says so (``imagemm``: "unavailable" / "failed")."""
         from sirilpipe import post
         with self.lock:
-            return post.restore(self.dir, self.meta, stack_params or {}, params or {}, self._cb(progress), self.checkpoint)
+            sp = dict(stack_params or {})
+            self._recover_stack_swap()
+            used, info = False, None
+            if sp.get("deconv_method") == "imagemm":
+                used, info = self._imagemm_stage(sp, progress)
+            if used:
+                out = self._restore_from(post, "imagemm.fits", info, sp, params, progress)
+            else:
+                out = post.restore(self.dir, self.meta, sp, params or {}, self._cb(progress), self.checkpoint)
+            if info is not None:
+                out = self._record_imagemm(out, used, info)
+            return out
+
+    def _imagemm_stage(self, sp: dict, progress) -> tuple[bool, dict]:
+        """Run the ImageMM stage.  Returns (imagemm.fits is usable, record for restore_meta.json)."""
+        global _IMAGEMM_WARNED
+        from sirilpipe import imagemm_stage
+        av = imagemm_stage.available()
+        if not av["ok"]:
+            if not _IMAGEMM_WARNED:
+                _IMAGEMM_WARNED = True
+                log.warning("ImageMM is not available (%s): restoring with BlurXTerminator / Siril RL instead", av["reason"])
+            return False, {"state": "unavailable", "reason": av["reason"]}
+        try:
+            return True, {"state": "ran", **imagemm_stage.run(self.dir, self.meta, sp, self._cb(progress), self.checkpoint)}
+        except Cancelled:
+            raise
+        except Exception as e:
+            log.warning("ImageMM failed (%s): restoring with BlurXTerminator / Siril RL instead", str(e).splitlines()[0])
+            return False, {"state": "failed", "reason": str(e).splitlines()[0][:400]}
+
+    def _restore_from(self, post, name: str, info: dict, sp: dict, params, progress) -> dict:
+        """``post.restore`` on ``name`` (a file of the session with stack.fits' header) instead of stack.fits.
+
+        post.py honours ``stack_meta['restore_source']`` (or a ``restore_input`` argument) when it knows it;
+        otherwise stack.fits is swapped for ``name`` while it runs and put back whatever happens.  The
+        deconvolution is off for it: ImageMM is the deconvolution."""
+        import inspect
+        meta = dict(self.meta)
+        r = int(info.get("r") or 1)
+        if r != 1:
+            meta.update(scale=float(meta.get("scale") or 1.0) * r, shape=[int(v) for v in info["shape"]],
+                        pixel_scale=(meta["pixel_scale"] / r) if meta.get("pixel_scale") else None)
+        meta["restore_source"] = name
+        sp2 = {**sp, "deconv_method": "none"}
+        cb = self._cb(progress)
+        kw: dict = {}
+        takes = "restore_input" in inspect.signature(post.restore).parameters
+        if takes:
+            kw["restore_input"] = name
+        try:
+            honours = "restore_source" in inspect.getsource(post)
+        except (TypeError, OSError):
+            honours = False
+        if takes or honours:
+            return post.restore(self.dir, meta, sp2, params or {}, cb, self.checkpoint, **kw)
+        with self._stack_as(name):
+            return post.restore(self.dir, meta, sp2, params or {}, cb, self.checkpoint)
+
+    @contextlib.contextmanager
+    def _stack_as(self, name: str):
+        stack, keep = self._p("stack.fits"), self._p("process", SWAP_NAME)
+        os.replace(stack, keep)
+        try:
+            shutil.copyfile(self._p(name), stack)
+            yield
+        finally:
+            os.replace(keep, stack)
+
+    def _recover_stack_swap(self) -> None:
+        """A crash inside ``_stack_as`` leaves the real stack under ``process/``: put it back."""
+        keep = self._p("process", SWAP_NAME)
+        if os.path.exists(keep):
+            os.replace(keep, self._p("stack.fits"))
+
+    def _record_imagemm(self, out: dict, used: bool, info: dict) -> dict:
+        """What ImageMM did, in restore_meta.json (and the returned meta): ``imagemm`` = ran | unavailable | failed."""
+        path = self._p("restore_meta.json")
+        rm = read_json(path, None)
+        if rm is None:
+            rm = dict(out or {})
+        rec = {"imagemm": info["state"]}
+        if used:
+            rec["imagemm_info"] = {k: v for k, v in info.items() if k not in ("state", "frames", "frames_skipped")}
+            rec["deconvolution_by"] = "imagemm"
+        else:
+            rec["imagemm_reason"] = info.get("reason")
+        rm.update(rec)
+        write_json(path, rm)
+        out = dict(out or {})
+        out.update(rec)
+        return out
 
     def train_star_remover(self, params: dict | None = None, stack_params: dict | None = None, progress=None) -> dict:
         """Star removal -> starless.fits + stars.fits."""

@@ -74,7 +74,7 @@ STACK_DEFAULTS = {
     "pattern_correction": True,
     "denoise_iters": 2000,
     "ai_deconvolution": True,
-    "deconv_method": "imagemm",
+    "deconv_method": "auto",   # auto = BlurXTerminator when licensed, else Siril RL; imagemm = ImageMM (needs torch)
     "imagemm_r": 1,
     "imagemm_sigma": 0.0,
     "imagemm_robust": True,

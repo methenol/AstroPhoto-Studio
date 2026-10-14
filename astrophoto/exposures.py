@@ -49,8 +49,154 @@ import cv2
 import numpy as np
 import sep
 
-from .analysis import poly_eval, poly_terms
 from .frames import cfa_masks, fix_defects, read_frame
+
+
+# ------------------------------------------------ polynomial helpers (from the former analysis/stacking)
+def poly_terms(x, y, deg=3):
+    return np.stack([x ** i * y ** j for i in range(deg + 1) for j in range(deg + 1 - i)], axis=-1)
+
+
+def poly_eval(x, y, deg, *coefs):
+    """poly_terms(x, y, deg) @ c for each coefficient vector c, without building the term
+    matrix (for full-frame coordinate maps it is 10 x the size of the frame): the same terms
+    x^i y^j in the same order, accumulated from precomputed powers."""
+    xp, yp = [np.ones_like(x)], [np.ones_like(y)]
+    for _ in range(deg):
+        xp.append(xp[-1] * x)
+        yp.append(yp[-1] * y)
+    out = [np.zeros_like(x, dtype=np.float64) for _ in coefs]
+    k = 0
+    for i in range(deg + 1):
+        for j in range(deg + 1 - i):
+            t = xp[i] * yp[j]
+            for o, c in zip(out, coefs):
+                o += c[k] * t
+            k += 1
+    return out
+
+
+def _poly_terms(x, y, deg):
+    return [x ** i * y ** j for i in range(deg + 1) for j in range(deg + 1 - i)]
+
+
+def fit_smooth_surface(img: np.ndarray, valid: np.ndarray, deg: int = 2, sub: int = 4,
+                       block: int = 16) -> np.ndarray:
+    """Robust low-order polynomial fit of a (H, W, C) residual image.
+
+    Returns coefficient array (C, n_terms) in normalised [-1, 1] coordinates.
+    """
+    h, w, c = img.shape
+    small = img[::sub, ::sub]
+    vs = valid[::sub, ::sub]
+    hb, wb = small.shape[0] // block, small.shape[1] // block
+    small = small[: hb * block, : wb * block]
+    vs = vs[: hb * block, : wb * block]
+    arr = np.where(vs[..., None], small, np.nan).reshape(hb, block, wb, block, c)
+    arr = arr.transpose(0, 2, 4, 1, 3).reshape(hb, wb, c, block * block)
+    frac = np.isfinite(arr[..., 0, :]).mean(-1)
+    with np.errstate(all="ignore"):
+        med = np.nanmedian(arr, axis=-1)  # (hb, wb, c)
+    yy, xx = np.mgrid[0:hb, 0:wb]
+    cy = ((yy + 0.5) * block * sub) / h * 2 - 1
+    cx = ((xx + 0.5) * block * sub) / w * 2 - 1
+    ok = frac > 0.5
+    coefs = np.zeros((c, len(_poly_terms(0, 0, deg))), np.float64)
+    if ok.sum() < 3 * len(coefs[0]):
+        for ch in range(c):
+            coefs[ch, 0] = np.nanmedian(med[..., ch]) if ok.any() else 0.0
+        return coefs
+    X = np.stack(_poly_terms(cx[ok], cy[ok], deg), axis=1)
+    for ch in range(c):
+        z = med[..., ch][ok]
+        keep = np.isfinite(z)
+        for _ in range(4):
+            beta, *_ = np.linalg.lstsq(X[keep], z[keep], rcond=None)
+            r = z - X @ beta
+            s = 1.4826 * np.median(np.abs(r[keep])) + 1e-9
+            keep = np.abs(r) < 3 * s
+        coefs[ch] = beta
+    return coefs
+
+
+def eval_surface(coefs: np.ndarray, h: int, w: int, deg: int = 2) -> np.ndarray:
+    """Evaluate polynomial coefficients on a full (h, w) grid (via low-res + resize)."""
+    lh, lw = max(8, h // 16), max(8, w // 16)
+    y = (np.arange(lh) + 0.5) / lh * 2 - 1
+    x = (np.arange(lw) + 0.5) / lw * 2 - 1
+    xx, yy = np.meshgrid(x, y)
+    terms = np.stack(_poly_terms(xx, yy, deg), axis=-1)  # lh, lw, T
+    low = terms @ coefs.T  # lh, lw, C
+    return cv2.resize(low.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC).reshape(h, w, -1)
+
+
+def poly_background(img: np.ndarray, degree: int = 2, grid: int = 24) -> tuple[np.ndarray, dict]:
+    """Smooth sky background of a linear (H, W, 3) image: a sigma-clipped lower-envelope polynomial fit
+    over star-free tiles (iteratively rejecting tiles above the model, i.e. nebulosity), dropping to a
+    plane when little of the field is sky.  Returns (model, info)."""
+    wl = np.array([0.2126, 0.7152, 0.0722])
+    h, w, _ = img.shape
+    L = (img @ wl).astype(np.float32)
+    small = L - cv2.medianBlur(np.ascontiguousarray(L, np.float32), 5)
+    sm_ = small[::4, ::4]
+    sm_ = sm_[np.isfinite(sm_)]
+    s_ = float(1.4826 * np.median(np.abs(sm_ - np.median(sm_)))) if sm_.size else 0.0
+    smask = cv2.dilate((small > 4.0 * s_).astype(np.uint8),
+                       cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))).astype(bool)
+    nx = int(grid)
+    ny = max(4, int(round(grid * h / w)))
+    ys = np.linspace(0, h, ny + 1).astype(int)
+    xs = np.linspace(0, w, nx + 1).astype(int)
+    pts, vals = [], []
+    for i in range(ny):
+        for j in range(nx):
+            tile = img[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            tm = ~smask[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            if tm.mean() < 0.4:
+                continue
+            px = tile[tm]
+            med = np.median(px, axis=0)
+            sd = 1.4826 * np.median(np.abs(px - med), axis=0) + 1e-9
+            ok = (np.abs(px - med) < 2.5 * sd).all(1)
+            if ok.sum() > 20:
+                med = np.median(px[ok], axis=0)
+            pts.append(((ys[i] + ys[i + 1]) / 2 / h * 2 - 1, (xs[j] + xs[j + 1]) / 2 / w * 2 - 1))
+            vals.append(med)
+    pts = np.array(pts)
+    vals = np.array(vals)
+    if len(vals) < 6:
+        return np.zeros_like(img, dtype=np.float32), {"samples": int(len(vals)), "total": int(ny * nx),
+                                                      "method": "none", "degree": 0,
+                                                      "note": "too few star-free sky tiles: no gradient removed"}
+    lum = vals @ wl
+    sel = lum <= np.percentile(lum, 75.0)
+
+    def terms(p, deg):
+        return np.stack([p[:, 1] ** a * p[:, 0] ** b for a in range(deg + 1) for b in range(deg + 1 - a)], 1)
+
+    def fit(sel_, deg):
+        beta, *_ = np.linalg.lstsq(terms(pts, deg)[sel_], vals[sel_], rcond=None)
+        return lambda p: terms(p, deg) @ beta
+
+    deg = int(degree)
+    for _ in range(8):
+        model = fit(sel, deg)
+        r = lum - model(pts) @ wl
+        rs = r[sel][np.isfinite(r[sel])]
+        s = float(1.4826 * np.median(np.abs(rs - np.median(rs)))) + 1e-9 if rs.size else 1e-9
+        new_sel = (r < 1.5 * s) & (r > -4.0 * s)
+        if new_sel.sum() < 12 or np.array_equal(new_sel, sel):
+            break
+        sel = new_sel
+    if sel.mean() < 0.35 and deg > 1:      # nebula-dominated field: protect large-scale structure
+        deg = 1
+        model = fit(sel, deg)
+    info = {"samples": int(sel.sum()), "total": int(len(sel)), "method": "poly", "degree": deg}
+    lh, lw = max(8, h // 32), max(8, w // 32)
+    gy, gx = np.mgrid[0:lh, 0:lw]
+    grid_pts = np.stack([(gy + 0.5) / lh * 2 - 1, (gx + 0.5) / lw * 2 - 1], -1).reshape(-1, 2)
+    low = model(grid_pts).reshape(lh, lw, 3).astype(np.float32)
+    return cv2.resize(low, (w, h), interpolation=cv2.INTER_CUBIC), info
 
 
 # ----------------------------------------------------------------- demosaic
@@ -1405,7 +1551,6 @@ class ExposureSet:
         return y, valid, hard
 
     def prepare_one(self, k: int) -> dict:
-        from .stacking import eval_surface, fit_smooth_surface
         info, fr = self.items[k]
         fwhm = float(fr["fwhm"]) if np.isfinite(fr["fwhm"]) else self.fwhm_max
         refine = None
@@ -1445,10 +1590,9 @@ class ExposureSet:
 
     # ------------------------------------------------------------- the pass
     def prepare(self, progress=None, cancel=None):
-        from .postprocess import background_model
         say = (lambda msg: progress(0, len(self.items), msg)) if progress else (lambda msg: None)
         say("ImageMM: reference sky model and star catalogue")
-        self.sky_ref, self.sky_info = background_model(self.ref, "poly", 2)
+        self.sky_ref, self.sky_info = poly_background(self.ref, 2)
         ref_bs = self.ref - self.sky_ref
         self.fwhm_ref = self.fwhm_med
         self.cat = star_catalog(ref_bs, self.sat, self.fwhm_ref)
@@ -1670,12 +1814,14 @@ class ExposureSet:
         var(y/T) = (c0 + c1 L)/T^2 with L = T * l the expected exposure level (ADU), l the
         reference level plus the exposure's sky deviation, so
         var(diff) = c0 (1/Ta^2 + 1/Tb^2) + c1 (la/Ta + lb/Tb)."""
-        ok = a["_valid"] & b["_valid"] & ~self.smask
+        ok = a["_valid"] & b["_valid"]                    # (H, W), or (H, W, 3) when the validity differs per channel
+        ok = ok & (~self.smask[..., None] if ok.ndim == 3 else ~self.smask)
         for c in range(3):
+            okc = ok[..., c] if ok.ndim == 3 else ok
             Ta, Tb = a["T"][c], b["T"][c]
-            la = (self.ref[..., c] + a["_surf"][..., c])[ok]
-            lb = (self.ref[..., c] + b["_surf"][..., c])[ok]
-            dv = ((a["_y"][..., c][ok] / Ta - a["_surf"][..., c][ok]) - (b["_y"][..., c][ok] / Tb - b["_surf"][..., c][ok]))
+            la = (self.ref[..., c] + a["_surf"][..., c])[okc]
+            lb = (self.ref[..., c] + b["_surf"][..., c])[okc]
+            dv = ((a["_y"][..., c][okc] / Ta - a["_surf"][..., c][okc]) - (b["_y"][..., c][okc] / Tb - b["_surf"][..., c][okc]))
             lv = 0.5 * (la + lb)
             edges = np.unique(np.quantile(lv, np.linspace(0, 1, nbins + 1)))
             # bin j holds edges[j] <= level < edges[j + 1] (the last bin also its upper edge): with the
@@ -2012,7 +2158,6 @@ class ExposureSet:
     def window(self, k: int, y0: int, y1: int, x0: int, x1: int, censored: bool = False):
         """y(t), v(t), m(t) of exposure k on the reference-grid window (float32, HxWx3); with ``censored``
         also c(t), the pixels whose resampling used a saturated sample."""
-        from .stacking import eval_surface
         info, fr = self.items[k]
         p = self.params[k]
         raw, sat, rep = self._raw(info)

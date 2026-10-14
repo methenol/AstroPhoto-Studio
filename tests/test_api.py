@@ -314,7 +314,7 @@ def test_profiles(env):
     assert p["effective"] == {"deconv_method": "network", "ai_deconvolution": True, "imagemm_n2n": True,
                               "star_remover": True, "scale": 2.0}
     d = r["profiles"]["default"]["effective"]
-    assert d == {"deconv_method": "imagemm", "ai_deconvolution": True, "imagemm_n2n": True, "star_remover": True, "scale": 1.0}
+    assert d == {"deconv_method": "auto", "ai_deconvolution": True, "imagemm_n2n": True, "star_remover": True, "scale": 1.0}
     assert r["profiles"]["n2n-rl"]["effective"]["ai_deconvolution"] is False
 
 
@@ -580,7 +580,7 @@ def test_ui_pages(env):
 def test_system(env):
     s = env.client.get("/api/system").json()
     assert s["backend"] == "siril" and s["version"] and "defaults" in s and s["param_spec"]
-    assert s["stack_defaults"]["deconv_method"] == "imagemm" and s["stack_defaults"]["sigma_low"] == 4.0
+    assert s["stack_defaults"]["deconv_method"] == "auto" and s["stack_defaults"]["sigma_low"] == 4.0
     assert s["tools"]["rcastro"]["ok"] is True and "Balanced" in s["presets"] and s["images_root"] == env.images
     assert {"group", "key", "label", "type"} <= set(s["param_spec"][0])
 

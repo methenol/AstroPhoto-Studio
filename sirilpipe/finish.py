@@ -36,6 +36,17 @@ TARGET_RANGE = (0.01, 0.99)
 # palettes the UI always offered); the HOO mapping is Hubble_Palette_from_Dual-Band_OSC.py's
 # ``rgbcomp HA OIII OIII`` (workflows.md A.9).
 PALETTES = ("natural", "hoo", "foraxx", "hoo_warm")
+# Dual-band stars take the starless stretch's full asinh factor (1.0): halving it (measured on M 42, Duo-Band) left every
+# star below ~3 sigma invisible, the "star field is gone" failure; the stars are meant to look as they do in the
+# unseparated stretch (see stretch_stars).
+GENTLE_DUAL_FACTOR = 1.0
+# Power applied to the asinh-stretched star layer (not an API setting: DEFAULTS keeps the contract keys; ``params.star_contrast`` overrides).
+# asinh alone squeezes a bright star's inner wing into a flat disc (M 31, M 45); 1.35 gives the bright end back and keeps colour.
+STAR_CONTRAST = 1.2
+HALO_KERNEL = 4.0            # opening disc diameter = this x the stars' FWHM (suppress_halos)
+# Black point of the linear star layer before its asinh stretch: 0.001-0.003 (workflows.md 7.5, Under South West Skies); it keeps the
+# faint remainder of the PSF wings out of the stars so they do not become a noisy glow.
+STAR_BP_MIN = 4e-4
 # "Improved" OIII of Hubble_Palette_from_Dual-Band_OSC.py: (G + B - 0.3 R) / 2 -> k = 0.3
 MAX_HA_LEAK = 0.3
 
@@ -244,26 +255,18 @@ def extract_ha_oiii(lin: np.ndarray, unmix: bool = True) -> tuple[np.ndarray, np
     ``O' = median(H) + (O - median(O)) mad(H) / mad(O)`` (workflows.md section 8).  (The OIII *boost* is applied
     after the stretch: every channel is stretched to the same sky median, which cancels any linear gain.)
 
-    The leakage k is measured from the data (the lower envelope of OIII/Ha over Ha-bright pixels,
-    capped at 0.3 = the "Improved" formula's constant) rather than fixed."""
+    With ``unmix`` the Ha that leaks into the G and B pixels is removed with the fixed constant of the "Improved" formula
+    of Hubble_Palette_from_Dual-Band_OSC.py, ``OIII = (G + B - 0.3 R) / 2`` (MAX_HA_LEAK; the sky level is kept).  A leak
+    measured from the data (lower envelope of OIII / Ha, capped at 0.3 of the *mean* G, B = twice the formula) took the blue out
+    of the whole M 42 core, so it is not used."""
     ha = lin[0].astype(np.float32)
     oiii = 0.5 * (lin[1] + lin[2])
     info: dict = {"unmix": bool(unmix)}
     hb, ob = float(np.median(sample(ha))), float(np.median(sample(oiii)))
     k = 0.0
     if unmix:
-        step = max(1, int(round(max(ha.shape) / 1500)))
-        hsub = np.ascontiguousarray(ha[::step, ::step])
-        hblur = cv2.GaussianBlur(hsub, (0, 0), 2.0)
-        hs = hblur - hb
-        os_ = cv2.GaussianBlur(np.ascontiguousarray(oiii[::step, ::step]), (0, 0), 2.0) - ob
-        noise = mad_sigma(hsub - hblur)                  # pixel noise of Ha (high-pass residual)
-        sel = hs > max(8 * noise, float(np.percentile(hs, 80)))
-        if sel.sum() > 500:
-            ratio = os_[sel] / hs[sel]
-            k = float(np.clip(np.percentile(ratio, 5), 0.0, MAX_HA_LEAK))
-        if k > 0:
-            oiii = np.maximum(oiii - k * (ha - hb), ob + 0.3 * (oiii - ob))
+        k = 0.5 * MAX_HA_LEAK
+        oiii = oiii - k * (ha - hb)
     info["ha_leak_k"] = round(k, 4)
     ho = sample(ha)
     oo = sample(oiii)
@@ -309,6 +312,104 @@ def synthetic_luminance(rgb: np.ndarray, amount: float) -> np.ndarray:
     return np.clip(out, 0, 1)
 
 
+# --------------------------------------------------------------------------- star wings left by StarNet
+
+WING_MIN_PEAK = 0.1          # only stars at least this bright (linear, 0..1) leave a wing above the noise: ~ 1e-3 at 30 px
+WING_MAX_STARS = 60
+WING_CORE = 0.05             # star-layer level (linear) that marks a core to keep out of the rings
+WING_RING = 6                # annulus width (px) of the radial profile
+WING_TEXTURE = 5e-4          # quadrant medians of the sky differ by this much from large-scale structure alone
+WING_SYMMETRY = 0.5          # quadrant medians may differ by this fraction of the wing (or 3e-4, the sky texture) before the profile stops
+
+
+def _ring_profile(win: np.ndarray, rr: np.ndarray, quad: np.ndarray, ok: np.ndarray, sky0: np.ndarray, rmax: int):
+    """Azimuthal median profile of the layer ``win`` (3, h, w) around the window centre, in rings of ``WING_RING`` px, followed
+    outward while it falls and stays circularly symmetric.  Returns ``(ring_start_radii, profile (3, n))``."""
+    prof: list[np.ndarray] = []
+    used: list[int] = []
+    for r0 in range(10, rmax, WING_RING):
+        sel = ok & (rr >= r0) & (rr < r0 + WING_RING)
+        if sel.sum() < 200:
+            if prof:
+                break
+            continue                                       # the core is still masked: start further out
+        lvl = np.array([np.median(win[c][sel]) for c in range(3)], np.float32)
+        spread = max(float(np.ptp([np.median(win[c][sel & (quad == k)]) for k in range(4)])) for c in range(3))
+        wing = float((lvl - sky0).max())
+        if prof and (lvl.mean() > prof[-1].mean() + 4e-5 or spread > max(WING_SYMMETRY * wing, WING_TEXTURE)):
+            break
+        prof.append(lvl)
+        used.append(r0)
+        if wing < 3e-5:                                       # the profile has reached the sky
+            break
+    if len(prof) < 4:
+        return [], np.zeros((3, 0), np.float32)
+    raw = np.stack(prof, 1)
+    p = np.minimum.accumulate(raw, axis=1)                                  # monotone falling outward
+    ref = np.minimum(np.median(raw[:, -5:], axis=1), sky0 + 3e-5)            # the sky the profile ends in (not above the image sky)
+    model = np.clip(p - ref[:, None], 0, None)
+    # a profile that stopped on an asymmetry still has a wing left at its last ring: continue it as the power law of its last
+    # rings (log-log slope, wings fall at least as r^-1) down to nothing, so no plateau is left inside the disc
+    r_end = used[-1] + WING_RING / 2
+    extra_r = np.arange(used[-1] + WING_RING, rmax, WING_RING)
+    if len(extra_r) and model[:, -1].max() > 3e-5:
+        rc = np.array(used, np.float32) + WING_RING / 2
+        k = max(3, len(used) // 4)
+        tail = []
+        for c in range(3):
+            y = np.maximum(model[c, -k:], 1e-7)
+            a = float(np.clip(-np.polyfit(np.log(rc[-k:]), np.log(y), 1)[0], 1.0, 4.0))
+            tail.append(model[c, -1] * ((extra_r + WING_RING / 2) / r_end) ** (-a))
+        used = used + [int(r) for r in extra_r]
+        model = np.concatenate([model, np.stack(tail)], axis=1)
+    return used, model
+
+
+def subtract_star_wings(lin: np.ndarray, starless: np.ndarray, stars: np.ndarray) -> tuple[np.ndarray, dict, np.ndarray]:
+    """Move the scattered-light wings of bright stars from the starless layer to the star layer.
+
+    StarNet2 removes the core and the first rings of a star but leaves its wing (measured on M 42: iota Ori keeps a
+    smooth glow of 1.6e-3 at 30 px falling to 2e-4 at 140 px in the starless layer, which the stretch then blows up into a
+    cyan disc); StarXTerminator, trained on such wings, takes them out.  The wing is the star's own light, so the photons
+    are *reassigned*, never invented: for each bright star the azimuthal median profile of the starless layer is measured
+    in rings outward and followed while it is (a) falling and (b) circularly symmetric (the four quadrant medians agree
+    to ``WING_SYMMETRY`` of the wing: a nebula, a neighbouring star or a gradient breaks the symmetry and ends the
+    profile there); the profile relative to the sky it ends in is removed from the starless layer as a smooth model (the noise
+    of the layer is untouched) and so lands in the star layer (``lin - starless``).  Growth-curve / PSF-wing modelling as in
+    stellar photometry.  (A flux-scaled template shared by all stars was tried and rejected: the wing's colour differs from
+    star to star, which carved a dark hole around the neighbours of iota Ori.)  Returns ``(starless, info, stars)``."""
+    h, w = starless.shape[1:]
+    lum = cv2.GaussianBlur(np.ascontiguousarray(stars.max(0)), (0, 0), 1.0)
+    dil = cv2.dilate(lum, np.ones((15, 15), np.uint8))
+    ys, xs = np.nonzero((lum == dil) & (lum > WING_MIN_PEAK))
+    order = np.argsort(-lum[ys, xs])[:WING_MAX_STARS]
+    ys, xs = ys[order], xs[order]
+    sky0 = np.array([float(np.median(sample(starless[c]))) for c in range(3)], np.float32)
+    star_mask = cv2.dilate((lum > WING_CORE).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0   # other stars' cores are not part of the sky ring
+    out = starless.copy()
+    moved, used_n, radii = 0.0, 0, []
+    for cy, cx in zip(ys, xs):
+        rmax = int(min(450, cy, cx, h - 1 - cy, w - 1 - cx))
+        if rmax < 40:
+            continue
+        y0, y1, x0, x1 = cy - rmax, cy + rmax + 1, cx - rmax, cx + rmax + 1
+        yy, xx = np.mgrid[y0 - cy:y1 - cy, x0 - cx:x1 - cx]
+        rr = np.hypot(yy, xx)
+        quad = (yy >= 0).astype(int) * 2 + (xx >= 0).astype(int)
+        win = out[:, y0:y1, x0:x1]
+        used, model = _ring_profile(win, rr, quad, ~star_mask[y0:y1, x0:x1], sky0, rmax)
+        if not used or model.max() <= 1e-5:
+            continue
+        rc = np.array(used, np.float32) + WING_RING / 2
+        full = np.stack([np.interp(rr, rc, model[c], left=model[c, 0], right=0.0) for c in range(3)]).astype(np.float32)
+        sub = np.minimum(full, np.maximum(win, 0))
+        win -= sub
+        moved += float(sub.sum())
+        used_n += 1
+        radii.append(int(used[-1]))
+    return out, {"stars": used_n, "flux_moved": round(moved, 3), "radius_px": radii[:12]}, np.maximum(lin - out, 0).astype(np.float32)
+
+
 # --------------------------------------------------------------------------- stars
 
 def screen(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -335,8 +436,75 @@ def star_noise_floor(stars: np.ndarray) -> float:
     return float(np.median(pos) / 0.6745) if pos.size > 200 else 0.0
 
 
+def star_color_balance(stars: np.ndarray, noise_floor: float = 0.0) -> tuple[np.ndarray, dict]:
+    """Channel gains for the LINEAR star layer of a dual-band image so the average star is neutral.
+
+    A Duo-Band / LP filter passes only Ha (R) and OIII (G, B): SPCC's narrowband mode calibrates the lines, not the stars'
+    broadband colour, and measured on M 42 every star came out cyan (flux R : G : B = 0.5 : 1 : 0.9).  The same
+    remedy as PCC with the average star colour (Siril ``pcc`` / SPCC with a G2V white reference): the median
+    colour of the unsaturated stars (each measured in a 7 x 7 aperture on the star layer, which is already
+    sky-free) is taken as white; gains are G = 1 and applied to the star layer only, never to the nebula.
+    Stars keep their relative colours (hot stars stay bluer than the median)."""
+    lum = cv2.GaussianBlur(np.ascontiguousarray(stars.max(0)), (0, 0), 1.0)
+    dil = cv2.dilate(lum, np.ones((9, 9), np.uint8))
+    lo = max(6.0 * noise_floor, 3e-3)
+    ys, xs = np.nonzero((lum == dil) & (lum > lo) & (lum < 0.5))
+    if len(ys) < 12:
+        return stars, {"gains": [1.0, 1.0, 1.0], "stars": int(len(ys))}
+    h, w = lum.shape
+    keep = (ys > 3) & (xs > 3) & (ys < h - 4) & (xs < w - 4)
+    ys, xs = ys[keep], xs[keep]
+    ap = np.stack([np.array([stars[c, y - 3:y + 4, x - 3:x + 4].sum() for y, x in zip(ys, xs)]) for c in range(3)], 1)
+    ok = ap[:, 1] > 0
+    r = np.median(ap[ok, 0] / ap[ok, 1]) if ok.sum() >= 12 else 1.0
+    b = np.median(ap[ok, 2] / ap[ok, 1]) if ok.sum() >= 12 else 1.0
+    gains = np.array([1.0 / max(r, 0.05), 1.0, 1.0 / max(b, 0.05)], np.float32)
+    gains = np.clip(gains, 0.25, 4.0)
+    out = stars * gains[:, None, None]
+    return out.astype(np.float32), {"gains": [round(float(g), 3) for g in gains], "stars": int(ok.sum())}
+
+
+def clipped_core_weight(stars: np.ndarray) -> np.ndarray | None:
+    """Weight (H, W) in 0..1 of the pixels where every channel of the linear star layer sits at its own top: a saturated core.
+    After colour calibration each channel clips at a different level (SPCC scaled G by 0.52 on the M 42 stack, so the clip is
+    R 0.92 / G 0.53 / B 0.89), and a core that clips at those levels has no colour information left: it came out magenta.
+    The levels are measured (channel maxima, accepted only when at least 3 pixels sit within 10 % of them: a real pile-up),
+    the weight is the smooth ramp 0.75 -> 0.95 of the lowest channel / level.  None when no channel clips."""
+    top = [float(stars[c].max()) for c in range(3)]
+    if min(top) <= 0.05:
+        return None
+    for c in range(3):
+        if int((stars[c] >= 0.9 * top[c]).sum()) < 3:
+            return None
+    frac = np.min(np.stack([stars[c] / top[c] for c in range(3)]), axis=0)
+    wgt = np.clip((frac - 0.75) / 0.2, 0.0, 1.0)
+    return wgt if wgt.max() > 0 else None
+
+
+def suppress_halos(stars: np.ndarray, fwhm_px: float, amount: float) -> tuple[np.ndarray, float]:
+    """Remove ``amount`` (0..1) of the smooth wing baseline of every star in the LINEAR star layer.
+
+    A star's scattered-light wing is the slowly varying part of the layer; the star itself is the narrow peak on top.  The
+    baseline is the morphological opening of the luminance with a disc of ``HALO_KERNEL x FWHM`` (it removes everything
+    narrower than the disc: a white top-hat is ``x - opening``), smoothed.  Cutting it at a constant black point instead left
+    every bright star inside a flat disc with a hard rim after the asinh stretch (measured on M 31 / M 45 / M 42); taking
+    the baseline out *proportionally* keeps the rim soft and leaves the faint stars (narrower than the disc) alone.  The
+    light is only left out of the display, never moved or invented.  Returns the layer and the disc diameter in px."""
+    amount = float(np.clip(amount, 0.0, 1.0))
+    k = int(max(9, round(HALO_KERNEL * max(float(fwhm_px), 1.5))))
+    k += 1 - k % 2
+    if amount <= 0:
+        return stars, k
+    lum = np.ascontiguousarray(stars.max(0))
+    base = cv2.morphologyEx(lum, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    base = np.minimum(cv2.GaussianBlur(base, (0, 0), k / 4.0), lum)
+    frac = np.clip(amount * base / np.maximum(lum, 1e-9), 0.0, 1.0)
+    return (stars * (1.0 - frac)[None]).astype(np.float32), k
+
+
 def stretch_stars(stars: np.ndarray, *, dual_band: bool, color_preservation: float = 0.5,
-                  halo_suppress: float = 0.6, factor: float | None = None) -> tuple[np.ndarray, dict]:
+                  halo_suppress: float = 0.6, factor: float | None = None, fwhm_px: float = 3.0,
+                  contrast: float = STAR_CONTRAST) -> tuple[np.ndarray, dict]:
     """Stretch a linear star layer with asinh: ``asinh(f x) / asinh(f)`` (workflows.md 7.5; black point 0.001-0.003).
 
     The factor ``f`` is the one the starless layer's stretch uses (its asinh member, ``Curve.beta``): stars are then as
@@ -344,11 +512,13 @@ def stretch_stars(stars: np.ndarray, *, dual_band: bool, color_preservation: flo
     every faint star invisible next to a nebula stretched by f ~ 2000 (measured on M 31: f = 100 lost 90 % of the stars,
     f = 3000 reproduces the unseparated look).  Dual-band data take half of it ("gentler": narrowband stars
     are not meant to compete with the nebula).  Without a reference the 99th percentile of the star pixels is
-    sent to 0.5 (0.4 dual-band).  The black point is 2.5 sigma of the layer's own noise (at least 0.0005), so there is
+    sent to 0.5 (0.4 dual-band).  The black point is 2.5 sigma of the layer's own noise (at least STAR_BP_MIN = 0.001), so there is
     no grey fuzz; ``halo_suppress`` then raises the black point of the stretched layer by 0.12 x amount (the "raise
     black point on the star layer" recipe), tightening the stars."""
+    stars_full = stars
+    stars, halo_k = suppress_halos(stars, fwhm_px, halo_suppress)
     sig = star_noise_floor(stars)
-    bp = float(max(2.5 * sig, 5e-4))
+    bp = float(max(2.5 * sig, STAR_BP_MIN))
     lum = stars.max(0)
     ls = sample(lum, valid_only=False)
     ls = ls[ls > bp] - bp
@@ -359,12 +529,12 @@ def stretch_stars(stars: np.ndarray, *, dual_band: bool, color_preservation: flo
         how = "percentile"
         factor = _solve_beta("asinh", min(max(ref, 1e-4), 0.999), q)
     else:
-        factor = factor * (0.5 if dual_band else 1.0)
+        factor = factor * (GENTLE_DUAL_FACTOR if dual_band else 1.0)
     factor = float(np.clip(factor, 3.0, 6000.0))
     f = np.float32(factor)
     norm = np.float32(np.arcsinh(f))
     cp = float(np.clip(color_preservation, 0, 1))
-    h = 0.12 * float(np.clip(halo_suppress, 0, 1))
+    h = 0.0
     out = np.empty_like(stars, dtype=np.float32)
     for r0, r1 in _bands(stars.shape[1]):
         x = np.clip(stars[:, r0:r1] - np.float32(bp), 0, None)
@@ -377,10 +547,30 @@ def stretch_stars(stars: np.ndarray, *, dual_band: bool, color_preservation: flo
         else:
             res = per
         out[:, r0:r1] = np.clip(res, 0, 1)
+    if abs(contrast - 1.0) > 1e-3:
+        out = np.power(out, np.float32(max(contrast, 0.3)))   # asinh alone squeezes a bright star's wing into a flat disc; a power > 1 gives the bright end back
     if h > 0:
         out = np.clip((out - h) / (1 - h), 0, 1)
+    wc = clipped_core_weight(stars_full)
+    n_core = 0
+    if wc is not None:                                    # saturated cores go to white (their brightness is kept)
+        n_core = int((wc > 0.5).sum())
+        grey = out.mean(0)
+        out = (out * (1.0 - wc[None]) + grey[None] * wc[None]).astype(np.float32)
     return out, {"asinh_factor": round(factor, 1), "factor_from": how, "black_point": round(bp, 6),
-                 "noise_sigma": round(sig, 6), "ref_p99": round(ref, 5), "target_q": q, "halo_floor": round(h, 4)}
+                 "noise_sigma": round(sig, 6), "ref_p99": round(ref, 5), "target_q": q, "halo_kernel_px": halo_k, "contrast": contrast, "clipped_core_px": n_core}
+
+
+def reduce_stars(st: np.ndarray, reduction: float, intensity: float = 1.0) -> tuple[np.ndarray, float]:
+    """Star reduction of a STRETCHED star layer: ``reduction`` 0..1 (1 = no stars).  Reducing means smaller stars, not
+    dimmer ones everywhere: the layer's black point is raised by ``0.12 x reduction`` (the footprints shrink, the
+    cores stay: "raise the black point on the star layer to shrink the stars", Under South West Skies, workflows.md 7.5)
+    and the layer fades out as ``1 - reduction^3`` so that 1.0 really is starless.  ``intensity`` multiplies last."""
+    r = float(np.clip(reduction, 0.0, 1.0))
+    bp = 0.12 * r
+    gain = (1.0 - r ** 3) * float(intensity)
+    out = np.clip((st - np.float32(bp)) / np.float32(1.0 - bp), 0, 1) * np.float32(gain)
+    return np.clip(out, 0, 1).astype(np.float32), gain
 
 
 def scale_saturation(rgb: np.ndarray, factor: float) -> np.ndarray:
@@ -582,9 +772,9 @@ def is_narrowband(filter_name: str | None) -> bool:
 
 
 def resolve_palette(palette: str, dual_band: bool) -> str:
-    """``auto`` = natural for broadband, the Foraxx-type palette for dual-band filters (the UI's long-standing choice)."""
+    """``auto`` = natural for broadband, HOO for dual-band filters (the old DEFAULTS semantics); foraxx / hoo_warm only when asked."""
     if palette in (None, "", "auto"):
-        return "foraxx" if dual_band else "natural"
+        return "hoo" if dual_band else "natural"
     return palette if palette in PALETTES else "natural"
 
 
@@ -599,10 +789,17 @@ def adapted_target(stretch: float, coverage: float, adapt: bool) -> float:
 
 
 def final_color_numpy(img: np.ndarray, p: dict, dual_band: bool) -> np.ndarray:
-    """satu / rmgreen / black point + midtones in numpy (the preview path and the fallback of the Siril step)."""
+    """satu / rmgreen in numpy (the preview path and the fallback of the Siril step).  Applied to the starless layer only:
+    the stars have their own colour control (``star_saturation``), and a saturation of 2 on a teal star turns it
+    into a green dot (seen on M 42 when the saturation was applied after the screen blend)."""
     img = satu_np(img, float(p["saturation"]) - 1.0)
     if not dual_band and float(p["scnr"]) > 0:                # no SCNR on dual-band: the green IS the OIII
         img = rmgreen_np(img, float(p["scnr"]))
+    return np.clip(img, 0, 1)
+
+
+def levels_numpy(img: np.ndarray, p: dict) -> np.ndarray:
+    """Black point + midtones on the finished picture (Siril ``mtf low mid 1``)."""
     bp, mid = float(p["black_point"]), brightness_to_mid(float(p["brightness"]))
     if bp > 0 or abs(mid - 0.5) > 1e-4:
         img = mtf_np(img, bp, mid, 1.0)
@@ -614,9 +811,9 @@ def render_layers(base: np.ndarray, stars: np.ndarray | None, p: dict, *, dual_b
     """Linear (starless or complete) RGB ``base`` + optional linear star layer -> display RGB (3, H, W) in [0,1].
 
     The order is the one of DESIGN section 4 "Export": palette -> statistical stretch of the starless layer
-    -> [GHS contrast pass] -> [second denoise] -> chroma smoothing, sharpening, local contrast -> star layer
-    (asinh stretch, reduction, intensity, saturation) -> screen recombination -> saturation / SCNR / black
-    point / midtones.  ``hooks`` replace steps by the Siril / RC-Astro versions in a real export:
+    -> [GHS contrast pass] -> [second denoise] -> chroma smoothing, sharpening, local contrast -> saturation / SCNR
+    (starless layer only) -> star layer (asinh stretch, reduction, intensity, saturation) -> screen recombination ->
+    black point / midtones.  ``hooks`` replace steps by the Siril / RC-Astro versions in a real export:
     ``contrast(img, target, p)``, ``denoise(img, p)``, ``final_color(img, p, dual_band)``; each returns the
     image or None to keep the numpy result.  ``tick(name)`` reports step starts."""
     hooks = hooks or {}
@@ -670,22 +867,26 @@ def render_layers(base: np.ndarray, stars: np.ndarray | None, p: dict, *, dual_b
     main = chroma_smooth(main, float(p.get("chroma_denoise", 0.0)))
     main = sharpen(main, float(p.get("sharpen", 0.0)))
     main = local_contrast(main, float(p.get("local_contrast", 0.0)))
+    step("Colour")
+    fc = hooks.get("final_color")
+    res = fc(main, p, dual_band) if fc else None
+    main = res if res is not None else final_color_numpy(main, p, dual_band)
     out = main
     if stars is not None and float(p.get("star_reduction", 0.0)) < 1.0:
         step("Stars")
         if stars_stretched:
             st, stinfo = stars, {"stretched_by": "unscreen"}
         else:
+            if dual_band and p.get("star_balance", True):
+                stars, binfo = star_color_balance(stars, star_noise_floor(stars))
+                info["star_balance"] = binfo
             st, stinfo = stretch_stars(stars, dual_band=dual_band, color_preservation=float(p.get("star_color_preservation", 0.5)),
-                                       halo_suppress=float(p.get("halo_suppress", 0.6)), factor=star_factor)
+                                       halo_suppress=float(p.get("halo_suppress", 0.6)), factor=star_factor,
+                                       fwhm_px=float(p.get("_fwhm_px") or 3.0), contrast=float(p.get("star_contrast", STAR_CONTRAST)))
         st = scale_saturation(st, float(p.get("star_saturation", 1.0)))
-        gain = float(np.clip(1.0 - float(p.get("star_reduction", 0.0)), 0, 1)) * float(p.get("star_intensity", 1.0))
-        st = np.clip(st * np.float32(gain), 0, 1)
+        st, gain = reduce_stars(st, float(p.get("star_reduction", 0.0)), float(p.get("star_intensity", 1.0)))
         out = screen(main, st)
         info["stars"] = {**stinfo, "gain": round(gain, 4)}
         del st
-    step("Colour")
-    fc = hooks.get("final_color")
-    res = fc(out, p, dual_band) if fc else None
-    out = res if res is not None else final_color_numpy(out, p, dual_band)
+    out = levels_numpy(out, p)
     return np.clip(out, 0, 1).astype(np.float32), info

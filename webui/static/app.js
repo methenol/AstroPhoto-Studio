@@ -310,7 +310,7 @@ function stackParams() {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
     local_norm: g("local_norm").checked,
-    deconv_method: on ? "imagemm" : "none", ai_deconvolution: on,
+    deconv_method: g("deconv_method").value, ai_deconvolution: on,
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
   };
@@ -416,7 +416,7 @@ async function fetchImage(which) {
   const size = $("#previewSize").value;
   const r = await fetch("/api/preview", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ folder: S.folder, params: S.params, which, size: size === "full" ? null : parseInt(size) }) });
-  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail; } catch { } throw new Error(m); }
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail; } catch { } const e = new Error(m); e.status = r.status; throw e; }
   return { url: URL.createObjectURL(await r.blob()), t: r.headers.get("X-Render-Time"), w: +r.headers.get("X-Width"), h: +r.headers.get("X-Height") };
 }
 
@@ -437,7 +437,15 @@ async function requestPreview() {
     $("#imgBefore").style.width = S.imgW + "px"; $("#imgBefore").style.height = S.imgH + "px";
     if (first || sizeChanged) fitView();
     layoutSplit();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    // 409: a job holds the pipeline (one at a time) - say so in the pane instead of a toast that
+    // disappears, and try again when the job is likely done
+    if (e.status === 409 && !$("#imgAfter").src) {
+      $("#placeholder .ph-inner p").innerHTML = "A pipeline job is running.<br>The preview appears when it finishes.";
+      showPlaceholder(true);
+      schedulePreview(8000);
+    } else toast(e.message, true);
+  }
   finally { if (seq === S.previewSeq) $("#spinner").hidden = true; }
 }
 

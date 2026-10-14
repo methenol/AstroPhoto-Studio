@@ -2,14 +2,11 @@
 numpy>=2.0
 scipy>=1.13
 astropy>=6.0
-scikit-image>=0.24
 opencv-python-headless>=4.10
 pillow>=10.0
 tifffile>=2024.1
-# legacy astrophoto/ package (removed with it): sep, astroalign, scikit-learn
+# astrophoto/ (ImageMM stage only): sep
 sep>=1.4
-astroalign>=2.5
-scikit-learn>=1.5
 # Web UI
 fastapi>=0.110
 uvicorn[standard]>=0.29
