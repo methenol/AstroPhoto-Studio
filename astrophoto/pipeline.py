@@ -29,7 +29,7 @@ from . import __version__
 from .analysis import analyse, finalize_selection
 from .frames import FrameInfo, build_defect_map, discover, read_frame, superpixel
 from .postprocess import DEFAULTS, is_narrowband, linear_stage, luminance, nonlinear_stage
-from .stacking import Integrator, sensor_pattern
+from .stacking import Integrator, sensor_pattern, PATTERN_FORMAT
 
 STACK_DEFAULTS = {
     "mode": "auto",          # auto | drizzle | demosaic
@@ -356,7 +356,11 @@ class Session:
         ok = False
         if os.path.exists(path) and os.path.exists(meta):
             try:
-                ok = json.load(open(meta)).get("calib") == self._pattern_key()
+                m = json.load(open(meta))
+                # patterns measured before the object masking (PATTERN_FORMAT 2) are star maps
+                # for fields with little dither: their subtraction carves dark bowls round the
+                # stars (M 45, 2026-10-12), so they must never be attached again
+                ok = m.get("calib") == self._pattern_key() and m.get("format", 1) >= PATTERN_FORMAT
             except Exception:
                 ok = False
         for info in self.infos:
@@ -555,7 +559,7 @@ class Session:
                 else:
                     del out
                     np.save(self._p("pattern.npy"), P)
-                    pattern_info = {**pattern_info, "calib": self._pattern_key(),
+                    pattern_info = {**pattern_info, "calib": self._pattern_key(), "format": PATTERN_FORMAT,
                                     "created": datetime.now().isoformat(timespec="seconds")}
                     json.dump(pattern_info, open(self._p("pattern.json"), "w"), indent=1)
                     self._attach_pattern()

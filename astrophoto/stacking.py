@@ -35,6 +35,10 @@ import numpy as np
 
 from .frames import FrameInfo, cfa_channel_map, cfa_masks, demosaic, fix_defects, read_frame
 
+# bumped whenever sensor_pattern changes in a way that invalidates a cached pattern.npy:
+# 2 masks the astronomical signal out of the median (a cached v1 pattern is a star map)
+PATTERN_FORMAT = 2
+
 
 def _bounded_map(fn, items, workers):
     """Like executor.map but keeps at most ``2*workers`` results in flight (bounded memory)."""
@@ -524,11 +528,14 @@ def sensor_pattern(items: list, stack: np.ndarray, defects: np.ndarray | None, s
 
     Each sampled sub, less the stack warped back into its pixels (scaled and offset per CFA
     colour, so transparency and sky level do not matter) and less its own large-scale residual
-    (cloud glow, gradients), leaves its noise plus the sensor's pattern.  The per-pixel median
-    over the subs is the pattern: the sky has been removed, and what is left of stars and
-    passing cloud lands on different pixels in every sub.  The estimate's own noise (a median of
-    ``n_sample`` subs) becomes a fixed pattern in its turn, hence many subs (float16: ~17 MB each
-    for a DWARF 3).  Returns (CFA-resolution pattern in the subs' ADU, info)."""
+    (cloud glow, gradients), leaves its noise plus the sensor's pattern.  Pixels where the stack
+    shows sky-plus-signal are masked out before the median: dither moves a nebula or a star's
+    wings far less than their own size, so unmasked they survive the median and the "pattern"
+    becomes a star map whose subtraction carves dark bowls round the stars (M 45, 2026-10-12).
+    What is left of passing cloud lands on different pixels in every sub.  The estimate's own
+    noise (a median of ``n_sample`` subs) becomes a fixed pattern in its turn, hence many subs
+    (float16: ~17 MB each for a DWARF 3).  A final guard refuses a pattern that still follows
+    the object.  Returns (CFA-resolution pattern in the subs' ADU, info)."""
     if len(items) < 12:
         raise ValueError("too few subs to measure the sensor pattern")
     pick = [items[j] for j in np.unique(np.linspace(0, len(items) - 1, min(n_sample, len(items))).round().astype(int))]
@@ -556,9 +563,23 @@ def sensor_pattern(items: list, stack: np.ndarray, defects: np.ndarray | None, s
             A = np.stack([ms[keep], np.ones(int(keep.sum()))], 1)
             a, b = np.linalg.lstsq(A, ys[keep], rcond=None)[0]
             r = np.where(ok, y - a * np.nan_to_num(m) - b, 0).astype(np.float32)
-            w = ok.astype(np.float32)
-            large = cv2.GaussianBlur(r, (0, 0), 12) / np.maximum(cv2.GaussianBlur(w, (0, 0), 12), 1e-3)
-            out[dy::2, dx::2] = np.where(ok, r - large, np.nan)
+            # The astronomical signal is not a fixed pattern.  Dither moves a nebula, or the
+            # broad wings of a star, far less than its own size, so it lands on the same pixels
+            # in most subs and survives the per-pixel median: subtracting that "pattern" from
+            # every sub carves dark bowls round the stars and a hollowed-out nebula (M 45,
+            # 2026-10-12).  Mask every pixel whose stack model sits above the local sky, plus a
+            # margin for the 12 px high-pass below, so only true sky feeds the median; the
+            # masked object then gets no correction, which is far safer than a wrong one.
+            sky = np.median(ms)
+            sig = 1.4826 * np.median(np.abs(ms - sky)) + 1e-6
+            obj = cv2.dilate((m > sky + 3.0 * sig).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+            keep_px = ok & ~obj
+            # the large-scale term is a masked mean, so a masked star does not bleed into the
+            # sky around it through the 12 px blur
+            rm = np.where(keep_px, r, 0).astype(np.float32)
+            wm = keep_px.astype(np.float32)
+            large = cv2.GaussianBlur(rm, (0, 0), 12) / np.maximum(cv2.GaussianBlur(wm, (0, 0), 12), 1e-3)
+            out[dy::2, dx::2] = np.where(keep_px, r - large, np.nan)
         return out.astype(np.float16)
 
     R = np.empty((len(pick), H, W), np.float16)
@@ -577,6 +598,15 @@ def sensor_pattern(items: list, stack: np.ndarray, defects: np.ndarray | None, s
         with np.errstate(all="ignore"):
             P[y0:y0 + 128] = np.nan_to_num(np.nanmedian(blk, axis=0))
     P[n_valid < max(8, len(pick) // 4)] = 0.0
+    # isolated spikes: star wings leaking through the mask at a few pixels.  What the dark's
+    # temperature mismatch leaves is smooth (a thermal scale error), so a lone pixel far from
+    # its neighbours is estimator noise, and subtracting it would punch a cold hole in every
+    # sub - visible in the stack, since sigma clipping cannot reject a consistent offset.
+    rms = float(1.4826 * np.median(np.abs(P - np.median(P))))
+    med5 = cv2.medianBlur(P, 5)
+    spike = np.abs(P - med5) > 6 * max(rms, 1e-3)
+    if spike.any():
+        P[spike] = med5[spike]
     # how much of it is reproducible: two independent halves of the sample against each other
     half = []
     for sel in (slice(0, None, 2), slice(1, None, 2)):
@@ -588,5 +618,20 @@ def sensor_pattern(items: list, stack: np.ndarray, defects: np.ndarray | None, s
         half.append(h)
     corr = float(np.corrcoef(half[0].ravel(), half[1].ravel())[0, 1])
     rms = float(1.4826 * np.median(np.abs(P - np.median(P))))
+    # guard: a pattern that still follows the object is not a sensor pattern.  PSF-smoothing P
+    # first matches the star blobs and kills the pixel noise, so the correlation separates a
+    # star map (0.4 measured on the M 45 leak) from a genuine pattern (<= 0.1 on M 42 / M 31).
+    Lo = cv2.resize(np.nanmean(stack, axis=0), (W, H), interpolation=cv2.INTER_AREA).astype(np.float32)
+    sky = np.nanmedian(Lo)
+    Lo = np.nan_to_num(Lo, nan=float(sky))                 # uncovered edges: sky, not NaN
+    sig = 1.4826 * np.median(np.abs(Lo - sky)) + 1e-6
+    obj = cv2.GaussianBlur(np.clip((Lo - sky) / (20 * sig), 0, 1), (0, 0), 3)
+    Ps = cv2.GaussianBlur(P, (0, 0), 2.0)
+    sl = (slice(H // 8, -H // 8), slice(W // 8, -W // 8))
+    a, b = Ps[sl] - np.median(Ps[sl]), obj[sl] - np.median(obj[sl])
+    obj_corr = float((a * b).sum() / max(np.sqrt((a * a).sum() * (b * b).sum()), 1e-12))
+    if obj_corr > 0.25:
+        raise ValueError(f"the measured pattern follows the object (correlation {obj_corr:.2f}): "
+                         "too little dither to tell it apart from a fixed pattern")
     del R
-    return P, {"n_subs": len(pick), "rms_adu": rms, "reproducibility": corr}
+    return P, {"n_subs": len(pick), "rms_adu": rms, "reproducibility": corr, "object_corr": obj_corr}
