@@ -1,0 +1,183 @@
+/* Tools panel: Siril, GraXpert, StarNet and the RC-Astro licence (BlurXTerminator, NoiseXTerminator,
+   StarXTerminator).  The server runs the tools; this only shows what /api/tools reports and sends the
+   user's actions (activation code, activate / deactivate, model downloads). */
+const Tools = (() => {
+  const T = { data: null, open: new Set(["rcastro"]), busy: "", msg: {}, starnetOk: false, code: "" };
+
+  const ok = t => !!(t && t.ok);
+  const dot = cls => `<span class="dot-${cls}"></span>`;
+  // the licence status classes: usable now / needs an action / not usable
+  const pcls = p => (p.valid || ["trial", "licensed", "valid", "ok"].includes(p.status)) ? "ok"
+    : ["available", "limit", "deactivated", "required"].includes(p.status) ? "warn" : "bad";
+
+  async function load() {
+    try { T.data = await api("/api/tools"); } catch (e) { T.data = null; $("#toolsBody").textContent = "Tools: " + e.message; return; }
+    S.tools = T.data;
+    render(); renderPlan();
+  }
+
+  /* which tool each processing step will use, from the licences and installed tools */
+  function plan() {
+    const d = T.data || {}, rc = d.rcastro || {}, prod = {};
+    for (const p of rc.products || []) prod[p.key] = p;
+    const live = k => prod[k] && pcls(prod[k]) === "ok" && ok(rc);
+    const gx = d.graxpert || {}, sn = d.starnet || {};
+    const bge = ok(gx) && (!gx.models || gx.models.bge !== false);
+    return {
+      background: bge ? "GraXpert background extraction" : "Siril background extraction (RBF)",
+      deconv: live("bxt") ? "BlurXTerminator (licensed)" : "Richardson-Lucy (Siril)",
+      denoise: live("nxt") ? "NoiseXTerminator (licensed)" : ok(gx) && gx.models?.denoise !== false ? "GraXpert denoising" : "Siril denoising",
+      stars: live("sxt") ? "StarXTerminator (licensed)" : ok(sn) ? "StarNet2" : "none installed: the stars stay in the image",
+    };
+  }
+  function renderPlan() {
+    const el = $("#toolPlan"); if (!el) return;
+    if (!T.data) { el.textContent = "Checking the tools…"; return; }
+    const p = plan();
+    el.innerHTML = `Restoration will use: <b>${esc(p.background)}</b>, colour calibration (Siril SPCC), ` +
+      `deconvolution <b>${esc(p.deconv)}</b>, noise reduction <b>${esc(p.denoise)}</b>; star removal <b>${esc(p.stars)}</b>.`;
+  }
+
+  const kv = rows => `<div class="tkv">${rows.filter(r => r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("")}</div>`;
+  const note = key => T.msg[key] ? `<div class="tmsg ${T.msg[key].err ? "err" : ""}">${esc(T.msg[key].text)}</div>` : "";
+  const card = (key, name, t, body, version) => `<details class="tool" data-tool="${key}" ${T.open.has(key) ? "open" : ""}>
+    <summary>${dot(ok(t) ? "ok" : "bad")}<span class="tname">${name}</span><span class="tver">${ok(t) ? esc(version || "") : "not available"}</span></summary>
+    <div class="tbody">${body}</div></details>`;
+
+  function sirilCard(t) {
+    t = t || {};
+    return card("siril", "Siril", t, kv([["Version", esc(t.version)], ["Path", esc(t.path)]]) +
+      (ok(t) ? "" : `<div class="tmsg err">${esc(t.error || t.reason || "siril-cli was not found: the stacking cannot run.")}</div>`), t.version);
+  }
+
+  function modelList(models) {
+    const names = { bge: "Background extraction", denoise: "Denoising", deconv_obj: "Deconvolution (objects)", deconv_stellar: "Deconvolution (stars)" };
+    return Object.entries(models || {}).map(([k, v]) => `<span class="pstat ${v ? "ok" : "warn"}" title="${esc(names[k] || k)}">${v ? "✓" : "–"} ${esc(names[k] || k)}</span>`).join(" ");
+  }
+
+  function graxpertCard(t) {
+    t = t || {};
+    const all = t.models && Object.values(t.models).every(Boolean);
+    return card("graxpert", "GraXpert", t, kv([["Version", esc(t.version)], ["GPU", t.gpu === undefined ? "" : (t.gpu ? (typeof t.gpu === "string" ? esc(t.gpu) : "yes") : "no (CPU)")]]) +
+      (t.models ? `<div>AI models: ${modelList(t.models)}</div>` : "") +
+      (ok(t) ? `<div class="row gap"><button class="btn small" data-act="dl" data-tool="graxpert" ${T.busy ? "disabled" : ""}>${all ? "Check / update models" : "Download models"}</button></div>`
+        : `<div class="tmsg err">${esc(t.error || t.reason || "GraXpert is not installed in this image.")}</div>`) +
+      note("graxpert"), t.version);
+  }
+
+  function starnetCard(t) {
+    t = t || {};
+    const lic = "I accept the StarNet licence. The download comes from starnetastro.com and is covered by their licence agreement; it is stored in this server's data folder.";
+    const need = !ok(t);
+    return card("starnet", "StarNet2", t, kv([["Version", esc(t.version)], ["Path", esc(t.path)], ["Licence accepted", t.licence_accepted === undefined ? "" : (t.licence_accepted ? "yes" : "no")]]) +
+      (need ? `<label class="check small" style="display:flex;gap:8px;align-items:flex-start"><input type="checkbox" id="starnetAccept" ${T.starnetOk ? "checked" : ""}> <span>${esc(lic)}</span></label>
+        <div class="row gap"><button class="btn small" data-act="dl" data-tool="starnet" ${T.busy ? "disabled" : ""}>Download StarNet2</button></div>` : "") +
+      note("starnet"), t.version);
+  }
+
+  function productRow(p, canAct) {
+    const c = pcls(p);
+    const can = canAct && !T.busy;
+    const act = p.valid ? `<button class="btn tiny ghost" data-act="deactivate" data-product="${esc(p.key)}" ${can ? "" : "disabled"}>Deactivate</button>`
+      : ["available", "deactivated", "required", "limit"].includes(p.status) ? `<button class="btn tiny" data-act="activate" data-product="${esc(p.key)}" ${can ? "" : "disabled"}>Activate</button>` : "";
+    return `<tr><td><b>${esc(p.name || p.key)}</b><br><span class="pstat ${c}">${esc(p.status || "")}</span></td>
+      <td class="pmsg">${esc(p.message || "")}${p.modelPresent === false ? `<br><span class="muted">model not downloaded</span>` : ""}</td><td>${act}</td></tr>`;
+  }
+
+  function rcastroCard(t) {
+    t = t || {};
+    const prods = t.products || [];
+    const email = typeof t.account === "string" ? t.account : t.account?.email;
+    const missingModels = prods.some(p => p.valid && p.modelPresent === false);
+    let body;
+    if (!ok(t)) {
+      body = `<div class="tmsg err">${esc(t.error || t.reason || "The RC-Astro command-line tool is not installed in this image (the installer was not provided at build time). BlurXTerminator, NoiseXTerminator and StarXTerminator are not available; GraXpert and Siril are used instead.")}</div>`;
+    } else {
+      body = kv([["Account", email ? esc(email) : "not registered"], ["Computer", esc(t.computer)], ["CLI", esc(t.version)]]) +
+        (t.attention ? `<div class="attention">${esc(t.attention.message || "")}${t.attention.command ? `<br>Run <code>${esc(t.attention.command)}</code> in an interactive terminal.` : ""}</div>` : "") +
+        `<table><tbody>${prods.map(p => productRow(p, true)).join("") || `<tr><td class="muted">No product information yet: press Refresh.</td></tr>`}</tbody></table>` +
+        `<div class="small muted">Activation code (8 letters, from your RC-Astro account page):</div>
+         <div class="codebox"><input type="text" id="rcCode" maxlength="9" placeholder="XXXX-XXXX" value="${esc(T.code)}" autocomplete="off" spellcheck="false">
+           <button class="btn small" data-act="license" ${T.busy ? "disabled" : ""}>Activate</button></div>
+         <div class="small"><a href="${esc(t.activationUrl || "https://www.rc-astro.com/account")}" target="_blank" rel="noopener">Get a code</a> <span class="muted">(log in, then copy the code it shows)</span></div>` +
+        (missingModels ? `<div class="row gap"><button class="btn small" data-act="dl" data-tool="rcastro" ${T.busy ? "disabled" : ""}>Download RC-Astro models</button></div>` : "") +
+        `<div class="small muted">A licence activates on a limited number of computers (a container counts as one). Activations are changed only when a job is not running.</div>`;
+    }
+    return card("rcastro", "RC-Astro", t, body + note("rcastro"), t.version ? "CLI " + t.version : "");
+  }
+
+  function render() {
+    const d = T.data; if (!d) return;
+    $("#toolsBody").className = "";
+    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro);
+    $$("#toolsBody details.tool").forEach(el => el.ontoggle = () => el.open ? T.open.add(el.dataset.tool) : T.open.delete(el.dataset.tool));
+    const code = $("#rcCode"); if (code) code.oninput = () => (T.code = code.value);
+    const acc = $("#starnetAccept"); if (acc) acc.onchange = () => (T.starnetOk = acc.checked);
+    $$("#toolsBody [data-act]").forEach(b => b.onclick = () => action(b.dataset.act, b.dataset));
+  }
+
+  const say = (key, text, err = false) => { T.msg[key] = { text, err }; render(); };
+
+  async function licenceCall(path, body, label) {
+    T.busy = label; say("rcastro", label + "…");
+    try {
+      const r = await api(path, { method: "POST", body });
+      T.code = "";
+      const rep = r.report || {};
+      if (rep.ok === false || rep.error) {                // the CLI refused: show why (its attention message, else its error)
+        T.msg.rcastro = { text: rep.attention?.message || rep.error || "RC-Astro refused the request", err: true };
+        toast(T.msg.rcastro.text, true);
+      } else { T.msg.rcastro = null; toast(label + ": done"); }
+      if (r.tools) T.data.rcastro = r.tools;
+      await load();
+    } catch (e) { T.busy = ""; say("rcastro", e.message, true); toast(e.message, true); return; }
+    T.busy = ""; render();
+  }
+
+  async function action(act, ds) {
+    if (T.busy) return;
+    if (act === "license") {
+      const code = ($("#rcCode").value || "").replace(/[^A-Za-z0-9]/g, "");
+      if (code.length !== 8) return say("rcastro", "Enter the 8-letter activation code from your RC-Astro account page.", true);
+      return licenceCall("/api/tools/rcastro/license", { code }, "Registering this computer");
+    }
+    if (act === "activate") return licenceCall("/api/tools/rcastro/activate", { product: ds.product }, "Activating " + ds.product.toUpperCase());
+    if (act === "deactivate") {
+      if (!confirm(`Free this computer's ${ds.product.toUpperCase()} activation? You can activate it again later.`)) return;
+      return licenceCall("/api/tools/rcastro/deactivate", { product: ds.product }, "Deactivating " + ds.product.toUpperCase());
+    }
+    if (act === "dl") {
+      const tool = ds.tool, body = { tool };
+      if (tool === "starnet") {
+        if (!$("#starnetAccept")?.checked) return say("starnet", "Tick the licence box first.", true);
+        body.accept_licence = true;
+      }
+      try {
+        const job = await api("/api/tools/models/download", { method: "POST", body });
+        T.busy = tool; say(tool, "Queued: " + (job.message || "waiting"));
+        watch(job.id, tool);
+      } catch (e) { say(tool, e.message, true); }
+    }
+  }
+
+  /* a download runs as a queued job (it never overlaps processing): follow it here */
+  async function watch(id, tool) {
+    let j;
+    try { j = await api(`/api/jobs/${id}`); } catch { setTimeout(() => watch(id, tool), 3000); return; }
+    if (["queued", "running", "paused"].includes(j.state)) {
+      T.msg[tool] = { text: `${j.message} (${(j.progress * 100).toFixed(0)} %)`, err: false };
+      const el = $(`details[data-tool="${tool}"] .tmsg`); if (el) el.textContent = T.msg[tool].text; else render();
+      return setTimeout(() => watch(id, tool), 1500);
+    }
+    T.busy = "";
+    if (j.state === "done") { T.msg[tool] = null; toast("Download finished"); }
+    else T.msg[tool] = { text: j.message || j.state, err: j.state === "error" };
+    await load();
+  }
+
+  function init() {
+    $("#toolsRefresh").onclick = load;
+    load();
+  }
+  return { init, load, renderPlan, plan };
+})();

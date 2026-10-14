@@ -31,11 +31,11 @@
       <h3>Pipeline</h3>
       <ol class="steps">
         <li id="step-calibrate"><span class="dot"></span><div><b>Calibrate</b><small>bias, dark &amp; flat masters (a DWARF's CALI_FRAME, darks/ flats/ biases/); dark scaled per sub to its sensor temperature; flat checked against the sky</small></div><button class="btn small" data-job="calibrate">Run</button></li>
-        <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, clouds, obstructions, ML anomalies</small></div><button class="btn small" data-job="analyse">Run</button></li>
-        <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>local normalisation, sigma-clip, drizzle</small></div><button class="btn small" data-job="stack">Run</button></li>
-        <li id="step-denoise"><span class="dot"></span><div><b>Restore</b><small>ImageMM on every sub (first run also prepares the subs, ~30 min), or the Noise2Noise networks</small></div><button class="btn small" data-job="denoise">Run</button></li>
-        <li id="step-starnet"><span class="dot"></span><div><b>Train AI star remover</b><small>learns this image's stars (its own PSF, colours and brightnesses) to separate them cleanly; the Star reduction slider then goes all the way to starless</small></div><button class="btn small" data-job="starnet">Run</button></li>
-        <li id="step-autofinish"><span class="dot"></span><div><b>Auto-finish</b><small>tunes the processing settings on the right and fits a colour grade to reference images of the target</small></div><button class="btn small" data-job="autofinish">Run</button></li>
+        <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, roundness and background of every sub (Siril registration); weak frames are rejected</small></div><button class="btn small" data-job="analyse">Run</button></li>
+        <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>two-pass registration, Bayer drizzle, rejection stacking, auto-crop, plate solve (Siril)</small></div><button class="btn small" data-job="stack">Run</button></li>
+        <li id="step-denoise"><span class="dot"></span><div><b>Restore</b><small>gradient removal, colour calibration (SPCC), deconvolution and noise reduction on the linear stack; BlurXTerminator / NoiseXTerminator when licensed</small></div><button class="btn small" data-job="denoise">Run</button></li>
+        <li id="step-starnet"><span class="dot"></span><div><b>Remove stars</b><small>StarXTerminator when licensed, else StarNet2: separates the stars so the Star reduction slider can go all the way to starless</small></div><button class="btn small" data-job="starnet">Run</button></li>
+        <li id="step-autofinish"><span class="dot"></span><div><b>Auto-finish</b><small>sets the processing settings on the right from measurements of the image</small></div><button class="btn small" data-job="autofinish">Run</button></li>
       </ol>
       <button class="btn primary wide" data-job="all">▶ Run everything &amp; export</button>
       <label class="check small" title="Before the export, tune the processing settings and fit a colour grade to reference images of the target (the Auto-finish step). Off: export with the settings on the right as they are."><input id="sp-autofinish" type="checkbox" checked> Auto-finish before the export</label>
@@ -52,47 +52,23 @@
       </details>
 
       <details class="adv">
-        <summary>Integration &amp; compute options</summary>
+        <summary>Integration &amp; options</summary>
         <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn tiny ghost" id="spReset" title="Set every option below back to the pipeline's defaults">Reset to defaults</button></div>
-        <label title="Apply the pipeline settings of an experiment's best trial (Experiments tab). Single objective: the trial with the best value; two objectives: the Pareto-optimal trial that is best on the first. Every setting the trial ran with is applied, tuned or held fixed.">From experiment <select id="sp-experiment"><option value="">—</option></select></label>
-        <div id="sp-experiment-info" class="muted small"></div>
-        <label>Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
-        <label title="Multi-frame super-resolution: every sub is shifted/rotated slightly differently, so the stack samples the sky on a finer grid than one frame. Measured on M 27: 7.7&quot; → 6.5&quot; star FWHM at 2×. Needs ~50+ subs; ~4× slower stacking and 4× larger files. Follows the Restoration choice: 2× for the Noise2Noise restorations, native for ImageMM (which has its own super-resolution and is best on a 1× stack).">Super-resolution <select id="sp-scale"><option value="1">Off (native; ImageMM default)</option><option value="1.5">1.5× drizzle</option><option value="2">2× drizzle (Noise2Noise default; ≥50 subs)</option></select></label>
-        <label>Rejection sensitivity <input id="sp-sensitivity" type="range" min="0.5" max="2" step="0.1" value="1"><output></output></label>
+        <label title="Bayer drizzle keeps the sensor's own samples (best for dithered OSC subs); demosaic interpolates first and registers on the colour image.">Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
+        <label title="Drizzle scale: every sub is shifted slightly differently, so the stack can sample the sky on a finer grid. 2x is only used with 100+ subs and a sharp median FWHM; otherwise the stack falls back to 1x and says why in the stack info.">Super-resolution <select id="sp-scale"><option value="1">Off (native)</option><option value="1.5">1.5× drizzle</option><option value="2">2× drizzle (≥100 sharp subs)</option></select></label>
+        <label title="How many of the weakest subs (by weighted FWHM) are dropped: 1.0 keeps the best 90 %, 0.5 keeps 97 %, 2.0 keeps 75 %.">Rejection sensitivity <input id="sp-sensitivity" type="range" min="0.5" max="2" step="0.1" value="1"><output></output></label>
         <label>Sigma low <input id="sp-sigma_low" type="number" step="0.5" value="4"></label>
         <label>Sigma high <input id="sp-sigma_high" type="number" step="0.5" value="3"></label>
-        <label class="check"><input id="sp-local_norm" type="checkbox" checked> Local normalisation</label>
-        <label class="check" title="Measure the fixed pattern calibration left in the subs (residual bias / dark structure) and remove it: one extra stack pass the first time."><input id="sp-pattern_correction" type="checkbox" checked> Sensor pattern correction</label>
-        <label>Denoise training steps <input id="sp-denoise_iters" type="number" step="250" value="2000"></label>
-        <label title="What the Noise2Noise denoiser is trained to minimise (the n2n-network path; ImageMM's own Noise2Noise pass always uses linear MSE). asinh MSE: in the variance-stabilised domain, the default. asinh unbiased: the same with the transform's Jensen-gap bias removed (about 1 ADU at faint levels, measured 2026-10-06). Linear MSE / chi-squared / Huber: exact star cores but a softer faint end (fewer faint sources recovered, worse flux error). Ablation: experiments/README.md.">Denoiser objective <select id="sp-n2n_loss"><option value="asinh_mse">asinh MSE (default)</option><option value="asinh_unbiased">asinh, unbiased</option><option value="lin_mse">Linear MSE</option><option value="lin_chi2">Linear chi-squared</option><option value="lin_huber">Linear Huber</option></select></label>
-        <label title="How the subs are divided into the two independent halves every Noise2Noise step learns from (half stacks, ImageMM's Noise2Noise pass, the network's multi-frame targets). Alternate: frame by frame. Dither blocks: whole runs of subs at one pointing go to one half, so pattern the calibration left fixed on the sensor lands on different sky pixels in the two halves and is removed as noise instead of kept as signal. Blocks are found from the time gaps of the dithers and the jumps of the field on the sensor; without dithering it falls back to alternate. Tested 2026-10-03 (experiments/README.md): no gain with Sensor pattern correction on, so alternate stays the default. Applies at the next Register &amp; integrate.">Noise2Noise halves <select id="sp-n2n_split"><option value="alternate">Alternate frames</option><option value="dither">Dither blocks</option></select></label>
-        <label title="AI network: a second Noise2Noise network learns to undo the star blur of the stack, checked against the independent half-stack. ImageMM (arXiv:2501.03002): one latent image fitted to every sub at once, each with its own measured PSF, variances and masks (majorization-minimization); the sky background is driven to zero. Noise2Noise + Richardson-Lucy: the Noise2Noise denoiser only, deconvolved by Richardson-Lucy (TV) in processing. Super-resolution is set to 2× for the two Noise2Noise restorations and native for ImageMM.">Restoration <select id="sp-deconv_method"><option value="imagemm" selected>ImageMM (all subs) — best</option><option value="network">Noise2Noise + AI deconvolution network</option><option value="none">Noise2Noise + Richardson-Lucy</option></select></label>
-        <fieldset id="imagemm-opts"><legend>ImageMM</legend>
-        <label title="Super-resolution factor r: the latent image has r× the resolution of the subs (Algorithm 2 with the PSFs of Eq. 11). Best on a 1× stack reference; each sub is used at its native resolution.">Super-resolution <select id="sp-imagemm_r"><option value="1">1× (Algorithm 1/3)</option><option value="2">2× (Algorithm 2)</option></select></label>
-        <label title="Standard deviation (latent pixels) of the Gaussian g_sigma in Eq. 11: the latent image is the sky seen through g_sigma. 0 = the paper's value (1 at 1×, 1.1 at 2×): the latent is then band-limited, so stars between pixel centres are represented without the dark ring a pixel-sampled latent leaves around them.">g<sub>σ</sub> (px) <input id="sp-imagemm_sigma" type="number" step="0.1" min="0" value="0"></label>
-        <label class="check" title="Algorithm 3: Huber M-estimator (delta = 2), robust to satellite trails and other outliers. Off: the plain L2 likelihood (Algorithm 1/2).">
-          <input id="sp-imagemm_robust" type="checkbox" checked> Robust (Huber)</label>
-        <label title="Huber threshold δ of Algorithm 3, in units of each pixel's noise σ: residuals beyond δσ are down-weighted. The paper uses 2.">Huber δ <input id="sp-imagemm_delta" type="number" step="0.1" min="0.1" value="2"></label>
-        <label title="Clipping κ of the multiplicative update (Eqs. 7–9): each iteration changes a pixel by at most ×κ or ÷κ. The paper uses 2.">Update clip κ <input id="sp-imagemm_kappa" type="number" step="0.1" min="1.01" value="2"></label>
-        <label title="When to stop. Eq. C15 (the paper, default, ε 1e-6) or Flux: the flux-weighted relative change of the image, Σ|x_k − x_k−1| / Σx_k over the effective mask, is below ε (use ε ≈ 1e-4: on IC 405 the accelerated run then lies within 2.5 % rms of the fixed point in faint nebulosity). Eq. C15 (the paper, ε 1e-4 … 1e-6): the mean of u′k/u′k−1 is within ε of 1 — ratios above and below 1 cancel, and pixels clamped at κ in two successive iterations count as converged, so on sky-dominated cutouts it stops after 2–23 iterations. Elementwise: the mean of |u′k/u′k−1 − 1| is below ε.">Stopping rule <select id="sp-imagemm_stop"><option value="c15">Eq. C15 (paper, default)</option><option value="flux">Flux change</option><option value="elementwise">Elementwise</option></select></label>
-        <label title="Stopping tolerance ε: the paper's Eq. C15 with 1e-6 (default); ~1e-4 for the flux rule.">Tolerance ε <input id="sp-imagemm_epsilon" type="number" step="any" min="0" value="0.000001"></label>
-        <label title="Maximum number of iterations K.">Max iterations <input id="sp-imagemm_max_iters" type="number" step="100" min="10" value="2000"></label>
-        <label title="PSF of each sub: empirical (measured from its stars, as in the paper) or an elliptical Moffat model fitted to it.">PSF model <select id="sp-imagemm_psf"><option value="empirical">Empirical</option><option value="moffat">Moffat fit</option></select></label>
-        <label title="0 = every sub is its own exposure (the paper). N = subs sorted by PSF width into N groups, each replaced by its inverse-variance coadd with the weight-averaged PSF: faster, exact when a group shares one PSF.">Seeing groups <input id="sp-imagemm_groups" type="number" step="1" min="0" value="0"></label>
-        <label class="check" title="Biggs &amp; Andrews (1997) vector extrapolation of the multiplicative update: fewer iterations to the same fixed point. Not part of ImageMM.">
-          <input id="sp-imagemm_accelerate" type="checkbox"> Biggs–Andrews acceleration</label>
-        <label class="check" title="Restore the two halves of the subs separately (disjoint data, independent noise; split as set by Noise2Noise halves) and combine them with a Noise2Noise network trained on that pair (unbiased linear-domain loss). Twice the ImageMM time plus training.">
-          <input id="sp-imagemm_n2n" type="checkbox" checked> Noise2Noise pass</label>
-        <label class="check" title="Model the smooth diffuse light (from the coadd: a lower envelope wider than a star and its halo) as a separate term of the fit, y = H(x + b), and restore only what is above it. Without it the non-negative fit folds the faint sky next to every bright star into the star and leaves a dark collar round it.">
-          <input id="sp-imagemm_background" type="checkbox"> Sky pedestal</label>
-        </fieldset>
-        <label title="AI network only: training steps of the deconvolution network (the denoiser's are the Denoise training steps above). 6000 gave rounder, sharper stars than 2000 on C 33.">Deconvolution training steps <input id="sp-deconv_iters" type="number" step="500" min="250" value="6000"></label>
-        <label title="AI network only: the round star profile (FWHM, stack pixels) it restores to, as in Magain, Courbin &amp; Sohy (1998). Deconvolving towards points stops short along the long axis of an elongated or comatic PSF, so stars stay oval. 0 = auto: 1.25 pixels of the subs' own grid and at least 2 stack pixels (2.5 px on a 2× stack). The profile is a Moffat (β 4.765), a natural star shape with a soft halo. A narrower target asks for detail above the subs' sampling and rings round stars. Negative values deconvolve towards points (the behaviour before 2026-10-09).">Target star FWHM (px) <input id="sp-deconv_target_fwhm" type="number" step="0.25" value="0"></label>
-        <label title="AI network only: weight of its simulated-source training term. While it trains, stars and nebular shapes made with this stack's own PSF, colours and noise are added to the raw half-stacks; the network's response to each must be exactly that source at the target resolution. This teaches it that stars are round points and that nebulosity stays extended. Nothing simulated reaches the image: the trained network is applied to the data only. On C 33 star ellipticity went from 0.47 to 0.1. 0 = off.">Simulated-source weight <input id="sp-deconv_sources" type="number" step="0.25" min="0" value="1"></label>
-        <label title="AI network only: replace its data term by ImageMM's multi-frame likelihood (Huber) over this many seeing-group coadds of the other half's subs, each with its own PSF and exact variances. 0 = the single-PSF half-stack loss.">Multi-frame loss groups <input id="sp-network_groups" type="number" step="1" min="0" value="0"></label>
-        <label title="Training steps of the AI star remover (Train star remover step).">Star remover training steps <input id="sp-star_remover_iters" type="number" step="250" min="250" value="3000"></label>
-        <label>Compute device <select id="sp-device"></select></label>
+        <label class="check" title="Normalise the subs to each other before rejection (the backend uses what Siril offers for the chosen resampling)."><input id="sp-local_norm" type="checkbox" checked> Local normalisation</label>
+        <label title="Deconvolution of the linear stack. On: BlurXTerminator when licensed, else Richardson-Lucy (Siril). The strength is the Deconvolution slider.">Deconvolution <select id="sp-deconv_method"><option value="imagemm" selected>On</option><option value="none">Off</option></select></label>
+        <label class="check" title="Run the star-removal step in Run everything (StarXTerminator when licensed, else StarNet2). Off: stars stay in the image."><input id="sp-star_remover" type="checkbox" checked> Separate the stars</label>
       </details>
+</details>
+    </section>
+
+    <section class="card" id="toolsCard">
+      <h3>Tools <button class="btn tiny ghost" id="toolsRefresh" title="Check the tools again">Refresh</button></h3>
+      <div id="toolsBody" class="small muted">Checking the tools…</div>
     </section>
 
     <section class="card" id="jobCard" hidden>
@@ -108,10 +84,8 @@
     <nav class="tabs">
       <button class="tab active" data-tab="process">Process</button>
       <button class="tab" data-tab="frames">Frames <span id="framesCount" class="pill"></span></button>
-      <button class="tab" data-tab="explore">Explore</button>
       <button class="tab" data-tab="export">Export</button>
       <button class="tab" data-tab="diag">Diagnostics</button>
-      <button class="tab" data-tab="lab">Experiments</button>
       <button class="tab" data-tab="jobs">Jobs <span id="jobsCount" class="pill" hidden></span></button>
     </nav>
 
@@ -182,51 +156,6 @@
       </div>
     </section>
 
-    <!-- EXPLORE -->
-    <section class="tabpane" id="tab-explore">
-      <div class="explore">
-        <div class="viewer">
-          <div class="viewer-toolbar">
-            <div class="seg" id="exMode">
-              <button class="segbtn active" data-exmode="overlay">Overlay</button>
-              <button class="segbtn" data-exmode="side">Side by side</button>
-              <button class="segbtn" data-exmode="chart">Star map</button>
-            </div>
-            <div class="seg">
-              <button class="segbtn" id="exFit">Fit</button>
-              <select id="exSize" title="image resolution"><option value="1400">Fast</option><option value="2400" selected>Detailed</option><option value="full">Full resolution</option></select>
-            </div>
-            <label class="small muted exrange" title="Opacity of the markers drawn over the image">Markers <input id="exOpacity" type="range" min="0" max="1" step="0.05" value="0.85"></label>
-            <label class="small muted exrange" title="Faintest Gaia star drawn (G magnitude)">Stars to G <input id="exMag" type="range" min="6" max="16" step="0.5" value="13"><output id="exMagOut">13</output></label>
-            <span id="exCursor" class="muted small excursor"></span>
-          </div>
-          <div class="exstage" id="exStage">
-            <canvas id="exImg"></canvas>
-            <canvas id="exChart" hidden></canvas>
-            <div class="placeholder" id="exPlaceholder">
-              <div class="ph-inner">
-                <div class="big">✦</div>
-                <p id="exPhText">Stack a dataset, then plate-solve it to explore what else is in the image.</p>
-                <button class="btn primary" id="exSolve" hidden>Identify objects in this image</button>
-                <p class="muted small" id="exSolveNote" hidden>Matches the stars against Gaia DR3 to find exactly where the image points, then
-                  looks up every catalogued object in the field in SIMBAD (internet connection needed once; the results are cached).</p>
-              </div>
-            </div>
-            <div class="spinner" id="exSpinner" hidden></div>
-            <div class="expop" id="exPop" hidden></div>
-          </div>
-        </div>
-        <aside class="expanel">
-          <div class="card" id="exField"><h3>Field</h3><div class="muted small">Not solved yet.</div></div>
-          <div class="card"><h3>Layers</h3><div id="exLayers" class="exlayers"></div></div>
-          <div class="card grow"><h3>In this image</h3>
-            <input id="exSearch" type="text" placeholder="Search names, types…">
-            <div id="exList" class="exlist"></div>
-          </div>
-        </aside>
-      </div>
-    </section>
-
     <!-- EXPORT -->
     <section class="tabpane" id="tab-export">
       <div class="export-grid">
@@ -248,55 +177,10 @@
     <!-- DIAGNOSTICS -->
     <section class="tabpane" id="tab-diag">
       <div class="diag-grid">
-        <figure><img id="diagRef" alt=""><figcaption>Reference frame (auto-selected)</figcaption></figure>
-        <figure><img id="diagCov" alt=""><figcaption>Integration coverage (frames × weights)</figcaption></figure>
-        <figure><img id="diagRej" alt=""><figcaption>Pixel rejection map (satellites, planes, cosmic rays)</figcaption></figure>
+        <div class="card"><h3>Stage logs <button class="btn tiny ghost" id="logsRefresh">Refresh</button></h3>
+          <div id="logList" class="loglist"></div><pre id="logText" class="log small" style="max-height:420px;user-select:text" hidden></pre></div>
+        <figure id="diagRefBox" hidden><img id="diagRef" alt=""><figcaption>Reference frame</figcaption></figure>
         <div class="card"><h3>Stack &amp; processing info</h3><pre id="diagInfo" class="small"></pre></div>
-      </div>
-    </section>
-
-    <!-- EXPERIMENTS -->
-    <section class="tabpane" id="tab-lab">
-      <div class="lab">
-        <div class="labform">
-          <div class="card">
-            <h3>New study</h3>
-            <label class="lf">Name <input id="lbName" type="text" placeholder="e.g. imagemm-huber-m27"></label>
-            <label class="lf">Experiment <select id="lbTask"></select></label>
-            <p id="lbTaskDesc" class="muted small"></p>
-            <label class="lf">Dataset <select id="lbData"></select></label>
-            <div id="lbCombine" class="combine small" hidden></div>
-            <details id="lbSynth" class="adv"><summary>New synthetic dataset…</summary>
-              <p class="muted small">Renders Seestar-format raw subs of an analytic sky (stars, nebula, galaxies) with known truth: per-sub dither, field rotation, Moffat seeing, transparency, sky gradient, Poisson + read noise, hot pixels, satellite trails and cosmic rays. It is then analysed and stacked with the pipeline defaults.</p>
-              <div id="lbSynthFields" class="lbgrid"></div>
-              <button class="btn small" id="lbSynthGo">Generate</button>
-            </details>
-            <div id="lbOptions" class="lbgrid"></div>
-          </div>
-          <div class="card">
-            <h3>Search space</h3>
-            <p class="muted small">Tick a parameter to tune it; otherwise it is held at the value shown (the pipeline default).</p>
-            <div id="lbSpace"></div>
-          </div>
-          <div class="card">
-            <h3>Objective &amp; search</h3>
-            <label class="lf">Optimise <select id="lbObj1"></select></label>
-            <label class="lf">…and also <select id="lbObj2"></select></label>
-            <label class="lf">Sampler <select id="lbSampler"></select></label>
-            <div class="lbgrid">
-              <label>Trials <input id="lbTrials" type="number" min="1" value="30"></label>
-              <label>Time limit (min, 0 = none) <input id="lbTimeout" type="number" min="0" value="0"></label>
-              <label>Seed <input id="lbSeed" type="number" value="0"></label>
-              <label>Device <select id="lbDevice"></select></label>
-            </div>
-            <label class="check small"><input id="lbBaseline" type="checkbox" checked> Trial 0 = the pipeline's current settings (the baseline to beat)</label>
-            <button class="btn primary wide" id="lbGo">Start study</button>
-          </div>
-        </div>
-        <div class="labmain">
-          <div class="card"><h3>Studies <button class="btn tiny ghost" id="lbRefresh">Refresh</button></h3><div id="lbStudies" class="lbstudies"></div></div>
-          <div id="lbDetail" class="lbdetail"></div>
-        </div>
       </div>
     </section>
 
@@ -312,8 +196,7 @@
 </div>
 <div id="toast" class="toast" hidden></div>
 <script src="/static/app.js"></script>
-<script src="/static/explore.js"></script>
-<script src="/static/lab.js"></script>
+<script src="/static/tools.js"></script>
 <script src="/static/jobs.js"></script>
 </body>
 </html>

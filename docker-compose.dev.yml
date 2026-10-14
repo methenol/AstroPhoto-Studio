@@ -1,0 +1,14 @@
+# Development overlay: run the deployed container with the repo's code mounted over the image's copy, so a
+# code change needs only `docker compose -f docker-compose.yml -f docker-compose.dev.yml restart` instead of a
+# rebuild.  Use explicitly (-f ... -f ...); plain `docker compose up` keeps using the image's own code.
+services:
+  astrophoto:
+    volumes:
+      - type: bind
+        source: ./sirilpipe
+        target: /app/sirilpipe
+        read_only: true
+      - type: bind
+        source: ./webui
+        target: /app/webui
+        read_only: true

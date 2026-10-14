@@ -36,16 +36,15 @@ const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "
 /* ------------------------------------------------------------ init */
 async function init() {
   S.system = await api("/api/system");
-  $("#versionBadge").textContent = "v" + S.system.version;
+  $("#versionBadge").textContent = "v" + S.system.version + (S.system.backend ? " · " + S.system.backend : "");
+  S.tools = S.system.tools || {};
   const dev = S.system.devices;
   const gpu = (dev.gpus || [])[0];
   $("#deviceBadge").textContent = gpu ? `⚡ ${gpu.name}${gpu.vram_gb ? " · " + gpu.vram_gb + " GB" : ""}` : "CPU only";
-  const ds = $("#sp-device");
-  ds.innerHTML = `<option value="auto">auto (${dev.default})</option>` +
-    (dev.gpus || []).map(g => `<option value="${g.id}">${g.name}</option>`).join("") + `<option value="cpu">CPU</option>`;
   buildParamUI();
   buildPresets();
   bindUI();
+  Tools.init();
   await loadDatasets();
   const last = splitFolders(store.get("lastFolder"));
   if (last.length && last.every(p => S.datasets.some(d => d.path === p))) {
@@ -94,8 +93,10 @@ function buildParamUI() {
       }
       body.appendChild(el);
     }
+    if (g === "Linear") body.insertAdjacentHTML("afterbegin", `<div id="toolPlan" class="toolplan"></div>`);
     host.appendChild(det);
   });
+  if (typeof Tools !== "undefined") Tools.renderPlan();
   $$("#paramGroups [data-key]").forEach(inp => {
     const ev = inp.type === "range" ? "input" : "change";
     inp.addEventListener(ev, () => {
@@ -137,7 +138,6 @@ async function openDataset(folder) {
     const r = await api("/api/open", { method: "POST", body: { folder } });
     folder = r.status.folder || folder;          // the server's canonical form (sorted, absolute)
     S.folder = folder; store.set("lastFolder", folder);
-    if (typeof Explore !== "undefined") Explore.reset();
     S.status = r.status; S.frames = r.frames;
     S.params = { ...currentDefaults(), ...store.get("params:" + folder, {}) };
     applyParamsToUI();
@@ -260,18 +260,20 @@ const AF_LABELS = { sky_L: "Sky brightness", sky_C: "Sky colour cast", sig_L50: 
 function renderAutofinish(res) {
   const box = $("#afReport");
   if (!res || !res.report) { box.hidden = true; box.innerHTML = ""; return; }
-  const r = res.report, f = v => v === undefined || v === null ? "–" : (+v).toFixed(3);
+  const r = res.report;
   const fv = v => typeof v === "number" ? (+v).toFixed(Math.abs(v) < 0.1 && v !== 0 ? 3 : 2) : esc(v ?? "–");
-  const steps = (r.steps || []).map(st => `<tr><td>${esc(st.step)}</td><td class="mono">${fv(st.from)} → <b>${fv(st.to)}</b></td>` +
-    `<td>${esc(AF_LABELS[st.measured] || st.measured)}: ${f(st.before)} → ${f(st.after)}${st.target !== null && st.target !== undefined ? ` <span class="muted">(aim ${f(st.target)})</span>` : ""}</td>` +
-    `<td class="muted">${esc(st.why)}</td></tr>`).join("");
-  const rows = Object.keys(AF_LABELS).filter(k => k in (r.stats_after || {}))
-    .map(k => `<tr><td>${AF_LABELS[k]}</td><td>${f((r.stats_before || {})[k])}</td><td>${f(r.stats_after[k])}</td><td>${f((r.stats_reference || {})[k])}</td></tr>`).join("");
-  const near = r.nearest ? ` · nearest: <a href="${esc(r.nearest.url)}" target="_blank" rel="noopener">${esc(r.nearest.title)}</a>` : "";
-  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b> · ${esc(r.reference)}${r.class ? " · " + esc(r.class) : ""}</span></div>
-    <div class="afrow muted"><span>distance to the references ${(+r.score_before).toFixed(1)} → <b>${(+r.score_after).toFixed(1)}</b>${near}</span><span>${r.renders} renders · ${fmtDur(r.seconds)}</span></div>
-    <details open><summary>What it did (${(r.steps || []).length} steps)</summary><table class="afsteps"><tr class="muted"><td>step</td><td>setting</td><td>measured</td><td>why it stopped there</td></tr>${steps}</table></details>
-    <details><summary>Measured look</summary><table><tr class="muted"><td></td><td>before</td><td>after</td><td>references</td></tr>${rows}</table></details>`;
+  const head = [r.reference, r.class].filter(Boolean).map(esc).join(" · ");
+  const steps = Array.isArray(r.steps) ? r.steps : (Array.isArray(r.decisions) ? r.decisions : []);
+  // one row per decision: what was set, from what measured value, and why
+  const rows = steps.map(st => `<tr><td>${esc(st.step ?? st.param ?? st.name ?? "")}</td>` +
+    `<td class="mono">${st.from !== undefined ? fv(st.from) + " → " : ""}<b>${fv(st.to ?? st.value)}</b></td>` +
+    `<td>${st.measured !== undefined ? esc(AF_LABELS[st.measured] || st.measured) + (st.before !== undefined ? ": " + fv(st.before) + " → " + fv(st.after) : "") : ""}` +
+    `${st.target !== null && st.target !== undefined ? ` <span class="muted">(aim ${fv(st.target)})</span>` : ""}</td>` +
+    `<td class="muted">${esc(st.why ?? st.reason ?? "")}</td></tr>`).join("");
+  const sec = r.seconds !== undefined ? `<span>${fmtDur(r.seconds)}</span>` : "";
+  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b>${head ? " · " + head : ""}</span>${sec}</div>` +
+    (rows ? `<details open><summary>What it did (${steps.length} settings)</summary><table class="afsteps"><tr class="muted"><td>setting</td><td>value</td><td>measured</td><td>why</td></tr>${rows}</table></details>` : "") +
+    `<details><summary>Report</summary><pre class="small" style="white-space:pre-wrap">${esc(JSON.stringify(r, null, 1))}</pre></details>`;
   box.hidden = false;
 }
 function applyAutofinish(res) {
@@ -285,79 +287,31 @@ async function loadAutofinish() {
   try { renderAutofinish((await api(`/api/autofinish?folder=${encodeURIComponent(S.folder)}`)).result); } catch { renderAutofinish(null); }
 }
 
-/* ------------------------------------------------------------ settings from an experiment */
-let EXPERIMENTS = [];
-async function loadExperimentChoices() {
-  try { EXPERIMENTS = (await api("/api/lab/best")).studies; } catch { return; }
-  const sel = $("#sp-experiment"), cur = sel.value;
-  const f = v => typeof v === "number" ? +v.toPrecision(4) : v;
-  sel.innerHTML = `<option value="">—</option>` + EXPERIMENTS.map(e =>
-    `<option value="${e.id}">${e.name} · ${e.task_label} · trial #${e.trial} (${e.objectives.map((o, i) => `${o.metric} ${f(e.values[i])}`).join(", ")})${e.state === "running" ? " · still running" : ""}</option>`).join("");
-  if (EXPERIMENTS.some(e => e.id === cur)) sel.value = cur;
-}
-function applyExperiment(id) {
-  const e = EXPERIMENTS.find(x => x.id === id);
-  if (!e) { $("#sp-experiment-info").textContent = ""; return; }
-  const set = [];
-  for (const [k, v] of Object.entries(e.settings)) {
-    const el = $("#sp-" + k); if (!el) continue;
-    if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
-    if (k === "deconv_method") el.dispatchEvent(new Event("change", { bubbles: true }));
-    set.push(`${k} = ${v}`);
-  }
-  const proc = Object.entries(e.processing || {});
-  for (const [k, v] of proc) { S.params[k] = v; set.push(`${k} = ${v} (processing)`); }
-  if (proc.length) { applyParamsToUI(); saveParams(); schedulePreview(0); }
-  const other = Object.entries(e.not_pipeline || {}).map(([k, v]) => `${k} = ${v}`);
-  $("#sp-experiment-info").innerHTML = `Applied trial #${e.trial} of “${e.name}” (${e.criterion}) on ${e.dataset}: ${set.join(", ")}.` +
-    (other.length ? ` Not pipeline settings (not applied): ${other.join(", ")}.` : "") + " Re-run the step to use them.";
-  toast(`Settings of “${e.name}” applied`);
-}
-document.addEventListener("change", e => { if (e.target.id === "sp-experiment") applyExperiment(e.target.value); });
-
 function resetStackParams() {
   // every option back to the pipeline's STACK_DEFAULTS (served by /api/system)
   const D = S.system.stack_defaults;
   for (const [k, v] of Object.entries(D)) {
     const el = $("#sp-" + k); if (!el) continue;
     if (el.type === "checkbox") el.checked = !!v;
+    else if (el.tagName === "SELECT" && ![...el.options].some(o => o.value === String(v))) continue;
     else el.value = String(v);
     if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
   }
-  $("#sp-experiment").value = ""; $("#sp-experiment-info").textContent = "";
-  $("#sp-deconv_method").dispatchEvent(new Event("change", { bubbles: true }));
   toast("Integration & compute options reset to defaults");
 }
 
 /* ------------------------------------------------------------ jobs */
-// ImageMM options only matter for the ImageMM restoration.  Choosing a restoration also sets its
-// default stack scale (pipeline.default_scale: 2x drizzle for the Noise2Noise restorations, native for
-// ImageMM); only on the user's own choice, so a reset or an applied experiment keeps the scale it set.
-document.addEventListener("change", e => {
-  if (e.target.id !== "sp-deconv_method") return;
-  $("#imagemm-opts").hidden = e.target.value !== "imagemm";
-  if (e.isTrusted) $("#sp-scale").value = e.target.value === "imagemm" ? "1" : "2";
-});
+// Only the options the Siril backend honours are in the page; the others (the old ImageMM /
+// Noise2Noise ones) are still accepted by the API and ignored, so they are not sent.
 function stackParams() {
   const g = id => $("#sp-" + id);
+  const on = g("deconv_method").value !== "none";
   return {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
-    local_norm: g("local_norm").checked, denoise_iters: parseInt(g("denoise_iters").value), device: g("device").value,
-    deconv_method: g("deconv_method").value, ai_deconvolution: g("deconv_method").value !== "none",
-    imagemm_r: parseInt(g("imagemm_r").value), imagemm_sigma: parseFloat(g("imagemm_sigma").value) || 0,
-    imagemm_robust: g("imagemm_robust").checked, imagemm_epsilon: parseFloat(g("imagemm_epsilon").value) || 1e-6,
-    imagemm_stop: g("imagemm_stop").value,
-    imagemm_delta: parseFloat(g("imagemm_delta").value) || 2, imagemm_kappa: parseFloat(g("imagemm_kappa").value) || 2,
-    imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 2000, imagemm_psf: g("imagemm_psf").value,
-    imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
-    imagemm_n2n: g("imagemm_n2n").checked, imagemm_background: g("imagemm_background").checked,
-    network_groups: parseInt(g("network_groups").value) || 0,
-    deconv_target_fwhm: parseFloat(g("deconv_target_fwhm").value) || 0,
-    deconv_iters: parseInt(g("deconv_iters").value) || 6000,
-    deconv_sources: Number.isFinite(parseFloat(g("deconv_sources").value)) ? parseFloat(g("deconv_sources").value) : 1,
-    pattern_correction: g("pattern_correction").checked, n2n_split: g("n2n_split").value, n2n_loss: g("n2n_loss").value,
-    star_remover_iters: parseInt(g("star_remover_iters").value) || 3000,
+    local_norm: g("local_norm").checked,
+    deconv_method: on ? "imagemm" : "none", ai_deconvolution: on,
+    star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
   };
 }
@@ -418,6 +372,7 @@ async function pollJob() {
   const pb = $("#pauseJob");
   pb.hidden = !(j.state === "running" || j.state === "paused");
   pb.textContent = j.state === "paused" ? "Resume" : "Pause";
+  if (j.kind === "tools") { /* shown in the Tools panel */ }
   const stepEl = { calibrate: "#step-calibrate", analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet", autofinish: "#step-autofinish" }[j.kind];
   $$(".steps li").forEach(li => li.classList.remove("running"));
   if (stepEl && (j.state === "running" || j.state === "paused")) $(stepEl).classList.add("running");
@@ -431,7 +386,7 @@ async function pollJob() {
       const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
       S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
       // the settings Auto-finish tuned (alone, or before the export of Run everything) become the sliders'
-      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(`Auto-finish: ${(j.result.autofinish.report.steps || []).length} settings set from the image, checked against ${j.result.autofinish.report.reference}`); }
+      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast("Auto-finish: settings set from the measurements of the image"); }
       else if (S.status.stacked) schedulePreview(0);
       if (["calibrate", "analyse", "all"].includes(j.kind)) loadCalibration();
       if (j.kind === "calibrate" && j.result?.changed_analysis) toast("Calibration changed: the frame analysis was dropped — run Analyse frames again");
@@ -637,22 +592,32 @@ async function refreshExports() {
 async function refreshDiag() {
   if (!S.folder) return;
   const q = `folder=${encodeURIComponent(S.folder)}&t=${Date.now()}`;
-  $("#diagRef").src = `/api/diagnostic?kind=reference&${q}`;
-  $("#diagCov").src = `/api/diagnostic?kind=coverage&${q}`;
-  $("#diagRej").src = `/api/diagnostic?kind=rejection&${q}`;
+  const ref = $("#diagRef");
+  ref.onload = () => ($("#diagRefBox").hidden = false);
+  ref.onerror = () => ($("#diagRefBox").hidden = true);
+  ref.src = `/api/diagnostic?kind=reference&${q}`;
   let li = {};
   try { li = await api(`/api/linear_info?folder=${encodeURIComponent(S.folder)}`); } catch { }
   $("#diagInfo").textContent = JSON.stringify({ stack: S.status?.stack_meta, processing: li }, null, 1);
+  loadLogs();
+}
+async function loadLogs() {
+  const box = $("#logList");
+  let r = { logs: [] };
+  try { r = await api(`/api/diagnostic?kind=logs&folder=${encodeURIComponent(S.folder)}`); } catch { }
+  box.innerHTML = r.logs.length ? r.logs.map(l => `<div><a data-log="${esc(l.name)}">${esc(l.name)}</a> <span class="muted">${(l.bytes / 1024).toFixed(1)} kB · ${new Date(l.modified * 1000).toLocaleString()}</span></div>`).join("")
+    : `<span class="muted">No stage logs yet: they appear when a Siril stage has run.</span>`;
+  $$("a[data-log]", box).forEach(el => el.onclick = async () => {
+    const t = await (await fetch(`/api/diagnostic?kind=log&name=${encodeURIComponent(el.dataset.log)}&folder=${encodeURIComponent(S.folder)}`)).text();
+    const pre = $("#logText"); pre.textContent = t; pre.hidden = false; pre.scrollTop = 1e9;
+  });
 }
 
 function switchTab(name) {
-  if (typeof Lab !== "undefined") Lab.hidePop();
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "process") setTimeout(fitView, 50);
   if (name === "diag") refreshDiag();
-  if (name === "explore") setTimeout(() => Explore.show(), 30);
-  if (name === "lab") Lab.show();
   if (name === "jobs") Jobs.show();
 }
 
@@ -690,8 +655,7 @@ function bindUI() {
   sps.nextElementSibling.textContent = "1.0";
   const q = $("#ex-quality"); q.oninput = () => (q.nextElementSibling.textContent = q.value);
   bindViewer();
-  loadExperimentChoices();
-  $(".sidebar details.adv").addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
+  $("#logsRefresh").onclick = loadLogs;
   $("#spReset").onclick = resetStackParams;
 }
 

@@ -9,6 +9,7 @@
 # then open http://localhost:${PORT} (default 8000).  Settings come from the environment or a
 # .env file next to this one (see .env.example):
 #   IMAGES_DIR   host folder with the session folders, mounted read-only   (default ./images)
+#   LIBRARY_DIR  optional second folder, read-only at /data/library (default: IMAGES_DIR)
 #   OUTPUT_DIR   host folder for caches, stacks and exports, read-write    (default ./output)
 #   PORT         host port                                                  (default 8000)
 #   PUID / PGID  user the server runs as (default: the output folder's owner, else 1000:1000);
@@ -22,13 +23,26 @@ x-astrophoto: &astrophoto
       source: ${IMAGES_DIR:-./images}
       target: /data/images
       read_only: true
+    # a second, optional read-only library (e.g. the whole NAS share when IMAGES_DIR is one of its
+    # subfolders): reachable in the UI and the API as /data/library/...; defaults to IMAGES_DIR
+    - type: bind
+      source: ${LIBRARY_DIR:-${IMAGES_DIR:-./images}}
+      target: /data/library
+      read_only: true
     - type: bind
       source: ${OUTPUT_DIR:-./output}
       target: /data/output
       bind:
         create_host_path: true
-  # the stacking / preparation worker pools and PyTorch share memory through /dev/shm
+  # Siril and the tool subprocesses share memory through /dev/shm
   shm_size: "${SHM_SIZE:-8gb}"
+  # stable RC-Astro machine identity: the licence activation is tied to it (licence lives in the volume)
+  hostname: astrophoto-studio
+  # Siril keeps every frame of a sequence open: thousands of subs need a high open-files limit
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
   restart: unless-stopped
 
 # environment of both services:
@@ -53,7 +67,8 @@ services:
       # network.host entitlement)
       network: ${BUILD_NETWORK:-host}
       args:
-        TORCH_INDEX: "${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
+        GRAXPERT_EXTRA: cuda
+        STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
     environment:
       ASTROPHOTO_DEVICE: "${ASTROPHOTO_DEVICE:-auto}"
       PUID: "${PUID:-}"
@@ -64,6 +79,7 @@ services:
       ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
       ASTROPHOTO_LOCAL_COPY: "${LOCAL_COPY:-false}"
       ASTROPHOTO_LOCAL_DIR: "${LOCAL_DIR:-}"
+      STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
     deploy:
       resources:
         reservations:
@@ -80,7 +96,8 @@ services:
       context: .
       network: ${BUILD_NETWORK:-host}   # see the GPU service
       args:
-        TORCH_INDEX: https://download.pytorch.org/whl/cpu
+        GRAXPERT_EXTRA: cpuonly
+        STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
     environment:
       ASTROPHOTO_DEVICE: cpu
       PUID: "${PUID:-}"
@@ -91,3 +108,4 @@ services:
       ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
       ASTROPHOTO_LOCAL_COPY: "${LOCAL_COPY:-false}"
       ASTROPHOTO_LOCAL_DIR: "${LOCAL_DIR:-}"
+      STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"

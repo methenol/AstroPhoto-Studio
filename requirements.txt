@@ -1,19 +1,15 @@
-# Core numerics / astronomy
+# Core numerics / astronomy (the heavy lifting is done by Siril, GraXpert, StarNet2, RC-Astro)
 numpy>=2.0
 scipy>=1.13
 astropy>=6.0
-sep>=1.4
-astroalign>=2.5
 scikit-image>=0.24
-scikit-learn>=1.5
 opencv-python-headless>=4.10
 pillow>=10.0
 tifffile>=2024.1
-# Explore tab (plate solving, Gaia / SIMBAD) and the experiment lab
-astroquery>=0.4.7
-optuna>=4.0
-# ML denoiser (install the CUDA build on NVIDIA machines — see README)
-torch>=2.3
+# legacy astrophoto/ package (removed with it): sep, astroalign, scikit-learn
+sep>=1.4
+astroalign>=2.5
+scikit-learn>=1.5
 # Web UI
 fastapi>=0.110
 uvicorn[standard]>=0.29

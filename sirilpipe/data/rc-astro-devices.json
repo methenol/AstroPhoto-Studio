@@ -1,0 +1,21 @@
+{
+ "schemaVersion": 6,
+ "cliVersion": "2.6.10",
+ "devices": [
+  {
+   "id": "auto",
+   "kind": "auto",
+   "device": "gpu",
+   "name": "NVIDIA GeForce RTX 4080 Laptop GPU"
+  },
+  {
+   "id": "gpu",
+   "kind": "gpu",
+   "name": "NVIDIA GeForce RTX 4080 Laptop GPU"
+  },
+  {
+   "id": "cpu",
+   "kind": "cpu"
+  }
+ ]
+}

@@ -4,9 +4,9 @@ by webui.server.
 Jobs submitted here go into the same queue as the web UI's (one heavy job at a time) and show
 up in its Jobs panel.  No authentication: it is meant for a private network (Tailscale).
 
-    GET    /api/v1/health                   cheap reachability check (no PyTorch import)
+    GET    /api/v1/health                   cheap reachability check (no heavy imports)
     GET    /api/v1                          version, devices, profiles, presets, job kinds, roots
-    GET    /api/v1/profiles                 named restoration recipes (astrophoto.pipeline.PROFILES)
+    GET    /api/v1/profiles                 named restoration recipes (PROFILES)
     POST   /api/v1/datasets/resolve         does the server see these session folders? (subs, target, filter)
     GET    /api/v1/uploads?prefix=          uploaded files and sizes (to resume an upload)
     PUT    /api/v1/uploads/{path}           upload one file (raw body), for clients whose data the
@@ -76,12 +76,22 @@ def _fits_in(d: str) -> list[str]:
     return sorted({f for ext in FITS_EXT for f in glob.glob(os.path.join(d, ext))})
 
 
+def _child(d: str, name: str) -> str | None:
+    """The sub-folder of ``d`` called ``name`` in any letter case."""
+    try:
+        for n in sorted(os.listdir(d)):
+            if n.lower() == name and os.path.isdir(os.path.join(d, n)):
+                return os.path.join(d, n)
+    except OSError:
+        pass
+    return None
+
+
 def _light_folders(d: str) -> list[str]:
     """The folders holding a session's subs: the folder itself (a DWARF ``DWARF_RAW_…`` folder, a
     Seestar ``*_sub`` folder), or its ``lights/`` folder and any ``lights/rejected/`` beside them."""
     if _fits_in(d):
         return [d]
-    from astrophoto.calibration import _child
     lights = _child(d, "lights")
     if lights and _fits_in(lights):
         out = [lights]
@@ -101,11 +111,10 @@ def _describe(folders: list[str]) -> dict:
     out["bytes"] = sum(os.path.getsize(f) for f in subs)
     if subs:
         try:
-            from astrophoto.frames import read_info
-            fi = read_info(subs[len(subs) // 2])
-            out.update({"object": fi.object, "filter": fi.filter, "exptime": fi.exptime,
-                        "instrument": fi.telescope or fi.instrument, "date": (fi.date_obs or "")[:10] or None,
-                        "total_min": round(fi.exptime * len(subs) / 60, 1)})
+            fi = srv.read_info(subs[len(subs) // 2])
+            out.update({"object": fi["object"], "filter": fi["filter"], "exptime": fi["exptime"],
+                        "instrument": fi["instrument"], "date": fi["date"],
+                        "total_min": round(fi["exptime"] * len(subs) / 60, 1)})
         except Exception as e:
             out["read_error"] = f"{type(e).__name__}: {e}"
     return out
@@ -154,7 +163,7 @@ def _job(job_id: str) -> dict:
 
 
 def _profiles() -> dict:
-    from astrophoto.pipeline import PROFILES, STACK_DEFAULTS
+    PROFILES, STACK_DEFAULTS = srv.PROFILES, srv.STACK_DEFAULTS
     return {name: {"label": p.get("label", name), "stack_params": p.get("stack_params", {}),
                    "params": p.get("params", {}),
                    "effective": {k: {**STACK_DEFAULTS, **p.get("stack_params", {})}[k]
@@ -173,18 +182,15 @@ def health():
 
 @router.get("")
 def info():
-    from astrophoto.pipeline import STACK_DEFAULTS
-    try:
-        from astrophoto.denoise import device_info
-        dev = device_info()
-    except Exception as e:
-        dev = {"default": "cpu", "gpus": [], "error": str(e)}
+    STACK_DEFAULTS = srv.STACK_DEFAULTS
+    dev = srv.device_info()
     srv._load_jobs()
     return srv.clean_json({
         "name": "AstroPhoto Studio", "api": API_VERSION, "version": srv.__version__, "devices": dev,
         "images_root": srv.CONFIG["images"], "uploads_root": _uploads_root(), "workdir": srv.CONFIG["workdir"],
         "job_kinds": srv.JOB_KINDS, "default_kind": "all", "default_profile": "default",
         "profiles": _profiles(), "presets": srv.PRESETS, "stack_defaults": STACK_DEFAULTS,
+        "backend": "siril", "tools": srv.tools_summary(),
         "queue": {"running": sum(j["state"] in ("running", "paused") for j in srv.JOBS.values()),
                   "queued": len(srv.QUEUE)}})
 
@@ -254,7 +260,7 @@ def submit(body: dict = Body(...)):
     profile and the defaults), preset (a processing preset of the web UI), export (quality,
     upscale, tiff), client_ref (the client's id for this job: submitting it again returns the job
     already queued or done instead of a second one), label (shown in the Jobs panel)."""
-    from astrophoto.pipeline import PROFILES
+    PROFILES = srv.PROFILES
     srv._load_jobs()
     ref = body.get("client_ref")
     if ref:
@@ -263,6 +269,8 @@ def submit(body: dict = Body(...)):
         if prior:
             return JSONResponse(_view(max(prior, key=lambda j: j.get("created") or 0)) | {"duplicate": True})
     kind = body.get("kind") or "all"
+    if kind == "tools":
+        raise HTTPException(400, "kind 'tools' is queued through /api/tools/models/download")
     if kind not in srv.JOB_KINDS:
         raise HTTPException(400, f"unknown kind {kind!r}; one of {list(srv.JOB_KINDS)}")
     profile = body.get("profile") or "default"
