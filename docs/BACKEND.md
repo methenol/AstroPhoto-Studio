@@ -89,7 +89,8 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 | Frames tab | per-frame FWHM, roundness, background, star count from Siril's registration; overrides |
 | Colour calibration from the stars' physics | Siril SPCC with the Siril SPCC database (narrowband mode for dual-band) |
 | Gradient removal against a sky survey | NSNS DR0.2 through CDS hips2fits (`sirilpipe/skyref.py`), `bg_method` auto / reference |
-| Auto-finish with reference looks | published rules plus the 58 reference photographs' statistics (`sirilpipe/looks.py`, `astrophoto/data/autofinish_refs.json`): saturation target, distance report |
+| Auto-finish | published rules on the image's own measurements (no reference images) |
+| Reference looks | the 58 reference photographs' statistics (`sirilpipe/looks.py`) grade the Experiments tab's finishing trials (`look_distance`) |
 | AI star remover | StarXTerminator, else StarNet2 (`star_removal`) |
 | Diagnostics | stage logs, reference frame, integration coverage map, Siril rejection map |
 | Explore | plate solution from Siril's WCS (own solver as fallback), Gaia DR3 + SIMBAD annotation |

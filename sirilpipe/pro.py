@@ -72,6 +72,8 @@ SHARPEN_SIGMA = 1.0                # px, Siril unsharp sigma for the final sharp
 SHARPEN_GAIN = 0.5                 # unsharp amount per unit of ``sharpen`` (0.25 -> 0.125: Brecher's MMT sharpening 0.03-0.06 per layer is the lower end)
 UNPURPLE_THRESH = 0.4              # Siril unpurple threshold (its default)
 FRAME_FILLING = 0.5                # the object covers at least this fraction of the frame: ``auto_stretch`` raises the background to the top of Brecher's band
+SKY_STEPS_MAX_COVERAGE = 0.3       # above this subject coverage the frame has no sky to sample: the colour-gradient and neutralisation steps are skipped (C 20: the degree-2
+                                   # per-channel model took the North America Nebula's own red, 2026-10-15); DBE / BackgroundNeutralization need true sky samples
 
 
 def ghs_colour_model(color_preservation: float) -> str:
@@ -372,11 +374,22 @@ class Finisher:
         return out
 
     # ---- 1. stretch -----------------------------------------------------------------------------------------------------
+    def subject_coverage(self, base: np.ndarray) -> float:
+        lum = finish.luminance(base)
+        return float(nebula_mask(lum, _hist_stats(lum)["mode"])[1]["coverage"])
+
     def stretch(self, base: np.ndarray) -> np.ndarray:
         method = str(self.p.get("stretch_method", "ghs2"))
         method = "ghs2" if method == "ghs" else method
         self._say("Stretching")
-        base = self.banding(self.neutralise(self.colour_gradient(base)), "linear starless", True)
+        cov = self.subject_coverage(base)
+        self.info["subject_coverage"] = round(cov, 3)
+        if cov <= SKY_STEPS_MAX_COVERAGE:
+            base = self.neutralise(self.colour_gradient(base))
+        else:
+            self.record("colour gradient (linear)", "none", None, status="skipped", note=f"the subject covers {cov * 100:.0f} % of the frame (> {SKY_STEPS_MAX_COVERAGE * 100:.0f} %): no sky to sample, the nebula's own colour would be taken")
+            self.record("background neutralisation (linear)", "none", None, status="skipped", note="no sky samples on a frame-filling subject (SPCC's background neutralisation stands)")
+        base = self.banding(base, "linear starless", True)
         if method == "statstretch":
             return self._stretch_stat(base)
         if method in ALT_METHODS:

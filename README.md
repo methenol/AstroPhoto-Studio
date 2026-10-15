@@ -386,13 +386,12 @@ source above the sliders:
 | Noise reduction | NoiseXTerminator 0.6–0.85 on the stretched starless image by the measured SNR (RC-Astro, Brecher), colour denoise 0.95 |
 | Local contrast | Siril `clahe` under a background mask at the lowest published LHE strengths |
 | Palette / SCNR | HOO for dual-band (no SCNR: the green is OIII); natural colour and SCNR only against a measured green cast for broadband |
-| Saturation | Siril `satu` 0.25 / 0.3 / 0.5 (Siril tutorial); the references' colourfulness is reported |
+| Saturation | Siril `satu` 0.25 / 0.3 / 0.5 (Siril tutorial); HOO at least 0.45, broadband at most 0.3 |
 | Stars | Seti Star Stretch amount 5 (lowered to 4 / 3 against clipping), colour boost by the measured star saturation, reduction by star density, checked against the linear star count |
 
-The references are the medians of the same measurements over 58 freely licensed astrophotographs of
-16 targets (Wikimedia Commons; only the statistics and attributions are kept in
-`astrophoto/data/autofinish_refs.json`).  The finished image is compared with the nearest reference and
-that distance is reported before and after, as a check, not an objective.  `autofinish.json` in the
+Auto-finish uses no reference images: every value comes from the image's own measurements.  The 58 reference
+photographs' statistics (`astrophoto/data/autofinish_refs.json`) are used only by the Experiments tab, where
+the *Stretch & finish* task grades its trials against them like held-out data.  `autofinish.json` in the
 session folder keeps the last result.
 
 ## Gradient removal against a sky survey
