@@ -297,8 +297,10 @@ class FinishTask(Task):
             if not isinstance(v, dict) or v.get("pass") or v.get("value") is None:
                 continue
             lim, val = v.get("limit"), v.get("value")
-            if isinstance(val, dict):
-                val = max(x for x in val.values() if isinstance(x, (int, float))) if any(isinstance(x, (int, float)) for x in val.values()) else None
+            if isinstance(val, dict):                             # stars_count -> its deviation; sky_chroma -> max(|a|, |b|)
+                val = val.get("deviation") if "deviation" in val else (max(x for x in val.values() if isinstance(x, (int, float))) if any(isinstance(x, (int, float)) for x in val.values()) else None)
+            if val is None:
+                continue
             if isinstance(lim, (list, tuple)):
                 lo, hi = lim
                 dist += (lo - val) / lo if val < lo else (val - hi) / hi
@@ -314,8 +316,8 @@ class FinishTask(Task):
         if ctx["looks"]:
             st = looks.look_stats(_hwc(img))
             out["look_distance"] = looks.score(st, ctx["looks"], looks.object_weight(st))[0]
-        disp = _hwc(img)
-        return out, disp
+        from .. import export as export_mod
+        return out, export_mod.display_image(img, export_mod.bottom_up(ctx["header"]))        # (H, W, 3) north-up like the exports
 
 
 # ----------------------------------------------------------------------------- linear restoration

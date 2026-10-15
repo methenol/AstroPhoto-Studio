@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="stack_params, e.g. -s scale=2 -s mode=demosaic -s sensitivity=1.5")
         p.add_argument("--param", "-p", action="append", default=[], metavar="KEY=VALUE", help="processing params")
         p.add_argument("--no-solve", action="store_true", help="skip plate solving")
+    sub.add_parser("devices", help="the GPUs the AI tools can use (nvidia-smi) and which tools are available")
+    sub.add_parser("tools", help="status of Siril, GraXpert, StarNet2 and the RC-Astro tools (licences, models)")
     return ap
 
 
@@ -55,6 +57,20 @@ def _kv(items: list[str]) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.cmd in ("devices", "tools"):
+        from . import tools as tools_mod
+        st = tools_mod.tools_status()
+        if args.cmd == "devices":
+            try:
+                import subprocess
+                out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=4).stdout.strip()
+                print("GPUs:\n" + (out or "  none (CPU only)"))
+            except Exception:                                         # noqa: BLE001
+                print("GPUs: none (nvidia-smi not available)")
+            print("GraXpert GPU:", st.get("graxpert", {}).get("gpu"), "| RC-Astro:", [(p["key"], p["status"]) for p in st.get("rcastro", {}).get("products", [])])
+        else:
+            print(json.dumps(st, indent=1, default=str))
+        return 0
     s = Session(args.folders, args.workdir, limit=args.limit)
     sp, pr, prog = _kv(args.stack_param), _kv(args.param), _progress()
     t0 = time.time()
