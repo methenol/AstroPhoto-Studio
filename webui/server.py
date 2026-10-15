@@ -1295,7 +1295,10 @@ def _study_dir(sid: str) -> str:
 
 
 def _load_trials(d: str, cfg: dict):
-    import optuna
+    try:
+        import optuna
+    except ImportError:                                   # an image built without optuna: the studies are listed without their trials
+        return None, []
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     db = os.path.join(d, "study.db")
     if not os.path.exists(db):
