@@ -74,7 +74,7 @@ IGNORED_KEYS: tuple = ()
 # Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount (5 when absent), ``stretch_boost`` the
 # Statistical_Stretch.py curves boost (0 when absent), ``hdr_method`` the highlight tool (auto: the stretch's own, GHS HP / Statistical Stretch -hdr; wavescale: Seti Wavescale
 # HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1).
-EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2")
+EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride")
 
 
 def _R(group, key, label, lo, hi, step):
@@ -780,7 +780,7 @@ def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params:
                 meta.update(tool="sxt", stage="linear", flags=m.get("flags"))
             else:
                 try:
-                    m = tools.starnet.run(src, starless_path, linear=True, progress=steps.sub, checkpoint=steps.checkpoint)
+                    m = tools.starnet.run(src, starless_path, linear=True, stride=int(p.get("starnet_stride", 256) or 256), progress=steps.sub, checkpoint=steps.checkpoint)
                     meta.update(tool="starnet2", stage="linear", version=m.get("version"), gpu=m.get("gpu"))
                 except ToolError as e:
                     meta["attempts"].append({"tool": "starnet2 --linear", "status": "failed", "note": str(e)})

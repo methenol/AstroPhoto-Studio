@@ -574,10 +574,10 @@ def test_ui_pages(env):
     r = c.get("/")
     assert r.status_code == 200 and "AstroPhoto" in r.text and "tools.js" in r.text
     assert "explore.js" in r.text and 'data-tab="explore"' in r.text and 'id="tab-explore"' in r.text
-    assert "lab.js" not in r.text and 'data-tab="lab"' not in r.text
+    assert "lab.js" in r.text and 'data-tab="lab"' in r.text
     assert c.get("/static/explore.js").status_code == 200
     assert c.get("/static/app.js").status_code == 200 and c.get("/static/tools.js").status_code == 200
-    assert c.get("/static/lab.js").status_code == 404
+    assert c.get("/static/lab.js").status_code == 200
 
 
 def test_system(env):
@@ -711,13 +711,21 @@ def test_diagnostic_logs_and_autofinish(env):
     assert set(c.get("/api/linear_info", params={"folder": folder}).json()) == {"restore", "starnet"}
 
 
-def test_lab_removed(env):
+def test_lab_routes(env):
+    """The Experiments tab's routes: task catalogue, datasets, studies (none yet), and the stubs for a bad study id."""
     c = env.client
+    r = c.get("/api/lab/tasks").json()
+    assert {t["name"] for t in r["tasks"]} == {"finish", "restore", "stack", "stars", "background"}
+    assert all(t["params"] and t["metrics"] and t["default_objective"] in t["metrics"] for t in r["tasks"])
+    assert [s["name"] for s in r["samplers"]] == ["tpe", "nsga2", "random", "grid"]
+    assert "width" in r["synthetic_defaults"]
+    d = c.get("/api/lab/datasets").json()
+    assert "real" in d and "synthetic" in d and d["sep"]
+    assert c.get("/api/lab/studies").json() == {"studies": []}
     assert c.get("/api/lab/best").json() == {"studies": []}
-    for method, path in (("get", "/api/lab/tasks"), ("get", "/api/lab/studies"), ("post", "/api/lab/studies"),
-                         ("delete", "/api/lab/studies/x")):
-        r = getattr(c, method)(path)
-        assert r.status_code == 410 and "removed" in r.json()["detail"], path
+    assert c.get("/api/lab/studies/nope").status_code == 404
+    r = c.post("/api/lab/studies", json={"config": {"task": "bogus", "objectives": [{"metric": "x"}]}})
+    assert r.status_code == 400
 
 
 class FakeAstrometry:

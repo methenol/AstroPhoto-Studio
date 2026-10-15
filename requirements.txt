@@ -9,6 +9,8 @@ tifffile>=2024.1
 sep>=1.4
 astroalign>=2.5
 pyvo>=1.5
+# Experiments tab (Optuna studies)
+optuna>=4.0
 # Web UI
 fastapi>=0.110
 uvicorn[standard]>=0.29

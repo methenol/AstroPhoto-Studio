@@ -47,6 +47,8 @@ async function init() {
   buildParamUI();
   buildPresets();
   bindUI();
+  loadExperimentChoices();
+  const adv = $(".sidebar details.adv"); if (adv) adv.addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
   Tools.init();
   await loadDatasets();
   const last = splitFolders(store.get("lastFolder"));
@@ -303,6 +305,36 @@ function resetStackParams() {
   }
   toast("Integration & compute options reset to defaults");
 }
+
+/* ------------------------------------------------------------ settings from an experiment */
+let EXPERIMENTS = [];
+async function loadExperimentChoices() {
+  try { EXPERIMENTS = (await api("/api/lab/best")).studies; } catch { return; }
+  const sel = $("#sp-experiment"), cur = sel.value;
+  const f = v => typeof v === "number" ? +v.toPrecision(4) : v;
+  sel.innerHTML = `<option value="">—</option>` + EXPERIMENTS.map(e =>
+    `<option value="${e.id}">${e.name} · ${e.task_label} · trial #${e.trial} (${e.objectives.map((o, i) => `${o.metric} ${f(e.values[i])}`).join(", ")})${e.state === "running" ? " · still running" : ""}</option>`).join("");
+  if (EXPERIMENTS.some(e => e.id === cur)) sel.value = cur;
+}
+function applyExperiment(id) {
+  const e = EXPERIMENTS.find(x => x.id === id);
+  if (!e) { $("#sp-experiment-info").textContent = ""; return; }
+  const set = [];
+  for (const [k, v] of Object.entries(e.settings)) {
+    const el = $("#sp-" + k); if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
+    if (k === "deconv_method") el.dispatchEvent(new Event("change", { bubbles: true }));
+    set.push(`${k} = ${v}`);
+  }
+  const proc = Object.entries(e.processing || {});
+  for (const [k, v] of proc) { S.params[k] = v; set.push(`${k} = ${v} (processing)`); }
+  if (proc.length) { applyParamsToUI(); saveParams(); schedulePreview(0); }
+  const other = Object.entries(e.not_pipeline || {}).map(([k, v]) => `${k} = ${v}`);
+  $("#sp-experiment-info").innerHTML = `Applied trial #${e.trial} of “${e.name}” (${e.criterion}) on ${e.dataset}: ${set.join(", ")}.` +
+    (other.length ? ` Not pipeline settings (not applied): ${other.join(", ")}.` : "") + " Re-run the step to use them.";
+  toast(`Settings of “${e.name}” applied`);
+}
+document.addEventListener("change", e => { if (e.target.id === "sp-experiment") applyExperiment(e.target.value); });
 
 /* ------------------------------------------------------------ jobs */
 // Only the options the Siril backend honours are in the page; the others (the old ImageMM /
@@ -636,6 +668,7 @@ function switchTab(name) {
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "process") setTimeout(fitView, 50);
   if (name === "diag") refreshDiag();
+  if (name === "lab" && typeof Lab !== "undefined") Lab.show();
   if (name === "jobs") Jobs.show();
   if (name === "explore") setTimeout(() => Explore.show(), 30);
 }

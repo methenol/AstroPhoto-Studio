@@ -1118,18 +1118,368 @@ def download(path: str, inline: bool = False):
 
 # ------------------------------------------------------------------ removed features
 
+def _lab(*parts) -> str:
+    d = os.path.join(CONFIG["workdir"], "lab", *parts)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _alive(pid) -> bool:
+    """Whether process ``pid`` is running.  On Windows os.kill(pid, 0) would send it
+    CTRL_C_EVENT (signal 0), so the process's exit code is queried instead."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _read_status(d: str) -> dict:
+    import json as _json
+    p = os.path.join(d, "status.json")
+    try:
+        st = _json.load(open(p))
+    except Exception:
+        return {"state": "new"}
+    if st.get("state") in ("starting", "preparing", "running") and not _alive(st.get("pid")):
+        st["state"] = "died"
+        st["message"] = (st.get("message") or "") + " (the process is gone)"
+    return st
+
+
+def _spawn(module: str, d: str):
+    import subprocess
+    out = open(os.path.join(d, "stdout.txt"), "a")
+    # detached from the server: its own session (POSIX) or process group (Windows, so that
+    # "Stop" can send it Ctrl-Break without touching the server)
+    kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    return subprocess.Popen([sys.executable, "-W", "ignore", "-m", module, d], cwd=ROOT, stdout=out,
+                            stderr=subprocess.STDOUT, **kw)
+
+
+def _safe_name(name: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip()).strip("_")[:60] or "untitled"
+
+
+@app.get("/api/lab/tasks")
+def lab_tasks():
+    from sirilpipe.lab.synthetic import DEFAULT_SPEC
+    from sirilpipe.lab.tasks import TASKS
+    return clean_json({"tasks": [t.describe() for t in TASKS.values()], "synthetic_defaults": DEFAULT_SPEC,
+                       "samplers": [{"name": "tpe", "label": "TPE (Bayesian, multivariate)"},
+                                    {"name": "nsga2", "label": "NSGA-II (multi-objective)"},
+                                    {"name": "random", "label": "Random search"},
+                                    {"name": "grid", "label": "Grid (needs steps)"}]})
+
+
+@app.get("/api/lab/datasets")
+def lab_datasets():
+    import json as _json
+    real = []
+    for d in datasets()["datasets"]:
+        # every session of the target, analysed or not: the drop-down keeps the ones a study can
+        # read (analysed/stacked), the "nights of one target" box lists them all - what counts for
+        # a combination is the cache of the combination itself, which the form checks separately
+        real.append({"kind": "real", "folder": d["path"], "name": d.get("object") or d["name"],
+                     "object": d.get("object"), "date": d.get("date"), "filter": d.get("filter"),
+                     "exptime": d.get("exptime"), "total_min": d.get("total_min"),
+                     "stacked": d["cached"]["stacked"], "analysed": d["cached"].get("analysed", d["cached"]["stacked"]),
+                     "n_fits": d["n_fits"]})
+    syn = []
+    root = _lab("synthetic")
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        spec = {}
+        try:
+            spec = _json.load(open(os.path.join(d, "spec.json")))
+        except Exception:
+            pass
+        syn.append({"kind": "synthetic", "dir": d, "name": name, "spec": spec, "status": _read_status(d)})
+    return clean_json({"real": real, "synthetic": syn, "sep": os.pathsep})
+
+
+@app.get("/api/lab/dataset_state")
+def lab_dataset_state(folder: str):
+    """What is cached for a dataset selection (several nights joined with os.pathsep included):
+    the Experiments tab shows whether the combined session still needs Analyse / Register."""
+    d = os.path.join(CONFIG["workdir"], dataset_slug(split_folders(folder)))
+    return {"analysed": os.path.exists(os.path.join(d, "frames.json")),
+            "stacked": os.path.exists(os.path.join(d, "stack.fits")),
+            "denoised": restoration_done(d)}
+
+
+@app.post("/api/lab/synthetic")
+def lab_synthetic(body: dict = Body(...)):
+    import json as _json
+    from sirilpipe.lab.synthetic import DEFAULT_SPEC
+    name = _safe_name(body.get("name") or "synthetic")
+    d = os.path.join(_lab("synthetic"), name)
+    if os.path.exists(d):
+        raise HTTPException(409, f"A synthetic dataset called {name} already exists")
+    os.makedirs(d)
+    spec = {k: body.get("spec", {}).get(k, v) for k, v in DEFAULT_SPEC.items()}
+    spec["name"] = name
+    spec["device"] = body.get("device", "auto")
+    _json.dump(spec, open(os.path.join(d, "spec.json"), "w"), indent=1)
+    _spawn("sirilpipe.lab.generate", d)
+    return {"name": name, "dir": d}
+
+
+@app.delete("/api/lab/synthetic/{name}")
+def lab_synthetic_delete(name: str):
+    d = os.path.join(_lab("synthetic"), _safe_name(name))
+    if not os.path.isdir(d):
+        raise HTTPException(404)
+    st = _read_status(d)
+    if st.get("state") == "running":
+        raise HTTPException(409, "Still generating")
+    shutil.rmtree(d)
+    return {"ok": True}
+
+
+@app.post("/api/lab/studies")
+def lab_create(body: dict = Body(...)):
+    import json as _json
+    from sirilpipe.lab.tasks import TASKS
+    cfg = body["config"]
+    if cfg.get("task") not in TASKS:
+        raise HTTPException(400, "unknown task")
+    if not cfg.get("objectives"):
+        raise HTTPException(400, "choose an objective")
+    ds = cfg.get("dataset") or {}
+    if ds.get("kind") == "real":
+        # a real dataset is one session or several nights of one target joined with os.pathsep
+        # (the same form the Process tab's "stack together with" selection sends)
+        given = split_folders(ds.get("folder") or "")
+        if not given:
+            raise HTTPException(400, "No dataset folder given")
+        missing = [f for f in given if not os.path.isdir(f)]
+        if missing:
+            raise HTTPException(400, f"Folder not found: {', '.join(missing)}")
+        ds["folder"] = os.pathsep.join(given)
+        ds["name"] = ds.get("name") or os.path.basename(os.path.normpath(given[0]))
+    sid = time.strftime("%Y%m%d-%H%M%S") + "_" + _safe_name(cfg.get("name") or cfg["task"])
+    d = os.path.join(_lab("studies"), sid)
+    os.makedirs(d)
+    cfg["name"] = cfg.get("name") or sid
+    cfg["workdir"] = CONFIG["workdir"]
+    cfg["created"] = time.time()
+    _json.dump(cfg, open(os.path.join(d, "config.json"), "w"), indent=1)
+    _spawn("sirilpipe.lab.run", d)
+    return {"id": sid}
+
+
+def _study_dir(sid: str) -> str:
+    d = os.path.join(_lab("studies"), _safe_name(sid))
+    if not os.path.isdir(d):
+        raise HTTPException(404)
+    return d
+
+
+def _load_trials(d: str, cfg: dict):
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    db = os.path.join(d, "study.db")
+    if not os.path.exists(db):
+        return None, []
+    try:
+        study = optuna.load_study(study_name=cfg["name"], storage=f"sqlite:///{db}")
+    except Exception:
+        return None, []
+    rows = []
+    for t in study.trials:
+        rows.append({"number": t.number, "state": t.state.name, "params": t.params,
+                     "values": t.values, "metrics": t.user_attrs.get("metrics"), "error": t.user_attrs.get("error"),
+                     "baseline": bool(t.user_attrs.get("baseline") or t.system_attrs.get("fixed_params")),
+                     "seconds": (t.datetime_complete - t.datetime_start).total_seconds()
+                     if t.datetime_complete and t.datetime_start else None,
+                     "image": os.path.exists(os.path.join(d, "trials", f"{t.number}.jpg"))})
+    return study, rows
+
+
+@app.get("/api/lab/studies")
+def lab_list():
+    import json as _json
+    out = []
+    root = _lab("studies")
+    for sid in sorted(os.listdir(root), reverse=True):
+        d = os.path.join(root, sid)
+        try:
+            cfg = _json.load(open(os.path.join(d, "config.json")))
+        except Exception:
+            continue
+        st = _read_status(d)
+        study, rows = _load_trials(d, cfg)
+        done = [r for r in rows if r["state"] == "COMPLETE"]
+        best = None
+        if done and len(cfg["objectives"]) == 1:
+            sign = 1 if (cfg["objectives"][0].get("direction") or "minimize") == "minimize" else -1
+            best = min((r["values"][0] for r in done), key=lambda v: sign * v)
+        out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "dataset": cfg["dataset"].get("name"),
+                    "state": st.get("state"), "message": st.get("message"), "n_trials": cfg.get("n_trials"),
+                    "n_complete": len(done), "n_total": len(rows), "best": best,
+                    "objectives": cfg["objectives"], "created": cfg.get("created")})
+    return clean_json({"studies": out})
+
+
+def _best_trial(study, cfg):
+    """The best trial as the study's objectives define it: the optimum of a single objective;
+    with several objectives, the Pareto-optimal trial that is best on the first (primary)."""
+    objs = cfg["objectives"]
+    if len(objs) == 1:
+        return study.best_trial, f"best {objs[0]['metric']} ({objs[0].get('direction', 'minimize')})"
+    front = study.best_trials
+    sign = 1 if objs[0].get("direction", "minimize") == "minimize" else -1
+    t = min(front, key=lambda q: sign * q.values[0])
+    return t, (f"Pareto-optimal on {' × '.join(o['metric'] for o in objs)}, best {objs[0]['metric']} "
+               f"of the {len(front)} on the front")
+
+
 @app.get("/api/lab/best")
 def lab_best():
-    """The Experiments tab is gone; clients that still ask get an empty list."""
-    return {"studies": []}
+    """Every study with a completed trial and the pipeline settings of its best trial."""
+    import json as _json
+    from sirilpipe.lab.tasks import TASKS
+    out = []
+    root = _lab("studies")
+    for sid in sorted(os.listdir(root), reverse=True):
+        d = os.path.join(root, sid)
+        try:
+            cfg = _json.load(open(os.path.join(d, "config.json")))
+        except Exception:
+            continue
+        study, rows = _load_trials(d, cfg)
+        if study is None or not any(r["state"] == "COMPLETE" for r in rows):
+            continue
+        try:
+            t, why = _best_trial(study, cfg)
+        except Exception:
+            continue
+        task = TASKS.get(cfg["task"])
+        if task is None:                                         # a study of a task the Siril backend does not have (imagemm, network, ...): its settings cannot be applied
+            continue
+        allp = t.user_attrs.get("params_all") or {**task.defaults(), **t.params}
+        settings, processing, other = {}, {}, {}
+        for p in task.params:
+            if p["name"] in allp:
+                if p.get("pipeline"):
+                    settings[p["pipeline"]] = allp[p["name"]]
+                elif p.get("processing"):
+                    processing[p["processing"]] = allp[p["name"]]
+                else:
+                    other[p["name"]] = allp[p["name"]]
+        out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "task_label": task.label,
+                    "dataset": cfg["dataset"].get("name"), "state": _read_status(d).get("state"),
+                    "trial": t.number, "values": t.values, "objectives": cfg["objectives"], "criterion": why,
+                    "settings": settings, "processing": processing, "not_pipeline": other})
+    return clean_json({"studies": out})
 
 
-_GONE = "The Experiments feature was removed with the move to the Siril backend."
+@app.get("/api/lab/studies/{sid}")
+def lab_detail(sid: str, log_lines: int = 200):
+    import json as _json
+    from sirilpipe.lab.tasks import TASKS
+    d = _study_dir(sid)
+    cfg = _json.load(open(os.path.join(d, "config.json")))
+    st = _read_status(d)
+    study, rows = _load_trials(d, cfg)
+    best, importance = [], {}
+    if study is not None and any(r["state"] == "COMPLETE" for r in rows):
+        try:
+            best = [t.number for t in study.best_trials]
+        except Exception:
+            best = []
+        tuned = [k for k, v in cfg.get("space", {}).items() if v.get("tune")]
+        n_done = sum(r["state"] == "COMPLETE" for r in rows)
+        if tuned and n_done >= 4:
+            import optuna
+            for i, o in enumerate(cfg["objectives"]):
+                try:
+                    importance[o["metric"]] = optuna.importance.get_param_importances(
+                        study, target=(lambda t, i=i: t.values[i]))
+                except Exception as e:
+                    importance[o["metric"]] = {"_error": str(e)}
+    log = []
+    lp = os.path.join(d, "log.txt")
+    if os.path.exists(lp):
+        with open(lp, errors="replace") as f:
+            log = f.readlines()[-log_lines:]
+    task = TASKS.get(cfg["task"])
+    params = task.params if task else []
+    metrics = task.metrics if task else {o["metric"]: {"label": o["metric"], "direction": o.get("direction", "minimize")} for o in cfg.get("objectives", [])}
+    pipeline_map = {p["name"]: p.get("pipeline") for p in params}
+    processing_map = {p["name"]: p.get("processing") for p in params}
+    code_map = {p["name"]: p.get("code") for p in params}
+    return clean_json({"id": sid, "config": cfg, "status": st, "trials": rows, "best": best,
+                       "importance": importance, "log": "".join(log), "pipeline_map": pipeline_map,
+                       "processing_map": processing_map, "code_map": code_map, "metrics": metrics,
+                       "legacy_task": task is None})
 
 
-@app.api_route("/api/lab/{rest:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
-def lab_gone(rest: str):
-    return JSONResponse({"detail": _GONE}, status_code=410)
+@app.get("/api/lab/studies/{sid}/trial/{n}.jpg")
+def lab_trial_image(sid: str, n: int):
+    f = os.path.join(_study_dir(sid), "trials", f"{int(n)}.jpg")
+    if not os.path.exists(f):
+        raise HTTPException(404)
+    return FileResponse(f, media_type="image/jpeg")
+
+
+@app.post("/api/lab/studies/{sid}/stop")
+def lab_stop(sid: str):
+    import signal
+    st = _read_status(_study_dir(sid))
+    if st.get("state") not in ("starting", "preparing", "running"):
+        raise HTTPException(409, "The study is not running")
+    # graceful: the runner cancels the running trial and marks the study stopped
+    os.kill(int(st["pid"]), signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
+    return {"ok": True}
+
+
+@app.post("/api/lab/studies/{sid}/continue")
+def lab_continue(sid: str, body: dict = Body(...)):
+    import json as _json
+    d = _study_dir(sid)
+    st = _read_status(d)
+    if st.get("state") in ("starting", "preparing", "running"):
+        raise HTTPException(409, "The study is already running")
+    cfg = _json.load(open(os.path.join(d, "config.json")))
+    _, rows = _load_trials(d, cfg)
+    done = sum(1 for r in rows if r["state"] in ("COMPLETE", "FAIL", "PRUNED"))
+    cfg["n_trials"] = done + int(body.get("extra", 10))
+    if body.get("device"):
+        cfg["device"] = body["device"]
+    _json.dump(cfg, open(os.path.join(d, "config.json"), "w"), indent=1)
+    _spawn("sirilpipe.lab.run", d)
+    return {"ok": True, "n_trials": cfg["n_trials"]}
+
+
+@app.delete("/api/lab/studies/{sid}")
+def lab_delete(sid: str):
+    d = _study_dir(sid)
+    if _read_status(d).get("state") in ("starting", "preparing", "running"):
+        raise HTTPException(409, "Stop the study first")
+    shutil.rmtree(d)
+    return {"ok": True}
+
+
 
 
 # ------------------------------------------------------------------ explore (plate solve + Gaia / SIMBAD annotation)

@@ -54,6 +54,8 @@
       <details class="adv">
         <summary>Integration &amp; options</summary>
         <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn tiny ghost" id="spReset" title="Set every option below back to the pipeline's defaults">Reset to defaults</button></div>
+        <label title="Apply the pipeline settings of an experiment's best trial (Experiments tab). Single objective: the trial with the best value; two objectives: the Pareto-optimal trial that is best on the first. Every setting the trial ran with is applied, tuned or held fixed.">From experiment <select id="sp-experiment"><option value="">—</option></select></label>
+        <div id="sp-experiment-info" class="muted small"></div>
         <label title="Compute device of the AI tools (BlurXTerminator, NoiseXTerminator, StarXTerminator, GraXpert, ImageMM): auto picks the GPU when there is one.">Device <select id="sp-device"><option value="auto">auto</option></select></label>
         <label title="Bayer drizzle keeps the sensor's own samples (best for dithered OSC subs); demosaic interpolates first and registers on the colour image.">Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
         <label title="Drizzle scale: every sub is shifted slightly differently, so the stack can sample the sky on a finer grid. 2x is only used with 100+ subs and a sharp median FWHM; otherwise the stack falls back to 1x and says why in the stack info.">Super-resolution <select id="sp-scale"><option value="1">Off (native)</option><option value="1.5">1.5× drizzle</option><option value="2">2× drizzle (≥100 sharp subs)</option></select></label>
@@ -89,6 +91,7 @@
       <button class="tab" data-tab="explore">Explore</button>
       <button class="tab" data-tab="export">Export</button>
       <button class="tab" data-tab="diag">Diagnostics</button>
+      <button class="tab" data-tab="lab">Experiments</button>
       <button class="tab" data-tab="jobs">Jobs <span id="jobsCount" class="pill" hidden></span></button>
     </nav>
 
@@ -235,6 +238,49 @@
     </section>
 
     <!-- JOBS -->
+    <section class="tabpane" id="tab-lab">
+      <div class="lab">
+        <div class="labform">
+          <div class="card">
+            <h3>New study</h3>
+            <label class="lf">Name <input id="lbName" type="text" placeholder="e.g. imagemm-huber-m27"></label>
+            <label class="lf">Experiment <select id="lbTask"></select></label>
+            <p id="lbTaskDesc" class="muted small"></p>
+            <label class="lf">Dataset <select id="lbData"></select></label>
+            <div id="lbCombine" class="combine small" hidden></div>
+            <details id="lbSynth" class="adv"><summary>New synthetic dataset…</summary>
+              <p class="muted small">Renders Seestar-format raw subs of an analytic sky (stars, nebula, galaxies) with known truth: per-sub dither, field rotation, Moffat seeing, transparency, sky gradient, Poisson + read noise, hot pixels, satellite trails and cosmic rays. It is then analysed and stacked with the pipeline defaults.</p>
+              <div id="lbSynthFields" class="lbgrid"></div>
+              <button class="btn small" id="lbSynthGo">Generate</button>
+            </details>
+            <div id="lbOptions" class="lbgrid"></div>
+          </div>
+          <div class="card">
+            <h3>Search space</h3>
+            <p class="muted small">Tick a parameter to tune it; otherwise it is held at the value shown (the pipeline default).</p>
+            <div id="lbSpace"></div>
+          </div>
+          <div class="card">
+            <h3>Objective &amp; search</h3>
+            <label class="lf">Optimise <select id="lbObj1"></select></label>
+            <label class="lf">…and also <select id="lbObj2"></select></label>
+            <label class="lf">Sampler <select id="lbSampler"></select></label>
+            <div class="lbgrid">
+              <label>Trials <input id="lbTrials" type="number" min="1" value="30"></label>
+              <label>Time limit (min, 0 = none) <input id="lbTimeout" type="number" min="0" value="0"></label>
+              <label>Seed <input id="lbSeed" type="number" value="0"></label>
+              <label>Device <select id="lbDevice"></select></label>
+            </div>
+            <label class="check small"><input id="lbBaseline" type="checkbox" checked> Trial 0 = the pipeline's current settings (the baseline to beat)</label>
+            <button class="btn primary wide" id="lbGo">Start study</button>
+          </div>
+        </div>
+        <div class="labmain">
+          <div class="card"><h3>Studies <button class="btn tiny ghost" id="lbRefresh">Refresh</button></h3><div id="lbStudies" class="lbstudies"></div></div>
+          <div id="lbDetail" class="lbdetail"></div>
+        </div>
+      </div>
+    </section>
     <section class="tabpane" id="tab-jobs">
       <div class="jobs">
         <div class="card"><h3>Now <span id="jobsServer" class="muted small"></span></h3><div id="jobsActive"></div></div>
@@ -249,5 +295,6 @@
 <script src="/static/tools.js"></script>
 <script src="/static/explore.js"></script>
 <script src="/static/jobs.js"></script>
+<script src="/static/lab.js"></script>
 </body>
 </html>
