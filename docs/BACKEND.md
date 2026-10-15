@@ -8,15 +8,14 @@ client written against 1.x keeps working.
 ## Build and run
 
 ```bash
-cp .env.example .env                 # IMAGES_DIR, LIBRARY_DIR, OUTPUT_DIR, PORT, STARNET_ACCEPT_LICENSE, IMAGEMM
+cp .env.example .env                 # IMAGES_DIR, OUTPUT_DIR, PORT, STARNET_ACCEPT_LICENSE, IMAGEMM
 mkdir -p vendor && cp ~/Downloads/rc-astro-cli-*-linux-x64.sh vendor/     # optional: RC-Astro CLI installer
 docker compose up -d --build         # NVIDIA profile (default); --profile cpu for the CPU image
 ```
 
 | Variable | Meaning |
 |---|---|
-| `IMAGES_DIR` | session folders, read-only at `/data/images` (relative API paths resolve here) |
-| `LIBRARY_DIR` | optional second folder, read-only at `/data/library` (use absolute paths in the API) |
+| `IMAGES_DIR` | session folders, read-only at `/data/images` (API paths resolve here, as in 1.x) |
 | `OUTPUT_DIR` | caches, exports, **and `.home/`: tool licences, models, Siril config** (keep it across rebuilds) |
 | `STARNET_ACCEPT_LICENSE=yes` | download the StarNet2 CLI from starnetastro.com at build time (you accept its licence) |
 | `IMAGEMM=cuda\|cpu\|off` | add PyTorch for the optional ImageMM multi-frame restoration (cuda adds ~4 GB) |

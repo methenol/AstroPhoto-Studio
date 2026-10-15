@@ -9,7 +9,6 @@
 # then open http://localhost:${PORT} (default 8000).  Settings come from the environment or a
 # .env file next to this one (see .env.example):
 #   IMAGES_DIR   host folder with the session folders, mounted read-only   (default ./images)
-#   LIBRARY_DIR  optional second folder, read-only at /data/library (default: IMAGES_DIR)
 #   OUTPUT_DIR   host folder for caches, stacks and exports, read-write    (default ./output)
 #   PORT         host port                                                  (default 8000)
 #   PUID / PGID  user the server runs as (default: the output folder's owner, else 1000:1000);
@@ -22,12 +21,6 @@ x-astrophoto: &astrophoto
     - type: bind
       source: ${IMAGES_DIR:-./images}
       target: /data/images
-      read_only: true
-    # a second, optional read-only library (e.g. the whole NAS share when IMAGES_DIR is one of its
-    # subfolders): reachable in the UI and the API as /data/library/...; defaults to IMAGES_DIR
-    - type: bind
-      source: ${LIBRARY_DIR:-${IMAGES_DIR:-./images}}
-      target: /data/library
       read_only: true
     - type: bind
       source: ${OUTPUT_DIR:-./output}
