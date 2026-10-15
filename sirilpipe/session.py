@@ -771,7 +771,8 @@ class Session:
         except Exception as e:                                        # noqa: BLE001  a missing map never fails the stack
             log.warning("coverage map not written: %s", e)
         try:
-            cands = sorted(glob.glob(os.path.join(self.process, "*rejmap*stack_raw*.fit*")) + glob.glob(os.path.join(self.process, "rejmap*.fit*")))
+            # Siril 1.4.4 names the merged map "<out>_low+high_rejmap.fit" (-rejmap); older builds "rejmap_<out>.fit"
+            cands = sorted(set(glob.glob(os.path.join(self.process, "stack_raw*rejmap*.fit*")) + glob.glob(os.path.join(self.process, "*rejmap*.fit*"))))
             if cands:
                 rm = _fits.getdata(cands[-1]).astype(np.float32)
                 if rm.ndim == 3:
