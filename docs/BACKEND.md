@@ -76,3 +76,24 @@ pip install -r requirements-dev.txt
 pytest -q tests -m "not docker"      # unit tests: fixtures are real FITS headers and Siril .seq files
 ```
 The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
+
+## Everything the 1.x application offered, on the Siril backend
+
+| Feature | Where it lives now |
+|---|---|
+| Process tab, presets, live preview | the preview runs the export's finishing chain (`sirilpipe/pro.py`) without the AI noise reduction |
+| Every processing control (stretch, highlights, colour, stars, detail, finish, colour grade) | steps of the finishing chain; nothing is ignored (`sirilpipe/post.py` PARAM_SPEC) |
+| Super-resolution 1.5x / 2x | Siril Bayer drizzle at the chosen scale when picked explicitly; `auto` keeps 1x unless the data supports more |
+| Device choice | *Integration & compute options* > Device (RC-Astro tools, GraXpert, ImageMM) |
+| Calibration panel | masters found beside the session, DWARF CALI_FRAME matching, overrides |
+| Frames tab | per-frame FWHM, roundness, background, star count from Siril's registration; overrides |
+| Colour calibration from the stars' physics | Siril SPCC with the Siril SPCC database (narrowband mode for dual-band) |
+| Gradient removal against a sky survey | NSNS DR0.2 through CDS hips2fits (`sirilpipe/skyref.py`), `bg_method` auto / reference |
+| Auto-finish with reference looks | published rules plus the 58 reference photographs' statistics (`sirilpipe/looks.py`, `astrophoto/data/autofinish_refs.json`): saturation target, distance report |
+| AI star remover | StarXTerminator, else StarNet2 (`star_removal`) |
+| Diagnostics | stage logs, reference frame, integration coverage map, Siril rejection map |
+| Explore | plate solution from Siril's WCS (own solver as fallback), Gaia DR3 + SIMBAD annotation |
+| Experiments (Optuna) | `sirilpipe/lab/`: finishing chain, linear restoration, registration & integration, star separation, gradient removal; synthetic datasets with truth; *From experiment* in the Process tab |
+| ImageMM | `deconv_method = imagemm` (needs `IMAGEMM=cuda`), `restored_resolution` = r |
+| CLI | `python -m sirilpipe run|stack|analyse|calibration|devices|tools` |
+| `/api/v1` | unchanged |
