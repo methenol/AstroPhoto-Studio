@@ -30,6 +30,7 @@ from .siril import SirilError, SirilRunner
 from .tools import ToolError, ToolUnavailable
 from .util import Cancelled
 
+PLATESOLVE_PAUSE = float(os.environ.get("PLATESOLVE_PAUSE", 20))   # seconds between catalogue retries
 RL_TIMEOUT = float(os.environ.get("RL_TIMEOUT", 1800))      # Siril's Richardson-Lucy: ~40 s / iteration on a loaded 8 MP frame
 
 # Siril failing = a failed script, or the binary not being startable at all (no Siril on a dev machine)
@@ -122,7 +123,7 @@ PARAM_SPEC: list[dict] = [
     _R("Stars", "star_saturation", "Star colour", 0, 2.5, 0.05),
     _R("Stars", "star_color_preservation", "Star colour intensity (stretch)", 0, 1, 0.05),
     _R("Stars", "halo_suppress", "Halo suppression", 0, 1, 0.05),
-    _R("Detail", "luminance_denoise", "Noise reduction (wavelet shrinkage before the stretch + NoiseXTerminator / GraXpert after; 0.6 = standard)", 0, 1.5, 0.05),
+    _R("Detail", "luminance_denoise", "Noise reduction of the render (BayesShrink wavelet pass before the stretch, on top of the restore stage's AI denoiser; 0.6 = standard)", 0, 1.5, 0.05),
     _R("Detail", "local_contrast", "Local contrast (Revela structure gain 1 + x on the signal)", 0, 2, 0.05),
     _R("Detail", "sharpen", "Final sharpening", 0, 1.5, 0.05),
     _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
@@ -361,6 +362,7 @@ class Restorer:
         self.dual = _dual_band(meta, self.header)
         self.psf_corrected = False
         self.info: dict = {"spcc": None}
+        self._snr: float | None = None
 
     # ---- plumbing
     def _file(self, arr: np.ndarray, name: str) -> str:
@@ -378,6 +380,16 @@ class Restorer:
         meta = tools.rcastro.run(product, src, dst, device=_device_gpu(self.sp), progress=s.sub,
                                  checkpoint=s.checkpoint, **params)
         return _sanitize(fitsio.read_rgb(dst)[0]), meta
+
+    def snr(self) -> float:
+        """Per-pixel signal-to-noise of the object (``finish.object_snr``), measured once on the background-corrected stack: the strengths of BXT and the
+        denoiser follow it (RC-Astro: sharpen less and denoise more on noisy data)."""
+        if self._snr is None:
+            e = finish.EDGE_CROP
+            lum = finish.luminance(self.arr)
+            self._snr = finish.object_snr(lum[e:-e, e:-e] if min(lum.shape) > 8 * e else lum)
+            self.info["snr"] = round(self._snr, 2)
+        return self._snr
 
     # ---- steps
     def background(self) -> None:
@@ -426,21 +438,36 @@ class Restorer:
         if self.header.get("FOCALLEN") and self.header.get("XPIXSZ"):
             scale = float(self.meta.get("scale") or 1.0) or 1.0
             hints = f" -focal={float(self.header['FOCALLEN']):g} -pixelsize={float(self.header['XPIXSZ']) / scale:g}"
-        t0 = time.time()
-        try:
-            out, hdr = _siril_image(self.work, s, "solve", self.arr, self.header, f"platesolve -force{hints}", "Plate solving")
-            if not _has_wcs(hdr):
-                raise SirilError("Siril reported success but wrote no WCS")
-            self.arr = _sanitize(out)
-            for card in hdr.cards:                                   # take over the astrometric solution (WCS + SIP)
-                if re.match(r"(CTYPE|CRVAL|CRPIX|CD\d|PC\d|CDELT|CUNIT|CROTA|LONPOLE|LATPOLE|EQUINOX|RADESYS|[AB]P?_|PLTSOLVD|"
-                            r"OBJCTRA|OBJCTDEC|RA$|DEC$)", card.keyword):
-                    self.header[card.keyword] = (card.value, card.comment)
-            s.add("platesolve", "siril", seconds=time.time() - t0)
-            return True
-        except SIRIL_FAILS as e:
-            s.add("platesolve", "siril", "failed", time.time() - t0, note=str(e).splitlines()[0])
-            return False
+        # Why a solve fails on a good frame (IC 1805 / NGC 1499, 2026-10-15): Siril's catalogue is fetched online (NOMAD, and Gaia DR3, from CDS VizieR's TAP
+        # service) and the service answers "503 No server is available" now and then; the log said "Server unreachable ... unable to retrieve the remote
+        # catalogue", the same frame solved a few minutes later (3 degree field, 1800 stars, 4 s).  So: try NOMAD, then Gaia DR3 (another VizieR table, another
+        # query), then both again after a pause; a solve is only reported failed when all of those did.
+        attempts = [("nomad", 0.0), ("gaia", 0.0), ("nomad", PLATESOLVE_PAUSE), ("gaia", PLATESOLVE_PAUSE)]
+        last = ""
+        for n, (cat, pause) in enumerate(attempts):
+            if pause:
+                end = time.time() + pause
+                while time.time() < end:
+                    s.check()
+                    time.sleep(min(1.0, max(0.0, end - time.time())))
+            t0 = time.time()
+            try:
+                out, hdr = _siril_image(self.work, s, "solve", self.arr, self.header, f"platesolve -force{hints} -catalog={cat}", "Plate solving")
+                if not _has_wcs(hdr):
+                    raise SirilError("Siril reported success but wrote no WCS")
+                self.arr = _sanitize(out)
+                for card in hdr.cards:                                   # take over the astrometric solution (WCS + SIP)
+                    if re.match(r"(CTYPE|CRVAL|CRPIX|CD\d|PC\d|CDELT|CUNIT|CROTA|LONPOLE|LATPOLE|EQUINOX|RADESYS|[AB]P?_|PLTSOLVD|"
+                                r"OBJCTRA|OBJCTDEC|RA$|DEC$)", card.keyword):
+                        self.header[card.keyword] = (card.value, card.comment)
+                s.add("platesolve", "siril", seconds=time.time() - t0, catalog=cat, attempt=n + 1)
+                return True
+            except Cancelled:
+                raise
+            except SIRIL_FAILS as e:
+                last = str(e).splitlines()[0]
+                s.add("platesolve", "siril", "failed", time.time() - t0, note=last, catalog=cat, attempt=n + 1)
+        return False
 
     def psf_correction(self) -> None:
         """BlurXTerminator "Correct Only" before colour calibration (RC-Astro's manual: it makes SPCC more
@@ -524,13 +551,17 @@ class Restorer:
             if method == "rl":                                       # the n2n-rl profile: Siril's own deconvolution
                 raise ToolUnavailable("deconv_method=rl: Siril Richardson-Lucy requested")
             tools.rcastro.require("bxt")
-            ss, sn = 0.25 + 0.25 * d, 0.5 + 0.4 * d                  # DESIGN section 4; AstroPipe: ss 0.25, sn 0.60, halos 0
+            # stellar sharpening 0.25-0.4 (RC-Astro); non-stellar sharpening follows the signal-to-noise (finish.bxt_sn: 0.3 noisy .. 0.75 clean), scaled
+            # by the deconvolution setting (1 at the default 0.7).  It was a fixed 0.5 + 0.4 d = 0.78: on the 1-3 h DWARF stacks (SNR 2-10) that sharpened
+            # the noise into dark specks and rings (IC 1805).
+            snr = self.snr()
+            ss, sn = 0.25 + 0.15 * d, round(finish.bxt_sn(snr) * min(1.0, d / 0.7), 3)
             extra: dict = {}
             fwhm = float(self.meta.get("fwhm_px") or 0)
             if p.get("bxt_manual_psf") and 1.0 < fwhm:                 # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
                 extra = {"ansp": False, "nsd": min(8.0, fwhm)}
             self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=0.0, **extra)
-            s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, ss=round(ss, 3), sn=round(sn, 3),
+            s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, ss=round(ss, 3), sn=round(sn, 3), snr=round(snr, 2),
                   flags=meta.get("flags"), **extra)
             return
         except Cancelled:
@@ -561,12 +592,18 @@ class Restorer:
         if d <= 0:
             s.add("denoise", "none", "skipped", note="denoise=0")
             return
+        # THE noise reduction of the picture (the render's wavelet pass only removes the grain this leaves): an AI denoiser on the linear data, strength by
+        # the measured signal-to-noise (NXT --dn 0.9 .. 0.6, GraXpert 1.0 .. 0.6; finish.nxt_dn / graxpert_strength), scaled by the ``denoise`` setting (1 at its
+        # default 0.95).  On IC 1805 (SNR 2) a light pass (NXT 0.28) left a pixel noise 20 x the nebula's signal, which the stretch then turned into blotches;
+        # GraXpert 1.0 on the same linear data resolves the Heart's filaments.
+        snr = self.snr()
+        scale = min(1.0, d / 0.95)
         t0 = time.time()
         try:
             tools.rcastro.require("nxt")
-            dn = round(0.3 * d, 3)         # light linear pass (AstroPipe: NXT 0.25 after BXT); the main pass is on the starless
+            dn = round(finish.nxt_dn(snr) * scale, 3)
             self.arr, meta = self._rc("nxt", self.arr, "nxt", dn=dn)
-            s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, flags=meta.get("flags"))
+            s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, snr=round(snr, 2), flags=meta.get("flags"))
             return
         except Cancelled:
             raise
@@ -575,10 +612,10 @@ class Restorer:
         t0 = time.time()
         try:
             src, dst = self._file(self.arr, "gxd_in.fits"), self._out("gxd_out.fits")
-            strength = round(0.5 * d, 3)                              # DESIGN: GraXpert strength = 0.5 x denoise
+            strength = round(finish.graxpert_strength(snr) * scale, 3)
             meta = tools.graxpert.denoise(src, dst, strength=strength, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
             self.arr = _sanitize(fitsio.read_rgb(dst)[0])
-            s.add("denoise", "graxpert", seconds=time.time() - t0, strength=strength, model=meta.get("model"),
+            s.add("denoise", "graxpert", seconds=time.time() - t0, strength=strength, snr=round(snr, 2), model=meta.get("model"),
                   providers=meta.get("providers"))
             return
         except Cancelled:
@@ -604,7 +641,7 @@ class Restorer:
         lum = finish.luminance(self.arr)
         ran = [r["tool"] for r in s.records if r["status"] == "done" and r["tool"] != "none"]
         return {"created": datetime.now().isoformat(timespec="seconds"), "steps": s.records, "tools": ran,
-                "scale": self.scale, "wcs": _has_wcs(self.header), "dual_band": self.dual, "spcc": self.info["spcc"],
+                "scale": self.scale, "wcs": _has_wcs(self.header), "dual_band": self.dual, "spcc": self.info["spcc"], "snr": self.info.get("snr"),
                 "stats": {"median": round(float(np.median(finish.sample(lum))), 6),
                           "noise_sigma": round(finish.lower_half_sigma(finish.sample(lum)), 6),
                           "max": round(float(self.arr.max()), 4)},
@@ -758,6 +795,10 @@ class _Layers:
             if self.stars is not None:
                 self.stars = np.ascontiguousarray(self.stars[:, e:-e, e:-e])
         self.fwhm_px = float(_load_json(_p(session, "stack_meta.json")).get("fwhm_px") or 3.0)
+        # the linear data went through a denoiser in the restore stage (NXT, GraXpert or Siril): the render's wavelet pass then only cleans the grain
+        rm = _load_json(_p(session, "restore_meta.json"))
+        self.denoised = os.path.basename(self.src) == "linear.fits" and any(
+            r.get("step") == "denoise" and r.get("status") == "done" and r.get("tool") != "none" for r in rm.get("steps", []))
         if max_side:
             self.fwhm_px *= min(1.0, max_side / max(self.base.shape[1:]))
             self.base = _reduce(self.base, max_side)
@@ -807,7 +848,7 @@ def _render(layers: _Layers, p: dict, dual: bool, fast: bool, hooks: dict | None
         pre = st_stretched = stars is not None
         if stars is None:
             base = layers.base
-    p = {**p, "_fwhm_px": layers.fwhm_px}
+    p = {**p, "_fwhm_px": layers.fwhm_px, "_denoised_linear": layers.denoised}
     img, info = finish.render_layers(base, stars, p, dual_band=dual, pre_stretched=pre, stars_stretched=st_stretched,
                                      hooks=hooks, tick=tick)
     info["star_layer"] = "separate" if stars is not None else "none"
@@ -899,14 +940,18 @@ def _record_numpy_steps(steps: _Steps, info: dict, p: dict) -> None:
     g = info.get("ghs") or {}
     if not g:
         return
-    steps.add("denoise (linear)", "numpy starlet", amount=g.get("denoise"), noise_sigma=g.get("noise_sigma"), thresholds_k=list(finish.STARLET_K), cold_sigma=finish.COLD_SIGMA)
+    steps.add("denoise (linear)", "numpy starlet (BayesShrink / bivariate)", amount=g.get("denoise"), noise_sigma=g.get("noise_sigma"),
+              scales=("1-%d, x%g (grain left by the restore stage's AI denoiser)" % (finish.FINE_SCALES, finish.AI_RESIDUAL_GAIN)) if info.get("denoised_by_restore") else "all", cold_sigma=finish.COLD_SIGMA)
     steps.add("background (second pass)", "numpy poly", degree=finish.FLATTEN_DEGREE, span=g.get("flatten_span"))
     steps.add("stretch", "numpy ghs", sky_aim=float(p["stretch"]), nebula_aim=finish.NEBULA_AIM, anchors=g.get("anchors"), white=g.get("white"), sky_in=g.get("sky_in"),
               nebula_in=g.get("nebula_in"), bright_in=g.get("bright_in"), signal_frac=g.get("signal_frac"), **{k: v for k, v in (g.get("ghs") or {}).items()})
     pi = info.get("palette_info") or {}
     if "nbn_strength" in pi:
         steps.add("narrowband normalisation", "numpy nbn", oiii_boost=pi.get("oiii_boost"), midtones_strength=pi.get("nbn_strength"), ha_leak_k=pi.get("ha_leak_k"),
-                  noise_gain=pi.get("gain"))
+                  noise_gain=pi.get("gain"), colour_sigma_px=pi.get("color_sigma_px"), sky_offset_oiii=pi.get("sky_offset_oiii"))
+        steps.add("lightness", "numpy ha luminance", amount=float(p.get("synthetic_luminance", 0.9)))
+    if float(p.get("hdr", 0)) > 0 and str(p.get("stretch_method", "ghs")) == "ghs":
+        steps.add("highlights", "numpy hdr compress", amount=float(p["hdr"]), knee=finish.HDR_KNEE_GHS, source="Statistical_Stretch.hdr_compress_color_luminance")
 
 
 def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict | None = None, progress=None,

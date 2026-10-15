@@ -15,7 +15,7 @@ from sirilpipe import autofinish as af, finish, fitsio, post   # noqa: E402
 
 
 def test_sky_aim_is_dark_grey_and_the_nebula_aim_is_a_midtone():
-    assert 0.07 <= af.SKY_AIM <= 0.10 and 0.45 <= finish.NEBULA_AIM <= 0.65 and finish.BRIGHT_AIM > finish.NEBULA_AIM
+    assert 0.07 <= af.SKY_AIM <= 0.10 and 0.45 <= finish.NEBULA_AIM <= 0.75 and finish.BRIGHT_AIM > finish.NEBULA_AIM
 
 
 def test_star_settings_by_density():
@@ -73,7 +73,7 @@ def test_run_writes_report_with_a_measurement_per_decision(session):
     assert p["stretch"] == af.SKY_AIM and p["auto_stretch"] is False and p["black_point"] == 0.0
     assert p["saturation"] >= 1.0                                              # never desaturates
     assert p["star_reduction"] == pytest.approx(0.30) and p["star_intensity"] == pytest.approx(1.0)   # 450 stars / MP: normal
-    assert p["hdr"] == 0.0 and p["contrast"] in finish.GHS_B_LADDER
+    assert p["hdr"] in af.HDR_LADDER and p["contrast"] in finish.GHS_B_LADDER
     assert p["grade_temperature"] == 0 and p["grade_contrast"] == 0           # grade stays neutral
     steps = {s["step"]: s for s in rep["steps"]}
     assert {"stretch", "auto_stretch", "star_reduction", "star_intensity", "hdr", "contrast", "saturation"} <= set(steps)

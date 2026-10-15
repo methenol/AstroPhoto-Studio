@@ -48,21 +48,29 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
 4. **Integrate** — `seqapplyreg` with Bayer drizzle (1×, pixfrac 1; 2× only for well-sampled, large
    sets), `-framing=max`, winsorized sigma rejection, additive-scale normalisation, wFWHM weights,
    32-bit output; auto-crop to the covered area; plate solve.
-5. **Restore** (linear) — GraXpert AI background extraction; SPCC colour calibration (sensor and filter
-   from the headers; narrowband mode for dual-band filters); BlurXTerminator correct-only then
-   sharpen (or Siril `makepsf` + Richardson-Lucy); NoiseXTerminator (or GraXpert denoise).
-   `deconv_method = imagemm` runs ImageMM on the registered subs instead (needs `IMAGEMM=cuda`).
+5. **Restore** (linear) — GraXpert AI background extraction; plate solve (NOMAD, then Gaia DR3, retried: the
+   online catalogue answers 503 now and then); SPCC colour calibration (sensor and filter from the headers;
+   narrowband mode for dual-band filters); BlurXTerminator correct-only then sharpen (or Siril `makepsf` +
+   Richardson-Lucy) with the non-stellar sharpening following the measured per-pixel signal-to-noise
+   (`finish.object_snr`: 0.3 on noisy data up to 0.75 on clean, RC-Astro: sharpen less on noisy data);
+   then THE noise reduction: NoiseXTerminator `--dn` 0.9 .. 0.6 by the same signal-to-noise (or GraXpert's AI
+   denoise 1.0 .. 0.6, or Siril) on the linear data.  `deconv_method = imagemm` runs ImageMM on the
+   registered subs instead (needs `IMAGEMM=cuda`).
 6. **Stars** — StarXTerminator (or StarNet2) splits stars and starless images.
-7. **Auto-finish** — sky level, GHS local intensity, star intensity, OIII normalisation strength,
-   saturation and local contrast chosen from measured statistics; the report lists each decision.
-8. **Export** — the starless image is denoised in the linear domain (starlet shrinkage with measured
-   per-scale noise, cold-pixel rejection), a second polynomial background pass flattens the sky, and
-   a Generalised Hyperbolic Stretch (Payne & Cranfield) with the black point at the sky and D / SP
-   solved so the sky sits at 0.085 and the nebula's 90th percentile at 0.6 ("stretch where the signal
-   is"); dual-band OIII is normalised to Ha on the stretched data (Blanshan / Cranfield), HOO /
-   Foraxx palettes, a second NoiseXTerminator pass, VeraLux-Revela local contrast on the structure
-   scales, asinh star stretch, screen recombination, SCNR for broadband, sRGB JPEG + 16-bit TIFF + a
-   JSON sidecar listing every step and parameter.  The outer 24 px of the stack are trimmed
+7. **Auto-finish** — sky level, GHS local intensity, HDR compress, star intensity, OIII normalisation strength,
+   saturation, sharpening and local contrast chosen from measured statistics; the report lists each decision.
+8. **Export** — only the grain the AI denoiser leaves (starlet scales 1-3, BayesShrink with bivariate parent
+   support, Chang-Yu-Vetterli / Sendur-Selesnick) is cleaned in the linear domain, a second polynomial
+   background pass flattens the sky, and a Generalised Hyperbolic Stretch (Payne & Cranfield) with D / SP
+   solved so the sky sits at 0.085 and the nebula's 90th percentile at 0.6 ("stretch where the signal is").
+   Dual-band: Ha and OIII are stretched with one GHS fitted on Ha; the colour (Ha : OIII ratio, OIII
+   normalised to Ha with Blanshan / Cranfield) is taken at colour resolution (0.3 % of the long side) from
+   background-neutralised planes, the lightness from the full-resolution Ha plus the OIII in proportion to its
+   signal-to-noise ("HOO with Ha luminance"), so OIII noise never reaches the picture; display-level sky
+   neutralisation (offsets only).  HDR highlight compress (Statistical_Stretch), output black level to the sky
+   aim, asinh star stretch, screen recombination, SCNR for broadband, sRGB JPEG + 16-bit TIFF + a JSON sidecar
+   listing every step and parameter.  A second NoiseXTerminator / GraXpert pass on the stretched image runs
+   only for the legacy stretches (one noise reduction, not two).  The outer 24 px of the stack are trimmed
    (noisier rim).  The legacy statistical stretch stays available as `stretch_method` mtf / asinh / log.
 
 Which tool runs is decided at run time from the licences (`GET /api/tools`); the Linear panel in the

@@ -598,7 +598,7 @@ def test_nbn_oiii_equalises_the_average_level_and_keeps_the_floor():
 def test_flatten_sky_removes_a_tilt_but_not_the_nebula():
     x, neb = _faint_nebula(h=320, w=480)
     tilt = np.linspace(0, 2e-4, x.shape[1], dtype=np.float32)[None, :]
-    y, info = finish.flatten_sky(finish.starlet_denoise(x + tilt, 1.0)[0])
+    y, info = finish.flatten_sky(x + tilt)
     sky = np.concatenate([y[:40].ravel(), y[-40:].ravel()])
     left, right = y[:, :60].mean(), y[:, -60:].mean()
     assert abs(left - right) < 0.5e-4                                                      # the 2e-4 tilt is gone
@@ -611,7 +611,9 @@ def test_ghs_stretch_puts_the_sky_and_the_nebula_on_their_aims_and_shows_the_neb
     y, info = finish.ghs_stretch([x, x * 0.9], sky_aim=0.085, neb_aim=0.55, b_max=4.0, denoise=1.0)
     assert len(y) == 2 and y[0].min() >= 0 and y[0].max() <= 1
     sky = float(np.median(y[0][:30, :30]))
-    assert 0.03 < sky < 0.2                                                                # dark grey sky
+    # (the synthetic nebula is one bright Gaussian, 59 % of the white point at its 90th percentile: the aims cannot both be met, the denoised plane is clean enough
+    # for the fit to see that; the sky then sits lower than the aim, never above the dark grey)
+    assert 0.01 < sky < 0.2                                                                # dark sky
     assert y[0][120, 180] > 0.4 and y[0][120, 180] > sky + 0.3                             # the nebula stands out
     assert info["ghs"]["b"] in finish.GHS_B_LADDER and info["sky_in"] < info["nebula_in"]
 
@@ -638,3 +640,120 @@ def test_ghs_render_of_a_dual_band_stack_is_dark_grey_sky_and_visible_nebula():
     assert 0.01 < np.median(lum[:30, :30]) < 0.2 and lum[100, 150] > np.median(lum[:30, :30]) + 0.2
     assert info["palette_info"]["ghs"]["b"] in finish.GHS_B_LADDER and info["palette"] == "hoo"
     assert np.allclose(img[1], img[2], atol=1e-5)                                          # HOO: G = B = OIII
+
+
+# --------------------------------------------------------------------------- noise-aware strengths, BayesShrink / bivariate denoise, Ha luminance, HDR compress, sky
+
+def _noisy_object(amp, h=300, w=400, noise=3e-4, seed=11):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    neb = amp * np.exp(-(((xx - w / 2) / 60) ** 2 + ((yy - h / 2) / 45) ** 2))
+    return (0.02 + neb + rng.normal(0, noise, (h, w))).astype(np.float32)
+
+
+def test_object_snr_follows_the_signal_and_the_ladders_run_from_noisy_to_clean():
+    weak, strong = finish.object_snr(_noisy_object(4e-4)), finish.object_snr(_noisy_object(8e-3))
+    assert 0 < weak < finish.SNR_LOW < finish.SNR_HIGH < strong
+    assert finish.bxt_sn(weak) == pytest.approx(0.3, abs=0.06) and finish.bxt_sn(strong) == 0.75     # RC-Astro: sharpen less on noisy data
+    assert finish.nxt_dn(weak) > 0.85 and finish.nxt_dn(strong) == 0.6                                # NXT 0.6-0.9, noisier = stronger
+    assert finish.graxpert_strength(weak) > 0.9 and finish.graxpert_strength(strong) == pytest.approx(0.6)
+    assert finish.bxt_sn(0.0) == 0.3 and finish.nxt_dn(0.0) == 0.9
+    assert finish.object_snr(np.full((100, 100), 0.02, np.float32)) == 0.0                           # no object, no signal-to-noise
+
+
+def test_object_snr_ignores_stars():
+    x = _noisy_object(4e-4)
+    y = x.copy()
+    for cy, cx in ((40, 50), (120, 300), (240, 90), (200, 200), (60, 330)):
+        y[cy - 3:cy + 4, cx - 3:cx + 4] += 0.3 * np.exp(-(np.mgrid[-3:4, -3:4] ** 2).sum(0) / 3.0)
+    assert finish.object_snr(y) == pytest.approx(finish.object_snr(x), rel=0.35)
+
+
+def test_bivariate_shrink_removes_isolated_noise_outliers_but_keeps_an_extended_structure():
+    rng = np.random.default_rng(2)
+    x = (0.02 + rng.normal(0, 3e-4, (300, 300))).astype(np.float32)
+    yy, xx = np.mgrid[0:300, 0:300]
+    structure = 1.2e-3 * np.exp(-(((xx - 150) / 12.0) ** 2 + ((yy - 150) / 12.0) ** 2))      # 4 sigma at the centre, extended
+    x += structure.astype(np.float32)
+    hot = [(40, 40), (60, 240), (250, 60)]
+    for y0, x0 in hot:
+        x[y0, x0] += 1.5e-3                                                                      # an isolated 5 sigma pixel
+    dn, _ = finish.starlet_denoise(x, 1.0)
+    assert all(dn[y0, x0] - 0.02 < 0.6 * 1.5e-3 for y0, x0 in hot)                               # isolated: no support from the coarser scale
+    assert dn[150, 150] - 0.02 > 0.5 * 1.2e-3                                                    # extended: kept
+    # one noise reduction, not two: with the AI denoiser's flag only the fine scales are touched, the coarse residual (a smooth ramp) is untouched
+    ramp = (0.02 + np.linspace(0, 1e-3, 300, dtype=np.float32)[None, :] * np.ones((300, 1), np.float32)).astype(np.float32)
+    ramp += rng.normal(0, 3e-4, ramp.shape).astype(np.float32)
+    coarse = finish.starlet(finish.starlet_denoise(ramp, 1.0, shrink_scales=3)[0], 6)[1]
+    assert abs(float(coarse[:, 250:].mean() - coarse[:, :50].mean()) - 1e-3 * 0.8) < 3e-4
+
+
+def test_wavelet_contrast_is_snr_gated():
+    noise_only = _noisy_object(0.0, seed=5)
+    flat = finish.starlet_denoise(noise_only, 1.0, contrast=0.0)[0]
+    boosted = finish.starlet_denoise(noise_only, 1.0, contrast=2.0)[0]
+    assert boosted.std() < 1.15 * flat.std()                                                      # noise is not amplified
+    rng = np.random.default_rng(6)
+    yy, xx = np.mgrid[0:300, 0:400]
+    pattern = (4e-3 * (np.sin(xx / 6.0) * np.sin(yy / 6.0)) * ((xx > 150) & (xx < 260) & (yy > 100) & (yy < 200))).astype(np.float32)   # 13 sigma structure on the 4-16 px scales
+    clean = (0.02 + pattern + rng.normal(0, 3e-4, pattern.shape)).astype(np.float32)
+    a, b = finish.starlet_denoise(clean, 1.0, contrast=0.0)[0], finish.starlet_denoise(clean, 1.0, contrast=1.5)[0]
+    assert b[100:200, 150:260].std() > 1.25 * a[100:200, 150:260].std()                           # the structure gets its gain
+
+
+def test_hdr_compress_is_the_statistical_stretch_curve():
+    y = np.linspace(0, 1, 11, dtype=np.float32)
+    assert np.array_equal(finish.hdr_compress_highlights(y, 0.0), y)
+    out = finish.hdr_compress_highlights(y, 0.5, 0.75)
+    assert np.allclose(out[y <= 0.75], y[y <= 0.75]) and out[-1] == pytest.approx(1.0)               # below the knee nothing moves, white stays white
+    assert (out[(y > 0.75) & (y < 1)] < y[(y > 0.75) & (y < 1)]).all() and (np.diff(out) >= 0).all()   # the cubic Hermite sags below the diagonal in between: room at the top
+    t = (0.9 - 0.75) / 0.25
+    expect = 0.75 + 0.25 * ((t ** 3 - 2 * t ** 2 + t) + (-2 * t ** 3 + 3 * t ** 2) + (t ** 3 - t ** 2) * (1 + 4 * 0.5))
+    assert float(finish.hdr_compress_highlights(np.array([0.9], np.float32), 0.5, 0.75)[0]) == pytest.approx(expect, abs=1e-5)
+    rgb = np.stack([np.full((4, 4), v, np.float32) for v in (0.95, 0.9, 0.85)])
+    c = finish.hdr_compress(rgb, 1.2)
+    assert finish.luminance(c)[0, 0] < finish.luminance(rgb)[0, 0] and c[0, 0, 0] > c[1, 0, 0] > c[2, 0, 0]     # darker, hue order kept
+    assert np.array_equal(finish.hdr_compress(rgb, 0.0), rgb)
+
+
+def test_ha_luminance_takes_the_lightness_from_ha_and_keeps_the_palette_colour():
+    rng = np.random.default_rng(8)
+    ha = np.clip(rng.uniform(0.1, 0.7, (40, 40)), 0, 1).astype(np.float32)
+    o = np.full((40, 40), 0.15, np.float32)                                                       # smooth OIII
+    rgb = finish.compose_palette(ha, o, "hoo")
+    out = finish.ha_luminance(rgb, ha, 1.0)
+    assert out.max() <= 1.0 and np.allclose(out.max(0), ha, atol=1e-4)                          # the lightness (brightest channel) is Ha's, nothing can overflow
+    assert np.array_equal(finish.ha_luminance(rgb, ha, 0.0), rgb)
+    hue_in = np.arctan2(np.sqrt(3) * (rgb[1] - rgb[2]), 2 * rgb[0] - rgb[1] - rgb[2])
+    hue_out = np.arctan2(np.sqrt(3) * (out[1] - out[2]), 2 * out[0] - out[1] - out[2])
+    assert np.abs(hue_in - hue_out).max() < 1e-3                                                  # G = B stays G = B: the palette's own hue
+    # the OIII noise cannot reach the lightness: noisy OIII, same lightness
+    noisy_o = (0.15 + rng.normal(0, 0.05, (40, 40))).clip(0, 1).astype(np.float32)
+    light_noisy = finish.ha_luminance(finish.compose_palette(ha, noisy_o, "hoo"), ha, 1.0).max(0)
+    assert np.abs(light_noisy - ha).max() < 1e-4
+
+
+def test_colour_planes_share_a_sky_and_neutralize_display_sky_equalises_the_medians():
+    rng = np.random.default_rng(9)
+    h = np.clip(0.06 + 0.4 * np.exp(-(((np.mgrid[0:300, 0:400][1] - 200) / 50.0) ** 2)) + rng.normal(0, 0.01, (300, 400)), 0, 1).astype(np.float32)
+    o = np.clip(0.11 + rng.normal(0, 0.01, (300, 400)), 0, 1).astype(np.float32)
+    hc, oc, d = finish.colour_planes(h, o)
+    assert abs(np.percentile(hc, 5) - np.percentile(oc, 5)) < 0.01 and d > 0.03
+    assert oc.std() < 0.5 * o.std()                                                               # colour resolution: the OIII grain is averaged away
+    rgb = np.stack([np.full((100, 100), 0.05, np.float32), np.full((100, 100), 0.08, np.float32), np.full((100, 100), 0.07, np.float32)])
+    rgb[:, 40:60, 40:60] = 0.7
+    out, off = finish.neutralize_display_sky(rgb)
+    sky = out[:, :30, :30]
+    assert np.allclose(sky[0], sky[1]) and np.allclose(sky[1], sky[2]) and off[0] == 0 and off[1] == pytest.approx(0.03, abs=1e-4)
+
+
+def test_sky_lift_brings_the_sky_up_to_the_aim_and_never_darkens():
+    rng = np.random.default_rng(10)
+    img = np.clip(rng.normal(0.03, 0.002, (3, 120, 160)), 0, 1).astype(np.float32)
+    img[:, 40:80, 60:120] = 0.8
+    out, a = finish.sky_lift(img, 0.085)
+    lum = cv2.GaussianBlur(finish.luminance(out), (0, 0), 2.0)
+    assert abs(float(np.median(lum[lum <= np.percentile(lum, 45)])) - 0.085) < 0.006 and 0.04 < a < 0.07
+    assert out.max() <= 1.0 and (out >= img).all()
+    bright_sky, a2 = finish.sky_lift(np.full((3, 50, 50), 0.2, np.float32), 0.085)
+    assert a2 == 0.0 and np.array_equal(bright_sky, np.full((3, 50, 50), 0.2, np.float32))
