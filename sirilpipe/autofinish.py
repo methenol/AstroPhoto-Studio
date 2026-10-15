@@ -53,6 +53,7 @@ STATS_SIDE = 1200
 GHS_D2_SMALL, GHS_D2_FILLING = 2.5, 1.5      # second GHS pass D by subject coverage (measured 2026-10-15; see autofinish.run)
 SATU_BROADBAND_MAX = 0.3                     # satu amount cap for broadband (Siril tutorial 0.25-0.5; the middle value keeps SPCC's calibration)
 SATU_CANDIDATES = (0.25, 0.3, 0.5)           # Siril tutorial satu values
+SATU_DUAL_MIN = 0.45                         # HOO renders judged right at satu 0.45 (the Siril tutorial range ends at 0.5)
 HDR_DUAL_DEFAULT = 0.5                       # GHS HP protection at half strength on dual-band nebulae (see run)
 STAR_BOOST_BROADBAND_MAX = 1.2               # colour boost 1.5 made M 31's faint stars green / magenta (chroma noise); 1.2 at most on broadband
 
@@ -213,6 +214,8 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     amount = satu_amount(sat0)
     if not dual:
         amount = min(amount, SATU_BROADBAND_MAX)                   # a galaxy / reflection nebula: the stronger satu tinted M 31's disc magenta; 0.3 is the published middle value
+    else:
+        amount = max(amount, SATU_DUAL_MIN)                        # HOO: at least the published upper value (judged on IC 1805 / M 42 2026-10-15; 0.25 left the nebula muted)
     if ref_agg and "C50" in ref_agg:
         # the references' colourfulness is reported beside the published value (satu 0.25 / 0.3 / 0.5); it does not override it: the 2026-10-15 renders judged
         # at satu 0.45 (dual-band) were right, and the Commons references (many of them deliberately muted) pulled the colour down when they decided
