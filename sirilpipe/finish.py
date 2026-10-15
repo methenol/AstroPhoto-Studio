@@ -839,6 +839,59 @@ def chroma_smooth(rgb: np.ndarray, amount: float) -> np.ndarray:
     return to_chw(np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2RGB), 0, 1))
 
 
+SKY_CHROMA_RAMP = 0.0            # display-lightness span above the sky over which the chroma comes back to full strength (smoothstep)
+CHROMA_K = (5.0, 4.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0)   # soft thresholds of the chrominance planes' starlet scales 1-128 px, in sigmas of the scale measured in the sky;
+                                                       # scales 1-3: Brecher's MultiscaleLinearTransform chrominance thresholds 5.0 / 4 / 3 (astrodoc.ca IC 417 SHO),
+                                                       # beyond: 3 (the large-scale colour mottle of the stack: the user's blotches), as TGVDenoise / MLT chrominance does at every scale
+
+
+def chroma_wavelet_denoise(rgb: np.ndarray, amount: float) -> tuple[np.ndarray, dict]:
+    """Chrominance noise reduction at every scale from 1 to 128 px (PixInsight MultiscaleLinearTransform / TGVDenoise "chrominance" practice, Brecher IC 417 SHO;
+    Delsaert: reduce the chrominance noise BEFORE raising the saturation): the Lab a* and b* planes of the picture are decomposed in starlet scales and every
+    coefficient is soft-thresholded at ``CHROMA_K[j] x amount / 0.8`` x sigma_j, with sigma_j the robust (MAD) noise of the scale measured on the SKY samples (the darkest
+    45 % of the 32 px smoothed lightness, where only noise lives).  A colour structure of the nebula stands many sigmas above that and keeps its hue and saturation (it
+    loses the threshold only); the blotches of the sky are 1-2 sigma and vanish.  The lightness plane is untouched.  Nothing is weighted by the significance of a line:
+    the threshold is the one of the noise, the same everywhere."""
+    amount = float(np.clip(amount, 0.0, 1.5))
+    info: dict = {"amount": amount}
+    if amount <= 0:
+        return rgb, info
+    hwc = to_hwc(rgb)
+    lab = cv2.cvtColor(hwc, cv2.COLOR_RGB2Lab)
+    lum = lab[..., 0]
+    mask = _sky_mask(lum, edge=EDGE_CROP)
+    sig_all = []
+    before = float(np.sqrt(np.mean([(cv2.GaussianBlur(lab[..., c], (0, 0), BAND_LO) - cv2.GaussianBlur(lab[..., c], (0, 0), BAND_HI))[mask].var() for c in (1, 2)])))
+    for c in (1, 2):
+        planes, res = starlet(lab[..., c], len(CHROMA_K))
+        out = res.copy()
+        sg = []
+        for j, w in enumerate(planes):
+            sj = float(1.4826 * np.median(np.abs(w[mask] - np.median(w[mask])))) if mask.sum() > 100 else 0.0
+            t = np.float32(CHROMA_K[j] * amount / 0.8 * sj)
+            out += np.sign(w) * np.maximum(np.abs(w) - t, 0.0)
+            sg.append(round(sj, 4))
+        lab[..., c] = out
+        sig_all.append(sg)
+    after = float(np.sqrt(np.mean([(cv2.GaussianBlur(lab[..., c], (0, 0), BAND_LO) - cv2.GaussianBlur(lab[..., c], (0, 0), BAND_HI))[mask].var() for c in (1, 2)])))
+    info.update(sigma_sky_a=sig_all[0], sigma_sky_b=sig_all[1], k=[round(k * amount / 0.8, 2) for k in CHROMA_K], band_ab_before=round(before, 3), band_ab_after=round(after, 3))
+    # the colour of the dark sky: chroma follows the lightness down to the sky (a photographic "saturation mask by luminance": the shadows of every colour image lose chroma;
+    # a smooth function of the 8 px smoothed lightness only, never of how significant a line is): w = smoothstep((L - sky) / ramp) with the sky = the median of the darkest
+    # 45 % and the ramp ``SKY_CHROMA_RAMP`` x amount / 0.8 (Lab L units / 100)
+    if SKY_CHROMA_RAMP <= 0:
+        return to_chw(np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2RGB), 0, 1)), info
+    sm = cv2.GaussianBlur(lum, (0, 0), 8.0) / 100.0
+    smp = sm[::3, ::3].reshape(-1)
+    sky = float(np.median(smp[smp <= np.percentile(smp, 45)]))
+    ramp = max(SKY_CHROMA_RAMP * amount / 0.8, 1e-3)
+    t = np.clip((sm - np.float32(sky)) / np.float32(ramp), 0.0, 1.0)
+    w = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+    lab[..., 1] *= w
+    lab[..., 2] *= w
+    info.update(sky_L=round(sky, 4), sky_chroma_ramp=round(ramp, 4))
+    return to_chw(np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2RGB), 0, 1)), info
+
+
 def sharpen(rgb: np.ndarray, amount: float) -> np.ndarray:
     """Unsharp mask on the lightness (Lab L) with a soft threshold at the image's noise, so the sky's
     grain is not sharpened; ``amount`` 0..1.5."""
@@ -989,10 +1042,15 @@ SKY_AIM = 0.085                   # display level of the sky (the user's aim 0.0
 NEBULA_AIM = 0.60                 # display level of the nebula's 90th percentile (aim: nebula p90 >= 0.45 measured on the final picture; the fit's "signal" mask is stricter than the picture's, so the aim is higher)
 ANCHOR_PERCENTILE = 1.0           # black point = this percentile of the smoothed, denoised channel (VeraLux uses 0.5 on the raw channel; the denoised one has no noise tail)
 ANCHOR_SMOOTH = 1.5               # px, gaussian used for the percentile statistics
-WHITE_PERCENTILE = 99.95         # default; autofinish picks 99.99 when the fit still meets its aims (M 42 Trapezium: 99.95 blew 4000 px to a flat white blob; M 31: 99.99 flattened the galaxy)
+WHITE_PERCENTILE = 99.999        # of the denoised, smoothed starless plane (a lower one clipped IC 1805's core, 0.2 % of the frame, to a flat white plateau)
 GHS_B_LADDER = (13.0, 10.0, 8.0, 6.0, 4.0, 3.0, 2.0, 1.0, 0.5)
 BRIGHT_AIM = 0.95                 # the signal's 99.5th percentile stays at or below this display level (headroom below clipping)
 GHS_FIT_TOLERANCE = 1e-4          # summed squared error of the two aims below which a b is "met"
+GHS_SKY_SHARE = 0.5               # the stretch puts the sky at this share of the sky aim; the output black level (sky_lift: Levels' output slider) brings it up to the aim.  A sky at 8.5 % of
+                                  # the output range sits 0.4 % above the black point of a white-scaled plane: the slope below it would have to exceed the slope above it
+NEBULA_AIMS = (0.60, 0.55, 0.50, 0.45, 0.40, 0.35)  # nebula p90 display levels tried in turn (the brightest whose stretched sky noise stays within ``SKY_NOISE_LIMIT``)
+SKY_NOISE_LIMIT = 0.01            # display units: noise in the 32-128 px band of the sky (the user's "watercolour" blobs are this band)
+NOISE_LP_MODES = (0.0, 1.0)       # shadow protection candidates of the noise-floor fit, as fractions of the sky level
 
 # Starlet (a trous B3-spline) shrinkage, Starck & Murtagh "Astronomical Image and Data Analysis" 2002 / Starck, Murtagh, Bijaoui 1998 (the noise reduction of
 # PixInsight's MultiscaleLinearTransform and Siril's wavelet tools), with the *locally adaptive* threshold of BayesShrink (Chang, Yu & Vetterli 2000, "Adaptive
@@ -1096,6 +1154,7 @@ def starlet_denoise(x: np.ndarray, amount: float = 1.0, scales: int = 6, contras
 
 
 FLATTEN_DEGREE = 2                # polynomial degree of the second background pass (Siril ``subsky`` poly, degree 1-4)
+FLATTEN_DEGREE_BROADBAND = 3      # broadband RGB planes: the colour gradients of the corners (an amber glow in NGC 1499's corner) need one more order
 FLATTEN_SKY_FRACTION = 0.40       # the darkest 40 % of the (model-corrected) smoothed plane are the sky samples
 
 
@@ -1129,66 +1188,130 @@ def flatten_sky(plane: np.ndarray, degree: int | None = None) -> tuple[np.ndarra
 
 
 def _ghs_g(u: np.ndarray, b: float, d: float) -> np.ndarray:
-    """Integral of the GHS slope ``(1 + b D t)^(-1/b)`` from 0 to ``u`` (harmonic family for b > 0; b = 1 logarithmic, b -> 0 exponential)."""
+    """Integral of the GHS slope ``(1 + b D t)^(-1 - 1/b)`` from 0 to ``u``: ``(1 - (1 + b D u)^(-1/b)) / D`` (b = 0: ``(1 - exp(-D u)) / D``).  Payne & Cranfield's harmonic
+    family, ``T(x) = 1 - (1 + b D x)^(-1/b)`` (Siril ``ght`` is checked against it in tests/test_finish.py)."""
     u = np.asarray(u, np.float64)
     if abs(b) < 1e-6:
         return (1.0 - np.exp(-d * u)) / d
-    if abs(b - 1.0) < 1e-6:
-        return np.log1p(d * u) / d
-    return ((1.0 + b * d * u) ** ((b - 1.0) / b) - 1.0) / (d * (b - 1.0))
+    return (1.0 - (1.0 + b * d * u) ** (-1.0 / b)) / d
 
 
-def ghs(x: np.ndarray, b: float, d: float, sp: float) -> np.ndarray:
-    """Generalised Hyperbolic Stretch (Payne & Cranfield 2021) of ``x`` in [0, 1] with local intensity ``b``, stretch factor ``d`` and symmetry point ``sp`` (LP = 0,
-    HP = 1): the slope peaks at SP and falls off as ``(1 + b D |x - SP|)^(-1/b)`` on both sides, the transform is odd about SP and normalised to 0 -> 0, 1 -> 1."""
+def _ghs_slope(t: np.ndarray, b: float, d: float) -> np.ndarray:
+    """The GHS slope at distance ``t`` from the symmetry point, ``(1 + b D t)^(-1 - 1/b)`` (b = 0: ``exp(-D t)``)."""
+    t = np.asarray(t, np.float64)
+    return np.exp(-d * t) if abs(b) < 1e-6 else (1.0 + b * d * t) ** (-1.0 - 1.0 / b)
+
+
+def _ghs_t(x, b: float, d, sp, lp=0.0, hp=1.0):
+    """The normalised GHS ``T(x)`` (see ``ghs``); ``x``, ``d``, ``sp``, ``lp``, ``hp`` broadcast against each other (``b`` is a scalar): used by the fit on parameter grids."""
     x = np.asarray(x, np.float64)
-    r = lambda v: np.where(v >= sp, _ghs_g(np.abs(v - sp), b, d), -_ghs_g(np.abs(v - sp), b, d))
-    r0, r1 = float(r(0.0)), float(r(1.0))
-    return ((r(x) - r0) / (r1 - r0)).astype(np.float32)
+
+    def raw(v):
+        core = np.clip(v, lp, hp)
+        f = np.where(core >= sp, _ghs_g(np.abs(core - sp), b, d), -_ghs_g(np.abs(core - sp), b, d))
+        return f + np.where(v < lp, _ghs_slope(sp - lp, b, d) * (v - lp), 0.0) + np.where(v > hp, _ghs_slope(hp - sp, b, d) * (v - hp), 0.0)
+    r0, r1 = raw(np.float64(0.0)), raw(np.float64(1.0))
+    return (raw(x) - r0) / (r1 - r0)
 
 
-def ghs_fit(sky: float, neb: float, sky_aim: float, neb_aim: float, b_max: float, bright: float | None = None) -> dict:
-    """D and SP of the GHS with the highest local intensity ``b <= b_max`` (from ``GHS_B_LADDER``) that sends ``sky`` to ``sky_aim`` and ``neb`` to ``neb_aim``
-    (grid search over log D 0.1 .. 1e6 and SP, then a finer grid around the best); when no b meets ``GHS_FIT_TOLERANCE`` the best-fitting one is returned.
-    ``bright`` (the 99.5th percentile of the signal) must not be sent above ``BRIGHT_AIM``: a one-sided penalty, so the bright cores keep a slope instead of
-    clipping to a flat plateau (a high b and a high D squeeze everything above the nebula's p90 into the last few percent)."""
+def ghs(x: np.ndarray, b: float, d: float, sp: float, lp: float = 0.0, hp: float = 1.0) -> np.ndarray:
+    """Generalised Hyperbolic Stretch (Payne & Cranfield 2021, https://ghsastro.co.uk) of ``x`` in [0, 1] with local intensity ``b``, stretch factor ``d`` (the
+    factor itself; Siril's ``-D`` is ``ln(d + 1)``), symmetry point ``sp``, shadow protection ``lp`` and highlight protection ``hp``: between LP and HP the slope peaks at
+    SP and falls off as ``(1 + b D |x - SP|)^(-1 - 1/b)`` on both sides (odd about SP); below LP and above HP the transform is the straight line that continues the curve
+    with its slope at LP / HP; normalised to 0 -> 0, 1 -> 1.  This is the numpy mirror of Siril's ``ght`` (checked against it to 1e-6 in tests/test_finish.py, docker
+    marker): it is used to FIT the parameters; the pixels are stretched by Siril (``stretch.py``) and only by this function when Siril is not available."""
+    lp, hp = float(np.clip(lp, 0.0, sp)), float(np.clip(hp, sp, 1.0))
+    return np.asarray(_ghs_t(x, float(b), float(d), float(sp), lp, hp), np.float32)
+
+
+def ghs_slope_at(x: float, b: float, d: float, sp: float, lp: float = 0.0, hp: float = 1.0, h: float = 1e-4) -> float:
+    """Output units per input unit of the GHS at ``x`` (central difference)."""
+    lo, hi = max(x - h, 0.0), min(x + h, 1.0)
+    t = _ghs_t(np.array([lo, hi]), float(b), float(d), float(sp), lp, hp)
+    return float((t[1] - t[0]) / (hi - lo))
+
+
+def ghs_fit(sky: float, neb: float, sky_aim: float, neb_aim: float, b_max: float, bright: float | None = None, noise: float | None = None,
+            lp_modes: tuple = (0.0,), sp_min: float = 0.0, hp: float = 1.0, focus: float | None = None, noise_limit: float | None = None) -> dict:
+    """D, SP, LP of the GHS that sends ``sky`` to ``sky_aim`` and ``neb`` to ``neb_aim`` (grid search over log D 0.1 .. 1e6 and SP, then a finer grid around the best),
+    for every local intensity ``b <= b_max`` of ``GHS_B_LADDER`` and every shadow protection of ``lp_modes`` (fractions of the sky level: 0 = none, 1 = LP at the sky: the
+    shadows below the sky stay linear).  Without ``noise`` the highest b that meets ``GHS_FIT_TOLERANCE`` wins (the legacy rule).  With ``noise`` (the sky's large-scale noise
+    in input units) the candidate that meets the aims with the LOWEST slope at the sky wins: the noise the stretch puts in the sky is ``noise x slope``, and the curve
+    of the GHS has a free shape (b, SP, LP) after the two aims are met - Payne & Cranfield / Cranfield's guidance, "SP above the noise you want to hide, LP to keep the
+    shadows".  ``bright`` (the 99.5th percentile of the signal) must not be sent above ``BRIGHT_AIM`` (a one-sided penalty: the cores keep a slope)."""
     sky, neb = float(np.clip(sky, 1e-4, 0.98)), float(np.clip(neb, 1e-4, 0.99))
     neb = max(neb, sky * 1.05)
-    best_overall = None
+    cands = []
     for b in [v for v in GHS_B_LADDER if v <= b_max] or [min(GHS_B_LADDER)]:
-        lds = np.linspace(-1.0, 6.0, 71)
-        sps = np.linspace(0.02, 0.9, 89)
-        best = None
-        for rnd in range(2):
-            d = (10.0 ** lds)[:, None]
-            s_ = sps[None, :]
+        for lpm in lp_modes:
+            lp = float(lpm) * sky
+            lds = np.linspace(-1.0, 6.0, 71)
+            sps = np.linspace(max(0.005, lp, sp_min), min(0.9, max(neb, sp_min * 1.5)), 89)
+            best = None
+            for rnd in range(2):
+                d = (10.0 ** lds)[:, None]
+                s_ = sps[None, :]
+                err = (_ghs_t(sky, b, d, s_, lp, hp) - sky_aim) ** 2 + (_ghs_t(neb, b, d, s_, lp, hp) - neb_aim) ** 2
+                if bright is not None:
+                    err = err + np.maximum(_ghs_t(max(bright, neb), b, d, s_, lp, hp) - BRIGHT_AIM, 0.0) ** 2
+                i, k = np.unravel_index(int(np.nanargmin(err)), err.shape)
+                best = (float(err[i, k]), float(lds[i]), float(sps[k]))
+                if rnd == 0:
+                    lds = np.linspace(best[1] - 0.15, best[1] + 0.15, 41)
+                    sps = np.linspace(max(0.005, lp, sp_min, best[2] - 0.012), min(0.95, best[2] + 0.012), 41)
+            c = {"b": b, "D": 10.0 ** best[1], "sp": best[2], "lp": lp, "hp": hp, "error": best[0]}
+            c["slope_sky"] = ghs_slope_at(sky, b, c["D"], c["sp"], lp, hp)
+            if noise is not None:
+                c["noise_out"] = float(noise) * c["slope_sky"]
+            if focus is not None:
+                c["slope_focus"] = ghs_slope_at(focus, b, c["D"], c["sp"], lp, hp)
+            # the steepest part of the curve between the sky and the nebula's 90th percentile, against the straight line between the two aims (the secant): a curve whose
+            # slope is several times the secant's makes a ragged boundary of whatever noise sits at that level (M 45's nebula edge with b = 13)
+            gx = np.linspace(sky, neb, 48)
+            gt = _ghs_t(gx, b, c["D"], c["sp"], lp, hp)
+            c["slope_max"] = float(np.max(np.diff(gt) / np.diff(gx)))
+            c["slope_ratio"] = c["slope_max"] / max((neb_aim - sky_aim) / max(neb - sky, 1e-9), 1e-9)
+            cands.append(c)
+            if noise is None and c["error"] <= GHS_FIT_TOLERANCE and lpm == lp_modes[0]:
+                return c
+    met = [c for c in cands if c["error"] <= GHS_FIT_TOLERANCE]
+    if noise is not None and met:
+        quiet = [c for c in met if noise_limit is None or c["noise_out"] <= noise_limit]
+        smooth = [c for c in quiet if c["slope_ratio"] <= MAX_SLOPE_RATIO]
+        quiet = smooth or ([min(quiet, key=lambda c: c["slope_ratio"])] if quiet else [])
+        if quiet and focus is not None:
+            return max(quiet, key=lambda c: c["slope_focus"])            # the noise limit is met: the most contrast where the signal sits (Cranfield: SP / b where you want contrast)
+        return min(met, key=lambda c: c["noise_out"])
+    return min(met or cands, key=lambda c: c["error"])
 
-            def tf(v):
-                above, below = v >= s_, v < s_
-                g = lambda u: ((1.0 + b * d * u) ** ((b - 1.0) / b) - 1.0) / (d * (b - 1.0)) if abs(b - 1.0) > 1e-6 else np.log1p(d * u) / d
-                rv = np.where(above, g(np.abs(v - s_)), -g(np.abs(v - s_)))
-                r0, r1 = -g(s_), g(1.0 - s_)
-                return (rv - r0) / (r1 - r0)
-            err = (tf(sky) - sky_aim) ** 2 + (tf(neb) - neb_aim) ** 2
-            if bright is not None:
-                err = err + np.maximum(tf(max(bright, neb)) - BRIGHT_AIM, 0.0) ** 2
-            i, k = np.unravel_index(int(np.nanargmin(err)), err.shape)
-            best = (float(err[i, k]), float(lds[i]), float(sps[k]))
-            if rnd == 0:
-                lds = np.linspace(best[1] - 0.15, best[1] + 0.15, 41)
-                sps = np.linspace(max(0.005, best[2] - 0.012), min(0.95, best[2] + 0.012), 41)
-        cand = {"b": b, "D": 10.0 ** best[1], "sp": best[2], "error": best[0]}
-        if best_overall is None or cand["error"] < best_overall["error"]:
-            best_overall = cand
-        if cand["error"] <= GHS_FIT_TOLERANCE:
-            return cand
-    return best_overall
+
+HP_AT_BRIGHT = True               # highlight protection at the 99.5th percentile of the signal: the cores above it stay on a straight line (Siril GHS tutorial: "almost always some HP")
+MAX_SLOPE_RATIO = 2.2             # the steepest slope of the curve between sky and nebula p90 is at most this many times the secant between the two aims
+SP_ABOVE_NOISE = 2.0              # the symmetry point sits at least this many (32-128 px band) noise sigmas above the sky (Cranfield: SP "above the level of noise you want to hide")
+
+
+def ghs_fit_noise_floor(sky: float, neb: float, bright: float | None, noise: float, sky_aim: float, neb_aims: tuple, b_max: float,
+                        noise_limit: float, focus: float | None = None) -> dict:
+    """``ghs_fit`` with the noise floor held down: the brightest of ``neb_aims`` for which the stretch's noise in the sky (``noise`` x the slope at the sky, display
+    units) stays within ``noise_limit``; when none does, the faintest aim with its lowest-noise curve ("accept a fainter nebula rather than mottling")."""
+    last = None
+    for aim in neb_aims:
+        hp = float(np.clip(bright, 0.3, 1.0)) if (bright is not None and HP_AT_BRIGHT) else 1.0
+        c = ghs_fit(sky, neb, sky_aim, aim, b_max, bright, noise=noise, lp_modes=NOISE_LP_MODES, sp_min=sky + SP_ABOVE_NOISE * noise, hp=hp, focus=focus,
+                    noise_limit=noise_limit)
+        c["neb_aim"] = aim
+        last = c
+        if c["error"] <= GHS_FIT_TOLERANCE and c["noise_out"] <= noise_limit:
+            c["noise_limit_met"] = True
+            return c
+    last["noise_limit_met"] = False
+    return last
 
 
 def nbn_oiii(ha: np.ndarray, oiii: np.ndarray, boost: float = 1.0) -> tuple[np.ndarray, float]:
     """Narrowband normalisation of the stretched OIII to the stretched Ha (Bill Blanshan & Mike Cranfield's NarrowbandNormalization as ported in
     siril-scripts/processing/NarrowbandNormalization.py by Y. Dutertre, GPL; shadow point 1 = the median): OIII is rescaled from its median to 1, sent through a
-    midtones function whose strength makes the *average level above the median* of OIII equal Ha's (divided by ``boost``: 1 = equal), and screen-blended with the
+    midtones function whose strength makes the *average level above the median* of OIII equal Ha's (``boost`` = strength, 1 = equal), and screen-blended with the
     part below the median.  Returns ``(normalised OIII, midtones strength)``."""
     def stats(ch):
         s = sample(ch)
@@ -1203,7 +1326,10 @@ def nbn_oiii(ha: np.ndarray, oiii: np.ndarray, boost: float = 1.0) -> tuple[np.n
     d = a_o - 2.0 * a_o * a_h + a_h
     if abs(d) < 1e-9:
         d = 1e-9
-    e1 = float(np.clip((a_o * (1.0 - a_h) / d) / max(float(boost), 1e-3), 0.01, 0.99))
+    e_full = float(np.clip(a_o * (1.0 - a_h) / d, 0.01, 0.99))                       # the midtones balance that equalises the two lines' levels (Blanshan / Cranfield)
+    # ``boost`` = the strength of that normalisation: 1 = equal levels, 0 = none (midtones balance 0.5 = identity), in between the geometric interpolation of the balance; 2 = twice
+    # as strong.  (A divisor of the balance made 0.5 still triple the faint OIII of IC 1805: the normalisation of a line 3x weaker than Ha is a strong operation)
+    e1 = float(np.clip(e_full ** max(float(boost), 0.0) * 0.5 ** (1.0 - max(float(boost), 0.0)), 0.01, 0.99))
     resc = np.clip((oiii - np.float32(m_o)) / np.float32(max(1.0 - m_o, 1e-6)), 0.0, 1.0)
     st = ((e1 - 1.0) * resc) / ((2.0 * e1 - 1.0) * resc - e1) if abs(e1 - 0.5) > 1e-9 else resc
     fl = np.minimum(oiii, np.float32(m_o))
@@ -1229,28 +1355,97 @@ def _smooth_sample(x: np.ndarray, sigma: float = ANCHOR_SMOOTH, step: int = 3) -
     return cv2.GaussianBlur(np.ascontiguousarray(x, dtype=np.float32), (0, 0), sigma)[::step, ::step]
 
 
-def ghs_stretch(planes: list[np.ndarray], *, sky_aim: float, neb_aim: float, b_max: float, denoise, mix=None, luma_ratio: bool = False,
-                contrast: float = 0.0, shrink_scales: int | None = None) -> tuple[list[np.ndarray], dict]:
+LARGE_SCALES = (3, 4, 5, 6, 7)    # starlet scales (8, 16, 32, 64, 128 px) of the large-scale noise pass
+LARGE_SCALE_K = 2.0               # soft threshold of that pass, in sigmas of the scale's coefficients in the sky (measured, not assumed)
+BAND_LO, BAND_HI = 10.7, 42.7     # gaussian sigmas (px) of the 32-128 px band the user's "watercolour" blobs live in (size ~ 3 sigma)
+BAND_SKY_FRACTION = 0.45          # the darkest 45 % of the 64 px smoothed plane are the sky samples of the band-noise estimates
+
+
+def _sky_mask(plane: np.ndarray, fraction: float = BAND_SKY_FRACTION, edge: int = 0) -> np.ndarray:
+    """The sky samples of a plane: the darkest ``fraction`` of its 64 px smoothing (the nebula and the stars are brighter than the sky at every large scale)."""
+    sm = cv2.GaussianBlur(np.ascontiguousarray(plane, dtype=np.float32), (0, 0), 64.0)
+    inner = sm[edge:-edge, edge:-edge] if edge and min(sm.shape) > 4 * edge else sm
+    m = sm <= np.percentile(inner[::2, ::2], fraction * 100)
+    if edge and min(sm.shape) > 4 * edge:
+        m[:edge] = m[-edge:] = False
+        m[:, :edge] = m[:, -edge:] = False
+    return m
+
+
+def band_noise(plane: np.ndarray, mask: np.ndarray | None = None) -> float:
+    """Noise of a plane in the 32-128 px band (std of ``G(BAND_LO) - G(BAND_HI)``) over its sky samples."""
+    pl = np.ascontiguousarray(plane, dtype=np.float32)
+    band = cv2.GaussianBlur(pl, (0, 0), BAND_LO) - cv2.GaussianBlur(pl, (0, 0), BAND_HI)
+    m = _sky_mask(pl, edge=EDGE_CROP) if mask is None else mask
+    return float(band[m].std()) if m.sum() > 100 else float(band.std())
+
+
+def large_scale_denoise(plane: np.ndarray, amount: float = 1.0, residual_k: float = 0.0) -> tuple[np.ndarray, dict]:
+    """Soft-threshold the 16-128 px starlet coefficients of a linear plane at ``amount`` x ``LARGE_SCALE_K`` sigma of the scale, sigma measured on the SKY samples
+    (the darkest 45 % at 64 px) where the nebula is absent: what Ron Brecher does with MultiscaleLinearTransform "on background areas with a mask protecting bright
+    structure" (astrodoc.ca IC 417 SHO) and what Delsaert recommends for the large-scale noise of a stack, in the coefficient domain.  A coefficient of a real
+    structure stands many sigmas above the sky's noise and loses only the threshold; the faint 32-128 px mottle of the stack (1-3 sigma) goes to zero.  The sky mask
+    comes from the plane itself, so the threshold follows the data (nothing is assumed about the noise).  With ``residual_k`` > 0 the smooth residual (structure beyond
+    128 px: what the background extraction and the flats leave of a channel-to-channel gradient, 0.1-0.2 % of the sky level on the DWARF stacks) is soft-thresholded about
+    its median at ``residual_k`` x its robust spread over the whole plane: a colour plane (the OIII of a dual-band stack) then carries a 128+ px structure only where it
+    stands out of that systematic floor."""
+    info: dict = {"k": round(float(LARGE_SCALE_K * amount), 3)}
+    if amount <= 0:
+        return np.asarray(plane, np.float32), info
+    nscales = max(LARGE_SCALES) + 1
+    planes, res = starlet(np.asarray(plane, np.float32), nscales)
+    mask = _sky_mask(plane, edge=EDGE_CROP)
+    out = res.copy()
+    if residual_k > 0:
+        med = float(np.median(res[::4, ::4]))
+        d = res - np.float32(med)
+        sd = float(1.4826 * np.median(np.abs(d[::4, ::4] - np.median(d[::4, ::4]))))
+        out = np.float32(med) + np.sign(d) * np.maximum(np.abs(d) - np.float32(residual_k * sd), 0.0)
+        info["residual_sigma"] = round(sd, 9)
+        info["residual_k"] = residual_k
+    sig = []
+    for j, w in enumerate(planes):
+        if j in LARGE_SCALES:
+            sj = float(1.4826 * np.median(np.abs(w[mask] - np.median(w[mask])))) if mask.sum() > 100 else 0.0
+            t = np.float32(LARGE_SCALE_K * amount * sj)
+            w = np.sign(w) * np.maximum(np.abs(w) - t, 0.0)
+            sig.append(round(sj, 9))
+        out += w
+    info["sigma_sky"] = sig
+    info["band_before"] = round(band_noise(plane, mask), 9)
+    info["band_after"] = round(band_noise(out, mask), 9)
+    return out.astype(np.float32), info
+
+
+def ghs_stretch(planes: list[np.ndarray], *, sky_aim: float, neb_aim: float | tuple | None = None, b_max: float, denoise, mix=None, luma_ratio: bool = False,
+                contrast: float = 0.0, shrink_scales: int | None = None, stretcher=None, method: str = "ghs", hdr: float = 0.0, boost: float = 0.0,
+                large_scale: float = 1.0, residual_k=0.0, compose=None) -> tuple[list[np.ndarray], dict]:
     """The "where the signal is" stretch of the linear planes ``planes`` (two: Ha, OIII of a dual-band stack, or three: R, G, B).
 
-    1. every plane is denoised with ``starlet_denoise(amount = denoise)`` (a number, or one per plane) and, with ``contrast`` > 0, sharpened where its
-       signal-to-noise allows it (the SNR-gated wavelet gain of ``starlet_denoise``);
-    2. the black point of each plane is the ``ANCHOR_PERCENTILE`` of the smoothed plane, one common white point (the largest ``WHITE_PERCENTILE`` of the planes
-       above their black points) keeps the planes' ratios;
-    3. ``ghs_fit`` solves D / SP / b so the sky (median of the darkest 40 % of the display luminance) lands on ``sky_aim`` and the 90th percentile of the signal
-       (pixels 3 sigma above the sky) on ``neb_aim``; the same GHS is applied to every plane.
+    1. every plane is denoised with ``starlet_denoise(amount = denoise)`` (a number, or one per plane; fine scales: BayesShrink) and ``large_scale_denoise`` (16-128 px:
+       the mottle of the stack, thresholds measured in the sky), and, with ``contrast`` > 0, sharpened where its signal-to-noise allows it;
+    2. the black point of each plane is the mode of the smoothed plane, one common white point (the largest ``WHITE_PERCENTILE`` of the planes above their floors)
+       keeps the planes' ratios: ``u = (x - black) / white``;
+    3. the statistics (sky, sky noise in the 32-128 px band, nebula 90th percentile = pixels 4 sigma above the sky) go to the stretch tool ``stretcher`` (``stretch.SirilStretcher``:
+       Siril ``ght`` / ``autoghs`` / ``modasinh`` / ``autostretch`` or Statistical_Stretch.py, ``method``), which fits its parameters to the aims (the sky on ``sky_aim``,
+       the nebula on the brightest of ``neb_aim`` whose stretched sky noise stays within ``SKY_NOISE_LIMIT``) and stretches every plane with the same transform;
+       without a ``stretcher`` the numpy mirror of ``ght`` does it.
     ``mix(planes)`` returns the display luminance of the planes (default: the mean).  Returns the stretched planes and the record of what was done."""
     amounts = list(denoise) if isinstance(denoise, (list, tuple)) else [float(denoise)] * len(planes)
     info: dict = {"denoise": [round(float(v), 3) for v in amounts] if len(set(amounts)) > 1 else round(float(amounts[0]), 3)}
     dn, sig = [], []
-    flat = []
-    for pl, am in zip(planes, amounts):
+    flat, large = [], []
+    rks = list(residual_k) if isinstance(residual_k, (list, tuple)) else [float(residual_k)] * len(planes)
+    for pl, am, rk in zip(planes, amounts, rks):
         a, s1 = starlet_denoise(pl, float(am), contrast=contrast, shrink_scales=shrink_scales)
-        a, fi = flatten_sky(a)
+        a, li = large_scale_denoise(a, float(am) * float(large_scale) if am > 0 else 0.0, float(rk)) if large_scale > 0 else (a, {})
+        a, fi = flatten_sky(a, FLATTEN_DEGREE_BROADBAND if luma_ratio else None)
         dn.append(a)
         sig.append(s1)
         flat.append(round(fi["span"], 7))
+        large.append(li)
     info["flatten_span"] = flat
+    info["large_scale"] = large
     info["noise_sigma"] = [round(float(s), 7) for s in sig]
     sm = [_smooth_sample(a) for a in dn]
     # black points: the sky of every plane (the mode of its smoothed histogram: the sky is the most frequent level; VeraLux's adaptive anchor also reads the
@@ -1261,7 +1456,6 @@ def ghs_stretch(planes: list[np.ndarray], *, sky_aim: float, neb_aim: float, b_m
     white = max(max(float(np.percentile(s - f, WHITE_PERCENTILE)) for s, f in zip(sm, floors)), 1e-9)
     s0 = float(np.mean([(k - f) for k, f in zip(skies, floors)])) / white
     bps = [k - s0 * white for k in skies]
-    xs = [np.clip(s - b, 0.0, None) for s, b in zip(sm, bps)]
     mixf = mix or (lambda ps: sum(ps) / len(ps))
     lraw = mixf([(s - b) / white for s, b in zip(sm, bps)])
     ls = np.clip(lraw, 0.0, 1.0)
@@ -1272,35 +1466,56 @@ def ghs_stretch(planes: list[np.ndarray], *, sky_aim: float, neb_aim: float, b_m
     sig_mask = ls > sky + SIGNAL_SIGMA * max(noise, 1e-4)
     neb = float(np.percentile(ls[sig_mask], 90)) if sig_mask.sum() > 500 else float(np.percentile(ls, 99.0))
     bright = float(np.percentile(ls[sig_mask], 99.5)) if sig_mask.sum() > 500 else None
-    fit = ghs_fit(sky, neb, sky_aim, neb_aim, b_max, bright)
-    info.update(anchors=[round(b, 7) for b in bps], sky_offset=round(s0, 4), white=round(white, 7), sky_in=round(sky, 4), noise_in=round(noise, 5), nebula_in=round(neb, 4), bright_in=None if bright is None else round(bright, 4), signal_frac=round(float(sig_mask.mean()), 4),
-                ghs={k: (round(v, 5) if isinstance(v, float) else v) for k, v in fit.items()})
+    # the sky's noise in the 32-128 px band, in the same units as ``lraw`` (the lightness the fit looks at): the dominant noise after the fine scales are gone
+    mix_full = mixf([(a - np.float32(b0)) / np.float32(white) for a, b0 in zip(dn, bps)])
+    band = band_noise(mix_full)
+    aims = tuple(neb_aim) if isinstance(neb_aim, (tuple, list)) else ((float(neb_aim),) if neb_aim is not None else NEBULA_AIMS)
+    if stretcher is None:
+        from .stretch import SirilStretcher
+        import tempfile
+        stretcher = SirilStretcher(tempfile.mkdtemp(prefix="stretch_"), allow=False)
+    focus = float(np.median(ls[sig_mask])) if sig_mask.sum() > 500 else None          # where the signal sits: the stretch's contrast is asked for here
+    ctx = {"method": method, "sky": sky, "noise": noise, "band": band, "neb": neb, "bright": bright, "focus": focus, "lum": mix_full, "sky_aim": sky_aim * GHS_SKY_SHARE, "neb_aims": aims,
+           "b_max": b_max, "hdr": hdr, "boost": boost}
+    info.update(anchors=[round(b, 7) for b in bps], sky_offset=round(s0, 4), white=round(white, 7), sky_in=round(sky, 4), noise_in=round(noise, 5), band_in=round(band, 6),
+                nebula_in=round(neb, 4), bright_in=None if bright is None else round(bright, 4), signal_frac=round(float(sig_mask.mean()), 4))
     if luma_ratio and len(dn) == 3:
-        # broadband colour: ONE GHS of the luminance, the colour carried as the (smoothed) ratio of every plane to the luminance (VeraLux HyperMetric Stretch's
+        # broadband colour: ONE stretch of the luminance, the colour carried as the (smoothed) ratio of every plane to the luminance (VeraLux HyperMetric Stretch's
         # vector colour preservation, ratio = channel / lightness of the anchored data; the lightness is the maximum channel, not Rec. 709 luminance: a red nebula
         # at lightness 0.4 needs R = 1.9 in luminance terms, every such pixel was gamut-mapped to the same R = 1 and the nebula came out a flat salmon plateau, NGC 1499): independent per-channel curves turn the planes' own noise and
         # calibration residuals into rainbow blotches (NGC 1499 before BGE / SPCC: colourfulness 0.58)
         u = [np.clip((a - np.float32(b0)) / np.float32(white), 0.0, None) for a, b0 in zip(dn, bps)]
         sg_c = max(LUMA_RATIO_SMOOTH, COLOR_SIGMA_FRAC * max(dn[0].shape))
         us = [cv2.GaussianBlur(np.ascontiguousarray(x), (0, 0), sg_c) for x in u]
+        lu = np.clip(np.max(np.stack(u), axis=0), 0.0, 1.0)             # the lightness is the brightest channel (HSV value): a saturated colour keeps its gradation
+        (ls_full,), srec = stretcher.stretch([lu], ctx)
+        info["ghs"] = srec.get("ghs_fit")
+        info["stretch_record"] = srec
         out = [np.empty_like(dn[0], dtype=np.float32) for _ in range(3)]
         for r0, r1 in _bands(dn[0].shape[0]):
-            lu = np.max(np.stack([x[r0:r1] for x in u]), axis=0)             # the lightness is the brightest channel (HSV value): a saturated colour keeps its gradation
             lus = np.maximum(np.max(np.stack([x[r0:r1] for x in us]), axis=0), 1e-4)
-            ls_ = np.clip(ghs(np.clip(lu, 0.0, 1.0), fit["b"], fit["D"], fit["sp"]), 0.0, 1.0)
+            ls_ = np.clip(ls_full[r0:r1], 0.0, 1.0)
             cols = np.stack([np.clip(x[r0:r1] / lus, 0.0, 4.0) * ls_ for x in us])
             cols = _gamut_map(cols, ls_, GAMUT_DARKEN)
             for c in range(3):
                 out[c][r0:r1] = np.clip(cols[c], 0.0, 1.0)
         return out, info
-    out = []
-    for a, b0 in zip(dn, bps):
-        o = np.empty_like(a, dtype=np.float32)
-        for r0, r1 in _bands(a.shape[0]):
-            u = np.clip((a[r0:r1] - np.float32(b0)) / np.float32(white), 0.0, 1.0)
-            o[r0:r1] = np.clip(ghs(u, fit["b"], fit["D"], fit["sp"]), 0.0, 1.0)
-        out.append(o)
-    return out, info
+    us = [np.clip((a - np.float32(b0)) / np.float32(white), 0.0, 1.0) for a, b0 in zip(dn, bps)]
+    if compose is not None:
+        # ``compose(us)`` -> (the mono lightness plane to stretch, extra): ONE stretch of one plane by the chosen tool (every community stretch tool is a lightness tool: Siril ght /
+        # autoghs / modasinh, Statistical_Stretch, VeraLux HyperMetric Stretch all run on a mono image here), the colour travels as ratios (``extra``)
+        light_u, extra = compose(us, info)
+        ctx["lum"] = light_u
+        (lt,), srec = stretcher.stretch([light_u], ctx)
+        info["ghs"] = srec.get("ghs_fit")
+        info["stretch_record"] = srec
+        info["_extra"] = extra
+        return [np.clip(lt, 0, 1).astype(np.float32)], info
+    out, srec = stretcher.stretch(us, ctx)
+    info["ghs"] = srec.get("ghs_fit")
+    info["stretch_record"] = srec
+    info["_u"] = us
+    return [np.clip(o, 0, 1).astype(np.float32) for o in out], info
 
 
 # --------------------------------------------------------------------------- the whole non-linear render
@@ -1347,10 +1562,14 @@ def levels_numpy(img: np.ndarray, p: dict) -> np.ndarray:
     return np.clip(img, 0, 1)
 
 
-SKY_PERCENTILE = 5.0               # the darkest sky of the colour planes
+SKY_PERCENTILE = 0.5               # the darkest sky of the colour planes
 AI_RESIDUAL_GAIN = 2.0              # the grain an AI denoiser leaves is spatially correlated (3-8 px): twice the BayesShrink threshold removes it, 1x left a crisp mottle on IC 1805,
                                    # 4 scales instead of 3 turned the nebula to watercolour
 FINE_SCALES = 3                   # starlet scales 1-3 (1-8 px) = the grain an AI denoiser leaves behind
+COLOR_SIGMA_OIII_FRAC = 0.006     # the OIII colour plane's resolution = this x the long side (23 px on a 3800 px stack): its noise is averaged over ~(2 sigma)^2 pixels, the cores are 100+ px
+OIII_FLAT_FRAC = 0.08             # window of the OIII background model's median = this x the long side (300 px on a 3800 px stack)
+OIII_COLOUR_K = 2.5               # soft threshold of the colour-resolution OIII, in sigmas of its sky (measured below the sky mode); what stands above it is OIII
+OIII_RESIDUAL_K = 1.5             # the OIII plane's 128+ px structure is soft-thresholded at this many robust sigmas of that structure (large_scale_denoise ``residual_k``)
 OIII_DENOISE = 1.5                # the OIII plane is denoised 1.5 x harder than Ha: its signal is the weaker (IC 1805: 2-3 x lower SNR) and it only carries colour
 COLOR_SIGMA_FRAC = 0.003          # colour resolution = this x the long side (11 px on a 3800 px DWARF stack): the colour (Ha : OIII ratio) is carried at lower resolution
                                   # than the Ha luminance (LRGB principle: the eye resolves lightness, not colour; chroma is binned 3-4x in video and JPEG alike); the OIII
@@ -1402,31 +1621,128 @@ def denoise_settings(p: dict) -> tuple[float, int | None]:
     return amount, None
 
 
-def dual_band_planes(base: np.ndarray, p: dict) -> tuple[np.ndarray, np.ndarray, dict, dict]:
-    """Ha and OIII of a dual-band starless layer, denoised once (OIII harder) and stretched with ONE GHS fitted on the Ha plane (the high-SNR channel decides where
-    the sky and the nebula sit).  Returns ``(Ha, OIII, ghs info, extraction info)``, display units."""
+STRETCH_METHODS = ("ghs", "autoghs", "modasinh", "autostretch", "statstretch", "hms")     # = stretch.METHODS (Siril commands / Statistical_Stretch.py); mtf, asinh, log = the legacy numpy statistical stretches
+
+
+def uses_siril_stretch(p: dict) -> bool:
+    return str(p.get("stretch_method", "ghs")) in STRETCH_METHODS
+
+
+def _stretch_kwargs(p: dict) -> dict:
+    return {"method": str(p.get("stretch_method", "ghs")) if uses_siril_stretch(p) else "ghs", "hdr": float(p.get("hdr", 0.0)), "boost": float(p.get("stretch_boost", 0.0)),
+            "large_scale": float(np.clip(float(p.get("luminance_denoise", 0.6)) / 0.6, 0.0, 2.0))}
+
+
+def dual_band_planes(base: np.ndarray, p: dict, stretcher=None):
+    """Ha and OIII of a dual-band starless layer, denoised once (OIII harder), the lightness = the Ha (with the OIII's share where it is as clean as the Ha) stretched by ONE tool
+    (``stretcher``: Siril ght / Statistical_Stretch / VeraLux HyperMetric Stretch ..., fitted on the Ha's sky and nebula), the colour = the smoothed ratio of the linear lines
+    (``ratio_colour``).  Returns ``(stretched lightness, colour (3, H, W) of unit maximum, ghs info, extraction + colour info)``, display units."""
     amount, shrink = denoise_settings(p)
     ha, oiii, pinfo = extract_ha_oiii(base, bool(p.get("oiii_unmix", True)))
     e = EDGE_CROP if min(ha.shape) > 8 * EDGE_CROP else 0
     snr_h, snr_o = (object_snr(x[e:-e, e:-e] if e else x) for x in (ha, oiii))
-    pinfo.update(snr_ha=round(snr_h, 2), snr_oiii=round(snr_o, 2), oiii_lightness_share=round(snr_o / max(snr_h + snr_o, 1e-6), 3))
-    (h_st, o_st), ginfo = ghs_stretch([ha, oiii], sky_aim=float(np.clip(p.get("stretch", SKY_AIM), 0.02, 0.4)), neb_aim=NEBULA_AIM,
-                                      b_max=float(np.clip(p.get("contrast", 2.0), 0.25, 13.0)), denoise=[amount, amount * OIII_DENOISE],
-                                      mix=lambda ps: ps[0], contrast=float(np.clip(p.get("local_contrast", 0.0), 0.0, 2.0)), shrink_scales=shrink)
-    return h_st, o_st, ginfo, pinfo
+    share = snr_o / max(snr_h + snr_o, 1e-6)
+    pinfo.update(snr_ha=round(snr_h, 2), snr_oiii=round(snr_o, 2), oiii_lightness_share=round(share, 3))
+    boost = float(p.get("oiii_boost", 1.0))
+    palette = resolve_palette(p.get("palette"), True)
+
+    def compose(us, ginfo_so_far):
+        col, cinfo, light_u = ratio_colour(us[0], us[1], float(ginfo_so_far.get("noise_in", 1e-3)), boost, palette, share)
+        return light_u, (col, cinfo)
+
+    (light_st,), ginfo = ghs_stretch([ha, oiii], sky_aim=float(np.clip(p.get("stretch", SKY_AIM), 0.02, 0.4)),
+                                     b_max=float(np.clip(p.get("contrast", 2.0), 0.25, 13.0)), denoise=[amount, amount * OIII_DENOISE],
+                                     mix=lambda ps: ps[0], contrast=float(np.clip(p.get("local_contrast", 0.0), 0.0, 2.0)), shrink_scales=shrink,
+                                     stretcher=stretcher, residual_k=[0.0, OIII_RESIDUAL_K], compose=compose, **_stretch_kwargs(p))
+    col, cinfo = ginfo.pop("_extra")
+    pinfo.update(cinfo, oiii_boost=boost, oiii_threshold_k=OIII_COLOUR_K)
+    return light_st, col, ginfo, pinfo
 
 
-def colour_planes(h_st: np.ndarray, o_st: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """The stretched Ha and OIII at colour resolution (``COLOR_SIGMA``) with the darkest ``SKY_PERCENTILE`` % of both at one level (background neutralisation of the
-    colour: Ha has a faint plateau over the whole frame that the OIII plane lacks, so equal *modes* left the dark sky teal on IC 1805).  Returns ``(Ha, OIII, offset)``."""
+def oiii_background(plane: np.ndarray) -> np.ndarray:
+    """Large-scale background of a colour plane whose targets are compact: the running MEDIAN over a window of ``OIII_FLAT_FRAC`` x the long side (on the plane reduced
+    16x; a median ignores any structure covering less than half the window, the OIII cores, and follows a rise of the plane towards the frame's edge), smoothed."""
+    from scipy.ndimage import median_filter
+    h, w = plane.shape
+    f = 16
+    small = cv2.resize(np.ascontiguousarray(plane, dtype=np.float32), (max(8, w // f), max(8, h // f)), interpolation=cv2.INTER_AREA)
+    k = int(max(3, round(OIII_FLAT_FRAC * max(h, w) / f))) | 1
+    m = median_filter(small, size=k, mode="reflect")
+    m = cv2.GaussianBlur(m, (0, 0), max(1.0, k / 4.0))
+    return cv2.resize(m, (w, h), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+
+
+def colour_planes(h_st: np.ndarray, o_st: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """The stretched Ha and OIII at colour resolution (``COLOR_SIGMA``), the OIII's SKY brought to the level of the Ha's empty sky (background neutralisation of the
+    colour, the offsets-only rule of Siril's / PixInsight's background neutralisation): Ha has a faint haze over a large part of the frame (its mode is the haze, 41 % of
+    the frame on IC 1805) and dark lanes well below it, while the OIII is flat there, so the mode of the OIII (its sky) sits ``d_sky`` above the darkest ``SKY_PERCENTILE`` %
+    of the Ha (its empty sky): subtracting ``d_sky`` makes the empty sky colourless and leaves the haze red, instead of the teal that equal modes (or equal 5th percentiles
+    of two planes with different tails) painted over the dark lanes of IC 1805.  Returns ``(Ha, OIII, d_sky, sigma of the OIII sky)``."""
     sg = max(4.0, COLOR_SIGMA_FRAC * max(h_st.shape))
     h_c = cv2.GaussianBlur(np.ascontiguousarray(h_st), (0, 0), sg)
-    o_c = cv2.GaussianBlur(np.ascontiguousarray(o_st), (0, 0), sg)
-    d_sky = float(np.percentile(o_c[::4, ::4], SKY_PERCENTILE) - np.percentile(h_c[::4, ::4], SKY_PERCENTILE))
-    return h_c, np.clip(o_c - np.float32(d_sky), 0.0, 1.0), d_sky
+    o_c = cv2.GaussianBlur(np.ascontiguousarray(o_st), (0, 0), max(sg, COLOR_SIGMA_OIII_FRAC * max(h_st.shape)))      # the weak line's colour is the most smoothed one
+    hs, os_ = h_c[::4, ::4], o_c[::4, ::4]
+    o_mode = _hist_mode(os_)
+    h_floor = float(np.percentile(hs, SKY_PERCENTILE))
+    # the noise of the colour-resolution OIII from the values BELOW its sky mode (a half Gaussian: the nebula only adds above), and the soft threshold that keeps what stands
+    # OIII_COLOUR_K sigmas above the sky (BayesShrink / MLT practice: what is within the noise is not colour); the Ha is not thresholded (its haze is the signal)
+    below = os_[os_ < o_mode]
+    sig_o = float(np.sqrt(np.mean((below - o_mode) ** 2))) if below.size > 50 else 0.0
+    # the OIII's own large-scale background (what the flats / the background extraction leave of a channel-to-channel gradient, 0.03-0.1 % of the sky on IC 1805, which the
+    # stretch turns into teal patches of 0.05 display units over a third of the frame): a heavy gaussian of the plane with its signal (above the sky + 3 sigma) clipped away,
+    # i.e. a dynamic-background-extraction model of a plane whose targets are compact (the OIII cores); subtracted about the sky mode
+    o_c = o_c - (oiii_background(o_c) - np.float32(o_mode))
+    thr = np.float32(OIII_COLOUR_K * sig_o)
+    e = o_c - np.float32(o_mode)
+    e = np.where(e > 0, e * e * e / (e * e + thr * thr + 1e-12), 0.0).astype(np.float32)        # smooth shrinkage e^3 / (e^2 + T^2): ~0 within the noise, ~e above it, no ragged islands
+    o_out = np.clip(np.float32(h_floor) + e, 0.0, 1.0)
+    return h_c, o_out, float(o_mode - h_floor), float(sig_o)
 
 
-def ghs_main(base: np.ndarray, p: dict, dual_band: bool, palette: str) -> tuple[np.ndarray, dict]:
+RATIO_OBJECT_PERCENTILE = 80.0    # the "object" of the normalisation statistic = the brightest 20 % of the Ha at colour resolution
+RATIO_EPS_K = 1.0                 # colour-vector floor (the sky grey): this many pixel-noise sigmas (u units) added to both lines before the ratio is taken
+RATIO_GAIN_MAX = 20.0
+
+
+def ratio_colour(u_h: np.ndarray, u_o: np.ndarray, noise_u: float, boost: float, palette: str, share: float = 0.0) -> tuple[np.ndarray, dict, np.ndarray]:
+    """The colour of the dual-band picture as the smoothed ratio of the two lines in the LINEAR domain (the lightness is the Ha's own, ``ghs_main``): ``(R, G, B)`` of unit
+    maximum channel.  The two lines' excess over their empty sky are taken at colour resolution (Ha: over its floor, the darkest 0.5 %; OIII: over its own large-scale
+    background (``oiii_background``) and soft-thresholded at ``OIII_COLOUR_K`` sigmas of its sky), the OIII is scaled by the Blanshan / Cranfield narrowband
+    normalisation (NarrowbandNormalization.py: the gain that equalises the two lines' mean deviation over the object, ``boost`` = its strength: 1 = equal, 0 = none, the
+    geometric interpolation between), and the palette is composed from ``(Ha + eps, gain x OIII + eps)`` and divided by its maximum channel: ``eps`` (``RATIO_EPS_K`` x the
+    pixel noise) makes the ratio of two lines that are both noise a neutral grey.  A ratio is invariant under the stretch, so a bright core keeps the colour it has (stretching
+    the lines separately, even at the same curve, drives every core towards white: IC 1805, R:G:B = 1 : 0.27 : 0.23 in the linear data came out 0.85 : 0.75 : 0.75)."""
+    sg_h = max(4.0, COLOR_SIGMA_FRAC * max(u_h.shape))
+    sg_o = max(sg_h, COLOR_SIGMA_OIII_FRAC * max(u_h.shape))
+    h_c = cv2.GaussianBlur(np.ascontiguousarray(u_h, dtype=np.float32), (0, 0), sg_h)
+    o_c = cv2.GaussianBlur(np.ascontiguousarray(u_o, dtype=np.float32), (0, 0), sg_o)
+    hs, os_ = h_c[::4, ::4], o_c[::4, ::4]
+    eh = np.maximum(h_c - np.float32(np.percentile(hs, SKY_PERCENTILE)), 0.0)
+    o_mode = _hist_mode(os_)
+    below = os_[os_ < o_mode]
+    sig_o = float(np.sqrt(np.mean((below - o_mode) ** 2))) if below.size > 50 else 0.0
+    e = o_c - oiii_background(o_c)
+    thr = np.float32(OIII_COLOUR_K * sig_o)
+    eo = np.where(e > 0, e * e * e / (e * e + thr * thr + 1e-12), 0.0).astype(np.float32)
+    obj = eh > np.percentile(eh[::4, ::4], RATIO_OBJECT_PERCENTILE)
+    e_h = float(eh[obj].mean()) if obj.any() else 1e-9
+    e_o = float(eo[obj].mean()) if obj.any() else 0.0
+    r0 = e_o / max(e_h, 1e-12)
+    gain_full = float(np.clip(1.0 / max(r0, 1e-6), 1.0, RATIO_GAIN_MAX))
+    gain = gain_full ** float(np.clip(boost, 0.0, 2.0))
+    eps = np.float32(RATIO_EPS_K * max(noise_u, 1e-6))
+    comp = compose_palette(eh + eps, np.minimum(gain * eo + eps, 4.0 * (eh + eps) + 1.0), palette)
+    col = comp / np.maximum(comp.max(0, keepdims=True), 1e-6)
+    # the synthetic luminance (linear): the Ha's own pixels, whose colour-resolution part is replaced by the signal-to-noise weighted mean of the Ha and the normalised OIII
+    # (``share`` = the OIII's weight, its SNR over the sum of both: Ha alone when the OIII is noise, both where the OIII is as clean as the Ha), so the OIII's noise never
+    # reaches the lightness and an OIII-bright core (M 42's teal haloes) does not go black on pure Ha
+    h_floor_v = float(np.percentile(hs, SKY_PERCENTILE))
+    light_u = np.clip(u_h - h_c + (1.0 - share) * h_c + share * (np.float32(h_floor_v) + gain * eo), 0.0, 1.0).astype(np.float32)
+    return col.astype(np.float32), {"oiii_to_ha": round(r0, 4), "gain_full": round(gain_full, 3), "gain": round(gain, 3), "boost": float(boost), "eps": round(float(eps), 6),
+                                    "oiii_sky_sigma_u": round(sig_o, 6), "colour_sigma_px": [round(sg_h, 1), round(sg_o, 1)], "object_frac": round(float(obj.mean()), 3)}, light_u
+
+
+def ghs_main(base: np.ndarray, p: dict, dual_band: bool, palette: str, stretcher=None) -> tuple[np.ndarray, dict]:
     """The starless layer's display picture by ``ghs_stretch``.
 
     Dual-band -> ``dual_band_planes`` (Ha / OIII denoised once, one GHS fitted on Ha), the colour at colour resolution (``colour_planes``: LRGB principle, the eye
@@ -1438,25 +1754,19 @@ def ghs_main(base: np.ndarray, p: dict, dual_band: bool, palette: str) -> tuple[
     denoise (0 = off), ``local_contrast`` = the SNR-gated wavelet gain."""
     info: dict = {"denoised_by_restore": bool(p.get("_denoised_linear"))}
     if dual_band and palette != "natural":
-        h_st, o_st, ginfo, pinfo = dual_band_planes(base, p)
-        h_c, o_c, d_sky = colour_planes(h_st, o_st)
-        boost = float(p.get("oiii_boost", 1.0))
-        o_c, e1 = nbn_oiii(h_c, o_c, boost)
-        pinfo.update(oiii_boost=boost, nbn_strength=round(e1, 4), color_sigma_px=round(max(4.0, COLOR_SIGMA_FRAC * max(h_st.shape)), 1), sky_offset_oiii=round(d_sky, 4))
-        # the lightness: the full-resolution Ha, whose colour-resolution part is replaced by the signal-to-noise weighted mean of the Ha and the (normalised) OIII there
-        # (inverse-noise weighting: Ha alone when the OIII is noise, both where the OIII is as clean as the Ha: M 42's teal haloes would go black on pure Ha)
-        a = float(pinfo["oiii_lightness_share"])
-        light = np.clip(h_st - h_c + (1.0 - a) * h_c + a * o_c, 0.0, 1.0)
-        main = ha_luminance(compose_palette(h_c, o_c, palette), light, float(p.get("synthetic_luminance", 0.9)))
+        light, col, ginfo, pinfo = dual_band_planes(base, p, stretcher)
+        main = np.clip(col * light[None], 0.0, 1.0).astype(np.float32)
         main, off = neutralize_display_sky(main)
         pinfo["sky_neutralised_by"] = off
         info["palette_info"] = {**pinfo, **ginfo}
     else:
         amount, shrink = denoise_settings(p)
-        pl, ginfo = ghs_stretch([base[0], base[1], base[2]], sky_aim=float(np.clip(p.get("stretch", SKY_AIM), 0.02, 0.4)), neb_aim=NEBULA_AIM,
+        pl, ginfo = ghs_stretch([base[0], base[1], base[2]], sky_aim=float(np.clip(p.get("stretch", SKY_AIM), 0.02, 0.4)),
                                 b_max=float(np.clip(p.get("contrast", 2.0), 0.25, 13.0)), denoise=amount, contrast=float(np.clip(p.get("local_contrast", 0.0), 0.0, 2.0)),
-                                mix=lambda ps: np.max(np.stack(ps), axis=0), luma_ratio=True, shrink_scales=shrink)
-        main = np.stack(pl)
+                                mix=lambda ps: np.max(np.stack(ps), axis=0), luma_ratio=True, shrink_scales=shrink,
+                                stretcher=stretcher, **_stretch_kwargs(p))
+        main, off = neutralize_display_sky(np.stack(pl))              # background neutralisation of the picture's sky (offsets only): no colour cast of the sky
+        ginfo["sky_neutralised_by"] = off
         info["stretch"] = ginfo
     info["ghs"] = ginfo
     return np.clip(main, 0, 1).astype(np.float32), info
@@ -1488,8 +1798,8 @@ def render_layers(base: np.ndarray, stars: np.ndarray | None, p: dict, *, dual_b
     target = adapted_target(float(p["stretch"]), cov, bool(p.get("auto_stretch", True)) and not pre_stretched)
     info.update(coverage=round(cov, 4), target_median=round(target, 4), curve_position=round(pos, 3), curve_shoulder=round(shd, 3))
     step("Stretching")
-    if not pre_stretched and str(p.get("stretch_method", "ghs")) == "ghs":
-        main, ginfo = ghs_main(base, p, dual_band, palette)
+    if not pre_stretched and uses_siril_stretch(p):
+        main, ginfo = ghs_main(base, p, dual_band, palette, hooks.get("stretcher"))
         info.update(ginfo)
         info["target_median"] = float(p.get("stretch", SKY_AIM))
     elif pre_stretched:
@@ -1518,27 +1828,28 @@ def render_layers(base: np.ndarray, stars: np.ndarray | None, p: dict, *, dual_b
     else:
         main, sinfo = stretch_rgb(base, target, position=pos, shoulder=shd, color_preservation=float(p.get("color_preservation", 0.7)))
         info["stretch"] = sinfo
-    if float(p.get("luminance_denoise", 0)) > 0 and "denoise" in hooks and (pre_stretched or str(p.get("stretch_method", "ghs")) != "ghs"):
+    if float(p.get("luminance_denoise", 0)) > 0 and "denoise" in hooks and (pre_stretched or not uses_siril_stretch(p)):
         # the second (stretched-image) noise reduction of the legacy stretches; the GHS render has had its one noise reduction (restore: AI denoiser on the linear
         # data, then the wavelet pass above): NXT 0.8 on top of that is what smeared the nebula into plastic
         step("Noise reduction")
         res = hooks["denoise"](main, p)
         main = main if res is None else res
     step("Detail")
-    main = chroma_smooth(main, float(p.get("chroma_denoise", 0.0)))
+    main, cinfo = chroma_wavelet_denoise(main, float(p.get("chroma_denoise", 0.0)))
+    info["chroma_denoise"] = cinfo
     main = sharpen(main, float(p.get("sharpen", 0.0)))
-    if str(p.get("stretch_method", "ghs")) != "ghs" or pre_stretched:
+    if not uses_siril_stretch(p) or pre_stretched:
         main = local_contrast(main, float(p.get("local_contrast", 0.0)))
     step("Colour")
     fc = hooks.get("final_color")
     res = fc(main, p, dual_band) if fc else None
     main = res if res is not None else final_color_numpy(main, p, dual_band)
-    if str(p.get("stretch_method", "ghs")) == "ghs" and not pre_stretched:
+    if uses_siril_stretch(p) and not pre_stretched and str(p.get("stretch_method")) != "statstretch":      # Statistical_Stretch.py has its own HDR compress (-hdr)
         main = hdr_compress(main, float(p.get("hdr", 0.0)))          # the GHS has no highlight shoulder of its own; the legacy curves use ``curve_shoulder``
     bpt = float(p.get("black_point", 0.0))
     if bpt > 0:                                           # black point on the starless layer only: the stars sit on top of the sky afterwards
         main = np.clip((main - np.float32(bpt)) / np.float32(1.0 - bpt), 0, 1)   # (a black point after the blend cut every star that is not far above the sky)
-    if str(p.get("stretch_method", "ghs")) == "ghs" and not pre_stretched:
+    if uses_siril_stretch(p) and not pre_stretched:
         main, lift = sky_lift(main, float(p.get("stretch", SKY_AIM)))
         info["sky_lift"] = round(lift, 4)
     out = main

@@ -365,6 +365,20 @@ def test_preview_is_a_jpeg_within_the_size_limit(session):
     assert max(im.shape[:2]) <= 400
 
 
+def test_preview_is_the_export_render(session):
+    """Preview = export: the same finishing function and parameters; at full size the two pictures differ by JPEG quality only, and a reduced preview equals the export
+    reduced (the user's "the preview in the app looks completely different from the exports")."""
+    meta = {"object": "M 42", "n_frames": 120, "total_exposure": 1800.0, "filter": "IRCUT"}
+    params = {"saturation": 1.3, "scnr": 0.4, "stretch_method": "ghs"}
+    files = post.export(session, meta, params, {"quality": 95, "tiff": False})
+    ex = cv2.imread(files["jpg"]).astype(np.float32) / 255
+    full = cv2.imdecode(np.frombuffer(post.preview_jpeg(session, meta, params, 5000), np.uint8), cv2.IMREAD_COLOR).astype(np.float32) / 255
+    assert full.shape == ex.shape and float(np.abs(full - ex).mean()) < 0.02
+    small = cv2.imdecode(np.frombuffer(post.preview_jpeg(session, meta, params, 400), np.uint8), cv2.IMREAD_COLOR).astype(np.float32) / 255
+    ref = cv2.resize(ex, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_AREA)
+    assert float(np.abs(small - ref).mean()) < 0.02
+
+
 def test_preview_uses_the_star_layers_when_present(session):
     lin, hdr = fitsio.read_rgb(os.path.join(session, "linear.fits"))
     starless = np.minimum(lin, np.float32(0.03))
@@ -613,7 +627,7 @@ def test_ghs_stretch_puts_the_sky_and_the_nebula_on_their_aims_and_shows_the_neb
     sky = float(np.median(y[0][:30, :30]))
     # (the synthetic nebula is one bright Gaussian, 59 % of the white point at its 90th percentile: the aims cannot both be met, the denoised plane is clean enough
     # for the fit to see that; the sky then sits lower than the aim, never above the dark grey)
-    assert 0.01 < sky < 0.2                                                                # dark sky
+    assert 0.005 < sky < 0.2                                                                # dark sky (the output black level lifts it to the aim later: finish.sky_lift)
     assert y[0][120, 180] > 0.4 and y[0][120, 180] > sky + 0.3                             # the nebula stands out
     assert info["ghs"]["b"] in finish.GHS_B_LADDER and info["sky_in"] < info["nebula_in"]
 
@@ -737,9 +751,10 @@ def test_colour_planes_share_a_sky_and_neutralize_display_sky_equalises_the_medi
     rng = np.random.default_rng(9)
     h = np.clip(0.06 + 0.4 * np.exp(-(((np.mgrid[0:300, 0:400][1] - 200) / 50.0) ** 2)) + rng.normal(0, 0.01, (300, 400)), 0, 1).astype(np.float32)
     o = np.clip(0.11 + rng.normal(0, 0.01, (300, 400)), 0, 1).astype(np.float32)
-    hc, oc, d = finish.colour_planes(h, o)
-    assert abs(np.percentile(hc, 5) - np.percentile(oc, 5)) < 0.01 and d > 0.03
-    assert oc.std() < 0.5 * o.std()                                                               # colour resolution: the OIII grain is averaged away
+    hc, oc, d, sig = finish.colour_planes(h, o)
+    # the OIII's sky is brought to the Ha's empty sky (its darkest 0.5 %), so the dark sky is colourless; the OIII grain is averaged away and thresholded
+    assert abs(np.median(oc) - np.percentile(hc, finish.SKY_PERCENTILE)) < 0.01 and d > 0.03 and sig >= 0
+    assert oc.std() < 0.5 * o.std()
     rgb = np.stack([np.full((100, 100), 0.05, np.float32), np.full((100, 100), 0.08, np.float32), np.full((100, 100), 0.07, np.float32)])
     rgb[:, 40:60, 40:60] = 0.7
     out, off = finish.neutralize_display_sky(rgb)

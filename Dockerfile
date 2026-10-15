@@ -105,6 +105,12 @@ ENV PYTHONUNBUFFERED=1 \
     RCASTRO_BIN=/usr/local/bin/rc-astro \
     PATH=/opt/starnet2:$PATH
 
+# libraries PyQt6 needs to be imported by the siril-scripts Python scripts run headless with `pyscript` (QT_QPA_PLATFORM=offscreen): Statistical_Stretch.py (Seti Astro) is
+# the stretch method `statstretch` of sirilpipe/stretch.py and imports PyQt6.QtWidgets before it looks at its command line (libGL.so.1 was missing: ImportError, and a failing
+# pyscript does not fail the Siril script).  The pyscript venv installs PyQt6 itself on first use (network once).
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libegl1 libxkbcommon0 libfontconfig1 libglib2.0-0 libdbus-1-3 \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY --from=siril-dl /opt/siril /opt/siril
 COPY --from=siril-dl /opt/siril-data /opt/siril-data
 RUN printf '#!/bin/sh\nexec /opt/siril/AppRun siril-cli "$@"\n' > /usr/local/bin/siril-cli \
