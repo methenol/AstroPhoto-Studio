@@ -4,7 +4,8 @@
 
 The script file is imported as it is (its Qt window code is never started: every siril-scripts script guards ``main()``), the function ``entry`` is called once per kwargs
 dict with the array as first argument, and the results are saved as ``<prefix>_<i>.npy``.  This is the community code itself, not a port: e.g. VeraLux HyperMetric
-Stretch's ``process_veralux_v6`` (the function its PROCESS button calls) or Statistical_Stretch's ``StatisticalStretchProcessor``.
+Stretch's ``process_veralux_v6`` (the function its PROCESS button calls), HDR_multiscale's ``compute_wavescale_hdr`` or NarrowbandNormalization's ``process_image``.
+Inputs are saved as given (``HWC`` for the colour functions); a tuple result is reduced to its first element.
 """
 import argparse
 import importlib.util
@@ -33,6 +34,8 @@ def main() -> int:
     pos = json.loads(a.args)
     for i, kw in enumerate(json.loads(a.kwargs)):
         out = fn(img.copy(), *pos, **kw)
+        if isinstance(out, tuple):                       # e.g. compute_wavescale_hdr -> (image, mask): the image is the result
+            out = out[0]
         np.save(f"{a.output_prefix}_{i}.npy", np.asarray(out, dtype=np.float32))
     return 0
 

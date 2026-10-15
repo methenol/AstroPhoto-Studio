@@ -48,30 +48,23 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
 4. **Integrate** — `seqapplyreg` with Bayer drizzle (1×, pixfrac 1; 2× only for well-sampled, large
    sets), `-framing=max`, winsorized sigma rejection, additive-scale normalisation, wFWHM weights,
    32-bit output; auto-crop to the covered area; plate solve.
-5. **Restore** (linear) — GraXpert AI background extraction; plate solve (NOMAD, then Gaia DR3, retried: the
-   online catalogue answers 503 now and then); SPCC colour calibration (sensor and filter from the headers;
-   narrowband mode for dual-band filters); BlurXTerminator correct-only then sharpen (or Siril `makepsf` +
-   Richardson-Lucy) with the non-stellar sharpening following the measured per-pixel signal-to-noise
-   (`finish.object_snr`: 0.3 on noisy data up to 0.75 on clean, RC-Astro: sharpen less on noisy data);
-   then THE noise reduction: NoiseXTerminator `--dn` 0.9 .. 0.6 by the same signal-to-noise (or GraXpert's AI
-   denoise 1.0 .. 0.6, or Siril) on the linear data.  `deconv_method = imagemm` runs ImageMM on the
-   registered subs instead (needs `IMAGEMM=cuda`).
-6. **Stars** — StarXTerminator (or StarNet2) splits stars and starless images.
-7. **Auto-finish** — sky level, GHS local intensity, HDR compress, star intensity, OIII normalisation strength,
-   saturation, sharpening and local contrast chosen from measured statistics; the report lists each decision.
-8. **Export** — only the grain the AI denoiser leaves (starlet scales 1-3, BayesShrink with bivariate parent
-   support, Chang-Yu-Vetterli / Sendur-Selesnick) is cleaned in the linear domain, a second polynomial
-   background pass flattens the sky, and a Generalised Hyperbolic Stretch (Payne & Cranfield) with D / SP
-   solved so the sky sits at 0.085 and the nebula's 90th percentile at 0.6 ("stretch where the signal is").
-   Dual-band: Ha and OIII are stretched with one GHS fitted on Ha; the colour (Ha : OIII ratio, OIII
-   normalised to Ha with Blanshan / Cranfield) is taken at colour resolution (0.3 % of the long side) from
-   background-neutralised planes, the lightness from the full-resolution Ha plus the OIII in proportion to its
-   signal-to-noise ("HOO with Ha luminance"), so OIII noise never reaches the picture; display-level sky
-   neutralisation (offsets only).  HDR highlight compress (Statistical_Stretch), output black level to the sky
-   aim, asinh star stretch, screen recombination, SCNR for broadband, sRGB JPEG + 16-bit TIFF + a JSON sidecar
-   listing every step and parameter.  A second NoiseXTerminator / GraXpert pass on the stretched image runs
-   only for the legacy stretches (one noise reduction, not two).  The outer 24 px of the stack are trimmed
-   (noisier rim).  The legacy statistical stretch stays available as `stretch_method` mtf / asinh / log.
+5. **Restore** (linear) — GraXpert AI background extraction; plate solve (NOMAD, then Gaia DR3, retried); BlurXTerminator correct-only;
+   SPCC colour calibration (sensor and filter from the headers; narrowband mode for dual-band filters); BlurXTerminator sharpen with
+   the 1-2 h values of research/pro-workflow.md (Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; the lower end on noisy data); NoiseXTerminator `--dn` 0.8 .. 0.5 on the linear
+   data (GraXpert denoise 0.8 .. 0.6, or Siril, as fallbacks).  `deconv_method = imagemm` runs ImageMM on the registered subs instead.
+6. **Stars** — StarXTerminator on the linear data (or StarNet2 `--linear`), no unscreen: `stars = linear - starless`.
+7. **Auto-finish** — `autofinish.py` picks among published values by stated rules (small vs frame-filling target, clipping -> HDR, dual-band vs broadband -> palette / SCNR,
+   star density -> reduction, SNR -> NXT strength); every decision is in the report with its rule.
+8. **Export** — `pro.py`, the professional chain, every step a Siril command, a pyscript or an rc-astro call, a picture saved after each step
+   (`process/finish/steps/NN_<step>.png`) and the verbatim commands in the sidecar (`linear_info.chain`):
+   colour-gradient removal (`subsky 2`, mean model added back) and background neutralisation (per-channel offsets) on the linear starless;
+   **GHS two-pass stretch** by `ght` (pass 1 SP at the histogram's left half-maximum, b 10, D raised until the background reaches 0.10; `linstretch -BP` at the histogram toe;
+   pass 2 SP on the nebula mask's median, b 4, D 1, LP = background, HP < 1 when `hdr` is on) — alternatives `statstretch` (`pyscript Statistical_Stretch.py -median 0.10|0.25 -sigma 5 -linked`),
+   `autoghs`, `modasinh`, `autostretch`, `hms`; highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless
+   (`--di --dn`, `--dc 0.95`; GraXpert fallback); palette (HOO classic / improved / foraxx / hoo_warm by `pm`; NBN port when `oiii_boost` != 1) or `rmgreen 3`; local contrast by `clahe`
+   under a mask (150 and 40 px); `satu 0.25-0.5`; stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
+   (`pm "~(~$starless$*~$stars$)"`); black point at the toe and `icc_convert_to sRGB relative`; sRGB JPEG + 16-bit TIFF + the JSON sidecar.  The exporter computes and prints the
+   **gates** of research/FINISH-SPEC.md (`gates.py`) and stores them in the sidecar.  The preview runs the same chain without the AI steps.  The outer 24 px of the stack are trimmed.
 
 Which tool runs is decided at run time from the licences (`GET /api/tools`); the Linear panel in the
 UI says what will be used.

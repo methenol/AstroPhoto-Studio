@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 
 from . import export as export_mod
-from . import finish, fitsio, stretch as stretch_mod, tools
+from . import finish, fitsio, gates, pro, tools
 from .siril import SirilError, SirilRunner
 from .tools import ToolError, ToolUnavailable
 from .util import Cancelled
@@ -53,14 +53,14 @@ DEFAULTS: dict = {
     "background": True, "bg_method": "auto", "bg_correction": "subtract", "bg_degree": 2, "bg_smoothing": 0.5,
     "white_balance": "auto", "spcc_sensor": "auto", "spcc_filter": "auto", "spcc_white_ref": "average_spiral_galaxy",
     "denoise": 0.95, "deconvolution": 0.7, "restored_resolution": 1.0,
-    # non-linear stage
+    # non-linear stage (the professional chain of pro.py; the published values, source at each use there)
     "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.5,
-    "stretch_method": "ghs", "stretch": 0.09, "auto_stretch": True, "hdr": 0.6, "contrast": 2.0,
+    "stretch_method": "ghs2", "stretch": 0.10, "auto_stretch": True, "hdr": 0.0, "contrast": 4.0,
     "color_preservation": 0.7,
-    "star_separation": True, "star_removal": "auto", "star_reduction": 0.35, "star_intensity": 0.9,
+    "star_separation": True, "star_removal": "auto", "star_reduction": 0.4, "star_intensity": 1.0,
     "star_saturation": 1.0, "halo_suppress": 0.6, "star_color_preservation": 0.5,
-    "saturation": 1.3, "chroma_denoise": 0.8, "luminance_denoise": 0.6, "oiii_unmix": True,
-    "local_contrast": 1.0, "scnr": 0.4, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.25,
+    "saturation": 1.3, "chroma_denoise": 0.95, "luminance_denoise": 0.7, "oiii_unmix": True,
+    "local_contrast": 0.5, "scnr": 0.0, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.0,
     # colour grade: neutral; not applied by this backend
     "grade_amount": 1.0, "grade_temperature": 0.0, "grade_tint": 0.0, "grade_warm_hue": 0.0, "grade_warm_sat": 1.0,
     "grade_cool_hue": 0.0, "grade_cool_sat": 1.0, "grade_contrast": 0.0,
@@ -69,12 +69,15 @@ DEFAULTS: dict = {
 # Accepted but without effect in this backend (the stack is cropped by the stack job, the ImageMM
 # restoration and the colour-grade module do not exist any more).
 IGNORED_KEYS = ("crop", "crop_threshold", "restored_resolution", "grade_amount", "grade_temperature", "grade_tint",
-                "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast")
+                "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast",
+                # the professional chain (pro.py) has no use for these: no fitted nebula aims, no SNR-weighted Ha / OIII luminance, no starlet star halo suppression, no unsharp mask
+                "auto_stretch", "color_preservation", "synthetic_luminance", "oiii_unmix", "halo_suppress", "star_color_preservation", "sharpen")
 
 
-# Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount, written by autofinish
-# (finish.STAR_STRETCH when absent); ``stretch_boost`` the Statistical_Stretch.py curves boost (0 when absent).
-EXTRA_KEYS = ("star_stretch", "stretch_boost")
+# Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount (5 when absent), ``stretch_boost`` the
+# Statistical_Stretch.py curves boost (0 when absent), ``hdr_method`` the highlight tool (auto: the stretch's own, GHS HP / Statistical Stretch -hdr; wavescale: Seti Wavescale
+# HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1).
+EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2")
 
 
 def _R(group, key, label, lo, hi, step):
@@ -103,30 +106,23 @@ PARAM_SPEC: list[dict] = [
     _S("Linear", "spcc_white_ref", "Colour calibration: white reference", ["average_spiral_galaxy", "g2v"]),
     _R("Linear", "denoise", "Light denoise before stretch (NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
     _R("Linear", "deconvolution", "Deconvolution (BlurXTerminator, else Richardson-Lucy)", 0, 1, 0.05),
-    _S("Stretch", "stretch_method", "Stretch tool (ghs: Siril ght; autoghs, modasinh, autostretch: Siril commands; statstretch: Seti Astro Statistical_Stretch.py; hms: VeraLux HyperMetric Stretch; mtf, asinh, log: legacy numpy)",
-       ["ghs", "autoghs", "modasinh", "autostretch", "statstretch", "hms", "mtf", "asinh", "log"]),
-    _R("Stretch", "stretch", "Sky level (ghs) / median target (statistical)", 0.04, 0.35, 0.01),
-    _B("Stretch", "auto_stretch", "Adapt statistical stretch to target size (not used by ghs)"),
-    _R("Stretch", "hdr", "HDR (protect bright cores; statistical stretch only)", 0, 1.5, 0.05),
-    _R("Stretch", "contrast", "GHS local intensity b (highest tried; the fit picks the highest that meets the sky / nebula levels)", 0.25, 13, 0.25),
-    _R("Stretch", "color_preservation", "Colour-preserving stretch", 0, 1, 0.05),
-    _S("Colour", "palette", "Palette", ["auto", "natural", "hoo", "foraxx", "hoo_warm"]),
-    _R("Colour", "oiii_boost", "OIII normalisation strength (1 = Blanshan / Cranfield equal level; applied after the stretch)", 0.5, 3, 0.05),
-    _R("Colour", "synthetic_luminance", "Synthetic luminance (dual-band)", 0, 1, 0.05),
-    _B("Colour", "oiii_unmix", "Remove Ha leakage from OIII"),
-    _R("Colour", "saturation", "Saturation", 0.5, 3, 0.05),
-    _R("Colour", "chroma_denoise", "Colour noise reduction", 0, 1, 0.05),
-    _R("Colour", "scnr", "SCNR (remove green cast, broadband only)", 0, 1, 0.05),
+    _S("Stretch", "stretch_method", "Stretch tool (ghs2: Siril ght, the GHS two-pass recipe; statstretch: Seti Astro Statistical Stretch; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
+       ["ghs2", "statstretch", "autoghs", "modasinh", "autostretch", "hms"]),
+    _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
+    _R("Stretch", "hdr", "Highlights (bright cores): 0 = off, 1 = the published values (GHS HP < 1, Statistical Stretch -hdr 0.15, Wavescale HDR 1.5)", 0, 1.5, 0.05),
+    _R("Stretch", "contrast", "GHS second pass: local intensity b (3-5, ghsastro)", 0.25, 13, 0.25),
+    _S("Colour", "palette", "Palette (dual-band: HOO classic ha=R oiii=(G+B)/2; hoo_improved; foraxx; hoo_warm; nbn: narrowband normalisation)", ["auto", "natural", "hoo", "hoo_improved", "foraxx", "hoo_warm", "nbn"]),
+    _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (NBN runs when this is not 1)", 0.5, 3, 0.05),
+    _R("Colour", "saturation", "Saturation (Siril satu amount = this - 1; published 0.25-0.5)", 1, 2, 0.05),
+    _R("Colour", "chroma_denoise", "Colour noise reduction (NoiseXTerminator --dc, 0.9-1.0)", 0, 1, 0.05),
+    _R("Colour", "scnr", "SCNR (Siril rmgreen, broadband only)", 0, 1, 0.05),
     _B("Stars", "star_separation", "Process stars separately"),
     _S("Stars", "star_removal", "Star removal (auto: StarXTerminator, else StarNet2)", ["auto", "sxt", "starnet", "none"]),
-    _R("Stars", "star_reduction", "Star reduction (1 = starless)", 0, 1, 0.05),
-    _R("Stars", "star_intensity", "Star brightness", 0, 1.5, 0.05),
-    _R("Stars", "star_saturation", "Star colour", 0, 2.5, 0.05),
-    _R("Stars", "star_color_preservation", "Star colour intensity (stretch)", 0, 1, 0.05),
-    _R("Stars", "halo_suppress", "Halo suppression", 0, 1, 0.05),
-    _R("Detail", "luminance_denoise", "Noise reduction of the render (BayesShrink wavelet pass before the stretch, on top of the restore stage's AI denoiser; 0.6 = standard)", 0, 1.5, 0.05),
-    _R("Detail", "local_contrast", "Local contrast (Revela structure gain 1 + x on the signal)", 0, 2, 0.05),
-    _R("Detail", "sharpen", "Final sharpening", 0, 1.5, 0.05),
+    _R("Stars", "star_reduction", "Star reduction strength (DSA star reduction value = 0.5 x (1 - this); published 0.4-0.6; 1 = starless)", 0, 1, 0.05),
+    _R("Stars", "star_intensity", "Star brightness (1 = as stretched)", 0, 1.5, 0.05),
+    _R("Stars", "star_saturation", "Star colour (Siril satu on the stars, 1 = none)", 0, 2.5, 0.05),
+    _R("Detail", "luminance_denoise", "Noise reduction of the stretched starless image (NoiseXTerminator --dn, 0.6-0.85; GraXpert denoise as the fallback)", 0, 1, 0.05),
+    _R("Detail", "local_contrast", "Local contrast (Siril clahe under a background mask; blend 0.4 x this, 0.5 = the lowest published strength)", 0, 2, 0.05),
     _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
     _R("Finish", "brightness", "Midtones", -1, 1, 0.05),
 ]
@@ -134,13 +130,13 @@ PARAM_SPEC: list[dict] = [
 # Same presets as before ("Balanced" = DEFAULTS); only keys that are still honoured matter.
 PRESETS: dict = {
     "Balanced": {},
-    "Vivid nebula": {"saturation": 1.8, "local_contrast": 1.4, "stretch": 0.09, "contrast": 4.0, "oiii_boost": 1.0,
-                     "star_reduction": 0.5, "star_intensity": 0.8},
+    "Vivid nebula": {"saturation": 1.5, "local_contrast": 0.8, "stretch": 0.10, "contrast": 4.0, "oiii_boost": 1.0,
+                     "star_reduction": 0.6, "star_intensity": 0.8},
     "Starless-ish": {"star_reduction": 0.8, "star_intensity": 0.45, "local_contrast": 1.0},
-    "Galaxy / broadband": {"palette": "natural", "stretch": 0.09, "contrast": 4.0, "saturation": 1.4,
-                           "local_contrast": 0.8, "star_reduction": 0.2, "bg_degree": 2},
+    "Galaxy / broadband": {"palette": "natural", "stretch": 0.10, "contrast": 4.0, "saturation": 1.4,
+                           "local_contrast": 0.8, "star_reduction": 0.4, "bg_degree": 2},
     "Natural colour": {"palette": "natural", "saturation": 1.3, "scnr": 0.6},
-    "Deep & dark": {"stretch": 0.06, "black_point": 0.0, "contrast": 6.0, "local_contrast": 1.0},
+    "Deep & dark": {"stretch": 0.06, "black_point": 0.0, "contrast": 5.0, "local_contrast": 0.8},
 }
 
 # Sensor / filter mapping for Siril's SPCC database (workflows.md 7.3, Naztronomy FILTER_COMMANDS_MAP).
@@ -552,11 +548,10 @@ class Restorer:
             if method == "rl":                                       # the n2n-rl profile: Siril's own deconvolution
                 raise ToolUnavailable("deconv_method=rl: Siril Richardson-Lucy requested")
             tools.rcastro.require("bxt")
-            # stellar sharpening 0.25-0.4 (RC-Astro); non-stellar sharpening follows the signal-to-noise (finish.bxt_sn: 0.3 noisy .. 0.75 clean), scaled
-            # by the deconvolution setting (1 at the default 0.7).  It was a fixed 0.5 + 0.4 d = 0.78: on the 1-3 h DWARF stacks (SNR 2-10) that sharpened
-            # the noise into dark specks and rings (IC 1805).
+            # BXT sharpen with the 1-2 h smart-scope values (research/pro-workflow.md A5/B3: Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; Brecher's 0.5/0.9 are
+            # for 15-19 h stacks, AstroPipe's 0.25/0.60/0 for smart-scope data); the lower end on the noisiest data (finish.bxt_ss / bxt_sn).
             snr = self.snr()
-            ss, sn = 0.25 + 0.15 * d, round(finish.bxt_sn(snr) * min(1.0, d / 0.7), 3)
+            ss, sn = round(finish.bxt_ss(snr), 3), round(finish.bxt_sn(snr), 3)     # research/pro-workflow.md A5: 1-2 h stacks ss 0.25-0.35, sn 0.5-0.6
             extra: dict = {}
             fwhm = float(self.meta.get("fwhm_px") or 0)
             if p.get("bxt_manual_psf") and 1.0 < fwhm:                 # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
@@ -819,162 +814,48 @@ def _reduce(arr: np.ndarray, max_side: int) -> np.ndarray:
 _PREVIEW_CACHE: dict[tuple, _Layers] = {}
 
 
+
 def preview_jpeg(session_dir: str, stack_meta: dict, params: dict, max_side: int = 1600) -> bytes:
-    """The preview of the best state on disk (starless + stars, else linear, else the stack) as JPEG bytes: the SAME finishing function as the export
-    (``finish.render_layers`` through ``_render``) with the same parameters, at the export's resolution (the picture is reduced to ``max_side`` only at the end: the
-    denoise statistics, the wavelet scales and the colour resolution depend on the pixel scale, a render of a reduced copy differed from the export by 0.03), and the same stretch tool (Siril ``ght`` /
-    ``autoghs`` / ``modasinh`` / ``autostretch`` or Statistical_Stretch.py through ``stretch.SirilStretcher``).  Only the external noise reduction and colour tools are
-    left out, and the preview is "without the AI noise reduction": the render has no second AI pass in the GHS path (the restore stage's NoiseXTerminator / GraXpert
-    denoise is already in ``linear.fits`` and so in the preview), the legacy statistical stretches' NXT / GraXpert pass is skipped, and Siril's ``satu`` / ``rmgreen``
-    run as their numpy twins.  The preview equals the export (mean absolute difference 0.003-0.005 measured on IC 1805 and NGC 1499, JPEG quality 88 vs 95) and a 1400 px preview equals the export reduced to 1400 px."""
+    """The preview of the best state on disk (starless + stars, else linear, else the stack) as JPEG bytes: the SAME finishing chain as the export (``pro.Finisher``, the
+    professional workflow of research/pro-workflow.md: Siril ``ght`` two-pass stretch, palette, ``clahe`` under a mask, ``satu``, Seti Star Stretch as ``mtf``, screen
+    recombination) on the same data with the same parameters, at the export's resolution (reduced to ``max_side`` only at the end).  Only the external AI steps are left
+    out: the preview is "without the AI noise reduction of the stretched image (NoiseXTerminator / GraXpert)", which the export runs at step 3."""
     p = {**DEFAULTS, **(params or {})}
     key = (session_dir, p["star_separation"]) + tuple(
         os.path.getmtime(_p(session_dir, f)) if os.path.exists(_p(session_dir, f)) else 0
         for f in ("stack.fits", "linear.fits", "starless.fits", "stars.fits", "starnet_meta.json"))
     layers = _PREVIEW_CACHE.get(key)
     if layers is None:
-        layers = _Layers(session_dir, p, None)           # full resolution: the noise statistics, the starlet scales and the colour resolution are those of the export
+        layers = _Layers(session_dir, p, None)           # full resolution: the noise statistics and the colour resolution are those of the export
         if len(_PREVIEW_CACHE) >= 1:
             _PREVIEW_CACHE.pop(next(iter(_PREVIEW_CACHE)))
         _PREVIEW_CACHE[key] = layers
     work = _p(session_dir, "process", "preview")
     os.makedirs(work, exist_ok=True)
-    hooks = {"stretcher": stretch_mod.SirilStretcher(work)}
-    img, _ = _render(layers, p, _dual_band(stack_meta or {}, layers.header), fast=True, hooks=hooks)
+    img, _ = _render(layers, p, _dual_band(stack_meta or {}, layers.header), external=False, work=work)
     return export_mod.jpeg_bytes(export_mod.display_image(img, export_mod.bottom_up(layers.header)), 88, max_side)
 
 
-def _render(layers: _Layers, p: dict, dual: bool, fast: bool, hooks: dict | None = None, tick=None,
-            work: str | None = None, sp: dict | None = None, steps: _Steps | None = None) -> tuple[np.ndarray, dict]:
-    """Run ``finish.render_layers`` on the loaded layers, doing the stretched-stage star removal when needed."""
-    base, stars, pre, st_stretched = layers.base, layers.stars, False, False
-    if layers.stage == "stretched" and not fast and work is not None and steps is not None:
-        base, stars = _stretched_star_removal(layers, p, dual, work, sp or {}, steps)
-        pre = st_stretched = stars is not None
-        if stars is None:
-            base = layers.base
-    p = {**p, "_fwhm_px": layers.fwhm_px, "_denoised_linear": layers.denoised}
-    img, info = finish.render_layers(base, stars, p, dual_band=dual, pre_stretched=pre, stars_stretched=st_stretched,
-                                     hooks=hooks, tick=tick)
+def _render(layers: _Layers, p: dict, dual: bool, external: bool, work: str, sp: dict | None = None, steps: _Steps | None = None,
+            tick=None, pictures: bool = False) -> tuple[np.ndarray, dict]:
+    """The finishing chain on the loaded layers: ``pro.Finisher`` (``external``: with the AI noise reduction of the stretched image)."""
+    base, stars = layers.base, layers.stars
+    if str(p.get("stretch_method")) in ("mtf", "asinh", "log"):      # the old numpy statistical stretches are gone: the default recipe runs
+        p = {**p, "stretch_method": "ghs2"}
+    fin = pro.Finisher(work, layers.header, p, dual, external=external, progress=(steps.sub if steps else None), checkpoint=(steps.checkpoint if steps else None), tick=tick,
+                       device=_device_gpu(sp), steps=steps, keep_pictures=pictures)
+    img, info = fin.run(base, stars)
     info["star_layer"] = "separate" if stars is not None else "none"
+    info["palette"] = fin.palette_name() if dual else "natural"
     return img, info
 
 
-def _stretched_star_removal(layers: _Layers, p: dict, dual: bool, work: str, sp: dict, steps: _Steps):
-    """StarNet2 on the stretched image (its network expects non-linear data): stretch -> remove stars -> the star
-    layer is the unscreened difference.  Returns (starless stretched, stars stretched) or (None, None)."""
-    pos = finish.curve_position(p["stretch_method"], float(p["hdr"]))
-    shd = finish.curve_shoulder(p["stretch_method"], float(p["hdr"]))
-    cov = finish.object_coverage(finish.luminance(layers.base))
-    target = finish.adapted_target(float(p["stretch"]), cov, bool(p["auto_stretch"]))
-    full, _ = finish.stretch_rgb(layers.base, target, position=pos, shoulder=shd, color_preservation=float(p["color_preservation"]))
-    src, dst = os.path.join(work, "sn_in.fits"), os.path.join(work, "sn_out.fits")
-    fitsio.write_rgb(src, full, layers.header)
-    try:
-        tools.starnet.run(src, dst, linear=False, progress=steps.sub, checkpoint=steps.checkpoint)
-    except Cancelled:
-        raise
-    except (ToolUnavailable, ToolError) as e:
-        steps.add("star removal (stretched)", "starnet2", "failed", note=str(e))
-        return None, None
-    starless = np.clip(fitsio.read_rgb(dst)[0], 0, 1)
-    return starless, finish.unscreen(full, starless)
-
-
-class _ExportHooks:
-    """The Siril / RC-Astro / GraXpert versions of the render's steps (export only)."""
-
-    def __init__(self, work: str, header, steps: _Steps, sp: dict, tag_tools: dict):
-        self.work, self.header, self.steps, self.sp, self.used = work, header, steps, sp, tag_tools
-        self.gpu = _device_gpu(sp)
-
-    def denoise(self, img: np.ndarray, p: dict):
-        """Second noise pass on the stretched starless layer (the RC-Astro recommended place): NXT 0.8 when licensed,
-        else GraXpert mild, else nothing (Siril's NL-Bayes would smear nebula detail at this point)."""
-        s = self.steps
-        ld = float(np.clip(p["luminance_denoise"], 0, 1.5))
-        t0 = time.time()
-        src, dst = os.path.join(self.work, "dn2_in.fits"), os.path.join(self.work, "dn2_out.fits")
-        fitsio.write_rgb(src, np.clip(img, 0, 1), self.header)
-        try:
-            tools.rcastro.require("nxt")
-            dn = round(min(0.95, 0.8 * ld / 0.6), 3)
-            m = tools.rcastro.run("nxt", src, dst, device=self.gpu, progress=s.sub, checkpoint=s.checkpoint, dn=dn)
-            s.add("denoise (stretched)", "rc-astro nxt", seconds=time.time() - t0, dn=dn, flags=m.get("flags"))
-            return np.clip(fitsio.read_rgb(dst)[0], 0, 1)
-        except Cancelled:
-            raise
-        except (ToolUnavailable, ToolError) as e:
-            s.add("denoise (stretched)", "rc-astro nxt", "unavailable", time.time() - t0, note=str(e))
-        t0 = time.time()
-        try:
-            strength = round(min(1.0, 0.5 * ld / 0.6), 3)
-            m = tools.graxpert.denoise(src, dst, strength=strength, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
-            s.add("denoise (stretched)", "graxpert", seconds=time.time() - t0, strength=strength, model=m.get("model"),
-                  providers=m.get("providers"))
-            return np.clip(fitsio.read_rgb(dst)[0], 0, 1)
-        except Cancelled:
-            raise
-        except (ToolUnavailable, ToolError) as e:
-            s.add("denoise (stretched)", "graxpert", "unavailable", time.time() - t0, note=str(e))
-        return None
-
-    def final_color(self, img: np.ndarray, p: dict, dual: bool):
-        """satu / rmgreen on the starless layer through Siril (numpy twin on failure); black point + midtones are applied after the star blend, in numpy."""
-        t0 = time.time()
-        lines = []
-        amount = float(p["saturation"]) - 1.0
-        if abs(amount) > 1e-3:
-            lines.append(f"satu {amount:.3f}")
-        if not dual and float(p["scnr"]) > 0:                     # no SCNR on dual-band: the green is the OIII
-            lines.append(f"rmgreen 0 {float(np.clip(p['scnr'], 0, 1)):.3f}")
-        if not lines:
-            return None
-        try:
-            out, _ = _siril_image(self.work, self.steps, "fc", np.clip(img, 0, 1), self.header, "\n".join(lines), "Colour")
-            self.steps.add("colour finish", "siril " + " + ".join(ln.split()[0] for ln in lines),
-                           seconds=time.time() - t0, commands=lines)
-            return np.clip(out, 0, 1)
-        except SIRIL_FAILS as e:
-            self.steps.add("colour finish", "siril", "failed", time.time() - t0, note=str(e).splitlines()[0] + " (numpy used)")
-            return None
-
-
-def _record_numpy_steps(steps: _Steps, info: dict, p: dict) -> None:
-    """The render's numpy steps (denoise, background pass, GHS, narrowband normalisation) as records of the sidecar, with the numbers that drove them."""
-    g = info.get("ghs") or {}
-    if not g:
-        return
-    steps.add("denoise (linear)", "numpy starlet (BayesShrink / bivariate)", amount=g.get("denoise"), noise_sigma=g.get("noise_sigma"),
-              scales=("1-%d, x%g (grain left by the restore stage's AI denoiser)" % (finish.FINE_SCALES, finish.AI_RESIDUAL_GAIN)) if info.get("denoised_by_restore") else "all", cold_sigma=finish.COLD_SIGMA)
-    ls = [x for x in (g.get("large_scale") or []) if x]
-    if ls:
-        steps.add("denoise (large scales)", "numpy starlet soft threshold", scales_px=[2 ** j for j in finish.LARGE_SCALES], k_sigma=ls[0].get("k"),
-                  sigma_sky=ls[0].get("sigma_sky"), band_before=[x.get("band_before") for x in ls], band_after=[x.get("band_after") for x in ls],
-                  source="Brecher (astrodoc.ca IC 417 SHO) MLT on background areas; Delsaert, noise reduction in PixInsight (CEDIC 2019)")
-    steps.add("background (second pass)", "numpy poly", degree=finish.FLATTEN_DEGREE, span=g.get("flatten_span"))
-    rec = g.get("stretch_record") or {}
-    steps.add("stretch", rec.get("tool", "numpy ghs"), status="done", seconds=rec.get("seconds", 0.0), note=rec.get("fallback") or rec.get("note", ""),
-              method=rec.get("method"), requested=rec.get("requested"), commands=rec.get("commands"), sky_aim=float(p["stretch"]), ghs_fit=rec.get("ghs_fit"),
-              trial_fit=rec.get("trial_fit"), pre_scaling="u = (x - black_point) / white per plane; black_point = sky mode of the plane", anchors=g.get("anchors"),
-              white=g.get("white"), sky_in=g.get("sky_in"), nebula_in=g.get("nebula_in"), bright_in=g.get("bright_in"), band_noise_in=g.get("band_in"),
-              signal_frac=g.get("signal_frac"),
-              source="Siril ght (Payne & Cranfield GHS, siril.org/tutorials/ghs); Statistical_Stretch.py (Seti Astro); GHS fit with the sky's noise floor held down")
-    ci = info.get("chroma_denoise") or {}
-    if ci.get("sigma_sky_a"):
-        steps.add("chrominance noise reduction", "numpy starlet soft threshold (Lab a*, b*)", amount=ci.get("amount"), k_sigma=ci.get("k"), sigma_sky_a=ci.get("sigma_sky_a"),
-                  sigma_sky_b=ci.get("sigma_sky_b"), band_ab_before=ci.get("band_ab_before"), band_ab_after=ci.get("band_ab_after"),
-                  source="MultiscaleLinearTransform chrominance thresholds 5/4/3 (Brecher, astrodoc.ca IC 417 SHO); Delsaert, CEDIC 2019")
-    pi = info.get("palette_info") or {}
-    if "oiii_to_ha" in pi:
-        steps.add("colour (ratio of the linear lines)", "numpy ratio colour + Blanshan / Cranfield normalisation gain", oiii_boost=pi.get("boost"), oiii_to_ha=pi.get("oiii_to_ha"),
-                  gain_full=pi.get("gain_full"), gain=pi.get("gain"), colour_sigma_px=pi.get("colour_sigma_px"), eps=pi.get("eps"), oiii_threshold_k=pi.get("oiii_threshold_k"),
-                  ha_leak_k=pi.get("ha_leak_k"), palette=info.get("palette"),
-                  source="NarrowbandNormalization.py (Cuiv; maths of Bill Blanshan & Mike Cranfield): equal mean deviation of the lines; the ratio colour is the LRGB / VeraLux vector-colour principle")
-        steps.add("lightness", "stretch of the synthetic luminance (Ha + SNR-weighted OIII share)", oiii_lightness_share=pi.get("oiii_lightness_share"), snr_ha=pi.get("snr_ha"),
-                  snr_oiii=pi.get("snr_oiii"), stretched_by=(g.get("stretch_record") or {}).get("tool"))
-    if float(p.get("hdr", 0)) > 0 and str(p.get("stretch_method", "ghs")) in finish.STRETCH_METHODS and str(p.get("stretch_method")) != "statstretch":
-        steps.add("highlights", "numpy hdr compress", amount=float(p["hdr"]), knee=finish.HDR_KNEE_GHS, source="Statistical_Stretch.hdr_compress_color_luminance")
+def _chain_record(info: dict) -> list[dict]:
+    """The chain's steps for the sidecar: command lines verbatim, parameters, levels after the step, the picture saved for it."""
+    out = []
+    for r in info.get("chain") or []:
+        out.append({k: v for k, v in r.items() if k in ("n", "step", "tool", "status", "seconds", "commands", "params", "levels", "picture", "note", "source")})
+    return out
 
 
 def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict | None = None, progress=None,
@@ -993,26 +874,34 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
     work = _p(session_dir, "process", "finish")
     os.makedirs(work, exist_ok=True)
     sp = (meta.get("params") or {}) if isinstance(meta, dict) else {}
-    hooks_obj = _ExportHooks(work, layers.header, steps, sp, {})
-    stretcher = stretch_mod.SirilStretcher(os.path.join(work, "stretch"), steps)
-    hooks = {"denoise": hooks_obj.denoise, "final_color": hooks_obj.final_color, "stretcher": stretcher}
 
     def tick(name):
-        steps.sub(msg=f"Stretching ({name.lower()})")
+        steps.sub(msg=f"Finishing ({name.lower()})")
 
     t0 = time.time()
-    img, info = _render(layers, p, dual, fast=False, hooks=hooks, tick=tick, work=work, sp=sp, steps=steps)
+    img, info = _render(layers, p, dual, external=True, work=work, sp=sp, steps=steps, tick=tick, pictures=True)
     info["render_seconds"] = round(time.time() - t0, 1)
-    _record_numpy_steps(steps, info, p)
     steps.begin("Exporting")
+    gate_report = None
+    if True:
+        try:
+            sm = layers.starnet.get("stars") or {}
+            level = float(pro.mtf_balance(pro.star_stretch_m(float(p.get("star_stretch", pro.STAR_STRETCH))), 5.0 * float(sm["sky_noise"]))) if sm.get("sky_noise") else None
+            gate_report = gates.compute(img, starless=info.get("starless") if layers.stars is not None and p["star_reduction"] < 1.0 else None,
+                                        linear_star_count=sm.get("count"), star_level=level)
+            print(gates.format_gates(gate_report), flush=True)
+            fitsio.write_rgb(_p(work, "finish.fits"), img, layers.header)
+        except Exception as e:                                           # noqa: BLE001  the gates never stop an export
+            gate_report = {"error": str(e)}
     disp = export_mod.display_image(img, export_mod.bottom_up(layers.header))
     lum = finish.sample(finish.luminance(layers.base))
     restore_meta = _load_json(_p(session_dir, "restore_meta.json"))
+    chain = _chain_record(info)
     linear_info = {
         "source": os.path.basename(layers.src), "star_layer": info.get("star_layer"), "star_removal": layers.starnet.get("tool", "none"),
         "star_removal_stage": layers.starnet.get("stage", "none"), "restoration": restore_meta.get("name", "none (stack only)"),
-        "palette": info.get("palette"), "dual_band": dual, "target_median": info.get("target_median"),
-        "coverage": info.get("coverage"), "stretch": info.get("stretch") or info.get("palette_info"), "stars": info.get("stars"),
+        "palette": info.get("palette"), "dual_band": dual, "stretch": info.get("stretch"), "highlights": info.get("highlights"),
+        "chain": chain, "gates": gate_report, "pictures": _p(work, "steps"),
         "noise_ref": round(finish.lower_half_sigma(lum), 6), "crop": meta.get("crop"),
         "steps": steps.records, "render_seconds": info["render_seconds"], "seconds": round(time.time() - t_all, 1),
         "siril_tools": sorted({r["tool"] for r in steps.records if r["status"] == "done"}),

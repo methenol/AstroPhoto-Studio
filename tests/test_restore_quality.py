@@ -66,10 +66,10 @@ def test_bxt_and_nxt_strengths_follow_the_signal_to_noise(tmp_path, fake_rc):
         bxt = next(c for c in fake_rc.calls if c[0] == "bxt")[1]
         nxt = next(c for c in fake_rc.calls if c[0] == "nxt")[1]
         if name == "noisy":
-            assert bxt["sn"] == pytest.approx(0.3, abs=0.06) and nxt["dn"] >= 0.85 and 0.25 <= bxt["ss"] <= 0.4
+            assert bxt["sn"] == pytest.approx(0.5, abs=0.03) and nxt["dn"] >= 0.75 and 0.25 <= bxt["ss"] <= 0.35        # research/pro-workflow.md A5 / A6
             snr_noisy = r.snr()
         else:
-            assert bxt["sn"] >= 0.7 and nxt["dn"] <= 0.65
+            assert 0.55 <= bxt["sn"] <= 0.6 and nxt["dn"] <= 0.6
             assert r.snr() > snr_noisy
         assert r.info["snr"] == pytest.approx(r.snr(), abs=0.01)
 
@@ -77,7 +77,7 @@ def test_bxt_and_nxt_strengths_follow_the_signal_to_noise(tmp_path, fake_rc):
 def test_the_denoise_setting_scales_the_ai_strength_and_zero_skips_it(tmp_path, fake_rc):
     r = _restorer(tmp_path, _stack(4e-4), {"denoise": 0.475})
     r.denoise()
-    assert fake_rc.calls[-1][1]["dn"] == pytest.approx(0.45, abs=0.01)                      # half the setting's default: half the SNR-derived strength
+    assert fake_rc.calls[-1][1]["dn"] == pytest.approx(0.4, abs=0.01)                      # half the setting's default: half the SNR-derived strength
     (tmp_path / "b").mkdir()
     r2 = _restorer(tmp_path / "b", _stack(4e-4), {"denoise": 0.0})
     n = len(fake_rc.calls)
@@ -99,7 +99,7 @@ def test_graxpert_stands_in_for_nxt_with_the_snr_strength(tmp_path, monkeypatch)
     monkeypatch.setattr(post.tools, "graxpert", FakeGX())
     r = _restorer(tmp_path, _stack(4e-4))
     r.denoise()
-    assert seen["strength"] >= 0.9 and r.steps.records[-1]["tool"] == "graxpert" and r.steps.records[-1]["params"]["snr"] > 0
+    assert seen["strength"] >= 0.75 and r.steps.records[-1]["tool"] == "graxpert" and r.steps.records[-1]["params"]["snr"] > 0
 
 
 def test_plate_solve_retries_the_catalogue_then_gaia(tmp_path, monkeypatch):

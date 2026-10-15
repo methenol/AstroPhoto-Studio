@@ -1,28 +1,18 @@
-"""The render's stretch, run by the community tools themselves.
+"""The alternative community stretches of the default chain (``pro.Finisher``), run by the tools themselves through Siril or the pyscript virtualenv.
 
-The user's rule: the stretch is not a numpy re-implementation but Siril's own commands and the siril-scripts Python script that has a headless mode.  Methods
-(``params["stretch_method"]``; the sidecar records the exact command lines, so a stretch can be repeated by hand in Siril):
+``stretch_method`` values other than ``ghs2`` (the GHS two-pass recipe, which ``pro.py`` runs as Siril ``ght`` + ``linstretch`` commands): ``statstretch`` (``pyscript
+Statistical_Stretch.py``, called by ``pro.py`` itself), and the four handled here, each with ONE free parameter raised until the background (the sky mode) of the stretched image sits
+at 0.10 (Brecher), trials on a reduced copy:
 
-=============  ===========================================================================================================================================
-``ghs``        Siril ``ght -D= -B= -SP= -LP= -HP= -clipmode=clip -independent``: Generalised Hyperbolic Stretch (Payne & Cranfield, https://ghsastro.co.uk,
-               Siril tutorial https://siril.org/tutorials/ghs/).  D, B, SP, LP are fitted from the image (``finish.ghs_fit_noise_floor``): SP above the sky's
-               noise, the sky on its aim, the nebula's 90th percentile on its aim, the lowest slope at the sky among the curves that meet both (noise floor).
-``autoghs``    Siril ``autoghs -linked <k> <D> -b= -hp= -lp=`` (SP = median + k sigma), D fitted to the nebula aim.
-``modasinh``   Siril ``modasinh -D= -LP= -SP= -HP= -independent``, SP above the sky's noise, D fitted to the nebula aim.
-``autostretch``  Siril ``autostretch -linked <shadowsclip> <targetbg>`` (the GUI's auto-stretch), targetbg fitted so the sky lands on its aim.
-``statstretch``  ``pyscript Statistical_Stretch.py -median <T> -sigma 5 -linked [-boost b] [-hdr ...]``: Seti Astro's Statistical Stretch as ported to Siril by
-               C. Richard (siril-scripts/processing/Statistical_Stretch.py, the one stretch script of the repository with an argparse mode), T fitted so the sky lands on its aim.
-=============  ===========================================================================================================================================
+``autoghs``      Siril ``autoghs -linked <k> <D> -b= -hp= -lp=`` (SP = median + k sigma), D free.
+``modasinh``     Siril ``modasinh -D= -LP= -SP= -HP= -independent``, D free.
+``autostretch``  Siril ``autostretch -linked <shadowsclip> <targetbg>``, targetbg free.
+``hms``          VeraLux HyperMetric Stretch ``process_veralux_v6`` (siril-scripts; no command-line mode: its GUI-free core is called by ``community_worker.py``), Log D free.
 
-The scripts of VeraLux (HyperMetric Stretch, Curves, ...) have no command-line mode: they open a PyQt6 window and block in ``app.exec()`` (tested in this image: no
-output, the process has to be killed), so they cannot be part of a headless pipeline and are not used (research/pro-finishing.md section 6).
-
-When Siril is not available (a developer machine) ``ghs`` falls back to ``finish.ghs`` (a numpy mirror of ``ght``, identical to 1e-6, checked in the tests), every other
-method falls back to ``ghs`` fitted on the same aims; the record says so.
+The exact command lines are recorded in the chain's sidecar.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
@@ -30,10 +20,11 @@ import time
 import cv2
 import numpy as np
 
-from . import finish, fitsio
+from . import fitsio
 from .siril import SirilError, SirilRunner
 
-METHODS = ("ghs", "autoghs", "modasinh", "autostretch", "statstretch", "hms")
+SIGNAL_SIGMA = 4.0                  # "signal" = more than this many sigmas above the sky mode (trial levels)
+METHODS = ("ghs2", "autoghs", "modasinh", "autostretch", "statstretch", "hms")
 TRIAL_SIDE = 900                    # px: the trial stretches of the non-analytic methods run on a copy reduced to this long side
 TRIAL_POINTS = 9                    # values of the method's parameter tried per Siril run
 AUTOGHS_K = 0.0                     # autoghs shadowsclip (SP = median + k sigma of each channel)
@@ -168,10 +159,10 @@ class SirilStretcher:
     @staticmethod
     def _levels(out_lum: np.ndarray, in_lum: np.ndarray, ctx: dict) -> tuple[float, float]:
         """(sky, nebula p90) of a stretched lightness plane, with the pixel sets of the input: the sky = the pixels within the input's noise of its mode, the nebula = the
-        pixels the fit calls signal (same masks as ``finish.ghs_stretch`` measured the aims with)."""
+        pixels the fit calls signal (the sky and the subject of the trial image)."""
         sky_in, noise = ctx["sky"], max(ctx["noise"], 1e-4)
         m_sky = np.abs(in_lum - sky_in) <= noise
-        m_sig = in_lum > sky_in + finish.SIGNAL_SIGMA * noise
+        m_sig = in_lum > sky_in + SIGNAL_SIGMA * noise
         sky = float(np.median(out_lum[m_sky])) if m_sky.sum() > 50 else float(np.median(out_lum))
         neb = float(np.percentile(out_lum[m_sig], 90)) if m_sig.sum() > 200 else float(np.percentile(out_lum, 99.0))
         return sky, neb
@@ -199,12 +190,6 @@ class SirilStretcher:
             return [line]
         raise ValueError(method)
 
-    @staticmethod
-    def ght_line(fit: dict) -> str:
-        """``ght`` for a ``finish.ghs_fit`` result (Siril's -D is ln(D + 1))."""
-        return (f"ght -D={np.log1p(fit['D']):.6f} -B={fit['b']:g} -SP={fit['sp']:.6f} -LP={fit.get('lp', 0.0):.6f} -HP={fit.get('hp', 1.0):.6f} "
-                f"-clipmode=clip -independent")
-
     # ------------------------------------------------------------------ the fit of the non-analytic methods (trials on a reduced copy)
     def _fit_value(self, method: str, ctx: dict, aims: dict) -> tuple[float | None, dict]:
         """The free parameter of ``method`` that lands the sky on ``aims['sky']`` (autostretch / statstretch: the median-based ones) or the nebula's 90th percentile
@@ -214,7 +199,7 @@ class SirilStretcher:
         in_lum = _reduce(ctx["lum"], TRIAL_SIDE)
         ctx_t = {**ctx, "lum": in_lum}
         mono = [np.clip(in_lum, 0.0, 1.0).astype(np.float32)]
-        by_sky = method in ("autostretch", "statstretch", "hms")
+        by_sky = method in ("autostretch", "statstretch", "hms") or aims.get("neb") is None
         trials: list[tuple[float, float, float]] = []
         for rnd in range(2):
             vals = list(np.exp(np.linspace(np.log(lo), np.log(hi), TRIAL_POINTS)))
@@ -242,94 +227,21 @@ class SirilStretcher:
         value = float(np.exp(np.interp(target, ys[order], np.log(xs[order]))))
         return value, {"trials": len(trials), "target": round(float(target), 4), "range": [round(float(xs.min()), 5), round(float(xs.max()), 5)]}
 
-    # ------------------------------------------------------------------ the public entry point
-    def stretch(self, us: list[np.ndarray], ctx: dict) -> tuple[list[np.ndarray], dict]:
-        """Stretch the planes ``us`` (anchored, scaled to [0, 1]) with ``ctx['method']``.  ``ctx`` carries the image statistics the fit needs (``finish.ghs_stretch``):
-        ``sky``, ``noise``, ``band`` (the sky's 32-128 px noise), ``neb``, ``bright``, ``lum`` (the lightness in the same units), ``sky_aim``, ``neb_aims``, ``b_max``,
-        ``hdr``, ``boost``.  Returns the stretched planes and the record (method, tool, exact commands, fitted parameters, notes)."""
-        method = ctx.get("method", "ghs")
+    def stretch_to_sky(self, us: list[np.ndarray], ctx: dict, method: str) -> tuple[list[np.ndarray], dict]:
+        """The alternative community stretches of the default chain (``autoghs``, ``modasinh``, ``autostretch``, ``hms``): ONE free parameter of the tool, raised until the
+        sky mode of the stretched image lands on ``ctx['sky_aim']`` (the Brecher background 0.10; trials on a reduced copy, then the full planes).  ``ctx``: ``lum`` (linear
+        lightness), ``sky`` (its mode), ``noise`` (its pixel sigma).  No GHS fit, no nebula aim."""
         t0 = time.time()
-        rec: dict = {"requested": method}
-        aims = {"sky": ctx["sky_aim"], "neb": None}
-        # 1. parameters
-        fit = finish.ghs_fit_noise_floor(ctx["sky"], ctx["neb"], ctx.get("bright"), ctx.get("band", ctx["noise"]), ctx["sky_aim"], tuple(ctx["neb_aims"]), ctx["b_max"],
-                                         finish.SKY_NOISE_LIMIT, focus=ctx.get("focus"))
-        aims["neb"] = fit["neb_aim"]
-        rec["ghs_fit"] = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in fit.items()}
-        lines: list[str] | None = None
-        used = "ghs"
-        if not self.allow:
-            rec["note"] = "Siril not available: numpy mirror of ght (finish.ghs)" + ("" if method == "ghs" else f"; {method} not run, ght used instead")
-            outs = [finish.ghs(np.clip(u, 0, 1), fit["b"], fit["D"], fit["sp"], fit["lp"], fit["hp"]) for u in us]
-            rec.update(method="ghs", tool="numpy mirror of siril ght", commands=[self.ght_line(fit)], seconds=round(time.time() - t0, 1))
-            return outs, rec
-        cache = self._cache_key(method, ctx, aims)
-        if method != "ghs":
-            try:
-                cached = self._cache_get(cache)
-                if cached is None:
-                    value, fi = self._fit_value(method, ctx, aims)
-                    self._cache_put(cache, {"value": value, "fit": fi})
-                else:
-                    value, fi = cached["value"], cached["fit"]
-                lines = self.command(method, value, ctx)
-                used = method
-                rec["trial_fit"] = fi
-                rec["value"] = round(value, 6)
-            except Exception as e:                       # noqa: BLE001  a failing community tool must not stop the render: ght takes over, the record says why
-                if e.__class__.__name__ == "Cancelled":
-                    raise
-                rec["fallback"] = f"{method} failed ({str(e).splitlines()[0][:200]}): ght used"
-                lines, used = None, "ghs"
-        if lines is None:
-            lines = [self.ght_line(fit)]
-        # 2. the stretch of the full planes
-        try:
-            if used == "hms":
-                out = [self._run_worker(us[0], [self.hms_kwargs(rec["value"])], "apply")[0]]
-            else:
-                out = self._run(us, [lines], "apply", must_log="Statistical stretch applied" if used == "statstretch" else None)[0]
-            if used == "statstretch" and all(float(np.abs(o - np.clip(u, 0, 1)).max()) < 1e-6 for o, u in zip(out, us)):
-                raise SirilError("Statistical_Stretch.py left the image unchanged")
-        except Exception as e:                           # noqa: BLE001
-            if e.__class__.__name__ == "Cancelled":
-                raise
-            rec["fallback"] = f"{used} failed ({str(e).splitlines()[0][:200]}): numpy mirror of ght used"
-            out = [finish.ghs(np.clip(u, 0, 1), fit["b"], fit["D"], fit["sp"], fit["lp"], fit["hp"]) for u in us]
-            lines, used = [self.ght_line(fit)], "ghs"
-            rec.update(method="ghs", tool="numpy mirror of siril ght", commands=lines, seconds=round(time.time() - t0, 1))
-            return [np.clip(o, 0, 1) for o in out], rec
-        rec.update(method=used, commands=lines, seconds=round(time.time() - t0, 1),
-                   tool={"ghs": "siril ght", "autoghs": "siril autoghs", "modasinh": "siril modasinh", "autostretch": "siril autostretch",
-                         "statstretch": "siril pyscript Statistical_Stretch.py (Seti Astro, C. Richard)",
-                         "hms": "VeraLux HyperMetric Stretch (siril-scripts, process_veralux_v6 headless)"}[used])
+        ctx = {"band": ctx.get("noise"), **ctx}
+        value, fi = self._fit_value(method, ctx, {"sky": ctx["sky_aim"], "neb": None})
+        lines = self.command(method, value, ctx)
+        if method == "hms":
+            res = self._run_worker(np.stack(us), [self.hms_kwargs(value)], "apply")[0]
+            res = np.moveaxis(res, -1, 0) if res.ndim == 3 and res.shape[-1] == 3 and res.shape[0] != 3 else res
+            out = [res[i] for i in range(3)]
+        else:
+            out = self._run(us, [lines], "apply")[0]
+        rec = {"method": method, "commands": lines, "value": round(value, 6), "trial_fit": fi, "seconds": round(time.time() - t0, 1),
+               "tool": {"autoghs": "siril autoghs", "modasinh": "siril modasinh", "autostretch": "siril autostretch",
+                        "hms": "VeraLux HyperMetric Stretch (siril-scripts, process_veralux_v6 headless)"}[method]}
         return [np.clip(o, 0, 1) for o in out], rec
-
-    # ------------------------------------------------------------------ fit cache (the preview and the export of one image fit once)
-    def _cache_key(self, method: str, ctx: dict, aims: dict) -> str:
-        lum = ctx["lum"]
-        sample = np.ascontiguousarray(lum[::37, ::37]).tobytes()
-        h = hashlib.sha1(sample + json.dumps({k: (round(float(ctx[k]), 6) if isinstance(ctx.get(k), (int, float)) else ctx.get(k)) for k in
-                                              ("sky", "noise", "band", "neb", "boost", "hdr", "sky_aim")}, sort_keys=True).encode() + method.encode()
-                         + json.dumps(aims, sort_keys=True).encode())
-        return h.hexdigest()[:20]
-
-    def _cache_get(self, key: str):
-        try:
-            with open(os.path.join(self.work, "stretch_fit_cache.json"), encoding="utf-8") as f:
-                return json.load(f).get(key)
-        except (OSError, ValueError):
-            return None
-
-    def _cache_put(self, key: str, doc: dict) -> None:
-        path = os.path.join(self.work, "stretch_fit_cache.json")
-        try:
-            with open(path, encoding="utf-8") as f:
-                d = json.load(f)
-        except (OSError, ValueError):
-            d = {}
-        d[key] = doc
-        if len(d) > 40:
-            d.pop(next(iter(d)))
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(d, f)

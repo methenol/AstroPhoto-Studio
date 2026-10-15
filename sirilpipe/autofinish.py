@@ -1,27 +1,28 @@
-"""Auto-finish: choose the processing settings from measurements of the image, with fixed rules.
+"""Auto-finish: choose the settings of the professional chain (``pro.py``) from measurements of the image, among PUBLISHED values only (research/FINISH-SPEC.md,
+research/pro-workflow.md).  No fitting, no reference library: every setting is one of the published values, picked by a stated rule on a measured number, and the report lists
+each decision with the measurement, the rule and its source (the web UI renders ``report.steps`` as one row per setting: ``step, from, to, measured, before, after, target, why``).
 
-No network, no machine learning, no reference library: every setting is a deterministic function of
-numbers measured on the restored image, and the report lists each decision with the measurement behind
-it (the web UI renders ``report.steps`` as one row per setting: ``step, from, to, measured, before,
-after, target, why``).  Rules (DESIGN section 4 "Autofinish"):
-
-* **stretch_method**: the tool that stretches (``stretch.METHODS``: Siril ``ght`` / ``autoghs`` / ``modasinh`` / ``autostretch``, Statistical_Stretch.py).  ``ghs`` unless the
-  settings name another one: it is the only method whose parameters are fitted to the noise (below), the others are fitted to the sky / nebula aims only;
-* **stretch** (= the sky's display level) and **contrast** (= the GHS local intensity b): the stretch is Siril's ``ght`` (Generalised Hyperbolic Stretch) with D, B, SP, LP, HP fitted
-  by ``finish.ghs_fit_noise_floor``: the sky on ``finish.SKY_AIM``, the 90th percentile of the signal on the brightest of ``finish.NEBULA_AIMS`` for which the stretched noise of the
-  sky's 32-128 px band stays within ``finish.SKY_NOISE_LIMIT`` (display units), SP above the sky's noise, the highest contrast at the signal's median among the curves that meet both;
-* **star_reduction / star_intensity**: from the star density (stars per megapixel, measured when the
-  stars were removed);
-* **star_stretch**: the Seti Astro Star Stretch amount that sends the median detected star of the full-resolution star layer to
-  display level 0.3 (finish.star_stretch_amount);
-* **oiii_boost** (dual-band): the Blanshan / Cranfield narrowband-normalisation boost (applied to the colour-resolution OIII, never to the pixel noise) that
-  puts the OIII signal over the sky at ``OIII_TO_HA`` x the Ha signal in the object;
-* **saturation**: raised until the object's mean colour saturation reaches the aim (never lowered: the
-  palette's own colour is kept);
-* **black_point**: 0 (the stretch anchors the sky itself), **hdr**: the lowest of ``HDR_LADDER`` (Statistical_Stretch's HDR highlight compress) for which at most
-  ``CLIP_LIMIT`` of the starless render's pixels are white (lightness >= ``WHITE_LEVEL``);
-* **gradient check**: the residual large-scale gradient after the restoration, in display units, reported
-  (changing it needs the linear stage to run again, so it is not a setting here).
+=====================  ======================================================================================================================================
+setting                rule (source)
+=====================  ======================================================================================================================================
+stretch_method         ``ghs2`` (the GHS two-pass recipe, Siril GHS tutorial + ghsastro) unless the settings name another published tool
+stretch                the background after the stretch: 0.10 (Brecher's five finished images 0.09 / 0.10 / 0.10 / 0.11 / 0.11); for Statistical Stretch the median target
+                       follows the size of the target: 0.10 when it covers less than half of the frame, 0.25 (the script's default) when it fills it (pro-workflow.md A8)
+hdr                    on (1 = the published values: GHS HP < 1, Statistical Stretch -hdr 0.15 / 0.75, Wavescale HDR 5 / 1.5 / 5.0) when, after the stretch, more than 0.05 % of
+                       the starless pixels have any channel >= 0.995 or Lab lightness >= 0.97 (FINISH-SPEC gates; Siril / fas37: < 0.1 % clipped)
+luminance_denoise      NoiseXTerminator ``--dn`` on the stretched starless: 0.85 on the noisiest data (per-pixel object SNR <= 3) down to 0.6 on clean data (SNR >= 15)
+                       (RC-Astro / Brecher 0.6-0.85-0.9: the noisier the data the stronger)
+chroma_denoise         NXT colour denoise 0.95 (NXT manual: colour 90-100 %)
+palette / oiii_boost   dual-band: HOO Classic (Ha = R, OIII = (G + B) / 2), NBN only when the user sets an OIII boost; broadband: natural colour
+scnr                   broadband: 0.6 (SW Skies 0.60-0.75, low end) when the subject has a green cast (median G - (R + B) / 2 > 0.01 after the stretch), else 0; dual-band: 0
+                       (green is the OIII; NBN never applies SCNR to HOO)
+local_contrast         the blend of the Siril ``clahe`` passes: 0.2 (0.5, the lowest published strength: Sh2-140 / IC 417) for noisy data (SNR <= 3), 0.35 (0.875, M51's second
+                       pass) for clean data (SNR >= 15), between by log SNR (Brecher: after the noise reduction, under a background mask)
+saturation             Siril ``satu`` amount from the published 0.25-0.5: the subject's mean saturation after the palette >= 0.35 -> 0.25, >= 0.20 -> 0.3, else 0.5
+star_reduction         by star density: sparse (< 150 per MP) 0.4 (Brecher StarReduction 0.4), normal 0.5, dense (> 600) 0.6 (DSA value 0.2 = strength 0.6)
+star_stretch           Seti Astro Star Stretch amount 5 (default; documented range 0-8)
+star_saturation        Seti colour boost 1.0 (default) unless the stretched stars' flux colour is below 0.10 saturation: then 1.5, and 2.0 (the documented maximum) if still short
+=====================  ======================================================================================================================================
 
 ``grade_*`` stay neutral.  The result is written to ``autofinish.json``.
 """
@@ -34,92 +35,65 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from . import finish
+from . import finish, gates, pro
 
-# Aims of the rules (documented constants, not tuned per image).
-SKY_AIM = finish.SKY_AIM           # display level of the sky (the user's 0.07-0.10: dark grey, not black)
-STAR_DENSITY = ((150.0, 0.25, 1.0), (600.0, 0.30, 1.0))                       # per MP: sparse, normal; dense above
-CLIP_LIMIT = 0.0005                # reported: fraction of pixels allowed at >= 0.985 in the starless render
-SATURATION_AIM = {"broadband": 0.32, "dual-band": 0.40}                        # mean HSV saturation of the object
-OIII_TO_HA = 0.3                   # OIII signal over the sky at 0.3 x the Ha signal in the object (0.5 / 1.2 on IC 1805 washed the whole sky teal: the faint OIII plateau and its
-                                   # residual noise at colour resolution are boosted with it; 0.3 keeps the OIII arcs teal-grey where they are and the sky neutral)
-OIII_BOOST_RANGE = (0.0, 0.5)    # "modest strength" (research/pro-finishing.md section 4): half of the Blanshan equalisation at most, the OIII of a DWARF stack is 2-3 x weaker than its Ha
-LOCAL_CONTRAST = 1.0               # SNR-gated wavelet gain 1 + amount on the 2-16 px scales (finish.starlet_denoise ``contrast``): only coefficients standing 5 sigma above the
-                                   # measured noise of their scale are amplified, so on noisy data it does nothing and on clean data it brings out the filaments
-SYNTH_LUM = 0.9                    # share of the lightness taken from the Ha plane (finish.ha_luminance): the OIII noise never reaches the lightness
-HDR_LADDER = (0.0, 0.3, 0.6, 0.9, 1.2, 1.5)
-CROWD_LEVEL, CROWD_LIMIT = 0.9, 0.02    # of the pixels above 0.5, at most 2 % may sit above 0.9 (a core that is not blown to white can still be crowded into the last 10 % of the range: M 42's Trapezium)
-WHITE_LEVEL = 0.97                 # lightness at which a pixel counts as white (a blown core)
-GRADIENT_LIMIT = 0.03              # display units: a visible sky gradient
+CLIP_LIMIT = 0.0005                    # 0.05 % (FINISH-SPEC)
+STAR_DENSITY = ((150.0, 0.4), (600.0, 0.5))      # per MP: sparse (< 150), normal (<= 600); dense above -> 0.6
+STAR_REDUCTION_DENSE = 0.6
+NXT_DN = (0.85, 0.60)                  # noisy -> clean
+LC_BLEND = (0.5, 0.875)                # local_contrast: the lowest published strength (x 0.4 = 0.2) -> M51's 0.35
+SATU_AMOUNTS = ((0.35, 0.25), (0.20, 0.30))      # (saturation of the subject at least ..., satu amount); below the last: 0.5
+SCNR_CAST = 0.01
+SCNR_AMOUNT = 0.6
+STAR_COLOUR_MIN = 0.10
+STAR_BOOSTS = (1.0, 1.5, 2.0)
+STATS_SIDE = 1200
 
 
-def sky_level(img: np.ndarray) -> float:
-    """Display level of the sky: the median of the darkest 45 % of the smoothed luminance (the nebula and the stars sit above it;
-    the whole-frame median of a nebula that fills a third of the frame is lifted by the nebula)."""
-    lum = cv2.GaussianBlur(np.ascontiguousarray(finish.luminance(img)), (0, 0), 2.0)
-    s = finish.sample(lum, valid_only=False)
-    return float(np.median(s[s <= np.percentile(s, 45)]))
-
-
-def star_settings(per_mp: float) -> tuple[float, float, str]:
-    """(star_reduction, star_intensity, class) from stars per megapixel."""
+def star_settings(per_mp: float) -> tuple[float, str]:
+    """(star_reduction, density class)."""
     if per_mp < STAR_DENSITY[0][0]:
-        return STAR_DENSITY[0][1], STAR_DENSITY[0][2], "sparse"
+        return STAR_DENSITY[0][1], "sparse"
     if per_mp <= STAR_DENSITY[1][0]:
-        return STAR_DENSITY[1][1], STAR_DENSITY[1][2], "normal"
-    # a dense field keeps its faint stars (the Seestar's own picture of M 27 shows 4000 per MP): reduction only trims the bright
-    # stars' footprints (finish.reduce_stars), never the count; 0.65 / 0.8 removed 90 % of them
-    return float(min(0.40, 0.30 + (per_mp - STAR_DENSITY[1][0]) / 3000.0 * 0.10)), 0.95, "dense"
+        return STAR_DENSITY[1][1], "normal"
+    return STAR_REDUCTION_DENSE, "dense"
 
 
-def gradient_residual(lum_lin: np.ndarray, slope: float) -> dict:
-    """Large-scale sky gradient left in the linear luminance, in display units.  The luminance is reduced to
-    64 x 64 block means; the sky blocks are the darkest 60 %; the spread (P95 - P5) of that sky map is multiplied by the
-    stretch's slope at the sky level (``slope``: display units per linear unit, from the GHS fit)."""
-    small = cv2.resize(np.ascontiguousarray(lum_lin), (64, 64), interpolation=cv2.INTER_AREA)
-    sky = small[small <= np.percentile(small, 60)]
-    if sky.size < 20 or slope <= 0:
-        return {"spread_linear": 0.0, "spread_display": 0.0}
-    spread = float(np.percentile(sky, 95) - np.percentile(sky, 5))
-    return {"spread_linear": round(spread, 6), "spread_display": round(spread * slope, 4)}
+def hdr_rule(clipped: float, white: float) -> bool:
+    return clipped > CLIP_LIMIT or white > CLIP_LIMIT
 
 
-def stretch_slope(ghs_info: dict) -> float:
-    """Display units per linear unit at the sky of the GHS recorded by ``finish.ghs_stretch``."""
-    g = ghs_info.get("ghs") or {}
-    white, sky = float(ghs_info.get("white") or 0), float(ghs_info.get("sky_in") or 0)
-    if white <= 0 or not g:
-        return 0.0
-    return finish.ghs_slope_at(sky, g["b"], g["D"], g["sp"], g.get("lp", 0.0), g.get("hp", 1.0)) / white
+def nxt_strength(snr: float) -> float:
+    return round(finish.snr_ladder(snr, *NXT_DN), 2)
 
 
-def measure(img: np.ndarray) -> dict:
-    """Statistics of a rendered display image (3, H, W): sky level, sky colour cast, clipping, object saturation."""
-    lum = finish.luminance(img)
-    med = float(np.median(lum))
-    sm = cv2.GaussianBlur(lum, (0, 0), 2.0)
-    sky = sm <= med + 0.02
-    obj = sm > med + 0.08
-    casts = [float(np.median(img[c][sky])) for c in range(3)] if sky.sum() > 100 else [med] * 3
-    lab = cv2.cvtColor(np.ascontiguousarray(np.moveaxis(np.clip(img, 0, 1), 0, -1)), cv2.COLOR_RGB2Lab)
-    sky_m = finish._sky_mask(lum, edge=finish.EDGE_CROP)
-    band = cv2.GaussianBlur(lum, (0, 0), finish.BAND_LO) - cv2.GaussianBlur(lum, (0, 0), finish.BAND_HI)
-    return {"sky_L": round(med, 4), "sky_C": round(max(casts) - min(casts), 4),
-            "sky_band_noise": round(float(band[sky_m].std()), 5) if sky_m.sum() > 100 else None,
-            "sky_chroma_a": round(float(np.median(np.abs(lab[..., 1][sky_m]))), 2) if sky_m.sum() > 100 else None,
-            "sky_chroma_b": round(float(np.median(np.abs(lab[..., 2][sky_m]))), 2) if sky_m.sum() > 100 else None,
-            "clip_frac": round(float((img.max(0) >= 0.985).mean()), 5), "white_frac": round(float((lum >= WHITE_LEVEL).mean()), 5),
-            "crowd": round(float((lum >= CROWD_LEVEL).sum() / max(int((lum >= 0.5).sum()), 1)), 4),
-            "C50": round(finish.mean_saturation(img, obj if obj.sum() > 200 else None), 4),
-            "object_frac": round(float(obj.mean()), 4)}
+def local_contrast_amount(snr: float) -> float:
+    return round(finish.snr_ladder(snr, *LC_BLEND), 2)
 
 
-def score(stats: dict, target: float) -> float:
-    """0..1: sky at the target level, neutral sky, no clipped cores (mean of the three)."""
-    a = 1.0 - min(1.0, abs(stats["sky_L"] - target) / max(target, 1e-6))
-    b = 1.0 - min(1.0, stats["sky_C"] / 0.02)
-    c = 1.0 - min(1.0, stats["clip_frac"] / 0.01)
-    return round((a + b + c) / 3.0, 3)
+def satu_amount(subject_saturation: float) -> float:
+    for floor, amount in SATU_AMOUNTS:
+        if subject_saturation >= floor:
+            return amount
+    return 0.5
+
+
+def green_cast(img: np.ndarray, mask: np.ndarray | None) -> float:
+    """Median of G - (R + B) / 2 over the subject pixels (display units)."""
+    g = img[1] - 0.5 * (img[0] + img[2])
+    return float(np.median(g[mask])) if mask is not None and mask.sum() > 100 else float(np.median(g))
+
+
+def subject_saturation(img: np.ndarray, mask: np.ndarray | None) -> float:
+    return finish.mean_saturation(img, mask)
+
+
+def star_boost(sat_after_stretch: float) -> float:
+    """Smallest of the Seti colour boosts 1.0 / 1.5 / 2.0 whose (linear) scaling of the flux colour reaches ``STAR_COLOUR_MIN``."""
+    for b in STAR_BOOSTS:
+        if sat_after_stretch * b >= STAR_COLOUR_MIN:
+            return b
+    return STAR_BOOSTS[-1]
 
 
 def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) -> dict:
@@ -128,7 +102,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     from .post import _save_json
 
     t0 = time.time()
-    steps_total = 8
+    steps_total = 6
     state = {"i": 0}
 
     def tick(msg):
@@ -140,151 +114,154 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
 
     p0 = {**post.DEFAULTS, **(params or {})}
     tick("loading")
-    layers = post._Layers(session, p0, 1000)
+    layers = post._Layers(session, p0, None)
     dual = post._dual_band(meta, layers.header)
-    full_mp = _full_megapixels(layers, session)
+    work = os.path.join(session, "process", "autofinish")
+    os.makedirs(work, exist_ok=True)
     tuned: dict = {}
     steps: list[dict] = []
 
-    def decide(key, new, measured, before, target=None, why=""):
-        old = p0.get(key)
+    def decide(key, new, measured, before, target=None, why="", after=None):
         tuned[key] = new
-        steps.append({"step": key, "from": old, "to": new, "measured": measured, "before": before, "after": None,
-                      "target": target, "why": why})
+        steps.append({"step": key, "from": p0.get(key), "to": new, "measured": measured, "before": before, "after": after, "target": target, "why": why})
 
     base = layers.base
     lum_lin = finish.luminance(base)
-
-    # 1. the sky's display level (the stretch setting)
-    tick("object coverage")
+    snr = _snr(session, lum_lin)
     cov = finish.object_coverage(lum_lin)
-    decide("stretch", SKY_AIM, "object_frac", round(cov, 3), SKY_AIM,
-           f"the object covers {cov * 100:.0f} % of the frame; the GHS sends the sky to {SKY_AIM} (dark grey) whatever the coverage: "
-           f"the black point is the sky itself, not a multiple of the pixel noise")
-    decide("auto_stretch", False, "object_frac", round(cov, 3), None, "the sky aim above replaces the automatic adaptation")
-    decide("black_point", 0.0, "sky_L", SKY_AIM, SKY_AIM, "the stretch's anchor already sits at the sky: no extra black point")
+    method = "ghs2" if str(p0.get("stretch_method")) in ("ghs", "") else str(p0.get("stretch_method"))
+    decide("stretch_method", method, "object_snr", round(snr, 2), None, "the GHS two-pass recipe by Siril ght (Siril GHS tutorial, ghsastro): the default; the settings may name another published tool")
+    small = cov < pro.STAT_FILLING_COVERAGE
+    decide("stretch", pro.SKY_TARGET, "object_frac", round(cov, 3), pro.SKY_TARGET,
+           f"the background after the stretch is {pro.SKY_TARGET} (Brecher: 0.10 / 0.11 / 0.09 / 0.11 / 0.10 on five finished images)"
+           + (f"; the target covers {cov * 100:.0f} % of the frame: a small target, so Statistical Stretch would send its median to {pro.STAT_SMALL}" if small else
+              f"; the target fills {cov * 100:.0f} % of the frame: Statistical Stretch would use its default median {pro.STAT_FILLING}"))
+    decide("black_point", 0.0, "sky_L", pro.SKY_TARGET, None, "the black point is part of the stretch (linstretch -BP at the histogram toe) and of the last step")
 
-    # 2. stars
+    # stretch without highlight protection: clipping measure
+    tick("stretch")
+    p1 = {**p0, **tuned, "hdr": 0.0, "stretch_method": method}
+    fin = pro.Finisher(work, layers.header, p1, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+    s0 = fin.stretch(base)
+    st0 = pro.level_stats(s0)
+    hdr_on = hdr_rule(st0["clipped"], st0["white"])
+    hdr_value, st1 = 0.0, st0
+    if hdr_on:
+        hdr_value = 1.0
+        tick("highlights")
+        fin2 = pro.Finisher(work, layers.header, {**p1, "hdr": hdr_value}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+        s0 = fin2.stretch(base)
+        st1 = pro.level_stats(s0)
+        if method == "ghs2" and hdr_rule(st1["clipped"], st1["white"]) and st1["white"] >= st0["white"]:
+            hdr_value = 1.0                                                      # the published HP protection did not help: Wavescale HDR as the second published tool
+            tuned["hdr_method"] = "wavescale"
+    decide("hdr", hdr_value, "white_frac", {"clipped": st0["clipped"], "white": st0["white"]}, CLIP_LIMIT,
+           (f"after the stretch {st0['clipped'] * 100:.3f} % of the starless pixels have a channel >= 0.995 and {st0['white'] * 100:.3f} % a lightness >= 0.97 (limit {CLIP_LIMIT * 100:.2f} %): "
+            f"highlight protection on ({'GHS HP < 1 in pass 2' if method == 'ghs2' else 'the tool-native HDR or Wavescale HDR'}), then {st1['clipped'] * 100:.3f} % / {st1['white'] * 100:.3f} %")
+           if hdr_on else f"after the stretch {st0['clipped'] * 100:.3f} % clipped, {st0['white'] * 100:.3f} % white: within the {CLIP_LIMIT * 100:.2f} % limit, no highlight protection",
+           after={"clipped": st1["clipped"], "white": st1["white"]})
+
+    # noise reduction, local contrast
+    nxt = nxt_strength(snr)
+    decide("luminance_denoise", nxt, "object_snr", round(snr, 2), None,
+           f"per-pixel signal-to-noise of the object {snr:.1f}: NoiseXTerminator --dn {nxt} on the stretched starless (RC-Astro / Brecher: 0.6-0.85, the noisier the data the stronger)")
+    decide("chroma_denoise", pro.NXT_DC, "object_snr", round(snr, 2), None, "NoiseXTerminator colour denoise 0.95 (--dc; NXT manual: colour 90-100 %)")
+    lc = local_contrast_amount(snr)
+    decide("local_contrast", lc, "object_snr", round(snr, 2), None,
+           f"clahe blend {pro.LC_STRENGTH * lc:.2f} (published LHE strengths 0.2-0.35, Brecher): {'the lowest' if lc <= 0.55 else 'between the lowest and M51 second pass'} for SNR {snr:.1f}")
+
+    # colour
+    tick("colour")
+    pal = fin.palette_name()
+    mask, _ = pro.nebula_mask(finish.luminance(s0), pro._hist_stats(finish.luminance(s0))["mode"])
+    if dual:
+        user_pal = str(p0.get("palette", "auto"))
+        if user_pal in ("", "auto"):
+            decide("palette", "hoo", "dual-band filter", None, None, "dual-band: HOO Classic, Ha = R and OIII = (G + B) / 2 (Hubble_Palette_from_Dual-Band_OSC.py)")
+        else:
+            decide("palette", user_pal, "settings", None, None, f"the settings name the palette {user_pal}")
+        decide("scnr", 0.0, "dual-band filter", None, None, "no SCNR on HOO: the green is the OIII (NarrowbandNormalization.py applies SCNR to SHO-type palettes only)")
+        decide("oiii_boost", float(p0.get("oiii_boost", 1.0)), "dual-band filter", None, None, "NBN (OIII boost != 1) is only run on request")
+        col = pro.Finisher(work, layers.header, {**p1, "palette": tuned["palette"], "oiii_boost": float(p0.get("oiii_boost", 1.0)), "hdr": hdr_value}, True, external=False,
+                           checkpoint=checkpoint, keep_pictures=False).colour(s0)
+    else:
+        cast = green_cast(s0, mask)
+        scnr = SCNR_AMOUNT if cast > SCNR_CAST else 0.0
+        decide("scnr", scnr, "green cast", round(cast, 4), SCNR_CAST,
+               f"median G - (R + B) / 2 over the subject {cast:+.3f}: " + (f"a green cast, SCNR {SCNR_AMOUNT} (SW Skies 0.60-0.75)" if scnr else "no green cast, no SCNR (PixInsight SPCC doc: calibration is kept)"))
+        decide("palette", "natural", "broadband filter", None, None, "broadband: natural colour")
+        col = s0
+    sat0 = subject_saturation(col, mask)
+    amount = satu_amount(sat0)
+    decide("saturation", round(1.0 + amount, 2), "C50", round(sat0, 3), None,
+           f"subject saturation {sat0:.2f} after the palette: Siril satu {amount} (published 0.25-0.5; >= 0.35 -> 0.25, >= 0.20 -> 0.3, else 0.5)")
+
+    # stars
     tick("stars")
-    star_info = _star_density(layers, session, full_mp)
+    star_info = _star_density(layers, session)
     cls_stars = "none"
     if star_info is not None:
-        red, inten, cls_stars = star_settings(star_info["per_megapixel"])
-        decide("star_reduction", round(red, 2), "star_frac", star_info["per_megapixel"], None,
-               f"{star_info['per_megapixel']:.0f} stars per megapixel ({cls_stars} field)")
-        decide("star_intensity", round(inten, 2), "star_frac", star_info["per_megapixel"], None, f"{cls_stars} star field")
-        amount, sa = _star_stretch(session, p0)
-        if sa.get("median_peak") is not None:
-            decide("star_stretch", amount, "median_star_peak", sa["median_peak"], finish.STAR_MEDIAN_AIM,
-                   f"the median of {sa['stars']} detected stars peaks at {sa['median_peak']:.4g} (linear): amount {amount} puts it at "
-                   f"{sa['median_after']}, the brightest unsaturated stars ({sa['bright_peak']:.3g}) at {sa['bright_after']}")
+        red, cls_stars = star_settings(star_info["per_megapixel"])
+        decide("star_reduction", red, "star_frac", star_info["per_megapixel"], None,
+               f"{star_info['per_megapixel']:.0f} stars per megapixel ({cls_stars} field): reduction strength {red} (DSA star reduction value {0.5 * (1 - red):.2f}; Brecher 0.4, DSA default 0.2); "
+               "lowered through the published 0.5 / 0.4 / 0.3 / 0.2 if the picture's star count would fall more than 18 % below the linear layer's (FINISH-SPEC gate: within 20 %)")
+        amount_st, clip_st = pro.STAR_STRETCH, 0.0
+        for amount_st in (5.0, 4.0, 3.0):
+            sf = pro.Finisher(work, layers.header, {**p1, "star_saturation": 1.0, "star_intensity": 1.0, "star_stretch": amount_st}, dual, external=False, checkpoint=checkpoint,
+                              keep_pictures=False)
+            st = sf.stars(layers.stars)
+            clip_st = float((st.max(0) >= 0.995).mean())
+            if clip_st <= 0.8 * CLIP_LIMIT:                                # a margin: the screen blend and the colour boost clip a little more
+                break
+        decide("star_stretch", amount_st, "star_frac", star_info["per_megapixel"], pro.STAR_STRETCH,
+               f"Seti Astro Star Stretch amount 5 (default; documented range 0-8): mtf 0 {pro.star_stretch_m(5.0):.6f} 1; "
+               + (f"{clip_st * 100:.3f} % of the star layer's pixels are clipped (limit {CLIP_LIMIT * 100:.2f} %)" if amount_st == 5.0 and clip_st <= 0.8 * CLIP_LIMIT else
+                  f"lowered to {amount_st:g} (published 5 / 4 / 3) so that the clipped fraction of the stretched stars is {clip_st * 100:.3f} % (limit {CLIP_LIMIT * 100:.2f} %)"))
+        p1["star_stretch"] = amount_st
+        sm = layers.starnet.get("stars") or {}
+        level = float(pro.mtf_balance(pro.star_stretch_m(amount_st), 5.0 * float(sm.get("sky_noise") or 2e-5)))
+        boost, ms = STAR_BOOSTS[0], {"saturation": None}
+        for boost in STAR_BOOSTS:                                                  # the smallest published boost whose stretched stars reach the colour limit (measured, not predicted)
+            sb = pro.Finisher(work, layers.header, {**p1, "star_saturation": boost, "star_intensity": 1.0}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+            st_b = sb.stars(layers.stars)
+            ms = gates.measure_stars(st_b, level / gates.STAR_SIGMA)
+            if (ms["saturation"] or 0.0) >= STAR_COLOUR_MIN:
+                break
+        st = st_b
+        decide("star_saturation", boost, "star_C", ms["saturation"], STAR_COLOUR_MIN,
+               f"Seti colour boost {boost} (default 1.0, maximum 2.0): the smallest whose stretched stars' flux colour reaches saturation {STAR_COLOUR_MIN} (measured {ms['saturation']})")
+        lin_n = (layers.starnet.get("stars") or {}).get("count")
+        if lin_n:
+            for cand in [c for c in (0.6, 0.5, 0.4, 0.3, 0.2) if c <= red]:
+                rc = pro.Finisher(work, layers.header, {**p1, "star_reduction": cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+                full = rc.recombine(col, st)
+                n_now = gates.measure_stars(gates.star_layer(full, col), level / gates.STAR_SIGMA)["count"]
+                dev = abs(n_now - lin_n) / lin_n
+                tuned["star_reduction"] = cand
+                steps[[x["step"] for x in steps].index("star_reduction")].update({"to": cand, "after": {"star_count": n_now, "linear": lin_n, "deviation": round(dev, 3)}})
+                if dev <= 0.18:
+                    break
+        decide("star_intensity", 1.0, "star_frac", star_info["per_megapixel"], None, "stars as stretched (the screen blend and the reduction value set their weight)")
+    else:
+        decide("star_reduction", p0["star_reduction"], "star_frac", None, None, "no separate star layer: the stars stay in the image")
 
-    # trial renders (numpy, 1000 px): stats before = the given params, after = the tuned ones
-    tick("trial render")
-    method = str(p0.get("stretch_method")) if str(p0.get("stretch_method")) in finish.STRETCH_METHODS else "ghs"
-    hooks = _hooks(session, method)
-    p_before = {**p0}
-    img0, _ = post._render(layers, p_before, dual, fast=True, hooks=hooks)
-    stats_before = measure(img0)
-    decide("stretch_method", method, "object_snr", None, None,
-           ("the settings name %s: its parameters are fitted to the sky and nebula aims" % method) if p0.get("stretch_method") in finish.STRETCH_METHODS and method != "ghs" else
-           "Siril ght (Generalised Hyperbolic Stretch): the one stretch whose D / B / SP / LP / HP are fitted to the sky's noise as well as to the aims; alternatives to select: "
-           + ", ".join(m for m in finish.STRETCH_METHODS if m != "ghs"))
-    p1 = {**p0, **tuned, "stretch_method": method, "contrast": 13.0, "oiii_boost": 1.0, "saturation": 1.0, "hdr": 0.0,
-          "synthetic_luminance": SYNTH_LUM, "local_contrast": LOCAL_CONTRAST}
-
-    # 3. GHS local intensity: the highest b whose D / SP meet both aims
-    tick("stretch")
-    flayers = post._Layers(session, p1, None)               # full resolution: the wavelet denoise and the statistics of the fit depend on the pixel scale
-    im_t, info_t = post._render(flayers, {**p1, "star_reduction": 1.0}, dual, fast=True, hooks=hooks)
-    g = info_t.get("ghs") or {}
-    gg = g.get("ghs") or {}
-    b = float(gg.get("b", p0["contrast"]))
-    decide("contrast", b, "ghs_error", gg.get("error"), finish.GHS_FIT_TOLERANCE,
-           f"GHS b {b:g} (D {gg.get('D')}, SP {gg.get('sp')}, LP {gg.get('lp')}, HP {gg.get('hp')}): sky {g.get('sky_in')} -> {SKY_AIM * finish.GHS_SKY_SHARE:.3f} (then the output black level lifts it to "
-           f"{SKY_AIM}), the signal's 90th percentile {g.get('nebula_in')} -> {gg.get('neb_aim')} (fit error {gg.get('error')}); the sky's 32-128 px noise {g.get('band_in')} x the slope at the sky "
-           f"{gg.get('slope_sky')} = {gg.get('noise_out')} display units against the limit {finish.SKY_NOISE_LIMIT}: "
-           + ("met" if gg.get("noise_limit_met") else "not met even at the faintest aim, the lowest-noise curve is used")
-           + f"; the curve with the highest contrast at the signal's median among those that meet the aims and the noise limit")
-    p1["contrast"] = b
-    tried = []
-    for h in HDR_LADDER:
-        m = measure(post._render(layers, {**p1, "hdr": h, "star_reduction": 1.0}, dual, fast=True, hooks=hooks)[0])
-        tried.append((h, m["white_frac"], m["crowd"]))
-    within = [t for t in tried if t[1] <= CLIP_LIMIT and t[2] <= CROWD_LIMIT]
-    cost = [t[1] / CLIP_LIMIT + t[2] / CROWD_LIMIT for t in tried]
-    # the lowest setting that keeps the whites and the crowding of the top within their limits; when none does (a core the compress cannot save), the lowest that gets
-    # within 10 % of the best achievable (a stronger compress that gains nothing only darkens the highlights)
-    best = min(cost)
-    hdr, white, crowd = within[0] if within else next(t for t, c in zip(tried, cost) if c <= best * 1.1 + 1e-9)
-    p1["hdr"] = hdr
-    decide("hdr", hdr, "white_frac", white, CLIP_LIMIT,
-           f"{white * 100:.3f} % of the starless render is white (lightness >= {WHITE_LEVEL}) and {crowd * 100:.1f} % of its bright pixels sit above {CROWD_LEVEL} at HDR {hdr}: "
-           f"the lowest of {HDR_LADDER} that keeps them within {CLIP_LIMIT * 100:.2f} % / {CROWD_LIMIT * 100:.0f} % "
-           f"(Statistical_Stretch's HDR highlight compress, knee {finish.HDR_KNEE_GHS})")
-
-    decide("local_contrast", LOCAL_CONTRAST, "ghs_error", p0["local_contrast"], None,
-           "wavelet gain on the 2-16 px scales, gated by each coefficient's measured signal-to-noise (>= 5 sigma of its scale): the GHS stretches tone, this separates the filaments from the glow where the data support it")
-    p1["local_contrast"] = LOCAL_CONTRAST
-
-    # 4. dual-band: OIII boost (Blanshan / Cranfield normalisation strength)
-    tick("colour")
-    if dual:
-        boost, ratio = _oiii_boost(flayers.base, {**p1, "_denoised_linear": flayers.denoised})
-        if boost is not None:
-            decide("oiii_boost", boost, "C50", ratio, OIII_TO_HA,
-                   f"the OIII is {ratio:.2f} x the Ha over the object (linear lines at colour resolution): normalisation strength {boost} (Blanshan / Cranfield, 1 = equal) gives {OIII_TO_HA}")
-            p1["oiii_boost"] = boost
-        decide("synthetic_luminance", SYNTH_LUM, "C50", p0["synthetic_luminance"], None,
-               f"lightness {SYNTH_LUM:.0%} from the Ha plane (the high-SNR channel), the colour from the Ha : OIII ratio at colour resolution")
-        p1["synthetic_luminance"] = SYNTH_LUM
-
-    # 4b. final sharpening from the measured signal-to-noise (the unsharp mask sharpens whatever is in the lightness: nothing below SNR 10, the setting's 0.25 at 50)
-    snr = _snr_before_denoise(session, lum_lin)
-    sharp = round(finish.snr_ladder(snr, 0.0, 0.25), 2)
-    decide("sharpen", sharp, "object_snr", round(snr, 2), None,
-           f"per-pixel signal-to-noise of the object {snr:.1f}: sharpening {sharp} (0 up to {finish.SNR_LOW:g}, 0.25 from {finish.SNR_HIGH:g})")
-    p1["sharpen"] = sharp
-
-    # 5. saturation from the measured object colour (never below 1.0: the palette's own colour is kept)
-    p_sat = {**p1, "saturation": 1.0}
-    s0 = measure(post._render(layers, p_sat, dual, fast=True, hooks=hooks)[0])["C50"]
-    aim = SATURATION_AIM["dual-band" if dual else "broadband"]
-    sat = float(np.clip(round(aim / max(s0, 1e-3) / 0.05) * 0.05, 1.0, 2.2))
-    decide("saturation", round(sat, 2), "C50", s0, aim, f"object colourfulness {s0:.2f} at saturation 1.0, aim {aim}")
-    p1["saturation"] = round(sat, 2)
-
-    # 6. gradient residual (report only)
-    tick("gradient check")
-    grad = gradient_residual(lum_lin, stretch_slope(g))
-    grad_note = ("a visible sky gradient remains: run Restore again with a higher gradient smoothing"
-                 if grad["spread_display"] > GRADIENT_LIMIT else "no visible gradient")
-
+    # gradient report (information)
     tick("final measurements")
-    img1, _ = post._render(layers, p1, dual, fast=True, hooks=hooks)
-    stats_after = measure(img1)
-    for s in steps:
-        s["after"] = {"stretch": stats_after["sky_L"], "hdr": stats_after["clip_frac"], "saturation": stats_after["C50"]}.get(s["step"])
-    tuned_full = {**p0, **tuned, "stretch_method": method, "saturation": p1["saturation"], "hdr": p1["hdr"], "contrast": p1["contrast"], "oiii_boost": p1["oiii_boost"],
-                  "black_point": 0.0, "synthetic_luminance": p1["synthetic_luminance"], "local_contrast": p1["local_contrast"], "sharpen": p1["sharpen"]}
-    cls = ("dual-band " if dual else "broadband ") + ("nebula" if cov > 0.0 and cov < 0.8 else "field")
+    tuned_full = {**p0, **tuned, "stretch_method": method, "grade_temperature": 0.0, "grade_contrast": 0.0}
+    tuned_full["saturation"] = round(1.0 + amount, 2)
+    cls = ("dual-band " if dual else "broadband ") + ("nebula" if 0.0 < cov < 0.8 else "field")
     report = {
-        "reference": "measured statistics (fixed rules, no reference image)", "class": cls,
-        "score_before": score(stats_before, SKY_AIM), "score_after": score(stats_after, SKY_AIM),
-        "nearest": None, "renders": 5, "seconds": round(time.time() - t0, 1), "steps": steps,
-        "stats_before": stats_before, "stats_after": stats_after,
-        "gradient": {**grad, "limit": GRADIENT_LIMIT, "note": grad_note},
-        "coverage": round(cov, 4), "star_field": cls_stars, "created": datetime.now().isoformat(timespec="seconds"),
-        "summary": f"{cls}: sky {SKY_AIM}, GHS b {b:g}, saturation {p1['saturation']}" + (f", OIII boost {p1['oiii_boost']}" if dual else ""),
+        "reference": "published values by fixed rules (research/pro-workflow.md), no fitting", "class": cls, "nearest": None, "seconds": round(time.time() - t0, 1), "steps": steps,
+        "stats_after_stretch": st1, "coverage": round(cov, 4), "snr": round(snr, 2), "star_field": cls_stars, "created": datetime.now().isoformat(timespec="seconds"),
+        "summary": f"{cls}: {method}, background {pro.SKY_TARGET}, " + ("HDR on, " if hdr_value else "") + f"NXT {nxt}, saturation {tuned_full['saturation']}",
     }
     result = {"params": tuned_full, "report": report}
     _save_json(os.path.join(session, "autofinish.json"), result)
     return result
 
 
-def _snr_before_denoise(session: str, lum_lin: np.ndarray) -> float:
-    """The object's per-pixel signal-to-noise as the restore stage measured it on the stack (before any denoiser: the denoised starless layer has a pixel noise that
-    says nothing about the data); measured here on the given luminance when the restore did not record it."""
+def _snr(session: str, lum_lin: np.ndarray) -> float:
+    """The object's per-pixel signal-to-noise as the restore stage measured it on the stack (before any denoiser); measured on the given luminance when it did not record it."""
     from .post import _load_json
     v = _load_json(os.path.join(session, "restore_meta.json")).get("snr")
     if v:
@@ -293,26 +270,7 @@ def _snr_before_denoise(session: str, lum_lin: np.ndarray) -> float:
     return finish.object_snr(lum_lin[e:-e, e:-e] if min(lum_lin.shape) > 8 * e else lum_lin)
 
 
-def _hooks(session: str, method: str) -> dict:
-    """The render hooks of the trial renders: Siril runs the stretch when the method needs it; ``ght`` itself is evaluated by its numpy mirror (identical to 1e-6) to keep the
-    trials fast."""
-    from . import stretch as stretch_mod
-    work = os.path.join(session, "process", "autofinish")
-    os.makedirs(work, exist_ok=True)
-    return {"stretcher": stretch_mod.SirilStretcher(work, allow=(method != "ghs"))}
-
-
-def _full_megapixels(layers, session: str) -> float:
-    from . import fitsio
-    try:
-        from astropy.io import fits
-        h = fits.getheader(layers.src)
-        return float(h["NAXIS1"]) * float(h["NAXIS2"]) / 1e6
-    except Exception:
-        return layers.base.shape[1] * layers.base.shape[2] / 1e6
-
-
-def _star_density(layers, session: str, full_mp: float) -> dict | None:
+def _star_density(layers, session: str) -> dict | None:
     """Stars per megapixel of the full frame: from the removal's own measurement, else from the star layer."""
     from .post import _load_json
     if layers.stars is None:
@@ -321,32 +279,5 @@ def _star_density(layers, session: str, full_mp: float) -> dict | None:
     if sm and sm.get("per_megapixel") is not None:
         return {"count": sm["count"], "per_megapixel": float(sm["per_megapixel"])}
     noise = finish.lower_half_sigma(finish.sample(finish.luminance(layers.base)))
-    n, _ = finish.count_stars(layers.stars, noise)
-    return {"count": n, "per_megapixel": n / max(full_mp, 1e-6)}
-
-
-def _star_stretch(session: str, p: dict) -> tuple[float, dict]:
-    """Star Stretch amount from the FULL-resolution star layer (a reduced layer averages the peaks down) and the sky noise of the
-    starless layer."""
-    from . import post
-    full = post._Layers(session, p, None)
-    if full.stars is None:
-        return finish.STAR_STRETCH, {"stars": 0, "median_peak": None}
-    noise = finish.lower_half_sigma(finish.sample(finish.luminance(full.base)))
-    return finish.star_stretch_amount(full.stars, noise)
-
-
-def _oiii_boost(base: np.ndarray, p: dict) -> tuple[float | None, float]:
-    """The ``oiii_boost`` (strength of the Blanshan / Cranfield normalisation, ``finish.ratio_colour``) at which the OIII's mean excess over the object is ``OIII_TO_HA`` x
-    the Ha's.  The normalisation gain is ``gain_full ** boost`` with ``gain_full`` = 1 / (OIII : Ha ratio r0 of the linear lines at colour resolution), so the ratio after
-    it is ``r0 ** (1 - boost)`` and boost = 1 - ln(OIII_TO_HA) / ln(r0), clipped to ``OIII_BOOST_RANGE``.  Returns ``(boost, r0)``."""
-    _, _, _, pinfo = finish.dual_band_planes(base, {**p, "oiii_boost": 1.0})
-    cinfo = pinfo
-    r0 = float(cinfo["oiii_to_ha"])
-    if r0 <= 1e-4:
-        return float(OIII_BOOST_RANGE[1]), round(r0, 4)
-    if r0 >= OIII_TO_HA:
-        return float(OIII_BOOST_RANGE[0]), round(r0, 4)
-    boost = 1.0 - float(np.log(OIII_TO_HA) / np.log(r0))
-    lo, hi = OIII_BOOST_RANGE
-    return float(np.clip(round(boost / 0.05) * 0.05, lo, hi)), round(r0, 4)
+    n, per = finish.count_stars(layers.stars, noise)
+    return {"count": n, "per_megapixel": per}
