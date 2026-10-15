@@ -35,7 +35,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from . import finish, looks, gates, pro
+from . import finish, gates, pro
 
 CLIP_LIMIT = 0.0005                    # 0.05 % (FINISH-SPEC)
 STAR_DENSITY = ((150.0, 0.4), (600.0, 0.5))      # per MP: sparse (< 150), normal (<= 600); dense above -> 0.6
@@ -136,9 +136,6 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     base = layers.base
     lum_lin = finish.luminance(base)
     snr = _snr(session, lum_lin)
-    ref_looks, ref_agg, ref_desc, ref_sources = looks.reference_looks((meta or {}).get("object"), dual)
-    if progress:
-        progress(state["i"], steps_total, f"Auto-finish: references: {ref_desc}")
     cov = finish.object_coverage(lum_lin)
     method = "ghs2" if str(p0.get("stretch_method")) in ("ghs", "") else str(p0.get("stretch_method"))
     decide("stretch_method", method, "object_snr", round(snr, 2), None, "the GHS two-pass recipe by Siril ght (Siril GHS tutorial, ghsastro): the default; the settings may name another published tool")
@@ -216,13 +213,6 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         amount = min(amount, SATU_BROADBAND_MAX)                   # a galaxy / reflection nebula: the stronger satu tinted M 31's disc magenta; 0.3 is the published middle value
     else:
         amount = max(amount, SATU_DUAL_MIN)                        # HOO: at least the published upper value (judged on IC 1805 / M 42 2026-10-15; 0.25 left the nebula muted)
-    if ref_agg and "C50" in ref_agg:
-        # the references' colourfulness is reported beside the published value (satu 0.25 / 0.3 / 0.5); it does not override it: the 2026-10-15 renders judged
-        # at satu 0.45 (dual-band) were right, and the Commons references (many of them deliberately muted) pulled the colour down when they decided
-        sat_img = pro.Finisher(work, layers.header, {**p1, "saturation": 1.0 + amount}, dual, external=False, checkpoint=checkpoint, keep_pictures=False).saturation(col)
-        c50 = looks.look_stats(np.moveaxis(sat_img, 0, -1))["C50"]
-        steps.append({"step": "saturation (references)", "from": None, "to": round(1.0 + amount, 2), "measured": "C50", "before": round(c50, 4), "target": round(ref_agg["C50"], 4),
-                      "why": f"{ref_desc}: median object chroma C50 {ref_agg['C50']:.3f} (reported; the published satu value stands)"})
     # stars
     tick("stars")
     star_info = _star_density(layers, session)
@@ -277,28 +267,9 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     tuned_full = {**p0, **tuned, "stretch_method": method, "grade_temperature": 0.0, "grade_contrast": 0.0}
     tuned_full["saturation"] = round(1.0 + amount, 2)
     cls = ("dual-band " if dual else "broadband ") + ("nebula" if 0.0 < cov < 0.8 else "field")
-    nearest, score_before, score_after = None, None, None
-    if ref_looks:
-        # the distance to the reference photographs of the target: a check, not the objective (the original Auto-finish's report)
-        try:
-            img0, _ = pro.Finisher(work, layers.header, {**p0, "hdr": p0.get("hdr", 0.0)}, dual, external=False, checkpoint=checkpoint, keep_pictures=False).run(base, layers.stars)
-            img1, _ = pro.Finisher(work, layers.header, tuned_full, dual, external=False, checkpoint=checkpoint, keep_pictures=False).run(base, layers.stars)
-            st0_, st1_ = looks.look_stats(np.moveaxis(img0, 0, -1)), looks.look_stats(np.moveaxis(img1, 0, -1))
-            ow = looks.object_weight(st1_)
-            score_before, _ = looks.score(st0_, ref_looks, ow)
-            score_after, terms = looks.score(st1_, ref_looks, ow)
-            n_ = terms.get("_nearest", 0)
-            src_ = ref_sources[n_] if n_ < len(ref_sources) else {}
-            nearest = {"title": src_.get("title") or src_.get("file") or f"reference {n_}", "url": src_.get("url"), "author": src_.get("author"), "licence": src_.get("license") or src_.get("licence")}
-            steps.append({"step": "distance to the references", "from": round(score_before, 1), "to": round(score_after, 1), "measured": "look_stats", "before": {k: round(v, 4) for k, v in st0_.items() if isinstance(v, float) and k in ("sky_L", "C50", "C90", "star_frac", "sky_noise", "peak_L")},
-                          "after": {k: round(v, 4) for k, v in st1_.items() if isinstance(v, float) and k in ("sky_L", "C50", "C90", "star_frac", "sky_noise", "peak_L")}, "target": {k: round(ref_agg[k], 4) for k in ("sky_L", "C50", "C90", "star_frac", "sky_noise", "peak_L") if ref_agg and k in ref_agg},
-                          "why": f"compared with {ref_desc} (statistics of freely licensed photographs; reported, not optimised)"})
-        except Exception as e:                                        # noqa: BLE001  the report never stops the job
-            steps.append({"step": "distance to the references", "why": f"not measured: {type(e).__name__}: {str(e)[:120]}"})
     report = {
-        "reference": ref_desc if ref_looks else "published values by fixed rules (research/pro-workflow.md), no references for this target", "class": cls, "nearest": nearest,
-        "score_before": None if score_before is None else round(score_before, 2), "score_after": None if score_after is None else round(score_after, 2),
-        "references": {"description": ref_desc, "sources": ref_sources[:60]}, "seconds": round(time.time() - t0, 1), "steps": steps,
+        "reference": "published values by fixed rules (research/pro-workflow.md); no reference images (those grade the Experiments tab's trials only)", "class": cls, "nearest": None,
+        "seconds": round(time.time() - t0, 1), "steps": steps,
         "stats_after_stretch": st1, "coverage": round(cov, 4), "snr": round(snr, 2), "star_field": cls_stars, "created": datetime.now().isoformat(timespec="seconds"),
         "summary": f"{cls}: {method}, background {pro.SKY_TARGET}, " + ("HDR on, " if hdr_value else "") + f"NXT {nxt}, saturation {tuned_full['saturation']}",
     }
