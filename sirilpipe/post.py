@@ -55,23 +55,20 @@ DEFAULTS: dict = {
     "denoise": 0.95, "deconvolution": 0.7, "restored_resolution": 1.0,
     # non-linear stage (the professional chain of pro.py; the published values, source at each use there)
     "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.5,
-    "stretch_method": "ghs2", "stretch": 0.10, "auto_stretch": True, "hdr": 0.0, "contrast": 4.0,
+    "stretch_method": "ghs2", "stretch": 0.10, "auto_stretch": True, "hdr": 0.5, "contrast": 4.0,
     "color_preservation": 0.7,
     "star_separation": True, "star_removal": "auto", "star_reduction": 0.4, "star_intensity": 1.0,
-    "star_saturation": 1.0, "halo_suppress": 0.6, "star_color_preservation": 0.5,
-    "saturation": 1.3, "chroma_denoise": 0.95, "luminance_denoise": 0.7, "oiii_unmix": True,
-    "local_contrast": 0.5, "scnr": 0.0, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.0,
-    # colour grade: neutral; not applied by this backend
+    "star_saturation": 1.5, "halo_suppress": 0.6, "star_color_preservation": 0.5,
+    "saturation": 1.45, "chroma_denoise": 0.95, "luminance_denoise": 0.8, "oiii_unmix": True,
+    "local_contrast": 0.8, "scnr": 0.0, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.0,
+    # colour grade (finish.color_grade): neutral by default
     "grade_amount": 1.0, "grade_temperature": 0.0, "grade_tint": 0.0, "grade_warm_hue": 0.0, "grade_warm_sat": 1.0,
     "grade_cool_hue": 0.0, "grade_cool_sat": 1.0, "grade_contrast": 0.0,
 }
 
-# Accepted but without effect in this backend (the stack is cropped by the stack job, the ImageMM
-# restoration and the colour-grade module do not exist any more).
-IGNORED_KEYS = ("crop", "crop_threshold", "restored_resolution", "grade_amount", "grade_temperature", "grade_tint",
-                "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast",
-                # the professional chain (pro.py) has no use for these: no fitted nebula aims, no SNR-weighted Ha / OIII luminance, no starlet star halo suppression, no unsharp mask
-                "auto_stretch", "color_preservation", "synthetic_luminance", "oiii_unmix", "halo_suppress", "star_color_preservation", "sharpen")
+# Every key of DEFAULTS has an effect: crop / crop_threshold reach the stack job through stack_params (webui.server copies them), restored_resolution is the ImageMM
+# super-resolution factor (session.run_denoise), the others are steps of pro.Finisher.  Nothing is silently ignored.
+IGNORED_KEYS: tuple = ()
 
 
 # Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount (5 when absent), ``stretch_boost`` the
@@ -111,8 +108,12 @@ PARAM_SPEC: list[dict] = [
     _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
     _R("Stretch", "hdr", "Highlights (bright cores): 0 = off, 1 = the published values (GHS HP < 1, Statistical Stretch -hdr 0.15, Wavescale HDR 1.5)", 0, 1.5, 0.05),
     _R("Stretch", "contrast", "GHS second pass: local intensity b (3-5, ghsastro)", 0.25, 13, 0.25),
+    _B("Stretch", "auto_stretch", "Adapt the background to the object's size (frame-filling object: top of Brecher's band)"),
+    _R("Stretch", "color_preservation", "Colour model of the GHS stretch (Siril ght: <0.33 independent channels, <0.66 even luminance, else human-weighted luminance = colour preserving)", 0, 1, 0.05),
     _S("Colour", "palette", "Palette (dual-band: HOO classic ha=R oiii=(G+B)/2; hoo_improved; foraxx; hoo_warm; nbn: narrowband normalisation)", ["auto", "natural", "hoo", "hoo_improved", "foraxx", "hoo_warm", "nbn"]),
     _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (NBN runs when this is not 1)", 0.5, 3, 0.05),
+    _R("Colour", "synthetic_luminance", "Ha as luminance (dual-band): share of the lightness taken from the Ha plane (Siril rgbcomp -lum)", 0, 1, 0.05),
+    _B("Colour", "oiii_unmix", "Remove the Ha leak from OIII (palette auto: Improved OIII = (G + B - 0.3 R) / 2 instead of Classic)"),
     _R("Colour", "saturation", "Saturation (Siril satu amount = this - 1; published 0.25-0.5)", 1, 2, 0.05),
     _R("Colour", "chroma_denoise", "Colour noise reduction (NoiseXTerminator --dc, 0.9-1.0)", 0, 1, 0.05),
     _R("Colour", "scnr", "SCNR (Siril rmgreen, broadband only)", 0, 1, 0.05),
@@ -121,10 +122,24 @@ PARAM_SPEC: list[dict] = [
     _R("Stars", "star_reduction", "Star reduction strength (DSA star reduction value = 0.5 x (1 - this); published 0.4-0.6; 1 = starless)", 0, 1, 0.05),
     _R("Stars", "star_intensity", "Star brightness (1 = as stretched)", 0, 1.5, 0.05),
     _R("Stars", "star_saturation", "Star colour (Siril satu on the stars, 1 = none)", 0, 2.5, 0.05),
+    _R("Stars", "star_color_preservation", "Colour-preserving star stretch (LRGB: stretched lightness with the linear colour ratios, blended by this)", 0, 1, 0.05),
+    _R("Stars", "halo_suppress", "Halo suppression (Siril unpurple with a star mask: blue / purple halos)", 0, 1, 0.05),
     _R("Detail", "luminance_denoise", "Noise reduction of the stretched starless image (NoiseXTerminator --dn, 0.6-0.85; GraXpert denoise as the fallback)", 0, 1, 0.05),
     _R("Detail", "local_contrast", "Local contrast (Siril clahe under a background mask; blend 0.4 x this, 0.5 = the lowest published strength)", 0, 2, 0.05),
+    _R("Detail", "sharpen", "Final sharpening (Siril unsharp under the subject mask, after the noise reduction)", 0, 1.5, 0.05),
     _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
     _R("Finish", "brightness", "Midtones", -1, 1, 0.05),
+    _R("Grade", "grade_amount", "Grade strength", 0, 1, 0.05),
+    _R("Grade", "grade_temperature", "Temperature (cool - warm)", -1, 1, 0.05),
+    _R("Grade", "grade_tint", "Tint (green - magenta)", -1, 1, 0.05),
+    _R("Grade", "grade_warm_hue", "Warm hues: shift (magenta - yellow)", -1, 1, 0.05),
+    _R("Grade", "grade_warm_sat", "Warm hues: saturation", 0, 2, 0.05),
+    _R("Grade", "grade_cool_hue", "Cool hues: shift (green - blue)", -1, 1, 0.05),
+    _R("Grade", "grade_cool_sat", "Cool hues: saturation", 0, 2, 0.05),
+    _R("Grade", "grade_contrast", "Object contrast (S-curve)", -1, 1, 0.05),
+    _B("Linear", "crop", "Auto-crop the stacking edges (stack job)"),
+    _R("Linear", "crop_threshold", "Crop: minimum frame coverage (stack job)", 0.1, 1.0, 0.05),
+    _R("Linear", "restored_resolution", "ImageMM super-resolution factor r (deconv_method imagemm)", 1, 3, 1),
 ]
 
 # Same presets as before ("Balanced" = DEFAULTS); only keys that are still honoured matter.

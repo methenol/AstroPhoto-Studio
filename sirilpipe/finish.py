@@ -482,3 +482,102 @@ def mean_saturation(rgb: np.ndarray, mask: np.ndarray | None = None) -> float:
 def screen(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Screen blend ``1 - (1-a)(1-b)`` = ``a + b - ab``: never above 1, the recombination RC-Astro and Brecher prescribe for two stretched layers."""
     return (a + b - a * b).astype(np.float32)
+
+
+# =========================================================================== OKLab and the colour grade (the application's own finishing controls, restored)
+
+def _srgb_to_linear(c: np.ndarray) -> np.ndarray:
+    c = np.clip(c, 0.0, 1.0).astype(np.float32)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4).astype(np.float32)
+
+
+def _linear_to_srgb(c: np.ndarray) -> np.ndarray:
+    c = np.clip(c, 0.0, 1.0).astype(np.float32)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055).astype(np.float32)
+
+
+_M1 = np.array([[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566], [0.0883024619, 0.2817188376, 0.6299787005]], np.float32)
+_M2 = np.array([[0.2104542553, 0.7936177850, -0.0040720468], [1.9779984951, -2.4285922050, 0.4505937099], [0.0259040371, 0.7827717662, -0.8086757660]], np.float32)
+_M2i = np.linalg.inv(_M2.astype(np.float64)).astype(np.float32)
+_M1i = np.linalg.inv(_M1.astype(np.float64)).astype(np.float32)
+
+
+def rgb_to_oklab(rgb_hwc: np.ndarray) -> np.ndarray:
+    """sRGB (H, W, 3) in 0..1 -> OKLab (Ottosson 2020)."""
+    lin = _srgb_to_linear(rgb_hwc)
+    lms = np.cbrt(cv2.transform(lin, _M1))
+    return cv2.transform(lms.astype(np.float32), _M2)
+
+
+def _oklab_to_linear(lab: np.ndarray) -> np.ndarray:
+    lms = cv2.transform(np.ascontiguousarray(lab, np.float32), _M2i)
+    return cv2.transform(lms * lms * lms, _M1i)
+
+
+def oklab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    """OKLab -> sRGB (H, W, 3); out-of-gamut colours get their chroma reduced (hue and lightness kept) instead of a hard clip."""
+    lin = _oklab_to_linear(lab)
+    bad = ((lin < -1e-4) | (lin > 1 + 1e-4)).any(-1)
+    if bad.any():
+        sub = lab[bad].astype(np.float32)
+        lo, hi = np.zeros(len(sub), np.float32), np.ones(len(sub), np.float32)
+        for _ in range(10):
+            mid = 0.5 * (lo + hi)
+            t = sub.copy()
+            t[:, 1:] *= mid[:, None]
+            ll = _oklab_to_linear(t[None])[0]
+            ok = ((ll >= -1e-4) & (ll <= 1 + 1e-4)).all(-1)
+            lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid)
+        sub[:, 1:] *= lo[:, None]
+        lin[bad] = _oklab_to_linear(sub[None])[0]
+    return np.clip(_linear_to_srgb(lin), 0, 1).astype(np.float32)
+
+
+def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - e0) / max(e1 - e0, 1e-9), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+GRADE_KEYS = ("grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast")
+GRADE_NEUTRAL = {"grade_temperature": 0.0, "grade_tint": 0.0, "grade_warm_hue": 0.0, "grade_warm_sat": 1.0, "grade_cool_hue": 0.0, "grade_cool_sat": 1.0, "grade_contrast": 0.0}
+_WARM_HUE, _COOL_HUE = np.deg2rad(40.0), np.deg2rad(220.0)        # OKLab hue: red ~25 deg, yellow ~110, cyan ~195, blue ~265
+
+
+def grade_neutral(p: dict) -> bool:
+    return float(p.get("grade_amount", 1.0)) <= 0 or all(abs(float(p.get(k, v)) - v) < 1e-4 for k, v in GRADE_NEUTRAL.items())
+
+
+def color_grade(rgb: np.ndarray, p: dict) -> np.ndarray:
+    """The colour grade of the finished image (3, H, W) in OKLab, as the application has always offered it: white balance of the object (temperature, tint), hue
+    rotation (up to 25 deg) and chroma gain of the warm and of the cool hue sectors (raised cosines 180 deg wide centred on red-orange and on cyan-blue: every hue moves
+    smoothly, greys not at all), and an S-curve of the object's lightness with its pivot at the object's median.  The sky (the darkest 15 %) is protected, so a neutral
+    background stays neutral; ``grade_amount`` blends the result."""
+    if grade_neutral(p):
+        return rgb
+    hwc = np.ascontiguousarray(np.moveaxis(np.clip(rgb, 0, 1), 0, -1), np.float32)
+    lab = rgb_to_oklab(hwc)
+    L = lab[..., 0]
+    Ls = cv2.GaussianBlur(L, (0, 0), max(1.5, 0.002 * max(L.shape)))
+    sky = float(np.percentile(Ls[::4, ::4], 15))
+    obj = smoothstep(sky + 0.02, sky + 0.25, Ls).astype(np.float32)
+    h = np.arctan2(lab[..., 2], lab[..., 1])
+    C = np.hypot(lab[..., 1], lab[..., 2])
+    w_warm = (np.clip(np.cos(h - _WARM_HUE), 0, 1) ** 1.5).astype(np.float32)
+    w_cool = (np.clip(np.cos(h - _COOL_HUE), 0, 1) ** 1.5).astype(np.float32)
+    h = h + np.deg2rad(25.0) * (float(p.get("grade_warm_hue", 0.0)) * w_warm + float(p.get("grade_cool_hue", 0.0)) * w_cool)
+    gain = 1 + ((float(p.get("grade_warm_sat", 1.0)) - 1) * w_warm + (float(p.get("grade_cool_sat", 1.0)) - 1) * w_cool) * obj
+    C = C * np.maximum(gain, 0)
+    a, b = C * np.cos(h), C * np.sin(h)
+    a = a + 0.025 * float(p.get("grade_tint", 0.0)) * obj
+    b = b + 0.025 * float(p.get("grade_temperature", 0.0)) * obj
+    k = float(np.clip(p.get("grade_contrast", 0.0), -1, 1)) * 1.5
+    if abs(k) > 1e-4:                                             # S-curve above the sky: y = x + k x (1 - x)(x - pivot), monotone for |k| <= 1.5 with the pivot in [0.25, 0.6]
+        x = np.clip((L - sky) / max(1 - sky, 1e-3), 0, 1)
+        sel = obj[::4, ::4] > 0.5
+        piv = float(np.clip(np.median(x[::4, ::4][sel]) if sel.sum() > 100 else 0.4, 0.25, 0.6))
+        lab[..., 0] = np.where(L > sky, sky + (1 - sky) * (x + k * x * (1 - x) * (x - piv)), L)
+    lab[..., 1], lab[..., 2] = a, b
+    out = oklab_to_rgb(lab)
+    amt = float(np.clip(p.get("grade_amount", 1.0), 0, 1))
+    res = hwc + (out - hwc) * amt if amt < 1 else out
+    return np.ascontiguousarray(np.moveaxis(res, -1, 0), np.float32)

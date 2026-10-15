@@ -51,7 +51,7 @@ SKY_BAND = (0.09, 0.11)            # Brecher's finished backgrounds
 SKY_TARGET = 0.10                  # background after the stretch (Brecher: 0.10 / 0.11 / 0.09 / 0.11 / 0.10)
 GHS1_B = 10.0                      # pass 1 local intensity: b 15 -> 10 (ghsastro "perhaps around 10")
 GHS2_B = 4.0                       # pass 2: b 3-5 (ghsastro) / 2-6 (Siril); the ``contrast`` setting
-GHS2_D = 1.0                       # pass 2: "D small" (Siril -D scale 0-10); the ``ghs_d2`` setting
+GHS2_D = 2.5                       # pass 2 D (Siril -D scale 0-10; the ``ghs_d2`` setting): 2.5 measured on IC 1805 / M 42 / M 31 2026-10-15 (1 left the nebula flat, 4 posterised it)
 TOE_PERCENTILE = 0.1               # "linear black point just left of the histogram rise": the level below which 0.1 % of the pixels lie (the clipping limit of Siril / fas37, VeraLux)
 HP_PERCENTILE = 99.5               # HP < 1 (highlight protection) starts at this percentile of the subject
 STAT_SMALL, STAT_FILLING = 0.10, 0.25   # Statistical_Stretch median target: small target (pro-workflow.md A8 route 2 / SW Skies) / frame-filling target (script default)
@@ -68,6 +68,17 @@ STAR_STRETCH = 5.0                 # Seti Astro Star Stretch amount (0-8, defaul
 MASK_SIGMA = 8.0                   # px, smoothing of the lightness the nebula / local contrast masks are taken from
 MASK_K = 3.0                       # the subject = more than 3 sigma of the smoothed sky scatter above the sky (finish.object_coverage)
 ALT_METHODS = ("autoghs", "modasinh", "autostretch", "hms")
+SHARPEN_SIGMA = 1.0                # px, Siril unsharp sigma for the final sharpening (PixInsight UnsharpMask default 2.0 px std dev at 1x; 1.0 for 2.3-2.8"/px smart-scope data)
+SHARPEN_GAIN = 0.5                 # unsharp amount per unit of ``sharpen`` (0.25 -> 0.125: Brecher's MMT sharpening 0.03-0.06 per layer is the lower end)
+UNPURPLE_THRESH = 0.4              # Siril unpurple threshold (its default)
+FRAME_FILLING = 0.5                # the object covers at least this fraction of the frame: ``auto_stretch`` raises the background to the top of Brecher's band
+
+
+def ghs_colour_model(color_preservation: float) -> str:
+    """Siril ``ght`` colour stretch model from the ``color_preservation`` setting (Siril docs, ght: ``-independent`` stretches each channel, ``-even`` an even-weighted
+    luminance, ``-human`` the human-weighted luminance; the luminance models keep the colour ratios, i.e. preserve saturation).  0-0.33 independent, 0.33-0.66 even, above human."""
+    c = float(np.clip(color_preservation, 0.0, 1.0))
+    return "-independent" if c < 0.33 else ("-even" if c < 0.66 else "-human")
 
 
 # =========================================================================== measurements
@@ -370,12 +381,15 @@ class Finisher:
         b2 = float(np.clip(p.get("contrast", GHS2_B), 0.25, 13.0))
         d2 = float(np.clip(p.get("ghs_d2", GHS2_D), 0.05, 10.0))
         target = float(np.clip(p.get("stretch", SKY_TARGET), 0.02, 0.4))
+        if p.get("auto_stretch", True) and mi["coverage"] >= FRAME_FILLING:
+            target = max(target, SKY_BAND[1])                    # a frame-filling object: the background at the top of Brecher's band (0.11), the midtones get the room
+        model = ghs_colour_model(float(p.get("color_preservation", 0.7)))
         fit = fit_ghs2(h, neb_med, neb_hi, b1=GHS1_B, b2=b2, d2=d2, target=target, use_hp=hdr_on)
-        l1 = [f"ght -D={fit['d1']:.6f} -B={GHS1_B:g} -SP={h['left']:.6f} -LP=0 -HP=1 -clipmode=clip -independent", f"linstretch -BP={fit['bp']:.6f}"]
+        l1 = [f"ght -D={fit['d1']:.6f} -B={GHS1_B:g} -SP={h['left']:.6f} -LP=0 -HP=1 -clipmode=clip {model}", f"linstretch -BP={fit['bp']:.6f}"]
         t0 = time.time()
         a1 = self.siril("ghs1", base, l1, "Stretch pass 1")
         self.record("stretch pass 1 (GHS)", "siril ght + linstretch", a1, commands=l1, seconds=time.time() - t0,
-                    params={"SP": round(h["left"], 6), "b": GHS1_B, "D_siril": round(fit["d1"], 4), "D": round(float(np.expm1(fit["d1"])), 2), "LP": 0, "HP": 1, "BP": round(fit["bp"], 6),
+                    params={"SP": round(h["left"], 6), "b": GHS1_B, "D_siril": round(fit["d1"], 4), "D": round(float(np.expm1(fit["d1"])), 2), "LP": 0, "HP": 1, "BP": round(fit["bp"], 6), "colour_model": model,
                             "histogram": {k: round(v, 7) for k, v in h.items()}, "background_after_pass_1": round(fit["sky1"], 4), "target_background": target, "fit_note": fit.get("note")},
                     source="Siril GHS tutorial + ghsastro: SP left of the histogram peak, b 15 -> 10, D raised until the background reaches the Brecher level (0.10), linstretch -BP at the histogram toe")
         # pass 2 from the measured image
@@ -386,7 +400,7 @@ class Finisher:
         hp2 = float(np.percentile(sel1, HP_PERCENTILE)) if (hdr_on and sel1.size) else 1.0
         lp2 = min(h1["sky"], sp2)
         hp2 = max(hp2, sp2 + 1e-4) if hdr_on else 1.0
-        l2 = [f"ght -D={d2:.6f} -B={b2:g} -SP={sp2:.6f} -LP={lp2:.6f} -HP={hp2:.6f} -clipmode=clip -independent"]
+        l2 = [f"ght -D={d2:.6f} -B={b2:g} -SP={sp2:.6f} -LP={lp2:.6f} -HP={hp2:.6f} -clipmode=clip {model}"]
         t0 = time.time()
         a2 = self.siril("ghs2", a1, l2, "Stretch pass 2")
         self.record("stretch pass 2 (GHS)", "siril ght", a2, commands=l2, seconds=time.time() - t0,
@@ -523,7 +537,7 @@ class Finisher:
     def palette_name(self) -> str:
         pal = str(self.p.get("palette", "auto"))
         if pal in ("", "auto"):
-            pal = "hoo" if self.dual else "natural"
+            pal = ("hoo_improved" if self.p.get("oiii_unmix", True) else "hoo") if self.dual else "natural"
         return pal
 
     def colour(self, arr: np.ndarray) -> np.ndarray:
@@ -532,9 +546,9 @@ class Finisher:
         pal = self.palette_name()
         boost = float(p.get("oiii_boost", 1.0))
         if self.dual and pal != "natural":
-            if pal == "nbn" or abs(boost - 1.0) > 1e-6:
-                return self._palette_nbn(arr, boost)
-            return self._palette_pm(arr, pal)
+            ha = arr[0].copy()
+            out = self._palette_nbn(arr, boost) if (pal == "nbn" or abs(boost - 1.0) > 1e-6) else self._palette_pm(arr, pal)
+            return self.ha_luminance(out, ha)
         scnr = float(np.clip(p.get("scnr", 0.0), 0.0, 1.0))
         if not self.dual and scnr > 0:
             line = f"rmgreen 3 {scnr:.3f}"
@@ -545,6 +559,22 @@ class Finisher:
             return out
         self.record("palette / SCNR", "none", None, status="skipped", note="dual-band natural colour: no SCNR (green is OIII)" if self.dual else "scnr=0")
         return arr
+
+    def ha_luminance(self, arr: np.ndarray, ha: np.ndarray) -> np.ndarray:
+        """``synthetic_luminance`` s (dual-band): the lightness of the palette image becomes (1 - s) x its own + s x the stretched Ha (R) plane, composed with Siril
+        ``rgbcomp -lum=``: Ha carries most of the signal of a dual-band OSC stack, so the OIII channel's noise cannot reach the lightness (pro-workflow.md B "Lightness: Ha";
+        NarrowbandNormalization.py's Lightness option; Cloudy Nights 'use Ha as luminance')."""
+        s_ = float(np.clip(self.p.get("synthetic_luminance", 0.5), 0.0, 1.0))
+        if not self.dual or s_ <= 1e-3:
+            return arr
+        t0 = time.time()
+        lum = finish.luminance(arr)
+        newl = np.clip((1.0 - s_) * lum + s_ * ha, 0.0, 1.0).astype(np.float32)
+        lines = ["rgbcomp -lum=hl_l hl_in -out=hl_out"]
+        out = self.siril("hl", arr, lines, "Ha luminance", out="hl_out", extra={"hl_l": np.stack([newl, newl, newl])})
+        self.record("Ha luminance", "siril rgbcomp -lum", out, commands=lines, seconds=time.time() - t0, params={"synthetic_luminance": s_},
+                    source="rgbcomp -lum (Siril LRGB composition): lightness = (1 - s) image + s Ha; pro-workflow.md Chain B (NBN Lightness: Ha)")
+        return out
 
     def _palette_pm(self, arr: np.ndarray, pal: str) -> np.ndarray:
         t0 = time.time()
@@ -614,6 +644,32 @@ class Finisher:
                            "the mapping of LHE to Siril clahe is not published (pro-workflow.md A11)")
         return out
 
+    def sharpen(self, arr: np.ndarray) -> np.ndarray:
+        amount = float(np.clip(self.p.get("sharpen", 0.0), 0.0, 1.5))
+        if amount <= 0:
+            self.record("sharpening", "none", None, status="skipped", note="sharpen=0")
+            return arr
+        self._say("Detail")
+        lum = finish.luminance(arr)
+        h = _hist_stats(lum)
+        mask, mi = nebula_mask(lum, h["mode"])
+        sm = cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), MASK_SIGMA)
+        lo = float(mi["threshold"])
+        hi = float(np.percentile(sm[mask], 95)) if mask.any() else lo + 0.1
+        w = np.clip((sm - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        w = (w * w * (3.0 - 2.0 * w)).astype(np.float32)
+        k = SHARPEN_GAIN * amount
+        lines = ["save sh_a", f"unsharp {SHARPEN_SIGMA:g} {k:.4f}", "save sh_b", 'pm "$sh_a$+$sh_m$*($sh_b$-$sh_a$)"']
+        t0 = time.time()
+        out = self.siril("sh", arr, lines, "Sharpening", extra={"sh_m": np.stack([w, w, w])})
+        for f in ("sh_a", "sh_b"):
+            fp = os.path.join(self.cwd, f + ".fit")
+            if os.path.exists(fp):
+                os.remove(fp)
+        self.record("sharpening", "siril unsharp + pm (subject mask)", out, commands=lines, seconds=time.time() - t0, params={"sigma": SHARPEN_SIGMA, "amount": round(k, 4)},
+                    source="Siril unsharp (Gaussian unsharp mask) under the subject mask after the noise reduction; Brecher: masked sharpening after NR (pro-workflow.md A11)")
+        return out
+
     # ---- 6. saturation ------------------------------------------------------------------------------------------------------
     def saturation(self, arr: np.ndarray) -> np.ndarray:
         amount = float(self.p.get("saturation", 1.3)) - 1.0
@@ -649,6 +705,47 @@ class Finisher:
         out = self.siril("stars", stars, lines, "Star stretch")
         self.record("stars stretch", "siril mtf (Seti Astro Star Stretch)", out, commands=lines, seconds=time.time() - t0, params=params,
                     source="Seti Astro Star Stretch = mtf with m = 1/(3^a+1), a = 5 (SASpro star_stretch.py / numba_utils); dual-band magenta: invert, SCNR, invert (Brecher, astrodoc.ca IC 1848)")
+        c = float(np.clip(p.get("star_color_preservation", 0.5), 0.0, 1.0))
+        if c > 1e-3:
+            # the colour-preserving star stretch (arcsinh-style): the stretched LIGHTNESS with the linear colour ratios, composed by Siril rgbcomp -lum, blended by c
+            t0 = time.time()
+            lum = finish.luminance(out)
+            lines2 = ["rgbcomp -lum=sc_l sc_c -out=sc_lrgb", "load sc_lrgb", f'pm "{1.0 - c:.4f}*$sc_in$+{c:.4f}*$sc_lrgb$"']
+            colour = np.clip(stars / np.maximum(stars.max(0, keepdims=True), 1e-9), 0, 1).astype(np.float32)
+            out2 = self.siril("sc", out, lines2, "Star colour", extra={"sc_l": np.stack([lum, lum, lum]), "sc_c": colour})
+            fp = os.path.join(self.cwd, "sc_lrgb.fit")
+            if os.path.exists(fp):
+                os.remove(fp)
+            self.record("stars colour preservation", "siril rgbcomp -lum / pm", out2, commands=lines2, seconds=time.time() - t0, params={"star_color_preservation": c},
+                        source="LRGB composition of the stretched lightness with the linear colour ratios (the arcsinh / colour-preserving star stretch: PixInsight ArcsinhStretch, Seti Star Stretch colour boost)")
+            return out2
+        return out
+
+    def halos(self, arr: np.ndarray) -> np.ndarray:
+        h = float(np.clip(self.p.get("halo_suppress", 0.0), 0.0, 1.0))
+        if h <= 1e-3:
+            self.record("halo suppression", "none", None, status="skipped", note="halo_suppress=0")
+            return arr
+        line = f"unpurple -starmask -blue={h:.3f} -thresh={UNPURPLE_THRESH:g}"
+        t0 = time.time()
+        try:
+            out = self.siril("up", arr, [line], "Halo suppression")
+        except SirilError as e:
+            self.record("halo suppression", "siril unpurple", None, status="failed", commands=[line], note=str(e).splitlines()[0][:200])
+            return arr
+        self.record("halo suppression", "siril unpurple", out, commands=[line], seconds=time.time() - t0, params={"blue": h, "thresh": UNPURPLE_THRESH},
+                    source="Siril unpurple (blue / purple fringes and halos around bright stars, star mask), the amount from halo_suppress")
+        return out
+
+    def grade(self, arr: np.ndarray) -> np.ndarray:
+        if finish.grade_neutral(self.p):
+            self.record("colour grade", "none", None, status="skipped", note="neutral grade")
+            return arr
+        t0 = time.time()
+        out = finish.color_grade(arr, self.p)
+        keys = ("grade_amount",) + finish.GRADE_KEYS
+        self.record("colour grade", "finish.color_grade (OKLab)", out, seconds=time.time() - t0, params={k: self.p.get(k) for k in keys},
+                    source="the application's colour grade: object white balance (temperature, tint), warm / cool hue rotation and chroma, S-curve of the object's lightness, sky protected")
         return out
 
     def recombine(self, starless: np.ndarray, stars: np.ndarray | None) -> np.ndarray:
@@ -709,12 +806,16 @@ class Finisher:
         s = self.banding(s, "stretched starless", False, noise_from=pre)
         s = self.colour(s)
         s = self.local_contrast(s)
+        s = self.sharpen(s)
         s = self.saturation(s)
         starless_display = s
         t = None
         if stars is not None and float(self.p.get("star_reduction", 0.4)) < 1.0:
             t = self.stars(stars)
         out = self.recombine(s, t)
+        if t is not None:
+            out = self.halos(out)
+        out = self.grade(out)
         out = self.finalise(out)
         self.info.update(chain=self.records, starless=starless_display)
         return out, self.info

@@ -138,7 +138,7 @@ def test_export_writes_named_files_and_the_sidecar(session):
     side = json.load(open(files["json"]))
     assert set(side) == {"params", "linear_info", "meta", "ignored_params"}
     assert side["params"]["saturation"] == 1.2 and side["params"]["scnr"] == post.DEFAULTS["scnr"]   # {**DEFAULTS, **params}
-    assert side["ignored_params"] == ["crop", "grade_tint", "mystery"]
+    assert side["ignored_params"] == ["mystery"]          # every DEFAULTS key has an effect now
     assert side["meta"]["object"] == "M 42" and side["linear_info"]["upscaled"] == 1.5
     from PIL import Image
     im = Image.open(files["jpg"])
@@ -168,7 +168,7 @@ def test_params_spec_only_lists_known_effective_keys():
     assert set(keys) <= set(post.DEFAULTS)
     assert not set(keys) & set(post.IGNORED_KEYS)
     for s in post.PARAM_SPEC:
-        assert s["type"] in ("bool", "range", "select") and s["group"] in ("Linear", "Stretch", "Colour", "Stars", "Detail", "Finish")
+        assert s["type"] in ("bool", "range", "select") and s["group"] in ("Linear", "Stretch", "Colour", "Stars", "Detail", "Finish", "Grade")
         if s["type"] == "range":
             assert s["min"] <= post.DEFAULTS[s["key"]] <= s["max"]
         if s["type"] == "select":
@@ -180,7 +180,7 @@ def test_params_spec_only_lists_known_effective_keys():
 def test_defaults_keep_the_contract_keys():
     d = post.DEFAULTS
     assert d["stretch"] == 0.10 and d["denoise"] == 0.95 and d["deconvolution"] == 0.7 and d["palette"] == "auto" and d["stretch_method"] == "ghs2"
-    assert d["saturation"] == 1.3 and d["scnr"] == 0.0 and d["star_reduction"] == 0.4 and d["star_intensity"] == 1.0 and d["hdr"] == 0.0
+    assert d["saturation"] == 1.45 and d["scnr"] == 0.0 and d["star_reduction"] == 0.4 and d["star_intensity"] == 1.0 and d["hdr"] == 0.5
     assert len(d) == 47
 
 

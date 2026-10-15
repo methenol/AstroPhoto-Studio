@@ -822,6 +822,13 @@ class Session:
         from sirilpipe import post
         with self.lock:
             sp = dict(stack_params or {})
+            # the processing setting ``restored_resolution`` is ImageMM's super-resolution factor r (api-contract: 1..3) unless imagemm_r was set explicitly
+            try:
+                rr = int(round(float((params or {}).get("restored_resolution", 1.0))))
+                if "imagemm_r" not in sp and rr > 1:
+                    sp["imagemm_r"] = rr
+            except (TypeError, ValueError):
+                pass
             self._recover_stack_swap()
             used, info = False, None
             if sp.get("deconv_method") == "imagemm":
