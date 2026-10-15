@@ -14,13 +14,8 @@ from test_finish import synthetic_linear                      # noqa: E402
 from sirilpipe import autofinish as af, finish, fitsio, post   # noqa: E402
 
 
-def test_stretch_target_rises_with_coverage():
-    vals = [af.target_for_coverage(c) for c in (0.0, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0)]
-    assert vals == sorted(vals)
-    assert vals[0] == pytest.approx(0.10) and af.target_for_coverage(0.15) == pytest.approx(0.10)
-    assert af.target_for_coverage(0.2) == pytest.approx(0.11, abs=0.005)           # DESIGN: ~0.11 below 30 % coverage
-    assert af.target_for_coverage(0.6) == pytest.approx(0.16)
-    assert af.target_for_coverage(1.0) == pytest.approx(0.20)
+def test_sky_aim_is_dark_grey_and_the_nebula_aim_is_a_midtone():
+    assert 0.07 <= af.SKY_AIM <= 0.10 and 0.45 <= finish.NEBULA_AIM <= 0.65 and finish.BRIGHT_AIM > finish.NEBULA_AIM
 
 
 def test_star_settings_by_density():
@@ -33,9 +28,17 @@ def test_star_settings_by_density():
 def test_gradient_residual_flags_a_tilted_sky():
     flat = np.full((200, 200), 0.02, np.float32) + np.random.default_rng(1).normal(0, 0.0005, (200, 200)).astype(np.float32)
     tilt = flat + np.linspace(0, 0.01, 200, dtype=np.float32)[None, :]
-    g0, g1 = af.gradient_residual(flat, 0.16, 0.0005), af.gradient_residual(tilt, 0.16, 0.0005)
+    slope = 8.0                                                   # display units per linear unit at the sky (what the GHS fit gives)
+    g0, g1 = af.gradient_residual(flat, slope), af.gradient_residual(tilt, slope)
     assert g1["spread_display"] > g0["spread_display"] * 3
     assert g1["spread_display"] > af.GRADIENT_LIMIT > g0["spread_display"]
+
+
+def test_stretch_slope_is_the_ghs_slope_at_the_sky():
+    fit = finish.ghs_fit(0.06, 0.25, 0.085, 0.55, 4.0)
+    info = {"ghs": fit, "white": 1e-3, "sky_in": 0.06}
+    assert af.stretch_slope(info) == pytest.approx((0.55 - 0.085) / (0.25 - 0.06) / 1e-3, rel=1.5)     # same order as the secant slope
+    assert af.stretch_slope({}) == 0.0
 
 
 def test_score_prefers_neutral_unclipped_sky_at_target():
@@ -67,13 +70,13 @@ def test_run_writes_report_with_a_measurement_per_decision(session):
     assert json.load(open(os.path.join(session, "autofinish.json")))["params"] == out["params"]
     p, rep = out["params"], out["report"]
     assert set(p) >= set(post.DEFAULTS)                                       # full parameter set for the sliders
-    assert 0.10 <= p["stretch"] <= 0.20 and p["auto_stretch"] is False
+    assert p["stretch"] == af.SKY_AIM and p["auto_stretch"] is False and p["black_point"] == 0.0
     assert p["saturation"] >= 1.0                                              # never desaturates
     assert p["star_reduction"] == pytest.approx(0.30) and p["star_intensity"] == pytest.approx(1.0)   # 450 stars / MP: normal
-    assert p["hdr"] in af.HDR_LADDER
+    assert p["hdr"] == 0.0 and p["contrast"] in finish.GHS_B_LADDER
     assert p["grade_temperature"] == 0 and p["grade_contrast"] == 0           # grade stays neutral
     steps = {s["step"]: s for s in rep["steps"]}
-    assert {"stretch", "auto_stretch", "star_reduction", "star_intensity", "hdr", "saturation"} <= set(steps)
+    assert {"stretch", "auto_stretch", "star_reduction", "star_intensity", "hdr", "contrast", "saturation"} <= set(steps)
     for s in rep["steps"]:
         assert s["why"] and s["measured"] is not None and "to" in s and "from" in s
     assert steps["stretch"]["from"] == 0.3 and steps["stretch"]["to"] == p["stretch"]
@@ -85,7 +88,7 @@ def test_run_writes_report_with_a_measurement_per_decision(session):
 def test_dual_band_run_sets_the_oiii_boost(session):
     out = af.run(session, {"object": "NGC 1", "filter": "Duo-Band", "is_dualband": True}, {}, None, None)
     assert out["report"]["class"].startswith("dual-band")
-    assert 0.7 <= out["params"]["oiii_boost"] <= 3.0
+    assert af.OIII_BOOST_RANGE[0] <= out["params"]["oiii_boost"] <= af.OIII_BOOST_RANGE[1]
     assert any(s["step"] == "oiii_boost" for s in out["report"]["steps"]) or out["params"]["oiii_boost"] == 1.0
 
 
@@ -109,10 +112,3 @@ def test_dense_star_field_gets_more_reduction(session):
               open(os.path.join(session, "starnet_meta.json"), "w"))
     out = af.run(session, {}, {}, None, None)
     assert out["params"]["star_reduction"] > 0.30 and out["params"]["star_intensity"] >= 0.9
-
-
-def test_dual_band_target_is_the_community_one_and_the_sky_aim_is_dark_grey():
-    assert af.target_for_coverage(1.0, dual=True) == pytest.approx(0.25)
-    assert af.target_for_coverage(0.3, dual=True) == pytest.approx(0.25)
-    assert af.target_for_coverage(0.05, dual=True) >= 0.12
-    assert 0.08 <= af.SKY_AIM <= 0.12

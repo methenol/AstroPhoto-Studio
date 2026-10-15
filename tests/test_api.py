@@ -458,7 +458,7 @@ def test_preset_and_param_merge_order(env):
     j = submit(env, preset="Vivid nebula", params={"saturation": 1.2}, stack_params={"autofinish": False, "star_remover": False})
     wait_state(env.client, j["id"])
     exported = FakeSession.instances[0].calls[-1][1]
-    assert exported["saturation"] == 1.2 and exported["local_contrast"] == 0.8 and exported["stretch"] == 0.18
+    assert exported["saturation"] == 1.2 and exported["local_contrast"] == 1.4 and exported["stretch"] == 0.09
 
 
 def test_job_list_filters_and_get(env):

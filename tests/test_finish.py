@@ -384,7 +384,8 @@ def test_export_writes_named_files_and_the_sidecar(session):
                         {"saturation": 1.2, "crop": False, "grade_tint": 0.3, "mystery": 1}, {"quality": 90, "upscale": 1.5})
     assert set(files) == {"jpg", "tif", "json", "size"}
     assert os.path.basename(files["jpg"]).startswith("M42_") and files["jpg"].endswith(".jpg")
-    assert files["size"] == [1200, 900]                                    # 800 x 600 x 1.5, Lanczos
+    e = finish.EDGE_CROP
+    assert files["size"] == [int(round((800 - 2 * e) * 1.5)), int(round((600 - 2 * e) * 1.5))]   # the stack's rim trimmed, then x 1.5 Lanczos
     side = json.load(open(files["json"]))
     assert set(side) == {"params", "linear_info", "meta", "ignored_params"}
     assert side["params"]["saturation"] == 1.2 and side["params"]["scnr"] == post.DEFAULTS["scnr"]   # {**DEFAULTS, **params}
@@ -392,10 +393,10 @@ def test_export_writes_named_files_and_the_sidecar(session):
     assert side["meta"]["object"] == "M 42" and side["linear_info"]["upscaled"] == 1.5
     from PIL import Image
     im = Image.open(files["jpg"])
-    assert im.size == (1200, 900) and "M 42 | 120 x subs, 30.0 min | AstroPhoto Studio" in im.getexif()[0x010E]
+    assert im.size == tuple(files["size"]) and "M 42 | 120 x subs, 30.0 min | AstroPhoto Studio" in im.getexif()[0x010E]
     import tifffile
     t = tifffile.imread(files["tif"])
-    assert t.dtype == np.uint16 and t.shape == (900, 1200, 3)
+    assert t.dtype == np.uint16 and t.shape == (files["size"][1], files["size"][0], 3)
 
 
 def test_export_without_tiff_and_default_name(session):
@@ -429,8 +430,8 @@ def test_params_spec_only_lists_known_effective_keys():
 
 def test_defaults_keep_the_contract_keys():
     d = post.DEFAULTS
-    assert d["stretch"] == 0.16 and d["denoise"] == 0.95 and d["deconvolution"] == 0.7 and d["palette"] == "auto"
-    assert d["saturation"] == 1.5 and d["scnr"] == 0.4 and d["star_reduction"] == 0.35 and d["star_intensity"] == 0.9
+    assert d["stretch"] == 0.09 and d["denoise"] == 0.95 and d["deconvolution"] == 0.7 and d["palette"] == "auto"
+    assert d["saturation"] == 1.3 and d["scnr"] == 0.4 and d["star_reduction"] == 0.35 and d["star_intensity"] == 0.9
     assert len(d) == 47
 
 
@@ -536,3 +537,104 @@ def test_stretch_stars_faint_star_not_cut_by_a_fixed_floor():
     st[:, 32, 32] = 8e-4                                                    # M 27's faint stars peak at ~5e-4 .. 3e-3
     out, info = finish.stretch_stars(st, amount=5.0)
     assert out[:, 32, 32].max() > 0.15 and info["black_point"] < 1e-4
+
+
+# --------------------------------------------------------------------------- GHS stretch of the starless layer (finish.ghs_*, starlet, nbn, flatten)
+
+def _faint_nebula(h=160, w=240, seed=3):
+    """Linear sky 0.02 with pixel noise 3e-4 and a Gaussian nebula of 6e-4 peak (the scale of the DWARF Duo-Band stacks: signal ~ 2 x noise)."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    neb = 6e-4 * np.exp(-(((xx - w / 2) / 35) ** 2 + ((yy - h / 2) / 25) ** 2))
+    return (0.02 + neb + rng.normal(0, 3e-4, (h, w))).astype(np.float32), neb
+
+
+def test_starlet_reconstructs_and_denoise_lowers_the_noise_but_keeps_the_nebula():
+    x, neb = _faint_nebula()
+    planes, resid = finish.starlet(x, 5)
+    assert np.allclose(sum(planes) + resid, x, atol=1e-5)
+    dn, sig1 = finish.starlet_denoise(x, 1.0)
+    assert sig1 == pytest.approx(3e-4, rel=0.25)
+    assert (dn - (0.02 + neb)).std() < 0.6 * (x - (0.02 + neb)).std()                   # noise down by > 40 %
+    assert dn[80, 120] - dn[10, 10] > 0.5 * 6e-4                                         # the nebula's peak survives
+    assert np.array_equal(finish.starlet_denoise(x, 0.0)[0], x)
+
+
+def test_ghs_is_monotone_normalised_and_steepest_at_its_symmetry_point():
+    x = np.linspace(0, 1, 2001)
+    for b in (0.5, 1.0, 2.0, 8.0):
+        y = finish.ghs(x, b, 30.0, 0.2)
+        assert y[0] == pytest.approx(0, abs=1e-6) and y[-1] == pytest.approx(1, abs=1e-6)
+        assert (np.diff(y) >= -1e-7).all()
+        assert abs(x[np.argmax(np.gradient(y, x))] - 0.2) < 0.01
+    y = finish.ghs(np.array([0.2 - 0.1, 0.2, 0.2 + 0.1]), 4.0, 50.0, 0.2)                # odd symmetry about SP
+    assert (y[2] - y[1]) == pytest.approx(y[1] - y[0], rel=1e-4)
+
+
+def test_ghs_fit_meets_both_aims_with_the_highest_feasible_b():
+    fit = finish.ghs_fit(0.06, 0.27, 0.085, 0.55, 13.0)
+    assert fit["error"] <= finish.GHS_FIT_TOLERANCE
+    t = finish.ghs(np.array([0.06, 0.27]), fit["b"], fit["D"], fit["sp"])
+    assert t[0] == pytest.approx(0.085, abs=0.01) and t[1] == pytest.approx(0.55, abs=0.01)
+    assert fit["b"] in finish.GHS_B_LADDER
+    assert finish.ghs_fit(0.06, 0.27, 0.085, 0.55, 0.5)["b"] == 0.5                       # b_max caps the ladder
+
+
+def test_nbn_oiii_equalises_the_average_level_and_keeps_the_floor():
+    rng = np.random.default_rng(4)
+    ha = np.clip(rng.normal(0.2, 0.1, (80, 80)), 0, 1).astype(np.float32)
+    oiii = np.clip(rng.normal(0.1, 0.03, (80, 80)), 0, 1).astype(np.float32)
+    out, e1 = finish.nbn_oiii(ha, oiii, 1.0)
+    assert 0.01 <= e1 < 0.5 and out.mean() > oiii.mean()                                   # a weak OIII is lifted
+    assert 0.01 < out.mean() - oiii.mean() < ha.mean() - oiii.mean()                       # towards the Ha level, not past it
+    low = oiii < np.median(oiii)
+    assert np.allclose(out[low], oiii[low], atol=1e-4)                                     # below the median nothing moves
+    out2, _ = finish.nbn_oiii(ha, oiii, 0.6)
+    assert out2.mean() < out.mean()                                                        # boost < 1 lifts less
+    same, e_same = finish.nbn_oiii(ha, ha, 1.0)
+    assert e_same == pytest.approx(0.5, abs=0.02) and np.allclose(same, ha, atol=0.02)
+
+
+def test_flatten_sky_removes_a_tilt_but_not_the_nebula():
+    x, neb = _faint_nebula(h=320, w=480)
+    tilt = np.linspace(0, 2e-4, x.shape[1], dtype=np.float32)[None, :]
+    y, info = finish.flatten_sky(finish.starlet_denoise(x + tilt, 1.0)[0])
+    sky = np.concatenate([y[:40].ravel(), y[-40:].ravel()])
+    left, right = y[:, :60].mean(), y[:, -60:].mean()
+    assert abs(left - right) < 0.5e-4                                                      # the 2e-4 tilt is gone
+    assert y[160, 240] - np.median(y) > 3e-4                                               # the nebula is still there
+    assert info["span"] > 1e-4
+
+
+def test_ghs_stretch_puts_the_sky_and_the_nebula_on_their_aims_and_shows_the_nebula():
+    x, neb = _faint_nebula(h=240, w=360)
+    y, info = finish.ghs_stretch([x, x * 0.9], sky_aim=0.085, neb_aim=0.55, b_max=4.0, denoise=1.0)
+    assert len(y) == 2 and y[0].min() >= 0 and y[0].max() <= 1
+    sky = float(np.median(y[0][:30, :30]))
+    assert 0.03 < sky < 0.2                                                                # dark grey sky
+    assert y[0][120, 180] > 0.4 and y[0][120, 180] > sky + 0.3                             # the nebula stands out
+    assert info["ghs"]["b"] in finish.GHS_B_LADDER and info["sky_in"] < info["nebula_in"]
+
+
+def test_local_contrast_gates_the_sky_and_boosts_structure():
+    rng = np.random.default_rng(5)
+    base = np.full((3, 200, 300), 0.08, np.float32) + rng.normal(0, 0.002, (3, 200, 300)).astype(np.float32)
+    yy, xx = np.mgrid[0:200, 0:300]
+    structure = (0.25 * (np.sin(xx / 7.0) * np.sin(yy / 6.0) > 0.4)).astype(np.float32)
+    img = np.clip(base + structure[None] * (xx > 150)[None], 0, 1)                         # right half carries the structure
+    out = finish.local_contrast(img, 1.0)
+    left, right = (out - img)[:, :, :120], (out - img)[:, :, 180:]
+    assert np.abs(left).mean() < 0.35 * np.abs(right).mean()                               # the sky half is left alone
+    assert out.std() > img.std() and np.array_equal(finish.local_contrast(img, 0.0), img)
+
+
+def test_ghs_render_of_a_dual_band_stack_is_dark_grey_sky_and_visible_nebula():
+    x, neb = _faint_nebula(h=200, w=300)
+    lin = np.stack([x, 0.02 + 0.4 * (x - 0.02), 0.02 + 0.4 * (x - 0.02)]).astype(np.float32)
+    p = {**post.DEFAULTS, "stretch": 0.085, "contrast": 4.0, "black_point": 0.0, "saturation": 1.0, "chroma_denoise": 0, "sharpen": 0, "local_contrast": 0,
+         "star_reduction": 1.0, "palette": "hoo", "oiii_boost": 1.0}
+    img, info = finish.render_layers(lin, None, p, dual_band=True)
+    lum = finish.luminance(img)
+    assert 0.01 < np.median(lum[:30, :30]) < 0.2 and lum[100, 150] > np.median(lum[:30, :30]) + 0.2
+    assert info["palette_info"]["ghs"]["b"] in finish.GHS_B_LADDER and info["palette"] == "hoo"
+    assert np.allclose(img[1], img[2], atol=1e-5)                                          # HOO: G = B = OIII

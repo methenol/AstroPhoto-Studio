@@ -5,16 +5,18 @@ numbers measured on the restored image, and the report lists each decision with 
 it (the web UI renders ``report.steps`` as one row per setting: ``step, from, to, measured, before,
 after, target, why``).  Rules (DESIGN section 4 "Autofinish"):
 
-* **stretch**: target sky median by how much of the frame holds signal (object coverage);
+* **stretch** (= the sky's display level) and **contrast** (= the GHS local intensity b): the stretch is the Generalised Hyperbolic Stretch of
+  ``finish.ghs_stretch`` with the sky sent to ``finish.SKY_AIM`` and the 90th percentile of the signal to ``finish.NEBULA_AIM``; b is the highest
+  of ``finish.GHS_B_LADDER`` for which a D / SP meeting both aims exists (measured in a trial render);
 * **star_reduction / star_intensity**: from the star density (stars per megapixel, measured when the
   stars were removed);
 * **star_stretch**: the Seti Astro Star Stretch amount that sends the median detected star of the full-resolution star layer to
   display level 0.3 (finish.star_stretch_amount);
-* **hdr**: the smallest highlight protection (0, 0.3, 0.6, 0.9, 1.2) that keeps the object's cores below 0.3 %
-  clipped pixels in a trial render;
+* **oiii_boost** (dual-band): the Blanshan / Cranfield narrowband-normalisation boost (applied to the stretched, denoised OIII: no noise
+  amplification) that puts the OIII signal over the sky at ``OIII_TO_HA`` x the Ha signal in the object;
 * **saturation**: raised until the object's mean colour saturation reaches the aim (never lowered: the
   palette's own colour is kept);
-* **oiii_boost** (dual-band): so the OIII signal over the sky is at least 0.7 x the Ha signal (never reduced);
+* **black_point**: 0 (the stretch anchors the sky itself), **hdr**: 0 (the GHS shoulder is the highlight protection);
 * **gradient check**: the residual large-scale gradient after the restoration, in display units, reported
   (changing it needs the linear stage to run again, so it is not a setting here).
 
@@ -32,33 +34,15 @@ import numpy as np
 from . import finish
 
 # Aims of the rules (documented constants, not tuned per image).
-STRETCH_RULE = ((0.15, 0.10), (0.30, 0.13), (0.60, 0.16), (1.00, 0.20))      # (coverage, target median) breakpoints
-# Dual-band (Ha / OIII) nebulae are stretched the community way: the statistical stretch's median target is 0.25 for an object that fills
-# the frame and ~0.11-0.15 for a small one (Statistical_Stretch / Under South West Skies, workflows.md 7.4), then the black point brings the
-# SKY down to 0.10 (the aim below).  A frame-filling target of 0.25 followed by that black point is what lifts the faint outer nebulosity (the
-# stretch's slope at the sky grows with the target); the 0.13-0.20 of the broadband rule left the wings at the noise (measured on M 42 and C 33), so even small objects start from 0.20 (community: 0.11-0.15 for small objects, but with a sky left at that level).
-STRETCH_RULE_DUAL = ((0.15, 0.20), (0.30, 0.25), (0.60, 0.25), (1.00, 0.25))
-SKY_AIM = 0.10                     # display level of the sky after the black point (0.08-0.12: dark grey, not black) -- dual-band
-HEADROOM_LEVEL, HEADROOM_LIMIT = 0.8, 0.015   # dual-band: at most 1.5 % of the object's pixels may lie above 0.8 in the starless render (room for the stars / the Trapezium; a larger plateau is a flat white core)
+SKY_AIM = finish.SKY_AIM           # display level of the sky (the user's 0.07-0.10: dark grey, not black)
 STAR_DENSITY = ((150.0, 0.25, 1.0), (600.0, 0.30, 1.0))                       # per MP: sparse, normal; dense above
-CLIP_LIMIT = 0.0005                # fraction of pixels allowed at >= 0.985 in the starless render (a white core of a few hundred pixels is allowed)
-HDR_LADDER = (0.0, 0.3, 0.6, 0.9, 1.2)       # 0 = the plain statistical (midtones) stretch: the most contrast in the highlights
-SATURATION_AIM = {"broadband": 0.32, "dual-band": 0.30}                        # mean HSV saturation of the object
-OIII_TO_HA = 0.7                   # OIII lifted to at least 0.7 x the Ha signal (never lowered: a strong OIII is the data, e.g. the M 42 core)
+CLIP_LIMIT = 0.0005                # reported: fraction of pixels allowed at >= 0.985 in the starless render
+SATURATION_AIM = {"broadband": 0.32, "dual-band": 0.40}                        # mean HSV saturation of the object
+OIII_TO_HA = 0.3                   # OIII signal over the sky at 0.3 x the Ha signal in the object (compared 0.7 / 0.5 / 0.3 on IC 1805, Sh2-132: above ~0.4 the teal clouds of OIII noise and faint OIII wash the sky and the cores to white)
+OIII_BOOST_RANGE = (0.5, 1.5)
+LOCAL_CONTRAST = 1.0               # Revela "structure" gain 1 + amount on the 4-16 px scales (finish.local_contrast): 2x where the signal mask is open, 1x on the sky
+SYNTH_LUM = 0.5                    # synthetic luminance (finish.synthetic_luminance) of a dual-band render
 GRADIENT_LIMIT = 0.03              # display units: a visible sky gradient
-
-
-def target_for_coverage(c: float, dual: bool = False) -> float:
-    """Piecewise-linear target median over the breakpoints of ``STRETCH_RULE`` (0.10 for a small object on empty
-    sky up to 0.20 for a nebula that fills the frame; 0.16 = the default at 60 % coverage), or of ``STRETCH_RULE_DUAL``
-    (0.12 ... 0.25, followed by the black point that puts the sky at ``SKY_AIM``)."""
-    rule = STRETCH_RULE_DUAL if dual else STRETCH_RULE
-    pts = ((0.0, rule[0][1]),) + rule
-    c = float(np.clip(c, 0, 1))
-    for (c0, t0), (c1, t1) in zip(pts, pts[1:]):
-        if c <= c1:
-            return t0 + (t1 - t0) * (c - c0) / max(c1 - c0, 1e-9)
-    return pts[-1][1]
 
 
 def sky_level(img: np.ndarray) -> float:
@@ -80,21 +64,27 @@ def star_settings(per_mp: float) -> tuple[float, float, str]:
     return float(min(0.40, 0.30 + (per_mp - STAR_DENSITY[1][0]) / 3000.0 * 0.10)), 0.95, "dense"
 
 
-def gradient_residual(lum_lin: np.ndarray, target: float, noise_sigma: float) -> dict:
+def gradient_residual(lum_lin: np.ndarray, slope: float) -> dict:
     """Large-scale sky gradient left in the linear luminance, in display units.  The luminance is reduced to
-    64 x 64 block means; the sky blocks are the darkest 60 %; the spread (P95 - P5) of that sky map is pushed through
-    the stretch's own slope at the sky level: the statistical stretch puts its black point 5 sigma (the pixel noise
-    ``noise_sigma``) below the sky median and sends the median to ``target``."""
+    64 x 64 block means; the sky blocks are the darkest 60 %; the spread (P95 - P5) of that sky map is multiplied by the
+    stretch's slope at the sky level (``slope``: display units per linear unit, from the GHS fit)."""
     small = cv2.resize(np.ascontiguousarray(lum_lin), (64, 64), interpolation=cv2.INTER_AREA)
     sky = small[small <= np.percentile(small, 60)]
-    if sky.size < 20 or noise_sigma <= 0:
+    if sky.size < 20 or slope <= 0:
         return {"spread_linear": 0.0, "spread_display": 0.0}
     spread = float(np.percentile(sky, 95) - np.percentile(sky, 5))
-    m = finish.STAT_SIGMA * noise_sigma
-    cur = finish.Curve(m, target, 0.0)
-    lo = float(cur(np.array([max(m - spread / 2, 0.0)], np.float32))[0])
-    hi = float(cur(np.array([m + spread / 2], np.float32))[0])
-    return {"spread_linear": round(spread, 6), "spread_display": round(hi - lo, 4)}
+    return {"spread_linear": round(spread, 6), "spread_display": round(spread * slope, 4)}
+
+
+def stretch_slope(ghs_info: dict) -> float:
+    """Display units per linear unit at the sky of the GHS recorded by ``finish.ghs_stretch``."""
+    g = ghs_info.get("ghs") or {}
+    white, sky = float(ghs_info.get("white") or 0), float(ghs_info.get("sky_in") or 0)
+    if white <= 0 or not g:
+        return 0.0
+    h = 0.01
+    t = finish.ghs(np.array([sky, sky + h], np.float64), g["b"], g["D"], g["sp"])
+    return float((t[1] - t[0]) / h / white)
 
 
 def measure(img: np.ndarray) -> dict:
@@ -152,15 +142,14 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     base = layers.base
     lum_lin = finish.luminance(base)
 
-    # 1. stretch target from the object coverage
+    # 1. the sky's display level (the stretch setting)
     tick("object coverage")
     cov = finish.object_coverage(lum_lin)
-    target = round(target_for_coverage(cov, dual), 3)
-    decide("stretch", target, "object_frac", round(cov, 3), None,
-           f"the object covers {cov * 100:.0f} % of the frame: median target {target} "
-           + ("(0.12 small object ... 0.25 fills the frame; the black point below puts the sky at 0.10)" if dual
-              else "(0.10 small object ... 0.20 fills the frame)"))
-    decide("auto_stretch", False, "object_frac", round(cov, 3), None, "the coverage rule above replaces the automatic adaptation")
+    decide("stretch", SKY_AIM, "object_frac", round(cov, 3), SKY_AIM,
+           f"the object covers {cov * 100:.0f} % of the frame; the GHS sends the sky to {SKY_AIM} (dark grey) whatever the coverage: "
+           f"the black point is the sky itself, not a multiple of the pixel noise")
+    decide("auto_stretch", False, "object_frac", round(cov, 3), None, "the sky aim above replaces the automatic adaptation")
+    decide("black_point", 0.0, "sky_L", SKY_AIM, SKY_AIM, "the stretch's anchor already sits at the sky: no extra black point")
 
     # 2. stars
     tick("stars")
@@ -182,38 +171,37 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     p_before = {**p0}
     img0, _ = post._render(layers, p_before, dual, fast=True)
     stats_before = measure(img0)
-    p1 = {**p0, **tuned}
+    p1 = {**p0, **tuned, "stretch_method": "ghs", "contrast": 13.0, "oiii_boost": 1.0, "saturation": 1.0, "hdr": 0.0}
 
-    # 3. highlight protection: the lowest hdr whose starless render keeps the cores below the clip limit (dual-band: and leaves
-    #    headroom above the cores for the stars: an HOO core is white by construction, Ha and OIII both saturate)
-    tick("highlights")
-    chosen = HDR_LADDER[0]
-    clip_seen, crowd = None, 0.0
-    for h in HDR_LADDER:
-        pt = {**p1, "hdr": h, "star_reduction": 1.0, "black_point": 0.0}
-        im = post._render(layers, pt, dual, fast=True)[0]
-        st = measure(im)
-        clip_seen, chosen = st["clip_frac"], h
-        crowd = 0.0
-        if dual:
-            lum = finish.luminance(im)
-            obj = cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), 2.0) > sky_level(im) + 0.08
-            crowd = float((lum >= HEADROOM_LEVEL).sum()) / max(float(obj.sum()), 1.0)
-        if st["clip_frac"] <= CLIP_LIMIT and crowd <= HEADROOM_LIMIT:
-            break
-    decide("hdr", chosen, "peak_L", clip_seen, CLIP_LIMIT,
-           f"{(clip_seen or 0) * 100:.2f} % of the starless render is clipped at hdr {chosen} (limit {CLIP_LIMIT * 100:.2f} %)"
-           + (f"; {crowd * 100:.2f} % of the object above {HEADROOM_LEVEL} (limit {HEADROOM_LIMIT * 100:.1f} %)" if dual else ""))
-    p1["hdr"] = chosen
+    # 3. GHS local intensity: the highest b whose D / SP meet both aims
+    tick("stretch")
+    flayers = post._Layers(session, p1, None)               # full resolution: the wavelet denoise and the statistics of the fit depend on the pixel scale
+    im_t, info_t = post._render(flayers, {**p1, "star_reduction": 1.0}, dual, fast=True)
+    g = info_t.get("ghs") or {}
+    gg = g.get("ghs") or {}
+    b = float(gg.get("b", p0["contrast"]))
+    decide("contrast", b, "ghs_error", gg.get("error"), finish.GHS_FIT_TOLERANCE,
+           f"GHS b {b:g} (D {gg.get('D')}, SP {gg.get('sp')}): sky {g.get('sky_in')} -> {SKY_AIM}, the signal's 90th percentile {g.get('nebula_in')} -> {finish.NEBULA_AIM} "
+           f"(fit error {gg.get('error')}); the highest b of {finish.GHS_B_LADDER} that meets both")
+    decide("hdr", 0.0, "peak_L", measure(im_t)["clip_frac"], CLIP_LIMIT,
+           f"{measure(im_t)['clip_frac'] * 100:.2f} % of the starless render is clipped: the GHS shoulder is the highlight protection (hdr only shapes the legacy methods)")
+    p1["contrast"] = b
 
-    # 4. dual-band: OIII boost
+    decide("local_contrast", LOCAL_CONTRAST, "ghs_error", p0["local_contrast"], None,
+           "the structure scales of the denoised nebula doubled through the signal mask (sky untouched): the GHS stretches tone, this separates the filaments from the glow")
+    p1["local_contrast"] = LOCAL_CONTRAST
+
+    # 4. dual-band: OIII boost (Blanshan / Cranfield normalisation strength)
     tick("colour")
     if dual:
-        boost, ratio = _oiii_boost(base, p1, target)
+        boost, ratio = _oiii_boost(flayers.base, p1)
         if boost is not None:
             decide("oiii_boost", boost, "C50", ratio, OIII_TO_HA,
-                   f"OIII signal is {ratio:.2f} x the Ha signal above the sky: boost to reach {OIII_TO_HA}")
+                   f"after the narrowband normalisation (boost 1) the OIII signal is {ratio:.2f} x the Ha signal over the sky in the object: boost {boost} gives {OIII_TO_HA}")
             p1["oiii_boost"] = boost
+        decide("synthetic_luminance", SYNTH_LUM, "C50", p0["synthetic_luminance"], None,
+               f"half-way lightness lift ({SYNTH_LUM}): the default 0.8 pulled Ha-red regions towards pink-white on IC 1805 and Sh2-132")
+        p1["synthetic_luminance"] = SYNTH_LUM
 
     # 5. saturation from the measured object colour (never below 1.0: the palette's own colour is kept)
     p_sat = {**p1, "saturation": 1.0}
@@ -223,18 +211,9 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     decide("saturation", round(sat, 2), "C50", s0, aim, f"object colourfulness {s0:.2f} at saturation 1.0, aim {aim}")
     p1["saturation"] = round(sat, 2)
 
-    # 5b. dual-band: black point that puts the sky at SKY_AIM after the (higher) stretch target
-    if dual:
-        im = post._render(layers, {**p1, "black_point": 0.0, "star_reduction": 1.0}, dual, fast=True)[0]
-        sky = sky_level(im)
-        bp = float(np.clip(round((sky - SKY_AIM) / (1.0 - SKY_AIM), 3), 0.0, 0.5))
-        decide("black_point", bp, "sky_L", round(sky, 3), SKY_AIM,
-               f"the stretched sky sits at {sky:.3f}: black point {bp} puts it at {SKY_AIM} (dark grey, the faint nebulosity keeps its contrast)")
-        p1["black_point"] = bp
-
     # 6. gradient residual (report only)
     tick("gradient check")
-    grad = gradient_residual(lum_lin, target, finish.lower_half_sigma(finish.sample(lum_lin)))
+    grad = gradient_residual(lum_lin, stretch_slope(g))
     grad_note = ("a visible sky gradient remains: run Restore again with a higher gradient smoothing"
                  if grad["spread_display"] > GRADIENT_LIMIT else "no visible gradient")
 
@@ -243,17 +222,17 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     stats_after = measure(img1)
     for s in steps:
         s["after"] = {"stretch": stats_after["sky_L"], "hdr": stats_after["clip_frac"], "saturation": stats_after["C50"]}.get(s["step"])
-    tuned_full = {**p0, **tuned, "saturation": p1["saturation"], "hdr": p1["hdr"]}
-    tuned_full["black_point"] = p1["black_point"]
+    tuned_full = {**p0, **tuned, "saturation": p1["saturation"], "hdr": p1["hdr"], "contrast": p1["contrast"], "oiii_boost": p1["oiii_boost"],
+                  "black_point": 0.0, "synthetic_luminance": p1["synthetic_luminance"]}
     cls = ("dual-band " if dual else "broadband ") + ("nebula" if cov > 0.0 and cov < 0.8 else "field")
     report = {
         "reference": "measured statistics (fixed rules, no reference image)", "class": cls,
-        "score_before": score(stats_before, SKY_AIM if dual else p0["stretch"]), "score_after": score(stats_after, SKY_AIM if dual else target),
+        "score_before": score(stats_before, SKY_AIM), "score_after": score(stats_after, SKY_AIM),
         "nearest": None, "renders": 5, "seconds": round(time.time() - t0, 1), "steps": steps,
         "stats_before": stats_before, "stats_after": stats_after,
         "gradient": {**grad, "limit": GRADIENT_LIMIT, "note": grad_note},
         "coverage": round(cov, 4), "star_field": cls_stars, "created": datetime.now().isoformat(timespec="seconds"),
-        "summary": f"{cls}: stretch {target}, saturation {p1['saturation']}, hdr {p1['hdr']}",
+        "summary": f"{cls}: sky {SKY_AIM}, GHS b {b:g}, saturation {p1['saturation']}" + (f", OIII boost {p1['oiii_boost']}" if dual else ""),
     }
     result = {"params": tuned_full, "report": report}
     _save_json(os.path.join(session, "autofinish.json"), result)
@@ -294,20 +273,35 @@ def _star_stretch(session: str, p: dict) -> tuple[float, dict]:
     return finish.star_stretch_amount(full.stars, noise)
 
 
-def _oiii_boost(base: np.ndarray, p: dict, target: float) -> tuple[float | None, float]:
-    """OIII boost so the stretched OIII signal over the sky equals ``OIII_TO_HA`` x the Ha signal (both
-    channels are stretched to the same sky median, so the signal is the excess above it, in the object)."""
-    pos = finish.curve_position(p["stretch_method"], float(p["hdr"]))
-    shd = finish.curve_shoulder(p["stretch_method"], float(p["hdr"]))
+def _oiii_boost(base: np.ndarray, p: dict) -> tuple[float | None, float]:
+    """The ``oiii_boost`` (Blanshan / Cranfield normalisation strength, ``finish.nbn_oiii``) at which the stretched OIII's signal over the sky is
+    ``OIII_TO_HA`` x the Ha signal, both medians over the object (pixels of the smoothed Ha 0.08 above its sky).  Bisection on the log of the boost;
+    returns ``(boost, ratio at boost 1)``."""
     ha, oiii, _ = finish.extract_ha_oiii(base, bool(p["oiii_unmix"]))
-    h_st, _ = finish.stretch_channel(ha, target, position=pos, shoulder=shd)
-    o_st, _ = finish.stretch_channel(oiii, target, position=pos, shoulder=shd)
-    obj = cv2.GaussianBlur(h_st, (0, 0), 2.0) > target + 0.08
+    (h_st, o_st), _ = finish.ghs_stretch([ha, oiii], sky_aim=float(p["stretch"]), neb_aim=finish.NEBULA_AIM, b_max=float(p["contrast"]),
+                                         denoise=float(np.clip(float(p["luminance_denoise"]) / 0.6, 0.0, 2.0)))
+    sm = cv2.GaussianBlur(h_st, (0, 0), 2.0)
+    sky_h = float(np.median(sm[sm <= np.percentile(sm, 40)]))
+    obj = sm > sky_h + 0.08
     if obj.sum() < 200:
         return None, 0.0
-    s_h = float(np.median(h_st[obj] - target))
-    s_o = float(np.median(o_st[obj] - target))
-    if s_h <= 1e-3:
-        return None, 0.0
-    ratio = max(s_o, 1e-3) / s_h
-    return float(np.clip(round(OIII_TO_HA / ratio / 0.05) * 0.05, 1.0, 3.0)), round(ratio, 3)
+
+    def ratio(boost: float) -> float:
+        o_n, _ = finish.nbn_oiii(h_st, o_st, boost)
+        so = cv2.GaussianBlur(o_n, (0, 0), 2.0)
+        sky_o = float(np.median(so[so <= np.percentile(so, 40)]))
+        return max(float(np.median(so[obj]) - sky_o), 1e-4) / max(float(np.median(sm[obj]) - sky_h), 1e-4)
+
+    r1 = ratio(1.0)
+    lo, hi = OIII_BOOST_RANGE
+    if ratio(hi) < OIII_TO_HA:
+        return float(hi), round(r1, 3)
+    if ratio(lo) > OIII_TO_HA:
+        return float(lo), round(r1, 3)
+    for _ in range(12):
+        mid = float(np.sqrt(lo * hi))
+        if ratio(mid) < OIII_TO_HA:
+            lo = mid
+        else:
+            hi = mid
+    return float(round(np.sqrt(lo * hi) / 0.05) * 0.05), round(r1, 3)

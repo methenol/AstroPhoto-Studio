@@ -133,13 +133,13 @@ PROFILES = {
 
 PRESETS = {
     "Balanced": {},
-    "Vivid nebula": {"saturation": 2.0, "local_contrast": 0.8, "stretch": 0.18, "contrast": 3.0, "oiii_boost": 1.3,
+    "Vivid nebula": {"saturation": 1.8, "local_contrast": 1.4, "stretch": 0.09, "contrast": 4.0, "oiii_boost": 1.0,
                      "star_reduction": 0.5, "star_intensity": 0.8},
-    "Starless-ish": {"star_reduction": 0.8, "star_intensity": 0.45, "local_contrast": 0.7},
-    "Galaxy / broadband": {"palette": "natural", "stretch": 0.12, "contrast": 4.0, "saturation": 1.4,
-                           "local_contrast": 0.4, "star_reduction": 0.2, "bg_degree": 2},
+    "Starless-ish": {"star_reduction": 0.8, "star_intensity": 0.45, "local_contrast": 1.0},
+    "Galaxy / broadband": {"palette": "natural", "stretch": 0.09, "contrast": 4.0, "saturation": 1.4,
+                           "local_contrast": 0.8, "star_reduction": 0.2, "bg_degree": 2},
     "Natural colour": {"palette": "natural", "saturation": 1.3, "scnr": 0.6},
-    "Deep & dark": {"stretch": 0.1, "black_point": 0.04, "contrast": 4.0, "local_contrast": 0.6},
+    "Deep & dark": {"stretch": 0.06, "black_point": 0.0, "contrast": 6.0, "local_contrast": 1.0},
 }
 
 

@@ -53,11 +53,17 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    sharpen (or Siril `makepsf` + Richardson-Lucy); NoiseXTerminator (or GraXpert denoise).
    `deconv_method = imagemm` runs ImageMM on the registered subs instead (needs `IMAGEMM=cuda`).
 6. **Stars** — StarXTerminator (or StarNet2) splits stars and starless images.
-7. **Auto-finish** — stretch target, star intensity, OIII boost, saturation and highlight protection
-   chosen from measured statistics; the report lists each decision.
-8. **Export** — statistical stretch of the starless image, GHS contrast, a second NoiseXTerminator
-   pass, asinh star stretch, screen recombination, HOO / Foraxx palettes for dual-band data, SCNR for
-   broadband, sRGB JPEG + 16-bit TIFF + a JSON sidecar listing every step and parameter.
+7. **Auto-finish** — sky level, GHS local intensity, star intensity, OIII normalisation strength,
+   saturation and local contrast chosen from measured statistics; the report lists each decision.
+8. **Export** — the starless image is denoised in the linear domain (starlet shrinkage with measured
+   per-scale noise, cold-pixel rejection), a second polynomial background pass flattens the sky, and
+   a Generalised Hyperbolic Stretch (Payne & Cranfield) with the black point at the sky and D / SP
+   solved so the sky sits at 0.085 and the nebula's 90th percentile at 0.6 ("stretch where the signal
+   is"); dual-band OIII is normalised to Ha on the stretched data (Blanshan / Cranfield), HOO /
+   Foraxx palettes, a second NoiseXTerminator pass, VeraLux-Revela local contrast on the structure
+   scales, asinh star stretch, screen recombination, SCNR for broadband, sRGB JPEG + 16-bit TIFF + a
+   JSON sidecar listing every step and parameter.  The outer 24 px of the stack are trimmed
+   (noisier rim).  The legacy statistical stretch stays available as `stretch_method` mtf / asinh / log.
 
 Which tool runs is decided at run time from the licences (`GET /api/tools`); the Linear panel in the
 UI says what will be used.

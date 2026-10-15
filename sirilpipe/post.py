@@ -53,13 +53,13 @@ DEFAULTS: dict = {
     "white_balance": "auto", "spcc_sensor": "auto", "spcc_filter": "auto", "spcc_white_ref": "average_spiral_galaxy",
     "denoise": 0.95, "deconvolution": 0.7, "restored_resolution": 1.0,
     # non-linear stage
-    "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.8,
-    "stretch_method": "ghs", "stretch": 0.16, "auto_stretch": True, "hdr": 0.6, "contrast": 2.0,
+    "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.5,
+    "stretch_method": "ghs", "stretch": 0.09, "auto_stretch": True, "hdr": 0.6, "contrast": 2.0,
     "color_preservation": 0.7,
     "star_separation": True, "star_removal": "auto", "star_reduction": 0.35, "star_intensity": 0.9,
     "star_saturation": 1.0, "halo_suppress": 0.6, "star_color_preservation": 0.5,
-    "saturation": 1.5, "chroma_denoise": 0.8, "luminance_denoise": 0.6, "oiii_unmix": True,
-    "local_contrast": 0.5, "scnr": 0.4, "black_point": 0.02, "brightness": 0.0, "sharpen": 0.25,
+    "saturation": 1.3, "chroma_denoise": 0.8, "luminance_denoise": 0.6, "oiii_unmix": True,
+    "local_contrast": 1.0, "scnr": 0.4, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.25,
     # colour grade: neutral; not applied by this backend
     "grade_amount": 1.0, "grade_temperature": 0.0, "grade_tint": 0.0, "grade_warm_hue": 0.0, "grade_warm_sat": 1.0,
     "grade_cool_hue": 0.0, "grade_cool_sat": 1.0, "grade_contrast": 0.0,
@@ -102,14 +102,14 @@ PARAM_SPEC: list[dict] = [
     _S("Linear", "spcc_white_ref", "Colour calibration: white reference", ["average_spiral_galaxy", "g2v"]),
     _R("Linear", "denoise", "Light denoise before stretch (NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
     _R("Linear", "deconvolution", "Deconvolution (BlurXTerminator, else Richardson-Lucy)", 0, 1, 0.05),
-    _S("Stretch", "stretch_method", "Stretch (ghs: statistical + GHS contrast; mtf, asinh, log)", ["ghs", "mtf", "asinh", "log"]),
-    _R("Stretch", "stretch", "Stretch (background level)", 0.04, 0.35, 0.01),
-    _B("Stretch", "auto_stretch", "Adapt stretch to target size"),
-    _R("Stretch", "hdr", "HDR (protect bright cores)", 0, 1.5, 0.05),
-    _R("Stretch", "contrast", "GHS focus (contrast)", -1, 10, 0.25),
+    _S("Stretch", "stretch_method", "Stretch (ghs: denoise + generalised hyperbolic stretch; mtf, asinh, log: statistical)", ["ghs", "mtf", "asinh", "log"]),
+    _R("Stretch", "stretch", "Sky level (ghs) / median target (statistical)", 0.04, 0.35, 0.01),
+    _B("Stretch", "auto_stretch", "Adapt statistical stretch to target size (not used by ghs)"),
+    _R("Stretch", "hdr", "HDR (protect bright cores; statistical stretch only)", 0, 1.5, 0.05),
+    _R("Stretch", "contrast", "GHS local intensity b (highest tried; the fit picks the highest that meets the sky / nebula levels)", 0.25, 13, 0.25),
     _R("Stretch", "color_preservation", "Colour-preserving stretch", 0, 1, 0.05),
     _S("Colour", "palette", "Palette", ["auto", "natural", "hoo", "foraxx", "hoo_warm"]),
-    _R("Colour", "oiii_boost", "OIII boost (dual-band)", 0.5, 3, 0.05),
+    _R("Colour", "oiii_boost", "OIII normalisation strength (1 = Blanshan / Cranfield equal level; applied after the stretch)", 0.5, 3, 0.05),
     _R("Colour", "synthetic_luminance", "Synthetic luminance (dual-band)", 0, 1, 0.05),
     _B("Colour", "oiii_unmix", "Remove Ha leakage from OIII"),
     _R("Colour", "saturation", "Saturation", 0.5, 3, 0.05),
@@ -122,8 +122,8 @@ PARAM_SPEC: list[dict] = [
     _R("Stars", "star_saturation", "Star colour", 0, 2.5, 0.05),
     _R("Stars", "star_color_preservation", "Star colour intensity (stretch)", 0, 1, 0.05),
     _R("Stars", "halo_suppress", "Halo suppression", 0, 1, 0.05),
-    _R("Detail", "luminance_denoise", "Noise reduction after the stretch (NoiseXTerminator / GraXpert)", 0, 1.5, 0.05),
-    _R("Detail", "local_contrast", "Local contrast (structures)", 0, 2, 0.05),
+    _R("Detail", "luminance_denoise", "Noise reduction (wavelet shrinkage before the stretch + NoiseXTerminator / GraXpert after; 0.6 = standard)", 0, 1.5, 0.05),
+    _R("Detail", "local_contrast", "Local contrast (Revela structure gain 1 + x on the signal)", 0, 2, 0.05),
     _R("Detail", "sharpen", "Final sharpening", 0, 1.5, 0.05),
     _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
     _R("Finish", "brightness", "Midtones", -1, 1, 0.05),
@@ -132,13 +132,13 @@ PARAM_SPEC: list[dict] = [
 # Same presets as before ("Balanced" = DEFAULTS); only keys that are still honoured matter.
 PRESETS: dict = {
     "Balanced": {},
-    "Vivid nebula": {"saturation": 2.0, "local_contrast": 0.8, "stretch": 0.18, "contrast": 3.0, "oiii_boost": 1.3,
+    "Vivid nebula": {"saturation": 1.8, "local_contrast": 1.4, "stretch": 0.09, "contrast": 4.0, "oiii_boost": 1.0,
                      "star_reduction": 0.5, "star_intensity": 0.8},
-    "Starless-ish": {"star_reduction": 0.8, "star_intensity": 0.45, "local_contrast": 0.7},
-    "Galaxy / broadband": {"palette": "natural", "stretch": 0.12, "contrast": 4.0, "saturation": 1.4,
-                           "local_contrast": 0.4, "star_reduction": 0.2, "bg_degree": 2},
+    "Starless-ish": {"star_reduction": 0.8, "star_intensity": 0.45, "local_contrast": 1.0},
+    "Galaxy / broadband": {"palette": "natural", "stretch": 0.09, "contrast": 4.0, "saturation": 1.4,
+                           "local_contrast": 0.8, "star_reduction": 0.2, "bg_degree": 2},
     "Natural colour": {"palette": "natural", "saturation": 1.3, "scnr": 0.6},
-    "Deep & dark": {"stretch": 0.1, "black_point": 0.04, "contrast": 4.0, "local_contrast": 0.6},
+    "Deep & dark": {"stretch": 0.06, "black_point": 0.0, "contrast": 6.0, "local_contrast": 1.0},
 }
 
 # Sensor / filter mapping for Siril's SPCC database (workflows.md 7.3, Naztronomy FILTER_COMMANDS_MAP).
@@ -752,6 +752,11 @@ class _Layers:
                 self.base = fitsio.read_rgb(sl)[0]
                 self.stars = fitsio.read_rgb(st)[0]
                 self.separate = True
+        e = finish.EDGE_CROP
+        if min(self.base.shape[1:]) > 8 * e:                  # the stack's outer rim: fewer dithered frames contribute, so it is noisier (and a wavelet / GraXpert artefact lives there)
+            self.base = np.ascontiguousarray(self.base[:, e:-e, e:-e])
+            if self.stars is not None:
+                self.stars = np.ascontiguousarray(self.stars[:, e:-e, e:-e])
         self.fwhm_px = float(_load_json(_p(session, "stack_meta.json")).get("fwhm_px") or 3.0)
         if max_side:
             self.fwhm_px *= min(1.0, max_side / max(self.base.shape[1:]))
@@ -837,27 +842,6 @@ class _ExportHooks:
         self.work, self.header, self.steps, self.sp, self.used = work, header, steps, sp, tag_tools
         self.gpu = _device_gpu(sp)
 
-    def contrast(self, img: np.ndarray, target: float, p: dict):
-        """GHS contrast pass: Siril ``ght`` around the sky level, then the sky median is put back to ``target``.
-        GHS (Payne / Cranfield): SP = symmetry point = where contrast is highest -> the stretched sky level;
-        B = local intensity = ``contrast``; D (the stretch factor) is small, the pass is a contrast move not a stretch."""
-        b = float(np.clip(p["contrast"], -1, 10))
-        d = round(0.25 + 0.15 * min(b, 6.0), 2)
-        sp_ = round(float(np.clip(target, 0.02, 0.9)), 3)
-        t0 = time.time()
-        body = f"ght -D={d} -B={b:.2f} -SP={sp_} -LP=0 -HP=1 -human"
-        try:
-            out, _ = _siril_image(self.work, self.steps, "ghs", img, self.header, body, "Stretching")
-        except SIRIL_FAILS as e:
-            self.steps.add("contrast", "siril ght", "failed", time.time() - t0, note=str(e).splitlines()[0])
-            return None
-        out = np.clip(out, 0, 1)
-        m = float(np.median(finish.sample(finish.luminance(out))))
-        if 0 < m < 1 and abs(m - target) > 0.003:                 # re-anchor the sky: one monotone midtones move
-            out = np.clip(finish.rational(out, m, target), 0, 1)
-        self.steps.add("contrast", "siril ght", seconds=time.time() - t0, D=d, B=b, SP=sp_, sky_after=round(m, 4))
-        return out
-
     def denoise(self, img: np.ndarray, p: dict):
         """Second noise pass on the stretched starless layer (the RC-Astro recommended place): NXT 0.8 when licensed,
         else GraXpert mild, else nothing (Siril's NL-Bayes would smear nebula detail at this point)."""
@@ -910,6 +894,21 @@ class _ExportHooks:
             return None
 
 
+def _record_numpy_steps(steps: _Steps, info: dict, p: dict) -> None:
+    """The render's numpy steps (denoise, background pass, GHS, narrowband normalisation) as records of the sidecar, with the numbers that drove them."""
+    g = info.get("ghs") or {}
+    if not g:
+        return
+    steps.add("denoise (linear)", "numpy starlet", amount=g.get("denoise"), noise_sigma=g.get("noise_sigma"), thresholds_k=list(finish.STARLET_K), cold_sigma=finish.COLD_SIGMA)
+    steps.add("background (second pass)", "numpy poly", degree=finish.FLATTEN_DEGREE, span=g.get("flatten_span"))
+    steps.add("stretch", "numpy ghs", sky_aim=float(p["stretch"]), nebula_aim=finish.NEBULA_AIM, anchors=g.get("anchors"), white=g.get("white"), sky_in=g.get("sky_in"),
+              nebula_in=g.get("nebula_in"), bright_in=g.get("bright_in"), signal_frac=g.get("signal_frac"), **{k: v for k, v in (g.get("ghs") or {}).items()})
+    pi = info.get("palette_info") or {}
+    if "nbn_strength" in pi:
+        steps.add("narrowband normalisation", "numpy nbn", oiii_boost=pi.get("oiii_boost"), midtones_strength=pi.get("nbn_strength"), ha_leak_k=pi.get("ha_leak_k"),
+                  noise_gain=pi.get("gain"))
+
+
 def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict | None = None, progress=None,
            checkpoint=None) -> dict:
     """The final render and the files: ``{"jpg", "tif", "json", "size"}`` (api-contract "Outputs")."""
@@ -928,8 +927,6 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
     sp = (meta.get("params") or {}) if isinstance(meta, dict) else {}
     hooks_obj = _ExportHooks(work, layers.header, steps, sp, {})
     hooks = {"denoise": hooks_obj.denoise, "final_color": hooks_obj.final_color}
-    if str(p["stretch_method"]) == "ghs":
-        hooks["contrast"] = hooks_obj.contrast
 
     def tick(name):
         steps.sub(msg=f"Stretching ({name.lower()})")
@@ -937,6 +934,7 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
     t0 = time.time()
     img, info = _render(layers, p, dual, fast=False, hooks=hooks, tick=tick, work=work, sp=sp, steps=steps)
     info["render_seconds"] = round(time.time() - t0, 1)
+    _record_numpy_steps(steps, info, p)
     steps.begin("Exporting")
     disp = export_mod.display_image(img, export_mod.bottom_up(layers.header))
     lum = finish.sample(finish.luminance(layers.base))
