@@ -261,6 +261,36 @@ def calibrate_script(unit: Unit, debayer: bool, force: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _plane_ratio(pl, row_med=15):
+    """Row-profile std / white-noise expectation of one 2-D plane over its central half of columns (see ``row_banding_ratio``)."""
+    import numpy as np
+    from scipy.ndimage import median_filter
+    pl = np.asarray(pl, dtype=np.float64)
+    w = pl.shape[1]
+    pl = pl[:, w // 8: w // 8 + w // 2]
+    dd = np.diff(pl, axis=1)
+    sig = 1.4826 * np.median(np.abs(dd - np.median(dd))) / math.sqrt(2)
+    prof = np.median(pl, axis=1)
+    hp = prof - median_filter(prof, size=row_med, mode="nearest")
+    return float(hp.std() / (1.2533 * sig / math.sqrt(pl.shape[1]))) if sig > 0 else None
+
+
+def banding_gate(ratios: list, n_rows: int) -> dict:
+    """Mean ratio against ``needed`` = 1 + BANDING_SIGMAS standard errors (1 / sqrt(2 n_rows)) of the estimate."""
+    ratios = [r for r in ratios if r is not None]
+    if not ratios:
+        return {"ratio": None, "needed": None, "banded": False}
+    r = float(sum(ratios) / len(ratios))
+    needed = 1.0 + BANDING_SIGMAS / math.sqrt(2 * n_rows)
+    return {"ratio": round(r, 3), "needed": round(needed, 3), "banded": r > needed}
+
+
+def image_banding_ratio(arr) -> dict:
+    """Row banding of a finished-chain image ``(3, H, W)`` or ``(H, W)``: the same measure as ``row_banding_ratio`` per channel, mean over channels."""
+    planes = [arr] if arr.ndim == 2 else list(arr)
+    return banding_gate([_plane_ratio(p) for p in planes], planes[0].shape[0])
+
+
 def row_banding_ratio(paths: list[str], pattern: str = "RGGB") -> dict:
     """Row banding of calibrated CFA subs, relative to the pixel noise.  Per Bayer plane: the clipped (median) row profile over the central half of
     the columns, high-passed with a 15-row median (keeps stripes a few px apart, drops the gradient), its std divided by the white-noise expectation
@@ -268,7 +298,6 @@ def row_banding_ratio(paths: list[str], pattern: str = "RGGB") -> dict:
     row noise; the estimate's own standard error is 1 / sqrt(2 n_rows), so ``needed`` = 1 + BANDING_SIGMAS standard errors."""
     import numpy as np
     from astropy.io import fits
-    from scipy.ndimage import median_filter
     ratios, n_rows = [], 0
     step = max(1, len(paths) // BANDING_SAMPLE)
     for p in paths[::step][:BANDING_SAMPLE]:
@@ -279,22 +308,16 @@ def row_banding_ratio(paths: list[str], pattern: str = "RGGB") -> dict:
             continue
         if d.ndim != 2:
             continue
-        w = d.shape[1]
         for oy in (0, 1):
             for ox in (0, 1):
-                pl = d[oy::2, ox::2][:, w // 8: w // 8 + w // 2]
-                dd = np.diff(pl, axis=1)
-                sig = 1.4826 * np.median(np.abs(dd - np.median(dd))) / math.sqrt(2)
-                prof = np.median(pl, axis=1)
-                hp = prof - median_filter(prof, size=15, mode="nearest")
-                if sig > 0:
-                    ratios.append(float(hp.std() / (1.2533 * sig / math.sqrt(pl.shape[1]))))
+                pl = d[oy::2, ox::2]
+                ratios.append(_plane_ratio(pl))
                 n_rows = pl.shape[0]
-    if not ratios:
+    if not [r for r in ratios if r is not None]:
         return {"ratio": None, "needed": None, "banded": False}
-    r = float(np.mean(ratios))
-    needed = 1.0 + BANDING_SIGMAS / math.sqrt(2 * n_rows)
-    return {"ratio": round(r, 3), "needed": round(needed, 3), "banded": r > needed, "n_subs": len(ratios) // 4}
+    g = banding_gate(ratios, n_rows)
+    g["n_subs"] = len(ratios) // 4
+    return g
 
 
 def banding_split_script(unit: Unit, seq: str) -> str:

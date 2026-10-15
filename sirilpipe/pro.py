@@ -41,7 +41,7 @@ import time
 import cv2
 import numpy as np
 
-from . import config, export as export_mod, finish, fitsio, nbn, tools
+from . import config, export as export_mod, finish, fitsio, nbn, tools, workflow
 from .siril import SirilError, SirilRunner
 from .tools import ToolError, ToolUnavailable
 from .util import Cancelled
@@ -315,12 +315,38 @@ class Finisher:
                     source="Siril SPCC -bgtol / PixInsight BackgroundNeutralization: per-channel offsets so that the sky has equal levels (no gains); needed because the stretch's slope at the sky is hundreds")
         return out
 
+    # ---- 0b. banding (second line of defence) --------------------------------------------------------------------------------
+    def banding(self, arr: np.ndarray, where: str, linear: bool) -> np.ndarray:
+        """Siril ``fixbanding 1 1`` on the whole image, only when the row-banding ratio (workflow.image_banding_ratio: row-profile std over the white-noise expectation) trips the
+        same gate as the sub-level pass.  Siril docs (https://siril.readthedocs.io/en/stable/Commands.html#fixbanding): "Tries to remove the horizontal or vertical banding in the loaded
+        image ... Values of 1 and 1 are often good enough" (community practice on stacks too).  Run on the linear starless image before the stretch (which multiplies the stripes by its slope
+        at the sky) and on the stretched starless after the denoise (a denoiser keeps row-correlated structure while it removes the white noise, so the stripes can emerge there)."""
+        name = f"banding ({where})"
+        before = workflow.image_banding_ratio(arr)
+        if not before["banded"]:
+            self.record(name, "none", None, status="skipped", note="row banding below the gate", params={"ratio": before["ratio"], "needed": before["needed"]})
+            return arr
+        t0 = time.time()
+        line = f"fixbanding {workflow.BANDING_AMOUNT:g} {workflow.BANDING_SIGMA:g}"
+        out = self.siril("bnd", arr, [line], "Banding")
+        after = workflow.image_banding_ratio(out)
+        if not (after["ratio"] is not None and after["ratio"] < before["ratio"]):
+            # measured, not assumed: on the stretched IC 1805 starless the tool raised the ratio (2.35 -> 2.70: its sigma-1 highlight protection acts on a non-linear noise level)
+            self.record(name, "siril fixbanding", None, status="skipped", commands=[line], seconds=time.time() - t0,
+                        note="fixbanding did not lower the measured ratio: result discarded",
+                        params={"ratio_before": before["ratio"], "ratio_after": after["ratio"], "needed": before["needed"]})
+            return arr
+        self.record(name, "siril fixbanding", out, commands=[line], seconds=time.time() - t0, linear=linear,
+                    params={"ratio_before": before["ratio"], "ratio_after": after["ratio"], "needed": before["needed"]},
+                    source="Siril docs, fixbanding: amount 1, sigma 1 'often good enough'; gated by the measured row ratio > 1 + 5/sqrt(2 n_rows)")
+        return out
+
     # ---- 1. stretch -----------------------------------------------------------------------------------------------------
     def stretch(self, base: np.ndarray) -> np.ndarray:
         method = str(self.p.get("stretch_method", "ghs2"))
         method = "ghs2" if method == "ghs" else method
         self._say("Stretching")
-        base = self.neutralise(self.colour_gradient(base))
+        base = self.banding(self.neutralise(self.colour_gradient(base)), "linear starless", True)
         if method == "statstretch":
             return self._stretch_stat(base)
         if method in ALT_METHODS:
@@ -674,6 +700,7 @@ class Finisher:
         s = self.stretch(base)
         s = self.highlights(s)
         s = self.denoise(s)
+        s = self.banding(s, "stretched starless", False)
         s = self.colour(s)
         s = self.local_contrast(s)
         s = self.saturation(s)
