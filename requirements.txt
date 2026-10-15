@@ -7,6 +7,8 @@ pillow>=10.0
 tifffile>=2024.1
 # astrophoto/ (ImageMM stage only): sep
 sep>=1.4
+astroalign>=2.5
+pyvo>=1.5
 # Web UI
 fastapi>=0.110
 uvicorn[standard]>=0.29

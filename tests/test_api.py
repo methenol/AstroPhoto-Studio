@@ -573,7 +573,9 @@ def test_ui_pages(env):
     c = env.client
     r = c.get("/")
     assert r.status_code == 200 and "AstroPhoto" in r.text and "tools.js" in r.text
-    assert "explore.js" not in r.text and "lab.js" not in r.text and 'data-tab="lab"' not in r.text
+    assert "explore.js" in r.text and 'data-tab="explore"' in r.text and 'id="tab-explore"' in r.text
+    assert "lab.js" not in r.text and 'data-tab="lab"' not in r.text
+    assert c.get("/static/explore.js").status_code == 200
     assert c.get("/static/app.js").status_code == 200 and c.get("/static/tools.js").status_code == 200
     assert c.get("/static/lab.js").status_code == 404
 
@@ -709,14 +711,77 @@ def test_diagnostic_logs_and_autofinish(env):
     assert set(c.get("/api/linear_info", params={"folder": folder}).json()) == {"restore", "starnet"}
 
 
-def test_lab_and_explore_removed(env):
+def test_lab_removed(env):
     c = env.client
     assert c.get("/api/lab/best").json() == {"studies": []}
     for method, path in (("get", "/api/lab/tasks"), ("get", "/api/lab/studies"), ("post", "/api/lab/studies"),
-                         ("delete", "/api/lab/studies/x"), ("get", "/api/explore/status"), ("post", "/api/explore/solve"),
-                         ("post", "/api/explore/data")):
+                         ("delete", "/api/lab/studies/x")):
         r = getattr(c, method)(path)
         assert r.status_code == 410 and "removed" in r.json()["detail"], path
+
+
+class FakeAstrometry:
+    """Stands in for astrophoto.astrometry: no network, no solver."""
+    solved: set = set()
+
+    @staticmethod
+    def solve_session(sess, gmax=16.0, progress=None):
+        for i, m in enumerate(("Detecting stars", "Querying Gaia DR3")):
+            progress(i, 2, m)
+            time.sleep(0.05)
+        if getattr(sess, "fail_solve", False):
+            raise RuntimeError("no consistent star pattern")
+        FakeAstrometry.solved.add(sess.dir)
+
+    @staticmethod
+    def load_solution(sess):
+        if sess.dir not in FakeAstrometry.solved:
+            return None
+        return {"n_matched": 120, "rms_arcsec": 0.4, "scale_arcsec": 1.8, "depth_g": 17.5, "solved": "now",
+                "center": [83.8, -5.4], "shape": [6, 9]}
+
+    @staticmethod
+    def annotate(sess, info, shape):
+        return {"W": shape[1], "H": shape[0], "field": {}, "stars": {"x": [1.0]}, "objects": [], "grid": [],
+                "lookup": {}, "categories": {}, "_info": info}
+
+
+def _wait_explore(c, folder, timeout=5):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = c.get("/api/explore/status", params={"folder": folder}).json()
+        if st["state"] != "running":
+            return st
+        time.sleep(0.05)
+    raise AssertionError("explore solve did not finish")
+
+
+def test_explore_routes(env, monkeypatch):
+    import astrophoto
+    monkeypatch.setattr(astrophoto, "astrometry", FakeAstrometry, raising=False)
+    monkeypatch.setitem(sys.modules, "astrophoto.astrometry", FakeAstrometry)
+    FakeAstrometry.solved.clear()
+    server.EXPLORE.clear()
+    c = env.client
+    folder = os.path.join(env.images, "M 42", "night1")
+    st = c.get("/api/explore/status", params={"folder": folder}).json()
+    assert st["state"] == "idle" and st["solved"] is False
+    assert c.post("/api/explore/solve", json={"folder": folder}).status_code == 400      # not stacked yet
+    assert c.post("/api/explore/data", json={"folder": folder}).status_code == 400
+    sess = server.get_session(folder)
+    open(os.path.join(sess.dir, "stack.fits"), "wb").write(b"x")
+    r = c.post("/api/explore/solve", json={"folder": folder}).json()
+    assert r["state"] == "running"
+    st = _wait_explore(c, folder)
+    assert st["state"] == "done" and st["solved"] is True and st["solution"]["n_matched"] == 120
+    d = c.post("/api/explore/data", json={"folder": folder}).json()
+    assert (d["W"], d["H"]) == (9, 6) and d["stars"]["x"] == [1.0]
+    # a failure is reported, not raised
+    server.EXPLORE.clear(); FakeAstrometry.solved.clear(); sess.fail_solve = True
+    c.post("/api/explore/solve", json={"folder": folder})
+    st = _wait_explore(c, folder)
+    assert st["state"] == "error" and "no consistent star pattern" in st["message"] and st["solved"] is False
+    assert c.get("/api/explore/status", params={"folder": "/nope"}).status_code == 404
 
 
 # --------------------------------------------------------------------------- tools

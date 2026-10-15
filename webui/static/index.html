@@ -84,6 +84,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="process">Process</button>
       <button class="tab" data-tab="frames">Frames <span id="framesCount" class="pill"></span></button>
+      <button class="tab" data-tab="explore">Explore</button>
       <button class="tab" data-tab="export">Export</button>
       <button class="tab" data-tab="diag">Diagnostics</button>
       <button class="tab" data-tab="jobs">Jobs <span id="jobsCount" class="pill" hidden></span></button>
@@ -156,6 +157,51 @@
       </div>
     </section>
 
+    <!-- EXPLORE -->
+    <section class="tabpane" id="tab-explore">
+      <div class="explore">
+        <div class="viewer">
+          <div class="viewer-toolbar">
+            <div class="seg" id="exMode">
+              <button class="segbtn active" data-exmode="overlay">Overlay</button>
+              <button class="segbtn" data-exmode="side">Side by side</button>
+              <button class="segbtn" data-exmode="chart">Star map</button>
+            </div>
+            <div class="seg">
+              <button class="segbtn" id="exFit">Fit</button>
+              <select id="exSize" title="image resolution"><option value="1400">Fast</option><option value="2400" selected>Detailed</option><option value="full">Full resolution</option></select>
+            </div>
+            <label class="small muted exrange" title="Opacity of the markers drawn over the image">Markers <input id="exOpacity" type="range" min="0" max="1" step="0.05" value="0.85"></label>
+            <label class="small muted exrange" title="Faintest Gaia star drawn (G magnitude)">Stars to G <input id="exMag" type="range" min="6" max="16" step="0.5" value="13"><output id="exMagOut">13</output></label>
+            <span id="exCursor" class="muted small excursor"></span>
+          </div>
+          <div class="exstage" id="exStage">
+            <canvas id="exImg"></canvas>
+            <canvas id="exChart" hidden></canvas>
+            <div class="placeholder" id="exPlaceholder">
+              <div class="ph-inner">
+                <div class="big">✦</div>
+                <p id="exPhText">Stack a dataset, then plate-solve it to explore what else is in the image.</p>
+                <button class="btn primary" id="exSolve" hidden>Identify objects in this image</button>
+                <p class="muted small" id="exSolveNote" hidden>Matches the stars against Gaia DR3 to find exactly where the image points, then
+                  looks up every catalogued object in the field in SIMBAD (internet connection needed once; the results are cached).</p>
+              </div>
+            </div>
+            <div class="spinner" id="exSpinner" hidden></div>
+            <div class="expop" id="exPop" hidden></div>
+          </div>
+        </div>
+        <aside class="expanel">
+          <div class="card" id="exField"><h3>Field</h3><div class="muted small">Not solved yet.</div></div>
+          <div class="card"><h3>Layers</h3><div id="exLayers" class="exlayers"></div></div>
+          <div class="card grow"><h3>In this image</h3>
+            <input id="exSearch" type="text" placeholder="Search names, types…">
+            <div id="exList" class="exlist"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
     <!-- EXPORT -->
     <section class="tabpane" id="tab-export">
       <div class="export-grid">
@@ -197,6 +243,7 @@
 <div id="toast" class="toast" hidden></div>
 <script src="/static/app.js"></script>
 <script src="/static/tools.js"></script>
+<script src="/static/explore.js"></script>
 <script src="/static/jobs.js"></script>
 </body>
 </html>

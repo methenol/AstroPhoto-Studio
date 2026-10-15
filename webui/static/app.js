@@ -138,6 +138,7 @@ async function openDataset(folder) {
     const r = await api("/api/open", { method: "POST", body: { folder } });
     folder = r.status.folder || folder;          // the server's canonical form (sorted, absolute)
     S.folder = folder; store.set("lastFolder", folder);
+    if (typeof Explore !== "undefined") Explore.reset();
     S.status = r.status; S.frames = r.frames;
     S.params = { ...currentDefaults(), ...store.get("params:" + folder, {}) };
     applyParamsToUI();
@@ -627,6 +628,7 @@ function switchTab(name) {
   if (name === "process") setTimeout(fitView, 50);
   if (name === "diag") refreshDiag();
   if (name === "jobs") Jobs.show();
+  if (name === "explore") setTimeout(() => Explore.show(), 30);
 }
 
 /* ------------------------------------------------------------ bindings */

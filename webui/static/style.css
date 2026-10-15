@@ -251,3 +251,41 @@ details.adv label input[type=text] { width: 160px; }
 .tool table { table-layout: fixed; }
 .tool td:first-child { width: 34%; }
 .tool td:last-child { width: 25%; text-align: right; }
+
+/* explore */
+.explore { flex: 1; display: grid; grid-template-columns: 1fr 330px; min-height: 0; }
+.exstage { position: relative; flex: 1; display: flex; background: #05070a; overflow: hidden; min-height: 0; }
+.exstage canvas { flex: 1; min-width: 0; height: 100%; display: block; cursor: crosshair; }
+.exstage canvas[hidden] { display: none; }
+.exstage canvas + canvas { border-left: 1px solid var(--line); }
+.exrange { display: flex; align-items: center; gap: 6px; }
+.exrange input { width: 90px; }
+.excursor { margin-left: auto; font-variant-numeric: tabular-nums; }
+.expanel { border-left: 1px solid var(--line); overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.expanel .card.grow { flex: 1; min-height: 240px; display: flex; flex-direction: column; }
+.exlayers { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
+.exlayers label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.exlayers .sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.exlayers .n { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.exlist { overflow-y: auto; margin-top: 8px; flex: 1; font-size: 12.5px; }
+.exlist .it { padding: 5px 6px; border-radius: 6px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+.exlist .it:hover, .exlist .it.sel { background: #1c2438; }
+.exlist .it b { font-weight: 500; }
+.exlist .it span { color: var(--muted); font-size: 11.5px; margin-left: auto; white-space: nowrap; }
+.exlist h5 { margin: 10px 0 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.expop { position: absolute; z-index: 5; max-width: 340px; background: #141b2bf2; border: 1px solid #34405c; border-radius: 10px;
+  padding: 10px 12px; font-size: 12.5px; box-shadow: 0 10px 30px #000a; pointer-events: none; }
+.expop.pinned { pointer-events: auto; }
+.expop h4 { margin: 0 0 2px; font-size: 14px; }
+.expop .ty { color: var(--accent2); font-size: 12px; margin-bottom: 6px; }
+.expop .note { color: #c5cddc; margin: 6px 0; line-height: 1.4; }
+.expop .kv { margin-top: 4px; }
+.expop a { color: var(--accent2); }
+.expop .close { position: absolute; right: 8px; top: 6px; cursor: pointer; color: var(--muted); }
+.exfield { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 12.5px; }
+.exfield span { color: var(--muted); }
+@media (max-width: 1100px) {
+  .explore { grid-template-columns: 1fr; }
+  .exstage { min-height: 60vh; }
+}
+

@@ -34,6 +34,7 @@ sys.path.insert(0, ROOT)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from sirilpipe import __version__  # noqa: E402
+from sirilpipe import finish as finish_mod  # noqa: E402
 from sirilpipe import tools as tools_mod  # noqa: E402
 from sirilpipe.post import DEFAULTS, PARAM_SPEC  # noqa: E402
 from sirilpipe.session import Cancelled, Session  # noqa: E402
@@ -1102,7 +1103,7 @@ def lab_best():
     return {"studies": []}
 
 
-_GONE = "The Experiments and Explore features were removed with the move to the Siril backend."
+_GONE = "The Experiments feature was removed with the move to the Siril backend."
 
 
 @app.api_route("/api/lab/{rest:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
@@ -1110,9 +1111,64 @@ def lab_gone(rest: str):
     return JSONResponse({"detail": _GONE}, status_code=410)
 
 
-@app.api_route("/api/explore/{rest:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
-def explore_gone(rest: str):
-    return JSONResponse({"detail": _GONE}, status_code=410)
+# ------------------------------------------------------------------ explore (plate solve + Gaia / SIMBAD annotation)
+
+EXPLORE: dict[str, dict] = {}       # session dir -> {"state": running|done|error, "message", "progress"}
+
+
+def _solve_thread(s: Session, gmax: float):
+    from astrophoto import astrometry
+    st = EXPLORE[s.dir]
+
+    def progress(i, n, msg):
+        st["message"] = msg
+        st["progress"] = i / max(n, 1)
+    try:
+        astrometry.solve_session(s, gmax=gmax, progress=progress)
+        st.update(state="done", message="Solved", progress=1.0)
+    except Exception as e:
+        st.update(state="error", message=f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
+
+
+@app.post("/api/explore/solve")
+def explore_solve(body: dict = Body(...)):
+    s = get_session(body["folder"])
+    if not _ui_status(s)["stacked"]:
+        raise HTTPException(400, "Stack the dataset first")
+    cur = EXPLORE.get(s.dir)
+    if cur and cur["state"] == "running":
+        return cur
+    EXPLORE[s.dir] = {"state": "running", "message": "Starting", "progress": 0.0}
+    threading.Thread(target=_solve_thread, args=(s, float(body.get("gmax", 16.0))), daemon=True).start()
+    return EXPLORE[s.dir]
+
+
+@app.get("/api/explore/status")
+def explore_status(folder: str):
+    from astrophoto import astrometry
+    s = get_session(folder)
+    st = dict(EXPLORE.get(s.dir) or {"state": "idle"})
+    sol = astrometry.load_solution(s) if _ui_status(s)["stacked"] else None
+    st["solved"] = sol is not None
+    if sol is not None:
+        st["solution"] = {k: sol.get(k) for k in ("n_matched", "rms_arcsec", "scale_arcsec", "depth_g", "solved", "center")}
+    return clean_json(st)
+
+
+@app.post("/api/explore/data")
+def explore_data(body: dict = Body(...)):
+    from astrophoto import astrometry
+    s = get_session(body["folder"])
+    sol = astrometry.load_solution(s) if _ui_status(s)["stacked"] else None
+    if sol is None:
+        raise HTTPException(400, "not solved")
+    try:
+        h, w = (int(v) for v in sol["shape"])
+        e = finish_mod.EDGE_CROP     # the render trims this rim from the stack (post._Layers): the view is that crop
+        info = {"crop": [e, h - e, e, w - e]} if min(h, w) > 8 * e else {}
+        return JSONResponse(clean_json(astrometry.annotate(s, info, (h, w))))
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
 
 
 # the programmatic API for other programs: /api/v1.  It is given this module
