@@ -50,3 +50,26 @@ def test_run_writes_report_with_a_measurement_per_decision(session):
         assert s["why"] and "to" in s and "from" in s
     assert {"stretch", "hdr", "luminance_denoise", "saturation", "star_reduction"} <= {s["step"] for s in rep["steps"]}
     assert rep["class"].startswith("broadband")
+
+
+def test_run_references_only_defined_names():
+    """Every global name used in autofinish.run must exist at import time (a NameError here reached production once)."""
+    import ast
+    import sirilpipe.autofinish as af
+    src = ast.parse(open(af.__file__).read())
+    fn = next(n for n in src.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    local = {a.arg for a in fn.args.args} | {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    local |= {n.name for n in ast.walk(fn) if isinstance(n, (ast.FunctionDef, ast.Import, ast.ImportFrom))}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.ImportFrom):
+            local |= {a.asname or a.name for a in n.names}
+        if isinstance(n, ast.Import):
+            local |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        if isinstance(n, ast.comprehension):
+            local |= {x.id for x in ast.walk(n.target) if isinstance(x, ast.Name)}
+        if isinstance(n, ast.ExceptHandler) and n.name:
+            local.add(n.name)
+    import builtins
+    used = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    missing = sorted(u for u in used if u not in local and not hasattr(af, u) and not hasattr(builtins, u))
+    assert not missing, missing

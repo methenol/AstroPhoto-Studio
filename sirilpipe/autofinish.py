@@ -51,8 +51,10 @@ STATS_SIDE = 1200
 
 
 GHS_D2_SMALL, GHS_D2_FILLING = 2.5, 1.5      # second GHS pass D by subject coverage (measured 2026-10-15; see autofinish.run)
-SATU_BROADBAND_MAX = 0.3
-SATU_CANDIDATES = (0.25, 0.3, 0.5)                 # Siril tutorial satu values                     # satu amount cap for broadband (Siril tutorial 0.25-0.5; the middle value keeps SPCC's calibration)
+SATU_BROADBAND_MAX = 0.3                     # satu amount cap for broadband (Siril tutorial 0.25-0.5; the middle value keeps SPCC's calibration)
+SATU_CANDIDATES = (0.25, 0.3, 0.5)           # Siril tutorial satu values
+HDR_DUAL_DEFAULT = 0.5                       # GHS HP protection at half strength on dual-band nebulae (see run)
+STAR_BOOST_BROADBAND_MAX = 1.2               # colour boost 1.5 made M 31's faint stars green / magenta (chroma noise); 1.2 at most on broadband
 
 
 def star_settings(per_mp: float) -> tuple[float, str]:
