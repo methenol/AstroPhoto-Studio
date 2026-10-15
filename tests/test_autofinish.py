@@ -61,6 +61,9 @@ def test_run_references_only_defined_names():
     local = {a.arg for a in fn.args.args} | {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
     local |= {n.name for n in ast.walk(fn) if isinstance(n, ast.FunctionDef)}
     for n in ast.walk(fn):
+        if isinstance(n, (ast.FunctionDef, ast.Lambda)):
+            local |= {a.arg for a in n.args.args + n.args.kwonlyargs} | {a.arg for a in (n.args.vararg, n.args.kwarg) if a}
+    for n in ast.walk(fn):
         if isinstance(n, ast.ImportFrom):
             local |= {a.asname or a.name for a in n.names}
         if isinstance(n, ast.Import):
