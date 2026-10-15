@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "analyse":
         print(s.run_analysis(float(sp.get("sensitivity", 1.0)), prog))
     elif args.cmd == "stack":
-        s.run_analysis(float(sp.get("sensitivity", 1.0)), prog)
+        s.run_analysis(float(sp.get("sensitivity", 1.0)), prog, sp)
         meta = s.run_stack(sp, prog)
         if not args.no_solve:
             s.plate_solve(prog)

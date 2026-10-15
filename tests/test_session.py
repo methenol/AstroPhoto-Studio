@@ -35,6 +35,16 @@ class FakeRunner:
         if stage.startswith("calibrate"):
             for e in expect:
                 touch(e)
+        elif stage.startswith("banding_merge"):                     # one merged mosaic per sub (the real seqmerge_cfa output names)
+            import re
+            from astropy.io import fits
+            last = expect[0]
+            m = re.match(r"(.*_)(\d{5})\.fit$", last)
+            for i in range(1, int(m.group(2)) + 1):
+                fits.PrimaryHDU(np.zeros((2, 2), np.float32)).writeto(f"{m.group(1)}{i:05d}.fit", overwrite=True)
+        elif stage.startswith("banding"):
+            for e in expect:
+                touch(e)
         elif stage == "register":
             shutil.copy(os.path.join(FIX, "siril_registered_all.seq"), os.path.join(w, "light_.seq"))
         elif stage == "apply_registration":
@@ -227,3 +237,23 @@ def test_local_copy_copies_and_cleans(session, monkeypatch, tmp_path):
         assert s._local and all(os.path.exists(p) for p in s._local.values())
         assert msgs[-1].startswith("Copying the subs to the local disk (12/12")
     assert session._local == {} and not any(os.path.isdir(p) for p in (tmp_path / "local").glob("*") if any(p.iterdir()))
+
+
+def test_banding_stage_runs_only_when_measured(session, monkeypatch):
+    """Calibrated CFA subs are measured (workflow.row_banding_ratio); the Siril banding stages run only above the threshold and are recorded."""
+    from sirilpipe import workflow
+    monkeypatch.setattr(workflow, "row_banding_ratio", lambda paths, pattern="RGGB": {"ratio": 1.36, "needed": 1.1, "banded": True, "n_subs": 8})
+    session.run_analysis(1.0)
+    stages = [s for s, _ in FakeRunner.log]
+    assert stages.index("calibrate_1") < stages.index("banding_split_1") < stages.index("banding_fix_1") < stages.index("banding_merge_1") < stages.index("register")
+    assert "seqfixbanding CFA3_light 1 1" in dict(FakeRunner.log)["banding_fix_1"]
+    st = json.load(open(os.path.join(session.process, "state.json")))
+    assert st["banding"]["applied"] is True and st["banding"]["amount"] == 1.0 and st["banding"]["measured"][0]["ratio"] == 1.36
+    assert st["signature"]["banding"][:2] == [1.0, 1.0]
+    meta = session.run_stack({})
+    assert meta["banding"]["applied"] is True
+    # not banded: no Siril banding stage
+    FakeRunner.log.clear()
+    monkeypatch.setattr(workflow, "row_banding_ratio", lambda paths, pattern="RGGB": {"ratio": 0.98, "needed": 1.1, "banded": False, "n_subs": 8})
+    session.run_stack({"pattern_correction": False})
+    assert not [s for s, _ in FakeRunner.log if s.startswith("banding")]

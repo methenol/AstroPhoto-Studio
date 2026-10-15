@@ -165,3 +165,31 @@ def test_every_community_constant_has_a_source_comment():
     for token in ("REGISTER_ARGS", "ROUNDNESS_K", "DRIZZLE_1X", "DRIZZLE_2X", "KEEP_PERCENT", "FASTNORM_FRAMES"):
         i = src.index(token + " =") if token + " =" in src else src.index(token)
         assert "#" in src[max(0, i - 400):i + 200], token
+
+
+def test_banding_scripts_split_fix_merge(tmp_path):
+    u = _unit(tmp_path, {"dark": "/d.fit"})
+    assert w.banding_split_script(u, "pp_light") == f"cd {u.dir}\nseqsplit_cfa pp_light\n"
+    fix = w.banding_fix_script(u, "pp_light").splitlines()
+    # Siril docs: "Values of 1 and 1 are often good enough"; one seqfixbanding per Bayer plane (1.4.4 has no -cfa)
+    assert fix[1:] == [f"seqfixbanding CFA{k}_pp_light 1 1" for k in range(4)]
+    mrg = w.banding_merge_script(u, "pp_light", "rggb").splitlines()[1]
+    assert mrg == "seqmerge_cfa unband_CFA0_pp_light unband_CFA1_pp_light unband_CFA2_pp_light unband_CFA3_pp_light RGGB"
+    assert w.BANDING_AMOUNT == 1.0 and w.BANDING_SIGMA == 1.0
+
+
+def test_banding_install_restores_filter_and_replaces_links(tmp_path):
+    import numpy as np
+    from astropy.io import fits
+    d = str(tmp_path)
+    raw = os.path.join(d, "raw.fit")
+    fits.PrimaryHDU(np.zeros((4, 4), np.float32), header=fits.Header({"FILTER": "Duo-Band"})).writeto(raw)
+    os.symlink(raw, os.path.join(d, "light_00001.fit"))                  # lights-only sets: the sequence links to the raw sub
+    fits.PrimaryHDU(np.ones((4, 4), np.float32), header=fits.Header({"FILTER": "Duo-Band_CFA0"})).writeto(os.path.join(d, "mCFA_unband_CFA0_light_00001.fit"))
+    open(os.path.join(d, "mCFA_unband_CFA0_light_.seq"), "w").close()
+    assert w.banding_install(d, "light") == 1
+    assert not os.path.islink(os.path.join(d, "light_00001.fit"))
+    assert fits.getheader(os.path.join(d, "light_00001.fit"))["FILTER"] == "Duo-Band"
+    assert fits.getdata(raw).max() == 0                                   # the raw sub is never written
+    w.banding_cleanup(d, "light", ("mCFA_unband_CFA",))
+    assert not os.path.exists(os.path.join(d, "mCFA_unband_CFA0_light_.seq"))

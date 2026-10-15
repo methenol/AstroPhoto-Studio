@@ -9,6 +9,7 @@ Pipeline (one ``siril-cli`` per stage; commands verified on Siril 1.4.4, see sir
 
     link light            symlinks of the selected subs only (``failed_*`` etc. never reach Siril)
     calibrate light ...   dark/flat when matched, ``-cfa``: keep the Bayer mosaic (Bayer drizzle)
+    [banding]             measured row noise > threshold: seqsplit_cfa, seqfixbanding 1 1 per Bayer plane, seqmerge_cfa (see BANDING_*)
     [merge]               several nights / exposure groups -> one sequence, one registration
     register -2pass       transforms + best reference + per-frame fwhm/wfwhm/roundness/nbstars
     unselect ...          frames our rules (frames.json "included") exclude
@@ -40,6 +41,19 @@ DRIZZLE_1X = {"scale": 1.0, "pixfrac": 1.0, "kernel": "square"}
 DRIZZLE_2X = {"scale": 2.0, "pixfrac": 0.5, "kernel": "square"}   # pixfrac ~ 1/scale (Siril drizzle docs)
 DRIZZLE2_MIN_FRAMES = 100
 DRIZZLE2_MAX_FWHM = 2.0
+# Banding (CMOS row noise): Siril's own tool, run on the calibrated CFA subs BEFORE registration, where the pattern still lies along the sensor rows
+# (after the 0-2 degree field rotation of an alt-az mount and the drizzle it is smeared into the stack and cannot be removed any more).  Siril docs
+# (https://siril.readthedocs.io/en/stable/Commands.html#fixbanding): "amount defines the amount of correction, between 0 and 4. sigma defines the
+# highlight protection level of the algorithm ... between 0 and 5. Values of 1 and 1 are often good enough"; `seqfixbanding` is the sequence form
+# (output prefix unband_).  Siril 1.4.4 has no -cfa option: on the raw mosaic the row medians of R/G and G/B rows are equalised (plane medians moved
+# by 40-70 % on IC 1805), so the mosaic is split into its four Bayer planes (seqsplit_cfa), each plane is de-banded, and seqmerge_cfa rebuilds the
+# mosaic (Siril docs: "applying some processing to the individual Bayer subchannels prior to demosaicing").
+BANDING_AMOUNT = 1.0
+BANDING_SIGMA = 1.0
+BANDING_SIGMAS = 5.0         # a stage is only run when the measured row-banding excess is > 5 standard errors of the estimate (see row_banding_ratio)
+BANDING_SAMPLE = 8           # subs measured
+BANDING_PATTERNS = ("RGGB", "BGGR", "GRBG", "GBRG")     # seqmerge_cfa's accepted patterns
+
 # Frames kept by `sensitivity` (DESIGN section 4): 1.0 -> best 90 % by wFWHM, 0.5 -> 97 %, 2.0 -> 75 %
 KEEP_PERCENT = ((0.5, 97.0), (1.0, 90.0), (2.0, 75.0))
 MIN_STARS = 5                    # DESIGN: subs with nbstars < 5 are excluded
@@ -245,6 +259,98 @@ def calibrate_script(unit: Unit, debayer: bool, force: bool = False) -> str:
         args.append("-prefix=pp_")
         lines.append(" ".join(args))
     return "\n".join(lines) + "\n"
+
+
+def row_banding_ratio(paths: list[str], pattern: str = "RGGB") -> dict:
+    """Row banding of calibrated CFA subs, relative to the pixel noise.  Per Bayer plane: the clipped (median) row profile over the central half of
+    the columns, high-passed with a 15-row median (keeps stripes a few px apart, drops the gradient), its std divided by the white-noise expectation
+    1.2533 * sigma / sqrt(n_columns) (sigma = MAD of horizontal neighbour differences / sqrt 2; 1.2533 = the median's efficiency loss).  1.0 = no
+    row noise; the estimate's own standard error is 1 / sqrt(2 n_rows), so ``needed`` = 1 + BANDING_SIGMAS standard errors."""
+    import numpy as np
+    from astropy.io import fits
+    from scipy.ndimage import median_filter
+    ratios, n_rows = [], 0
+    step = max(1, len(paths) // BANDING_SAMPLE)
+    for p in paths[::step][:BANDING_SAMPLE]:
+        try:
+            with fits.open(p) as h:
+                d = np.asarray(h[0].data, dtype=np.float64)
+        except (OSError, ValueError, TypeError):
+            continue
+        if d.ndim != 2:
+            continue
+        w = d.shape[1]
+        for oy in (0, 1):
+            for ox in (0, 1):
+                pl = d[oy::2, ox::2][:, w // 8: w // 8 + w // 2]
+                dd = np.diff(pl, axis=1)
+                sig = 1.4826 * np.median(np.abs(dd - np.median(dd))) / math.sqrt(2)
+                prof = np.median(pl, axis=1)
+                hp = prof - median_filter(prof, size=15, mode="nearest")
+                if sig > 0:
+                    ratios.append(float(hp.std() / (1.2533 * sig / math.sqrt(pl.shape[1]))))
+                n_rows = pl.shape[0]
+    if not ratios:
+        return {"ratio": None, "needed": None, "banded": False}
+    r = float(np.mean(ratios))
+    needed = 1.0 + BANDING_SIGMAS / math.sqrt(2 * n_rows)
+    return {"ratio": round(r, 3), "needed": round(needed, 3), "banded": r > needed, "n_subs": len(ratios) // 4}
+
+
+def banding_split_script(unit: Unit, seq: str) -> str:
+    """Split the calibrated mosaic sequence into its four Bayer planes: ``CFA0_<seq>_NNNNN.fit`` .. ``CFA3_`` (Siril's default names; its
+    ``-prefix=`` option crashes 1.4.4)."""
+    return "\n".join([f"cd {quote(unit.dir)}", f"seqsplit_cfa {seq}"]) + "\n"
+
+
+def banding_fix_script(unit: Unit, seq: str, amount: float = BANDING_AMOUNT, sigma: float = BANDING_SIGMA) -> str:
+    """``seqfixbanding`` on each Bayer plane (horizontal banding, the default) -> ``unband_CFA<k>_<seq>_NNNNN.fit``."""
+    lines = [f"cd {quote(unit.dir)}"]
+    lines += [f"seqfixbanding CFA{k}_{seq} {amount:g} {sigma:g}" for k in range(4)]
+    return "\n".join(lines) + "\n"
+
+
+def banding_merge_script(unit: Unit, seq: str, pattern: str) -> str:
+    """Rebuild the mosaic: ``mCFA_unband_CFA0_<seq>_NNNNN.fit`` (the plane order CFA0..3 is the pattern's reading order, as ``seqsplit_cfa`` wrote it)."""
+    planes = " ".join(f"unband_CFA{k}_{seq}" for k in range(4))
+    return "\n".join([f"cd {quote(unit.dir)}", f"seqmerge_cfa {planes} {pattern.upper()}"]) + "\n"
+
+
+def banding_cleanup(unit_dir: str, seq: str, prefixes: tuple[str, ...]) -> None:
+    """Delete the intermediates ``<prefix><k>_<seq>_*`` (frames and .seq) of a banding stage: ``("CFA",)`` after the de-banding,
+    ``("unband_CFA",)`` after the merge, ``("mCFA_unband_CFA",)`` for the merge's own .seq file."""
+    for name in os.listdir(unit_dir):
+        if any(name.startswith(f"{p}{k}_{seq}_") for p in prefixes for k in range(4)):
+            try:
+                os.remove(os.path.join(unit_dir, name))
+            except OSError:
+                pass
+
+
+def banding_install(unit_dir: str, seq: str) -> int:
+    """Put the de-banded mosaics in place of ``<seq>_NNNNN.fit`` (the .seq file stays valid: same names and count).  Siril renames FILTER to
+    ``<FILTER>_CFA0`` in the merged files (the stack header, and with it the dual-band / SPCC filter decisions, inherit it): restored from the
+    calibrated sub.  Replaces the file itself, never a symlink target (lights-only sets: ``light_*.fit`` link to the raw subs).  Returns the count."""
+    from astropy.io import fits
+    n = 0
+    for name in sorted(os.listdir(unit_dir)):
+        if not (name.startswith(f"mCFA_unband_CFA0_{seq}_") and name.endswith(".fit")):
+            continue
+        dst = os.path.join(unit_dir, name[len(f"mCFA_unband_CFA0_"):])
+        filt = None
+        try:
+            with fits.open(dst) as h:
+                filt = h[0].header.get("FILTER")
+        except OSError:
+            pass
+        if filt is not None:
+            with fits.open(os.path.join(unit_dir, name), mode="update") as h:
+                h[0].header["FILTER"] = filt
+        if os.path.islink(dst):
+            os.remove(dst)
+        os.replace(os.path.join(unit_dir, name), dst)
+        n += 1
+    return n
 
 
 def seq_name(units: list[Unit], debayer: bool) -> str:

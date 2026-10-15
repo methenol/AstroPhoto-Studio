@@ -592,7 +592,7 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
     if kind == "calibrate":
         return s.run_calibration(progress)
     if kind == "analyse":
-        r = s.run_analysis(float(sp["sensitivity"]), progress)
+        r = s.run_analysis(float(sp["sensitivity"]), progress, sp)
         return r if isinstance(r, dict) else {"n": r}
     if kind == "stack":
         r = s.run_stack(sp, progress)
@@ -608,7 +608,7 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
     if kind == "export":
         return s.export(params, progress=progress, **export_opts)
     if kind == "all":
-        s.run_analysis(float(sp["sensitivity"]), progress)
+        s.run_analysis(float(sp["sensitivity"]), progress, sp)
         s.run_stack(sp, progress)
         s.plate_solve(progress)
         _call(s.run_denoise, sp, progress, params=params)

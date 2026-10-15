@@ -310,7 +310,7 @@ function stackParams() {
   return {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
-    local_norm: g("local_norm").checked,
+    local_norm: g("local_norm").checked, pattern_correction: g("pattern_correction").checked,
     deconv_method: g("deconv_method").value, ai_deconvolution: on,
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,

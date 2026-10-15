@@ -283,7 +283,36 @@ class Session:
             u.masters = paths
 
     # ------------------------------------------------------------------ registration / analysis
-    def _signature(self, units: list[workflow.Unit], debayer: bool) -> dict:
+    @staticmethod
+    def _banding_param(sp: dict | None) -> bool | None:
+        """The stack parameter (``pattern_correction``, the API contract's key; ``banding`` as an alias): None = not given."""
+        sp = sp or {}
+        v = sp.get("pattern_correction", sp.get("banding"))
+        return None if v is None else v not in (False, 0, "false", "off")
+
+    def _banding_on(self, units: list[workflow.Unit], debayer: bool, banding: bool) -> str | None:
+        """Bayer pattern to de-band with (None: switched off, demosaic path, or not a Bayer mosaic: mono data are not touched)."""
+        pat = (units[0].frames[0].bayer or "").upper() if units and units[0].frames else ""
+        return pat if banding and not debayer and pat in workflow.BANDING_PATTERNS else None
+
+    def _band_unit(self, u: workflow.Unit, seq: str, pattern: str, progress) -> None:
+        """Row-noise removal on the calibrated CFA subs of one unit (workflow.BANDING_*): split into Bayer planes, seqfixbanding each, merge back,
+        install over ``<seq>_NNNNN.fit``.  Intermediates are deleted stage by stage (peak: 3 x the calibrated subs)."""
+        n = len(u.frames)
+        r = SirilRunner(self.process, progress=self._cb(progress), checkpoint=self.checkpoint)
+        r.run(workflow.banding_split_script(u, seq), f"banding_split_{u.index + 1}", expect=[os.path.join(u.dir, f"CFA3_{seq}_{n:05d}.fit")],
+              count_glob=os.path.relpath(os.path.join(u.dir, f"CFA3_{seq}_[0-9]*.fit"), self.process), total=n, label="Banding (splitting the Bayer planes)")
+        r.run(workflow.banding_fix_script(u, seq), f"banding_fix_{u.index + 1}", expect=[os.path.join(u.dir, f"unband_CFA3_{seq}_{n:05d}.fit")],
+              label="Banding (Siril seqfixbanding)")
+        workflow.banding_cleanup(u.dir, seq, ("CFA",))
+        r.run(workflow.banding_merge_script(u, seq, pattern), f"banding_merge_{u.index + 1}", expect=[os.path.join(u.dir, f"mCFA_unband_CFA0_{seq}_{n:05d}.fit")],
+              label="Banding (merging the Bayer planes)")
+        workflow.banding_cleanup(u.dir, seq, ("unband_CFA",))
+        if workflow.banding_install(u.dir, seq) != n:
+            raise SirilError(f"banding: {n} subs expected in {u.dir}")
+        workflow.banding_cleanup(u.dir, seq, ("mCFA_unband_CFA",))
+
+    def _signature(self, units: list[workflow.Unit], debayer: bool, banding: str | None = None) -> dict:
         h = hashlib.sha1()
         for u in units:
             for f in u.frames:
@@ -297,7 +326,8 @@ class Session:
                 h.update(f"{k}:{p}:{os.path.getmtime(p) if os.path.exists(p) else 0}".encode())
         h.update(("|".join(f"g{u.group}" for u in units)).encode())
         return {"format": SESSION_FORMAT, "frames": h.hexdigest(), "debayer": debayer,
-                "register": workflow.REGISTER_ARGS, "n": sum(len(u.frames) for u in units)}
+                "register": workflow.REGISTER_ARGS, "n": sum(len(u.frames) for u in units),
+                "banding": [workflow.BANDING_AMOUNT, workflow.BANDING_SIGMA, banding] if banding else None}
 
     def _ordered_frames(self, units: list[workflow.Unit]) -> list[Frame]:
         return [f for u in units for f in u.frames]
@@ -306,7 +336,7 @@ class Session:
         return str((stack_params or {}).get("mode", "auto")).lower() == "demosaic"
 
     def _ensure_registered(self, progress, sensitivity: float, debayer: bool = False, force: bool = False,
-                           hdr: bool | None = None) -> dict:
+                           hdr: bool | None = None, banding: bool | None = None) -> dict:
         """Calibrate + 2-pass registration unless the process dir already holds a registration of exactly
         these inputs.  Returns the state dict."""
         if self.fs is None:
@@ -314,9 +344,11 @@ class Session:
         hdr = self._hdr_wanted() if hdr is None else hdr
         units = self._make_units(debayer, hdr)
         self._ensure_masters(units, progress)
-        sig = self._signature(units, debayer)
         st_path = os.path.join(self.process, "state.json")
         state = read_json(st_path, {}) or {}
+        # banding=None (analysis): keep what the registered state was made with (default on), so analysing never re-registers
+        band = self._banding_on(units, debayer, state.get("banding_requested", True) if banding is None else banding)
+        sig = self._signature(units, debayer, band)
         seq = workflow.seq_name(units, debayer)
         seqfile = os.path.join(self.process, f"{seq}_.seq")
         if not force and state.get("signature") == sig and os.path.exists(seqfile) and \
@@ -350,6 +382,16 @@ class Session:
                   total=len(u.frames), label="Calibrating")
             done += len(u.frames)
         self._time("calibrate", time.time() - t0)
+        band_info = None
+        if band:
+            t0 = time.time()
+            # measured first (calibrated subs, the same numbers as the report): Seestar M 27 (IMX585) measures 0.98 and keeps its 16-bit subs untouched
+            meas = [workflow.row_banding_ratio(sorted(glob.glob(os.path.join(u.dir, f"{seq}_[0-9]*.fit"))), band) for u in units]
+            band_info = {"measured": meas, "applied": any(m["banded"] for m in meas)}
+            for u, m in zip(units, meas):
+                if m["banded"]:
+                    self._band_unit(u, seq, band, progress)
+            self._time("banding", time.time() - t0)
         if len(units) > 1:
             runner.run(workflow.merge_script(units, self.process, seq), "merge", expect=[f"{seq}_.seq"],
                        label="Calibrating (merging nights)")
@@ -357,7 +399,9 @@ class Session:
         runner.run(workflow.register_script(self.process, seq, n), "register", expect=[f"{seq}_.seq"],
                    label="Registering (pass 1/2)", markers=[(r"Trial #|choosing image|Matching stars", "Registering (pass 2/2)")])
         self._time("register", time.time() - t0)
-        state = {"signature": sig, "seq": seq, "n": n, "debayer": debayer, "hdr": hdr, "created": time.time()}
+        state = {"signature": sig, "seq": seq, "n": n, "debayer": debayer, "hdr": hdr, "created": time.time(), "banding_requested": band is not None,
+                 "banding": {"command": f"seqfixbanding <CFA plane> {workflow.BANDING_AMOUNT:g} {workflow.BANDING_SIGMA:g}", "amount": workflow.BANDING_AMOUNT,
+                             "sigma": workflow.BANDING_SIGMA, "pattern": band, "sequence": seq, **band_info} if band else None}
         seqd = parse_seq(seqfile)
         if len(seqd.frames) != n:
             raise SirilError(f"registration produced {len(seqd.frames)} frames for {n} subs (see {self.process}/logs)")
@@ -432,14 +476,14 @@ class Session:
             self._rows = rows
         return self._rows
 
-    def run_analysis(self, sensitivity: float = 1.0, progress=None) -> dict:
+    def run_analysis(self, sensitivity: float = 1.0, progress=None, stack_params: dict | None = None) -> dict:
         """Scan, calibrate, register (2-pass) and measure every sub: ``frames.json`` with fwhm / wfwhm /
         roundness / background / nbstars and the ``included`` flag; stops before any resampling."""
         with self.lock:
             t0 = time.time()
             self.scan(progress)
             self._rows = None
-            self._ensure_registered(progress, float(sensitivity))
+            self._ensure_registered(progress, float(sensitivity), banding=self._banding_param(stack_params))
             self._load_rows()
             self._apply_selection(float(sensitivity))
             self.analysis = {**(self.analysis or read_json(self._p("analysis.json"), {}) or {}),
@@ -513,7 +557,7 @@ class Session:
             t_all = time.time()
             if self.fs is None:
                 self.scan(progress)
-            state = self._ensure_registered(progress, sens, debayer)
+            state = self._ensure_registered(progress, sens, debayer, banding=self._banding_param(sp))
             rows = self._load_rows()
             if (self.analysis or {}).get("sensitivity") != sens:
                 self._apply_selection(sens)
@@ -666,6 +710,10 @@ class Session:
         x, y, w, h = box
         out = np.ascontiguousarray(arr[:, y:y + h, x:x + w])
         scale = float(rs.get("scale", 1.0))
+        band = (read_json(os.path.join(self.process, "state.json"), {}) or {}).get("banding")
+        hdr = hdr.copy() if hasattr(hdr, "copy") else hdr
+        if band and band.get("applied") and hasattr(hdr, "add_history"):
+            hdr.add_history(f"AstroPhoto Studio: {band['command']} on {band['pattern']} subs")
         fitsio.write_rgb(self._p("stack.fits"), out, fitsio.strip_wcs(hdr))   # the inherited WCS no longer fits
         self._time("crop", time.time() - t0)
         cb(1, 1, "Cropping")
@@ -695,6 +743,7 @@ class Session:
             "created": datetime.now().isoformat(timespec="seconds"),
             "calibration": {"dark": masters.get("dark"), "flat": masters.get("flat"), "bias": masters.get("bias"),
                             "cc": "dark 3 3" if masters.get("dark") else None, "summary": rep.get("summary")},
+            "banding": band,
             "siril_version": "1.4.4", "sirilpipe_version": __version__,
             "params": sp, "local_norm": False, "sensor_pattern": None, "split": None,
             "nights": [{"folder": d, "n": len([i for i in inc if rows[i]["folder"] == d])} for d, _ in self.fs.nights],
@@ -897,7 +946,7 @@ class Session:
         """analysis -> stack -> plate solve -> restore -> (star removal) -> (auto-finish) -> export."""
         sp, pr, eo = dict(stack_params or {}), dict(params or {}), dict(export_opts or {})
         t0 = time.time()
-        self.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), progress)
+        self.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), progress, sp)
         self.run_stack(sp, progress)
         self.plate_solve(progress)
         self.run_denoise(sp, progress, pr)

@@ -156,7 +156,7 @@ class FakeSession:
         self.calls.append("calibrate"); self._steps(progress, "Calibrating")
         return {"changed_analysis": False, "summary": "no masters"}
 
-    def run_analysis(self, sensitivity, progress):
+    def run_analysis(self, sensitivity, progress, stack_params=None):
         self.calls.append(("analyse", sensitivity)); self._steps(progress, "Registering (pass 1/2)")
         with open(os.path.join(self.dir, "frames.json"), "w") as f:
             json.dump([], f)
@@ -419,9 +419,9 @@ def test_client_ref_reusable_after_cancel(env):
     gate = threading.Event()
     orig = FakeSession.run_analysis
 
-    def slow(self, sens, progress):
+    def slow(self, sens, progress, sp=None):
         gate.wait(5)
-        return orig(self, sens, progress)
+        return orig(self, sens, progress, sp)
     FakeSession.run_analysis = slow
     try:
         first = submit(env, client_ref="r2", kind="analyse")
@@ -478,7 +478,7 @@ def test_job_list_filters_and_get(env):
 
 
 def test_error_job(env):
-    def boom(self, sens, progress):
+    def boom(self, sens, progress, sp=None):
         raise ValueError("kaput")
     orig = FakeSession.run_analysis
     FakeSession.run_analysis = boom
@@ -496,7 +496,7 @@ def test_cancel_queued_and_running(env):
     gate = threading.Event()
     orig = FakeSession.run_analysis
 
-    def slow(self, sens, progress):
+    def slow(self, sens, progress, sp=None):
         for i in range(200):
             progress(i, 200, f"Measuring {i}/200")
             if gate.wait(0.02):
