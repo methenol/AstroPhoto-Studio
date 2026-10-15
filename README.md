@@ -1,68 +1,55 @@
 # AstroPhoto Studio — raw FITS subs → finished astrophoto
 
-An end-to-end pipeline that turns the raw one-shot-colour FITS subs from a smart
-telescope or an astronomy camera into a finished image. It
-handles the whole chain: calibration, frame grading, cloud/tree/obstruction rejection,
-registration with alt-az field rotation, local normalisation, sigma-clipped
-Bayer-drizzle integration, AI denoising, gradient removal, deconvolution,
-star separation, narrowband palettes, stretching and export to a
-full-resolution JPEG + 16-bit TIFF. It includes a web UI and a CLI.
+An end-to-end pipeline that turns the raw one-shot-colour FITS subs from a smart telescope or an
+astronomy camera into a finished image, built on **Siril 1.4** (headless) with **GraXpert**,
+**StarNet2** and the **RC-Astro** tools (BlurXTerminator, NoiseXTerminator, StarXTerminator; licensed
+from the web UI).  It handles the whole chain: calibration, frame grading, registration with alt-az
+field rotation, Bayer-drizzle integration with rejection, plate solving, gradient removal (GraXpert or
+the NSNS sky survey), spectrophotometric colour calibration (Siril SPCC), deconvolution, noise reduction,
+star separation, the community's finishing workflow (GHS two-pass stretch, highlight protection,
+HOO / Foraxx palettes, Seti Astro star stretch, screen recombination) and export to a full-resolution
+JPEG + 16-bit TIFF with a sidecar that lists every Siril command and tool call.  Every step is a named
+community tool with its published parameters; the sources are cited in the code.  It includes a web UI,
+a programmatic API (`/api/v1`), an Explore tab (Gaia / SIMBAD annotation), an Experiments tab (Optuna
+studies of every stage) and a CLI.  Everything runs inside the Docker image; nothing is installed on
+the host.
 
-Nothing is tuned for a particular object or telescope. Every decision comes from the
-FITS headers (`BAYERPAT`, `BIAS`, `FILTER`, `EXPTIME`, …), from calibration frames
-when there are any, and from statistics of the data. Where a telescope leaves header
-keys out, a profile of that telescope fills them in (see
-[Supported telescopes and cameras](#supported-telescopes-and-cameras)). A dual-band filter
-(Seestar `LP`, DWARF `Duo-Band`, L-eXtreme, …) automatically gets an Ha/OIII (HOO)
-workflow. A broadband filter (`IRCUT`, `Astro`, `VIS`, none) gets a natural-colour RGB workflow.
+Nothing is tuned for a particular object or telescope. Every decision comes from the FITS headers
+(`BAYERPAT`, `FILTER`, `EXPTIME`, `GAIN`, …), from calibration frames when there are any, and from
+statistics of the data. A dual-band filter (Seestar `LP`, DWARF `Duo-Band`, L-eXtreme, …) gets an
+Ha/OIII (HOO) workflow with SPCC in narrowband mode; a broadband filter gets a natural-colour workflow.
 
 ## Quick start
 
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt          # or: uv pip install -r requirements.txt
-
-# Web UI  →  http://127.0.0.1:8000
-python -m webui.server                   # --images /path/to/sessions  --port 8080  --host 0.0.0.0
-
-# or headless, one command:
-python -m astrophoto run "images/IC 5070_sub"
-python -m astrophoto run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
-python -m astrophoto run NIGHT1 NIGHT2     # several sessions of one target, stacked together
-python -m astrophoto analyse DIR          # just the frame-quality report
-python -m astrophoto calibration DIR      # telescope profile + the bias / dark / flat masters it will use
-python -m astrophoto devices              # show GPUs PyTorch can use
+cp .env.example .env                      # IMAGES_DIR, OUTPUT_DIR, PORT, STARNET_ACCEPT_LICENSE, IMAGEMM
+mkdir -p vendor && cp ~/Downloads/rc-astro-cli-*-linux-x64.sh vendor/   # optional: the RC-Astro CLI installer
+docker compose up -d --build              # NVIDIA GPU (default profile); --profile cpu for CPU only
+# → http://localhost:8000  (or your PORT)
 ```
 
-Point the UI or CLI at any folder of light subs: a Seestar `<Object>_sub` folder, a DWARF
-`DWARF_RAW_…` session folder, or a `lights/` folder from any camera. Only same-size
-light frames with the dominant filter are used. JPG/PNG previews, the telescope's own stacks,
-thumbnails and calibration frames are skipped. Several sessions of the same target (one
-folder per night) can be stacked as one dataset: in the UI, open one of them and tick the others
-under *Stack together with*; on the CLI, give all the folders. A combination has its own cache
-folder (`output/<first folder>+<n more>-<hash>/`), and the calibration masters are searched beside
-every folder. Results are cached in `output/<folder>-<hash>/`:
-`stack.fits`, the two half stacks, `denoised.fits`, the coverage and
-rejection maps, and `exports/`.
+Then open the web UI, choose a session folder and press **Run everything & export**.  The *Tools* card
+shows Siril, GraXpert, StarNet2 and RC-Astro; paste your RC-Astro activation code there once (the
+licence is kept in `OUTPUT_DIR/.home`, bound to the container's fixed hostname).  For development
+without rebuilding: `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d` mounts the
+repository's code into the container.
 
-### NVIDIA GPUs (Windows / Linux)
-
-The AI denoiser runs on NVIDIA CUDA, Apple Metal (MPS) or CPU. The default
-PyTorch wheel on Windows/Linux is often CPU-only, so install the CUDA build:
+Headless, inside the container:
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate      # Windows  (Linux: source .venv/bin/activate)
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
-python -m astrophoto devices          # should list your RTX card
+docker compose exec astrophoto python -m sirilpipe run "/data/images/DWARF_RAW_TELE_M 42_…"   # everything
+docker compose exec astrophoto python -m sirilpipe stack DIR [DIR ...]   # several nights of one target
+docker compose exec astrophoto python -m sirilpipe analyse DIR           # frame-quality report
+docker compose exec astrophoto python -m sirilpipe calibration DIR       # masters it will use
+docker compose exec astrophoto python -m sirilpipe devices               # GPUs and tool status
 ```
 
-On CUDA the denoiser uses mixed precision (bf16 on RTX 30/40/50, fp16 on
-older cards). It sizes the training batch and the inference tiles to the
-card's VRAM: 8 GB cards work fine, and 4–6 GB cards use smaller tiles. Pick a
-specific GPU with `--device cuda:1`, or with `ASTROPHOTO_DEVICE=cuda:1`. The
-UI also has a device selector. Everything outside the denoiser (NumPy,
-OpenCV, SEP) runs on the CPU and is platform-independent.
+### NVIDIA GPUs
+
+The RC-Astro tools and GraXpert run on CUDA inside the container (the image carries the CUDA 12 user-space
+libraries; the host needs only the NVIDIA driver and the NVIDIA Container Toolkit).  The optional ImageMM
+restoration needs PyTorch: build with `IMAGEMM=cuda` (about 4 GB more).  Pick the device per job in
+*Integration & compute options* (auto / a GPU / CPU).
 
 ### Docker (NVIDIA or CPU)
 
@@ -106,6 +93,10 @@ docker compose down                               # stop
   `cpu` profile works there, and the AI stages are much slower than a native run on MPS.
   Docker Desktop must be allowed to share the images folder (*Settings → Resources → File
   sharing*; `/Volumes` covers mounted NAS shares).
+- **Tools:** `STARNET_ACCEPT_LICENSE=yes` downloads the StarNet2 CLI from starnetastro.com at build time
+  (you accept its licence); the RC-Astro CLI installer goes to `vendor/` before the build; GraXpert's
+  AI models are downloaded on first use into `OUTPUT_DIR/.home` (or from the Tools card).
+- **ImageMM:** `IMAGEMM=cuda|cpu|off` adds PyTorch for the multi-frame restoration (`deconv_method = imagemm`).
 - **Calibration library elsewhere:** set `ASTROPHOTO_CALIB` to its path *inside* the container
   (under `/data/images`), or set it per dataset in the UI's *Calibration* panel.
 - **Images on a NAS:** `LOCAL_COPY=true` in `.env` makes every job that reads the subs (calibrate,
@@ -372,69 +363,37 @@ Siril predicts star colours from each star's Gaia XP spectrum. The Gaia archive 
 spectra one star at a time (minutes for a few hundred stars), while temperature and extinction
 come with the catalogue query that plate solving already makes.
 
-## AI star remover
+## Star separation
 
-**Train AI star remover** (Pipeline panel, and part of *Run everything*) takes about 2–3 minutes
-on an Apple-silicon GPU. It trains a U-Net to remove stars from this dataset (details in the
-*Star separation* row above). Once it is trained, *Star removal: auto* uses it for star
-separation. The **Star reduction** slider then works in two ranges:
-
-- up to 0.5 it shrinks the stars;
-- from 0.5 to 1 it also fades them out, and 1 is the starless image.
-
-A new restack or restoration makes the trained remover stale, and it has to be trained again.
+**Remove stars** (Pipeline panel, and part of *Run everything*) separates the stars from the linear
+restored image with **StarXTerminator** when licensed (on linear data, no unscreen, as RC-Astro
+recommends), else **StarNet2**.  The star layer is stretched on its own (Seti Astro Star Stretch, which is
+Siril's `mtf` with m = 1/(3^a+1)), colour-balanced for dual-band data (invert, SCNR, invert), reduced with the
+Deep Space Astro star-reduction formula and screened back onto the starless image (`~(~starless*~stars)`).
+The **Star reduction** slider runs from 0 (as stretched) to 1 (starless).
 
 ## Auto-finish
 
 **Auto-finish** (the last Pipeline step, the ✨ button under the Process sliders, and part of *Run
-everything* unless *Auto-finish before the export* is unticked) works through the sliders on the
-right the way a finisher does: one control at a time, in the professional order, watching one
-measurement per control and stopping where the image says stop. Every step and its reason are
-listed above the sliders afterwards, and the sliders land where it left them, so you can carry on
-by hand.
+everything* unless *Auto-finish before the export* is unticked) sets the processing settings from
+measurements of the image by published rules, and lists every decision with its measurement and its
+source above the sliders:
 
-| In this order | What it watches | Where it stops |
-|---|---|---|
-| Stretch | the object's midtones | where the reference images put them |
-| Black point | the sky's brightness | the references' sky, but never clipping the sky's noise to black |
-| HDR | the brightest extended structure | the least compression that keeps it off the ceiling |
-| Midtones | the object's midtones again | re-checked after the black point and HDR |
-| GHS focus (contrast) | structure against grain on the object | the focus with the most structure, grain bounded |
-| Fine-grain noise reduction | the sky's grain on a **full-resolution crop** (1:1) | the least that brings it to the references' grain |
-| Colour noise reduction | colour mottle of sky and object | the least that removes it |
-| Local contrast | mid-scale noise and mottle on the faint parts | raised until they would show |
-| Sharpening | fine noise and dark halos on the 1:1 crop | raised until they begin to show |
-| Star reduction | the share of the frame the stars cover | no more than in a typical reference |
-| Star brightness | clipped star cores | the brightest stars just below clipping |
-| Halo suppression | blue excess round bright stars | until it is gone |
-| Saturation | the object's colourfulness | the references' colourfulness, unless the colour mottles, clips or tints the field |
-| OIII boost (dual-band) | the warm / cool balance | the references' balance, unless OIII noise tints the sky |
-| SCNR | the share of green hues | only if it exceeds the references' |
-| Colour grade | hue of the red and of the teal / blue sectors, star colour cast, tonal spread | towards the nearest reference's hues; the star field neutral (broadband); the references' tonal spread |
+| Setting | Rule |
+|---|---|
+| Stretch | Siril GHS two-pass recipe (Siril GHS tutorial, ghsastro): background 0.10 (Brecher's finished images 0.09–0.11), second pass D 2.5 for a small subject / 1.5 for a frame-filling one |
+| Highlights | GHS HP < 1 at half strength on dual-band nebulae; full when more than 0.05 % of the stretched pixels clip |
+| Noise reduction | NoiseXTerminator 0.6–0.85 on the stretched starless image by the measured SNR (RC-Astro, Brecher), colour denoise 0.95 |
+| Local contrast | Siril `clahe` under a background mask at the lowest published LHE strengths |
+| Palette / SCNR | HOO for dual-band (no SCNR: the green is OIII); natural colour and SCNR only against a measured green cast for broadband |
+| Saturation | Siril `satu` 0.25 / 0.3 / 0.5 (Siril tutorial); the references' colourfulness is reported |
+| Stars | Seti Star Stretch amount 5 (lowered to 4 / 3 against clipping), colour boost by the measured star saturation, reduction by star density, checked against the linear star count |
 
-The **targets** are not constants in the code. They are the medians of the same measurements over
-reference astrophotographs of the target: 58 freely licensed images on Wikimedia Commons of 16
-targets (M 42, M 31, M 27, M 20, M 76, NGC 281, NGC 6960, NGC 6992, NGC 7000, NGC 7635, NGC 7662,
-IC 405, IC 1318, IC 5070, Sh2-142, LDN 1235), chosen for natural-colour or HOO looks that a one-shot-
-colour camera can reach. Only the statistics and the attributions are kept, in
-`astrophoto/data/autofinish_refs.json`; `python experiments/autofinish_refs.py` rebuilds it. The
-**limits** (where to stop) come from the image itself: its own grain, clipping, colour mottle and
-star coverage, measured on a 1000 px render for the tonal and colour steps and on a 1024 px
-full-resolution crop of the most structured part of the object for noise reduction and sharpening,
-which act below the resolution of a small render. A target without references of its own uses those
-of its class (emission nebulae, supernova remnants, planetary nebulae, galaxies, dark and reflection
-nebulae), found from the `OBJECT` header and a list of common names; without a known class, all the
-dual-band or all the broadband references. For a small object in a wide field (M 27 in a Seestar
-frame) the object's brightness targets count in proportion to the share of the frame it covers.
-
-The finished image is then compared with the nearest reference and that distance is reported,
-before and after. It is a check, not the objective: the earlier Auto-finish searched the sliders to
-minimise this distance and could pay for a match with the wrong trade-offs (desaturating and
-tinting to match a hue histogram, lifting the sky to match a close-up's brightness). The rules of
-thumb it works by (how much grain, clipping and star coverage is acceptable, how strong the grade
-is) are `autofinish.RULES`, tunable in the Experiments tab (task *Auto-finish (finishing look)*).
-`autofinish.json` in the session folder keeps the last result; on the CLI `--no-autofinish` turns the
-step off. About 60 renders, one to two minutes on the CPU.
+The references are the medians of the same measurements over 58 freely licensed astrophotographs of
+16 targets (Wikimedia Commons; only the statistics and attributions are kept in
+`astrophoto/data/autofinish_refs.json`).  The finished image is compared with the nearest reference and
+that distance is reported before and after, as a check, not an objective.  `autofinish.json` in the
+session folder keeps the last result.
 
 ## Gradient removal against a sky survey
 
@@ -494,46 +453,24 @@ the session folder (`explore/`).
 
 ## Experiments (Optuna)
 
-The **Experiments** tab tunes the pipeline with [Optuna](https://optuna.org) studies. For
-each study you choose:
+The **Experiments** tab tunes the pipeline with [Optuna](https://optuna.org) studies. For each study you
+choose an experiment, a dataset (a stacked real session, several nights of one target, or a **synthetic**
+one generated in the tab), which parameters to tune and over what ranges, one or two objectives, and a
+sampler (multivariate TPE, NSGA-II, random or grid).  Each study runs as its own background process.
+While it runs you see the optimisation history, Pareto front, fANOVA importances, slice plots, a trials
+table with a preview of every result, and the log.  Trial 0 is the pipeline's current settings.  Stop a
+study, continue it, or apply its best trial to the pipeline (from the study, or with **From experiment** in
+*Integration & compute options*).
 
-- an experiment: ImageMM restoration, the Noise2Noise denoiser, the N2N restoration
-  network, registration & integration, star detection & separation (classic), the AI star
-  remover, or gradient removal
-- a dataset: a stacked real session, or a **synthetic** one generated in the tab
-- which parameters to tune, and over what ranges
-- one or two objectives
-- a sampler: multivariate TPE, NSGA-II, random or grid
-
-Each study runs as its own background process, so several can run at once on different
-GPUs. While it runs you see the optimisation history, Pareto front, fANOVA parameter
-importances, slice plots, a trials table with a preview of every result in one shared
-stretch, and the log. Trial 0 is the pipeline's current settings, so every result is shown
-as a change from the baseline. Stop a study, continue it with more trials, or apply its
-best trial to the pipeline: from the study itself, or with **From experiment** in
-*Integration & compute options*. That sets integration & compute options and processing
-settings. Some tuned values are constants of the code instead, such as the star detection
-thresholds and mask radii (`postprocess.STAR_DETECT`, `STAR_MASK`), the gradient model's
-sampling (`postprocess.BACKGROUND`) and the star remover's training (`starnet.train`). The
-study names these, and a better value becomes the default for every dataset when it is
-changed there.
-
-How results are scored:
-
-- **Real data** is scored on held-out data only, never on data the method saw:
-  - restorations: the odd subs, predicted through each one's own PSF
-  - the denoiser: the independent half-stack, on held-out bands
-  - star separation and the star remover: the stars the default detector finds in a window
-    (flux left behind and the fraction still detected), and the change away from every star
-  - gradient removal: the flatness of the star-free sky tiles, and how much of the brightest
-    tiles' emission the model took away
-- **Synthetic datasets** are raw subs of an analytic sky in the Seestar S50's format (stars, nebulae,
-  galaxies) with the same held-out scores, plus comparison against the exact truth: error,
-  SSIM, faint-emission error and star photometry. Each sub has its own dither, field
-  rotation, Moffat seeing, transparency, sky gradient, shot and read noise, hot pixels,
-  satellite trails and cosmic rays.
-
-Details: [experiments/README.md](experiments/README.md#experiment-lab-optuna).
+Experiments: **Stretch & finish** (the finishing chain: stretch tool and settings, highlights, noise
+reduction, palette, saturation, stars; scored by the finishing gates, the nebula contrast and the distance
+to the reference looks), **Linear restoration** (gradient model, deconvolution and denoise strengths;
+star FWHM, background noise, sharpness, photometry against the stack), **Registration & integration**
+(rejection sigmas, frame selection, drizzle; background noise, FWHM, roundness), **Star separation**
+(residual star flux and stars left in the starless image, change away from the stars) and **Gradient
+removal** (gradient left in the sky, emission removed).  Synthetic datasets (Seestar-format subs of an
+analytic sky with stars, nebulae, galaxies, dither, field rotation, Moffat seeing, noise, hot pixels,
+satellite trails) are also scored against their exact truth, registered onto the stack's grid.
 
 ## Research & benchmarks
 
