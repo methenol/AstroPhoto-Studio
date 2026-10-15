@@ -54,12 +54,12 @@ DEFAULTS: dict = {
     "white_balance": "auto", "spcc_sensor": "auto", "spcc_filter": "auto", "spcc_white_ref": "average_spiral_galaxy",
     "denoise": 0.95, "deconvolution": 0.7, "restored_resolution": 1.0,
     # non-linear stage (the professional chain of pro.py; the published values, source at each use there)
-    "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.5,
+    "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.0,
     "stretch_method": "ghs2", "stretch": 0.10, "auto_stretch": True, "hdr": 0.5, "contrast": 4.0,
-    "color_preservation": 0.7,
+    "color_preservation": 0.2,
     "star_separation": True, "star_removal": "auto", "star_reduction": 0.4, "star_intensity": 1.0,
     "star_saturation": 1.5, "halo_suppress": 0.6, "star_color_preservation": 0.5,
-    "saturation": 1.45, "chroma_denoise": 0.95, "luminance_denoise": 0.8, "oiii_unmix": True,
+    "saturation": 1.45, "chroma_denoise": 0.95, "luminance_denoise": 0.8, "oiii_unmix": False,
     "local_contrast": 0.8, "scnr": 0.0, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.0,
     # colour grade (finish.color_grade): neutral by default
     "grade_amount": 1.0, "grade_temperature": 0.0, "grade_tint": 0.0, "grade_warm_hue": 0.0, "grade_warm_sat": 1.0,
