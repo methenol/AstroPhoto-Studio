@@ -102,22 +102,33 @@ STACK_DEFAULTS = {
 
 
 def default_scale(deconv_method: str) -> float:
-    """The stack scale a restoration runs at unless set (contract: 1.0 for imagemm, else 2.0)."""
+    """The stack scale a restoration runs at unless set (contract: 1.0 for imagemm, else 2.0).  With the
+    Siril backend a scale of 2 asks for 2x drizzle, which run_stack grants only when the data supports it
+    (enough dithered subs, FWHM under 2 px) and otherwise records why it stayed at 1x."""
     return 1.0 if deconv_method == "imagemm" else 2.0
 
 
+# The 1.x profile names are part of the API contract (the telescope controller submits them); their
+# stack_params map onto the Siril backend's restoration choices:
+#   deconv_method  auto    = BlurXTerminator when licensed, else Siril makepsf + Richardson-Lucy
+#                  rl      = Siril Richardson-Lucy even when BlurXTerminator is licensed
+#                  imagemm = ImageMM multi-frame restoration of the registered subs (slow; needs IMAGEMM=cuda)
+#                  none    = no deconvolution
+# ai_deconvolution and imagemm_n2n are accepted for compatibility and have no effect.
 PROFILES = {
     "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
-    "imagemm": {"label": "ImageMM: multi-frame restoration of every sub (no Noise2Noise pass)",
+    "imagemm": {"label": "ImageMM: multi-frame restoration of every registered sub (slow, GPU)",
                 "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": False}},
-    "n2n-imagemm": {"label": "ImageMM on the two halves of the subs + Noise2Noise pass",
+    "n2n-imagemm": {"label": "ImageMM multi-frame restoration (same as imagemm with this backend)",
                     "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
-    "n2n-network": {"label": "Noise2Noise denoiser + self-supervised deconvolution network (conv2d U-Net); "
-                             "much faster than ImageMM",
-                    "stack_params": {"deconv_method": "network", "ai_deconvolution": True,
-                                     "scale": default_scale("network")}},
-    "n2n-rl": {"label": "Noise2Noise denoiser, Richardson-Lucy (TV) deconvolution when rendering",
-               "stack_params": {"deconv_method": "none", "ai_deconvolution": False, "scale": default_scale("none")}},
+    "n2n-network": {"label": "Fast restoration: BlurXTerminator + NoiseXTerminator when licensed, else Siril "
+                             "deconvolution + GraXpert denoise; 2x drizzle when the data supports it "
+                             "(was: Noise2Noise + deconvolution network)",
+                    "stack_params": {"deconv_method": "auto", "ai_deconvolution": True,
+                                     "scale": default_scale("auto")}},
+    "n2n-rl": {"label": "Siril Richardson-Lucy (TV) deconvolution, no AI restoration "
+                        "(was: Noise2Noise denoiser + Richardson-Lucy)",
+               "stack_params": {"deconv_method": "rl", "ai_deconvolution": False, "scale": default_scale("rl")}},
 }
 
 PRESETS = {

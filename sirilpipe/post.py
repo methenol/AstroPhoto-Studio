@@ -521,6 +521,8 @@ class Restorer:
             return
         t0 = time.time()
         try:                                                         # BlurXTerminator sharpening (auto PSF)
+            if method == "rl":                                       # the n2n-rl profile: Siril's own deconvolution
+                raise ToolUnavailable("deconv_method=rl: Siril Richardson-Lucy requested")
             tools.rcastro.require("bxt")
             ss, sn = 0.25 + 0.25 * d, 0.5 + 0.4 * d                  # DESIGN section 4; AstroPipe: ss 0.25, sn 0.60, halos 0
             extra: dict = {}

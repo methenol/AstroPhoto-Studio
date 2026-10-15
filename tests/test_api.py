@@ -309,13 +309,14 @@ def test_profiles(env):
     assert r["default"] == "default"
     assert list(r["profiles"]) == ["default", "imagemm", "n2n-imagemm", "n2n-network", "n2n-rl"]
     p = r["profiles"]["n2n-network"]
-    assert p["label"].startswith("Noise2Noise denoiser + self-supervised deconvolution network")
-    assert p["stack_params"] == {"deconv_method": "network", "ai_deconvolution": True, "scale": 2.0}
-    assert p["effective"] == {"deconv_method": "network", "ai_deconvolution": True, "imagemm_n2n": True,
+    assert p["label"].startswith("Fast restoration: BlurXTerminator")
+    assert p["stack_params"] == {"deconv_method": "auto", "ai_deconvolution": True, "scale": 2.0}
+    assert p["effective"] == {"deconv_method": "auto", "ai_deconvolution": True, "imagemm_n2n": True,
                               "star_remover": True, "scale": 2.0}
     d = r["profiles"]["default"]["effective"]
     assert d == {"deconv_method": "auto", "ai_deconvolution": True, "imagemm_n2n": True, "star_remover": True, "scale": 1.0}
     assert r["profiles"]["n2n-rl"]["effective"]["ai_deconvolution"] is False
+    assert r["profiles"]["n2n-rl"]["effective"]["deconv_method"] == "rl"
 
 
 def test_datasets_resolve(env):
@@ -386,7 +387,7 @@ def test_submit_all_job_runs_and_outputs(env):
     s = FakeSession.instances[0]
     assert [c if isinstance(c, str) else c[0] for c in s.calls] == ["analyse", "stack", "solve", "restore", "stars", "autofinish", "export"]
     stack_call = s.calls[1][1]
-    assert stack_call["deconv_method"] == "network" and stack_call["scale"] == 2.0 and stack_call["sigma_low"] == 4.0
+    assert stack_call["deconv_method"] == "auto" and stack_call["scale"] == 2.0 and stack_call["sigma_low"] == 4.0
     export_call = s.calls[-1]
     assert export_call[1]["saturation"] == 1.7 and export_call[2:] == (92, 1.0, True)
     f = env.client.get(done["outputs"][0]["url"])
