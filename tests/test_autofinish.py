@@ -59,7 +59,7 @@ def test_run_references_only_defined_names():
     src = ast.parse(open(af.__file__).read())
     fn = next(n for n in src.body if isinstance(n, ast.FunctionDef) and n.name == "run")
     local = {a.arg for a in fn.args.args} | {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    local |= {n.name for n in ast.walk(fn) if isinstance(n, (ast.FunctionDef, ast.Import, ast.ImportFrom))}
+    local |= {n.name for n in ast.walk(fn) if isinstance(n, ast.FunctionDef)}
     for n in ast.walk(fn):
         if isinstance(n, ast.ImportFrom):
             local |= {a.asname or a.name for a in n.names}
