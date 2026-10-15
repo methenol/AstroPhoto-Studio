@@ -158,7 +158,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     s0 = fin.stretch(base)
     st0 = pro.level_stats(s0)
     hdr_on = hdr_rule(st0["clipped"], st0["white"])
-    hdr_value, st1 = 0.0, st0
+    hdr_value, st1 = (HDR_DUAL_DEFAULT if dual else 0.0), st0
     if hdr_on:
         hdr_value = 1.0
         tick("highlights")
@@ -168,6 +168,9 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         if method == "ghs2" and hdr_rule(st1["clipped"], st1["white"]) and st1["white"] >= st0["white"]:
             hdr_value = 1.0                                                      # the published HP protection did not help: Wavescale HDR as the second published tool
             tuned["hdr_method"] = "wavescale"
+    if not hdr_on and hdr_value > 0:
+        steps.append({"step": "hdr (default)", "from": 0.0, "to": hdr_value, "measured": None, "before": None, "target": None,
+                      "why": "dual-band nebula: GHS HP < 1 in pass 2 at half strength (Siril GHS tutorial: HP protects bright nebula and stars); judged on IC 1805 / M 42 2026-10-15"})
     decide("hdr", hdr_value, "white_frac", {"clipped": st0["clipped"], "white": st0["white"]}, CLIP_LIMIT,
            (f"after the stretch {st0['clipped'] * 100:.3f} % of the starless pixels have a channel >= 0.995 and {st0['white'] * 100:.3f} % a lightness >= 0.97 (limit {CLIP_LIMIT * 100:.2f} %): "
             f"highlight protection on ({'GHS HP < 1 in pass 2' if method == 'ghs2' else 'the tool-native HDR or Wavescale HDR'}), then {st1['clipped'] * 100:.3f} % / {st1['white'] * 100:.3f} %")
@@ -209,23 +212,12 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     if not dual:
         amount = min(amount, SATU_BROADBAND_MAX)                   # a galaxy / reflection nebula: the stronger satu tinted M 31's disc magenta; 0.3 is the published middle value
     if ref_agg and "C50" in ref_agg:
-        # the references' colourfulness (median OKLab chroma of the object, C50) decides among the published satu values: the one whose render lands nearest
-        best, best_d, tried = amount, None, {}
-        for cand in SATU_CANDIDATES:
-            if (not dual) and cand > SATU_BROADBAND_MAX:
-                continue
-            sat_img = pro.Finisher(work, layers.header, {**p1, "saturation": 1.0 + cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False).saturation(col)
-            c50 = looks.look_stats(np.moveaxis(sat_img, 0, -1))["C50"]
-            tried[cand] = round(c50, 4)
-            d = abs(c50 - ref_agg["C50"])
-            if best_d is None or d < best_d:
-                best, best_d = cand, d
-        amount = best
-        steps.append({"step": "saturation (references)", "from": None, "to": round(1.0 + amount, 2), "measured": "C50 per satu amount", "before": tried, "target": round(ref_agg["C50"], 4),
-                      "why": f"{ref_desc}: median object chroma C50 {ref_agg['C50']:.3f}; satu {amount} lands nearest among the published 0.25 / 0.3 / 0.5"})
-    decide("saturation", round(1.0 + amount, 2), "C50", round(sat0, 3), None,
-           f"subject saturation {sat0:.2f} after the palette: Siril satu {amount} (published 0.25-0.5; >= 0.35 -> 0.25, >= 0.20 -> 0.3, else 0.5)")
-
+        # the references' colourfulness is reported beside the published value (satu 0.25 / 0.3 / 0.5); it does not override it: the 2026-10-15 renders judged
+        # at satu 0.45 (dual-band) were right, and the Commons references (many of them deliberately muted) pulled the colour down when they decided
+        sat_img = pro.Finisher(work, layers.header, {**p1, "saturation": 1.0 + amount}, dual, external=False, checkpoint=checkpoint, keep_pictures=False).saturation(col)
+        c50 = looks.look_stats(np.moveaxis(sat_img, 0, -1))["C50"]
+        steps.append({"step": "saturation (references)", "from": None, "to": round(1.0 + amount, 2), "measured": "C50", "before": round(c50, 4), "target": round(ref_agg["C50"], 4),
+                      "why": f"{ref_desc}: median object chroma C50 {ref_agg['C50']:.3f} (reported; the published satu value stands)"})
     # stars
     tick("stars")
     star_info = _star_density(layers, session)
@@ -251,7 +243,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         sm = layers.starnet.get("stars") or {}
         level = float(pro.mtf_balance(pro.star_stretch_m(amount_st), 5.0 * float(sm.get("sky_noise") or 2e-5)))
         boost, ms = STAR_BOOSTS[0], {"saturation": None}
-        for boost in STAR_BOOSTS:                                                  # the smallest published boost whose stretched stars reach the colour limit (measured, not predicted)
+        for boost in [b for b in STAR_BOOSTS if dual or b <= STAR_BOOST_BROADBAND_MAX]:   # the smallest published boost whose stretched stars reach the colour limit (measured, not predicted)
             sb = pro.Finisher(work, layers.header, {**p1, "star_saturation": boost, "star_intensity": 1.0}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
             st_b = sb.stars(layers.stars)
             ms = gates.measure_stars(st_b, level / gates.STAR_SIGMA)
