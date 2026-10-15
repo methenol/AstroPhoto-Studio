@@ -316,29 +316,34 @@ class Finisher:
         return out
 
     # ---- 0b. banding (second line of defence) --------------------------------------------------------------------------------
-    def banding(self, arr: np.ndarray, where: str, linear: bool) -> np.ndarray:
+    def banding(self, arr: np.ndarray, where: str, linear: bool, noise_from: np.ndarray | None = None) -> np.ndarray:
         """Siril ``fixbanding 1 1`` on the whole image, only when the row-banding ratio (workflow.image_banding_ratio: row-profile std over the white-noise expectation) trips the
         same gate as the sub-level pass.  Siril docs (https://siril.readthedocs.io/en/stable/Commands.html#fixbanding): "Tries to remove the horizontal or vertical banding in the loaded
         image ... Values of 1 and 1 are often good enough" (community practice on stacks too).  Run on the linear starless image before the stretch (which multiplies the stripes by its slope
         at the sky) and on the stretched starless after the denoise (a denoiser keeps row-correlated structure while it removes the white noise, so the stripes can emerge there)."""
         name = f"banding ({where})"
-        before = workflow.image_banding_ratio(arr)
+        before = workflow.image_banding_ratio(arr, noise_from)
+        ref = "its own pixel noise" if noise_from is None else "the pixel noise before the denoiser"
         if not before["banded"]:
-            self.record(name, "none", None, status="skipped", note="row banding below the gate", params={"ratio": before["ratio"], "needed": before["needed"]})
+            rec = self.record(name, "none", None, status="skipped", note=f"row banding below the gate (measured against {ref})",
+                              params={"ratio_before": before["ratio"], "needed": before["needed"]})
+            rec.update(ratio_before=before["ratio"], ratio_after=None, needed=before["needed"], command=None)
             return arr
         t0 = time.time()
         line = f"fixbanding {workflow.BANDING_AMOUNT:g} {workflow.BANDING_SIGMA:g}"
         out = self.siril("bnd", arr, [line], "Banding")
-        after = workflow.image_banding_ratio(out)
+        after = workflow.image_banding_ratio(out, noise_from)
         if not (after["ratio"] is not None and after["ratio"] < before["ratio"]):
             # measured, not assumed: on the stretched IC 1805 starless the tool raised the ratio (2.35 -> 2.70: its sigma-1 highlight protection acts on a non-linear noise level)
-            self.record(name, "siril fixbanding", None, status="skipped", commands=[line], seconds=time.time() - t0,
-                        note="fixbanding did not lower the measured ratio: result discarded",
-                        params={"ratio_before": before["ratio"], "ratio_after": after["ratio"], "needed": before["needed"]})
+            rec = self.record(name, "siril fixbanding", None, status="skipped", commands=[line], seconds=time.time() - t0,
+                              note="fixbanding did not lower the measured ratio: result discarded",
+                              params={"ratio_before": before["ratio"], "ratio_after": after["ratio"], "needed": before["needed"]})
+            rec.update(ratio_before=before["ratio"], ratio_after=after["ratio"], needed=before["needed"], command=line)
             return arr
-        self.record(name, "siril fixbanding", out, commands=[line], seconds=time.time() - t0, linear=linear,
-                    params={"ratio_before": before["ratio"], "ratio_after": after["ratio"], "needed": before["needed"]},
-                    source="Siril docs, fixbanding: amount 1, sigma 1 'often good enough'; gated by the measured row ratio > 1 + 5/sqrt(2 n_rows)")
+        rec = self.record(name, "siril fixbanding", out, commands=[line], seconds=time.time() - t0, linear=linear,
+                          params={"ratio_before": before["ratio"], "ratio_after": after["ratio"], "needed": before["needed"]},
+                          source="Siril docs, fixbanding: amount 1, sigma 1 'often good enough'; gated by the measured row ratio > 1 + 5/sqrt(2 n_rows)")
+        rec.update(ratio_before=before["ratio"], ratio_after=after["ratio"], needed=before["needed"], command=line)
         return out
 
     # ---- 1. stretch -----------------------------------------------------------------------------------------------------
@@ -699,8 +704,9 @@ class Finisher:
                     note="shown through a linked autostretch")
         s = self.stretch(base)
         s = self.highlights(s)
+        pre = s
         s = self.denoise(s)
-        s = self.banding(s, "stretched starless", False)
+        s = self.banding(s, "stretched starless", False, noise_from=pre)
         s = self.colour(s)
         s = self.local_contrast(s)
         s = self.saturation(s)

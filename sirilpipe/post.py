@@ -854,7 +854,8 @@ def _chain_record(info: dict) -> list[dict]:
     """The chain's steps for the sidecar: command lines verbatim, parameters, levels after the step, the picture saved for it."""
     out = []
     for r in info.get("chain") or []:
-        out.append({k: v for k, v in r.items() if k in ("n", "step", "tool", "status", "seconds", "commands", "params", "levels", "picture", "note", "source")})
+        out.append({k: v for k, v in r.items() if k in ("n", "step", "tool", "status", "seconds", "commands", "params", "levels", "picture", "note", "source",
+                                                         "ratio_before", "ratio_after", "needed", "command")})
     return out
 
 

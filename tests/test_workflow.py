@@ -193,3 +193,16 @@ def test_banding_install_restores_filter_and_replaces_links(tmp_path):
     assert fits.getdata(raw).max() == 0                                   # the raw sub is never written
     w.banding_cleanup(d, "light", ("mCFA_unband_CFA",))
     assert not os.path.exists(os.path.join(d, "mCFA_unband_CFA0_light_.seq"))
+
+
+def test_image_banding_ratio_reference_noise_and_gate():
+    import numpy as np
+    rng = np.random.default_rng(1)
+    rows = rng.normal(0, 0.02, (400, 1)).astype(np.float32)               # row stripes
+    noisy = rng.normal(0, 1.0, (3, 400, 600)).astype(np.float32) + rows
+    smooth = rows + rng.normal(0, 0.02, (3, 400, 600)).astype(np.float32)  # a "denoised" image: white noise gone, stripes kept
+    own = w.image_banding_ratio(smooth)
+    ref = w.image_banding_ratio(smooth, noise_from=noisy)
+    assert own["banded"] and own["ratio"] > ref["ratio"]                   # against the denoised noise the ratio is inflated
+    assert ref["needed"] == pytest.approx(1 + 5 / (800 ** 0.5), abs=1e-3)
+    assert not w.image_banding_ratio(rng.normal(0, 1, (3, 400, 600)))["banded"]

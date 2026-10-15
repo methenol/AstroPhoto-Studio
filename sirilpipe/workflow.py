@@ -261,7 +261,7 @@ def calibrate_script(unit: Unit, debayer: bool, force: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _plane_ratio(pl, row_med=15):
+def _plane_ratio(pl, row_med=15, sigma=None):
     """Row-profile std / white-noise expectation of one 2-D plane over its central half of columns (see ``row_banding_ratio``)."""
     import numpy as np
     from scipy.ndimage import median_filter
@@ -270,6 +270,8 @@ def _plane_ratio(pl, row_med=15):
     pl = pl[:, w // 8: w // 8 + w // 2]
     dd = np.diff(pl, axis=1)
     sig = 1.4826 * np.median(np.abs(dd - np.median(dd))) / math.sqrt(2)
+    if sigma is not None:
+        sig = sigma
     prof = np.median(pl, axis=1)
     hp = prof - median_filter(prof, size=row_med, mode="nearest")
     return float(hp.std() / (1.2533 * sig / math.sqrt(pl.shape[1]))) if sig > 0 else None
@@ -285,10 +287,24 @@ def banding_gate(ratios: list, n_rows: int) -> dict:
     return {"ratio": round(r, 3), "needed": round(needed, 3), "banded": r > needed}
 
 
-def image_banding_ratio(arr) -> dict:
-    """Row banding of a finished-chain image ``(3, H, W)`` or ``(H, W)``: the same measure as ``row_banding_ratio`` per channel, mean over channels."""
+def pixel_noise(arr) -> list:
+    """Per-channel pixel noise (MAD of horizontal neighbour differences / sqrt 2) over the central half of the columns, as ``_plane_ratio`` measures it."""
+    import numpy as np
+    out = []
+    for pl in ([arr] if arr.ndim == 2 else list(arr)):
+        w = pl.shape[1]
+        dd = np.diff(np.asarray(pl, dtype=np.float64)[:, w // 8: w // 8 + w // 2], axis=1)
+        out.append(1.4826 * float(np.median(np.abs(dd - np.median(dd)))) / math.sqrt(2))
+    return out
+
+
+def image_banding_ratio(arr, noise_from=None) -> dict:
+    """Row banding of a finished-chain image ``(3, H, W)`` or ``(H, W)``: the same measure as ``row_banding_ratio`` per channel, mean over channels.  ``noise_from``: an image
+    whose pixel noise is the reference instead of the image's own (the stretched starless is measured against its noise BEFORE the denoiser: a denoiser removes the white
+    noise but keeps row-correlated structure, which inflates a ratio taken against the denoised image's own noise)."""
     planes = [arr] if arr.ndim == 2 else list(arr)
-    return banding_gate([_plane_ratio(p) for p in planes], planes[0].shape[0])
+    ref = pixel_noise(noise_from) if noise_from is not None else [None] * len(planes)
+    return banding_gate([_plane_ratio(p, sigma=r) for p, r in zip(planes, ref)], planes[0].shape[0])
 
 
 def row_banding_ratio(paths: list[str], pattern: str = "RGGB") -> dict:
