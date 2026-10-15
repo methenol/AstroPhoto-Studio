@@ -23,6 +23,11 @@ def luminance(rgb: np.ndarray, weights=LUM709) -> np.ndarray:
     return rgb[0] * np.float32(weights[0]) + rgb[1] * np.float32(weights[1]) + rgb[2] * np.float32(weights[2])
 
 
+def luminance_hwc(img_hwc: np.ndarray) -> np.ndarray:
+    """Rec. 709 luminance of an (H, W, 3) image."""
+    return (0.2126 * img_hwc[..., 0] + 0.7152 * img_hwc[..., 1] + 0.0722 * img_hwc[..., 2]).astype(np.float32)
+
+
 def sample(a: np.ndarray, n: int = 500_000, valid_only: bool = True) -> np.ndarray:
     """A strided sample of ``a`` (same spatial positions for every plane of equal shape).  Exact zeros
     (the empty border of a stack that was not cropped) are dropped when they are more than 0.1 % of

@@ -1053,6 +1053,22 @@ def _stage_logs(s: Session) -> list[dict]:
     return out
 
 
+def _map_png(path: str, kind: str, max_side: int = 1400) -> bytes:
+    """A map FITS (coverage: frames per pixel; rejection: rejected fraction) as a PNG with a colour ramp and north up."""
+    from astropy.io import fits as _fits
+    a = np.nan_to_num(_fits.getdata(path).astype(np.float32))
+    if a.ndim == 3:
+        a = a.max(0)
+    a = a[::-1]                                            # Siril bottom-up rows -> display
+    s = max(1.0, max(a.shape) / max_side)
+    if s > 1:
+        a = cv2.resize(a, (int(a.shape[1] / s), int(a.shape[0] / s)), interpolation=cv2.INTER_AREA)
+    hi = float(np.percentile(a, 99.5)) or 1.0
+    u8 = (np.clip(a / hi, 0, 1) * 255).astype(np.uint8)
+    img = cv2.applyColorMap(u8, cv2.COLORMAP_VIRIDIS if kind == "coverage" else cv2.COLORMAP_INFERNO)
+    return cv2.imencode(".png", img)[1].tobytes()
+
+
 @app.get("/api/diagnostic")
 def diagnostic(folder: str, kind: str = "logs", name: str | None = None, tail: int = 400):
     """``kind=logs``: the Siril / tool stage logs of the session (list); ``kind=log&name=``: one
@@ -1066,6 +1082,11 @@ def diagnostic(folder: str, kind: str = "logs", name: str | None = None, tail: i
             raise HTTPException(404)
         with open(f, errors="replace") as fh:
             return PlainTextResponse("".join(fh.readlines()[-max(tail, 1):]))
+    if kind in ("coverage", "rejection"):
+        f = os.path.join(s.dir, "coverage.fits" if kind == "coverage" else "rejection_map.fits")
+        if not os.path.exists(f):
+            raise HTTPException(404)
+        return Response(_map_png(f, kind), media_type="image/png")
     if kind == "reference":
         f = os.path.join(s.dir, "reference.jpg")
         if not os.path.exists(f):

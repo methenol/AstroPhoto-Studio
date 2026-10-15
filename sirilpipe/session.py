@@ -715,6 +715,7 @@ class Session:
         if band and band.get("applied") and hasattr(hdr, "add_history"):
             hdr.add_history(f"AstroPhoto Studio: {band['command']} on {band['pattern']} subs")
         fitsio.write_rgb(self._p("stack.fits"), out, fitsio.strip_wcs(hdr))   # the inherited WCS no longer fits
+        self._write_maps(box, inc, rows, (f0.width, f0.height), scale, (W, H), info)
         self._time("crop", time.time() - t0)
         cb(1, 1, "Cropping")
         valid = out[:, ::4, ::4]
@@ -754,6 +755,33 @@ class Session:
             meta["exptime"] = max(g["exptime"] for g in hdr_info["groups"])
             meta["weights"] = "wfwhm (per group); groups blended by inverse variance"
         return meta
+
+    def _write_maps(self, box, inc: list[int], rows: list[dict], sub_size, scale: float, canvas, info: dict) -> None:
+        """The Diagnostics tab's maps, cropped like the stack: ``coverage.fits`` (frames covering each pixel, from the registration homographies) and
+        ``rejection_map.fits`` (Siril's ``-rejmap`` of the integration: the share of frames rejected per pixel - satellites, planes, cosmic rays)."""
+        from astropy.io import fits as _fits
+        x, y, w, h = box
+        try:
+            hm = [rows[i]["H"] for i in inc if rows[i].get("H")]
+            if len(hm) == len(inc) and hm:
+                conv = (info or {}).get("convention") or "FHF"
+                cov, _ = stackpost.frame_coverage(hm, sub_size[0], sub_size[1], scale, canvas, conv, down=1)
+                cov = cov[y:y + h, x:x + w].astype(np.float32)
+                _fits.PrimaryHDU(cov).writeto(self._p("coverage.fits"), overwrite=True)
+        except Exception as e:                                        # noqa: BLE001  a missing map never fails the stack
+            log.warning("coverage map not written: %s", e)
+        try:
+            cands = sorted(glob.glob(os.path.join(self.process, "*rejmap*stack_raw*.fit*")) + glob.glob(os.path.join(self.process, "rejmap*.fit*")))
+            if cands:
+                rm = _fits.getdata(cands[-1]).astype(np.float32)
+                if rm.ndim == 3:
+                    rm = rm.max(0)
+                rm = rm[y:y + h, x:x + w] if rm.shape[0] >= y + h and rm.shape[1] >= x + w else rm
+                _fits.PrimaryHDU(rm).writeto(self._p("rejection_map.fits"), overwrite=True)
+                for f in cands:
+                    os.remove(f)
+        except Exception as e:                                        # noqa: BLE001
+            log.warning("rejection map not written: %s", e)
 
     def _invalidate_after_stack(self) -> None:
         """A new stack makes every later product stale (restore, star removal, auto-finish)."""

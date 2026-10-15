@@ -54,6 +54,7 @@
       <details class="adv">
         <summary>Integration &amp; options</summary>
         <div class="row" style="justify-content:flex-end;margin-top:8px"><button class="btn tiny ghost" id="spReset" title="Set every option below back to the pipeline's defaults">Reset to defaults</button></div>
+        <label title="Compute device of the AI tools (BlurXTerminator, NoiseXTerminator, StarXTerminator, GraXpert, ImageMM): auto picks the GPU when there is one.">Device <select id="sp-device"><option value="auto">auto</option></select></label>
         <label title="Bayer drizzle keeps the sensor's own samples (best for dithered OSC subs); demosaic interpolates first and registers on the colour image.">Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
         <label title="Drizzle scale: every sub is shifted slightly differently, so the stack can sample the sky on a finer grid. 2x is only used with 100+ subs and a sharp median FWHM; otherwise the stack falls back to 1x and says why in the stack info.">Super-resolution <select id="sp-scale"><option value="1">Off (native)</option><option value="1.5">1.5× drizzle</option><option value="2">2× drizzle (≥100 sharp subs)</option></select></label>
         <label title="How many of the weakest subs (by weighted FWHM) are dropped: 1.0 keeps the best 90 %, 0.5 keeps 97 %, 2.0 keeps 75 %.">Rejection sensitivity <input id="sp-sensitivity" type="range" min="0.5" max="2" step="0.1" value="1"><output></output></label>
@@ -227,6 +228,8 @@
         <div class="card"><h3>Stage logs <button class="btn tiny ghost" id="logsRefresh">Refresh</button></h3>
           <div id="logList" class="loglist"></div><pre id="logText" class="log small" style="max-height:420px;user-select:text" hidden></pre></div>
         <figure id="diagRefBox" hidden><img id="diagRef" alt=""><figcaption>Reference frame</figcaption></figure>
+        <figure id="diagCovBox" hidden><img id="diagCov" alt=""><figcaption>Integration coverage (frames per pixel, from the registration)</figcaption></figure>
+        <figure id="diagRejBox" hidden><img id="diagRej" alt=""><figcaption>Pixel rejection map (Siril -rejmap: satellites, planes, cosmic rays)</figcaption></figure>
         <div class="card"><h3>Stack &amp; processing info</h3><pre id="diagInfo" class="small"></pre></div>
       </div>
     </section>

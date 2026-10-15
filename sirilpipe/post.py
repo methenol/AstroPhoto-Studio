@@ -24,7 +24,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from . import export as export_mod
+from . import skyref as skyref_mod, export as export_mod
 from . import finish, fitsio, gates, pro, tools
 from .siril import SirilError, SirilRunner
 from .tools import ToolError, ToolUnavailable
@@ -93,7 +93,7 @@ def _S(group, key, label, options):
 # meaning is unchanged).  spcc_sensor / spcc_filter options are completed by the server from the SPCC database.
 PARAM_SPEC: list[dict] = [
     _B("Linear", "background", "Gradient removal (GraXpert AI background extraction)"),
-    _S("Linear", "bg_method", "Gradient model (auto: GraXpert AI, Siril RBF when the model is missing)", ["auto", "poly", "rbf"]),
+    _S("Linear", "bg_method", "Gradient model (auto: the NSNS sky survey when the stack is plate-solved and the field is covered, else GraXpert AI; reference: the survey only; poly / rbf: Siril subsky)", ["auto", "reference", "poly", "rbf"]),
     _S("Linear", "bg_correction", "Gradient correction", ["subtract", "divide"]),
     _R("Linear", "bg_degree", "Polynomial degree (poly model)", 1, 4, 1),
     _R("Linear", "bg_smoothing", "Gradient smoothing", 0, 1, 0.05),
@@ -410,9 +410,29 @@ class Restorer:
         if not p["background"]:
             s.add("gradient", "none", "skipped", note="background=false")
             return
-        method = p["bg_method"] if p["bg_method"] in ("poly", "rbf") else "auto"
+        method = p["bg_method"] if p["bg_method"] in ("poly", "rbf", "reference") else "auto"
         smoothing = float(p["bg_smoothing"])
         t0 = time.time()
+        if method in ("auto", "reference"):
+            # the calibrated sky survey (NSNS DR0.2, skyref.py): the gradient is what the survey's maps cannot explain, so emission that fills the field is kept
+            try:
+                if not _has_wcs(self.header):
+                    raise ValueError("the stack has no plate solution")
+                bg, info = self._survey_gradient()
+                self.arr = _sanitize(self.arr - np.moveaxis(bg, -1, 0))
+                zero = skyref_mod.sky_zero_mask(info, self.arr.shape[1:])
+                if zero is not None and zero.sum() > 100:
+                    off = [float(np.median(self.arr[c][zero])) for c in range(3)]
+                    lvl = float(np.median(finish.luminance(self.arr)))
+                    self.arr = _sanitize(self.arr - np.array(off, np.float32)[:, None, None] + lvl)   # the sky's zero point where the survey sees the least emission
+                s.add("gradient", "sky survey reference (skyref)", seconds=time.time() - t0, method=info["method"], degree=info["degree"], coverage=info["coverage"],
+                      gradient_range=round(info["gradient_range"], 2), survey_coefficients=info["survey_coefficients"], credit=info["credit"])
+                return
+            except Cancelled:
+                raise
+            except Exception as e:                                    # noqa: BLE001  offline, outside the survey, no plate solution: the sample-based models follow
+                s.add("gradient", "sky survey reference (skyref)", "failed" if method == "reference" else "skipped", time.time() - t0, note=f"{type(e).__name__}: {str(e)[:160]}")
+                method = "auto"
         if method == "auto":
             try:
                 src, dst = self._file(self.arr, "bge_in.fits"), self._out("bge_out.fits")
@@ -438,6 +458,28 @@ class Restorer:
             s.add("gradient", "siril subsky", seconds=time.time() - t0, command=cmd)
         except SIRIL_FAILS as e:
             s.add("gradient", "siril subsky", "failed", time.time() - t0, note=str(e).splitlines()[0])
+
+    def _survey_gradient(self):
+        """The NSNS maps on the stack's grid (cached in ``skyref.npz``) fitted beside a degree-3 polynomial (skyref.fit); returns (model (H, W, 3), info)."""
+        from astropy.wcs import WCS
+        wcs = WCS(self.header)
+        shape = self.arr.shape[1:]
+        key = json.dumps([wcs.to_header_string()[:4000], list(shape), skyref_mod.SURVEYS, skyref_mod.FACTOR])
+        path = _p(self.session, "skyref.npz")
+        refs = None
+        if os.path.exists(path):
+            try:
+                z = np.load(path)
+                if str(z["key"]) == key:
+                    refs = z["refs"].astype(np.float32)
+            except Exception:                                         # noqa: BLE001
+                refs = None
+        if refs is None:
+            refs = skyref_mod.fetch(wcs, shape)
+            np.savez_compressed(path, key=key, refs=refs)
+        img = np.ascontiguousarray(np.moveaxis(self.arr, 0, -1), np.float32)
+        bg, info = skyref_mod.fit(img, refs, float(skyref_mod.FACTOR), degree=3, smooth=1.5, clip_high=2.5)
+        return bg.astype(np.float32), info
 
     def plate_solve(self) -> bool:
         """WCS for SPCC.  The stack job normally solved it already; solve again only when it is missing."""

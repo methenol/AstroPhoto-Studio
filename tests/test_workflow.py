@@ -84,7 +84,7 @@ def test_apply_script_unselect_ranges_are_one_based_and_filter_included():
 def test_stack_script_flags():
     rs = w.decide_resampling({}, 100, 3.0)
     s = w.stack_script("/p", "pp_light", w.rejection({}, rs), 100)
-    assert "stack r_pp_light rej w 4 3 -norm=addscale -output_norm -rgb_equal -maximize -32b -weight=wfwhm -filter-included -out=stack_raw" in s
+    assert "stack r_pp_light rej w 4 3 -norm=addscale -output_norm -rgb_equal -maximize -32b -rejmap -weight=wfwhm -filter-included -out=stack_raw" in s
     assert "-fastnorm" not in s
     assert "-fastnorm" in w.stack_script("/p", "pp_light", w.rejection({}, rs), 1001)
     assert "-output_norm" not in w.stack_script("/p", "light", w.rejection({}, rs), 10, output_norm=False)

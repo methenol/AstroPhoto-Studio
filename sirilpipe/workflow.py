@@ -101,6 +101,10 @@ def decide_resampling(params: dict, n_included: int, median_fwhm: float | None, 
                    reason="demosaic + Lanczos4 registration" if cfa else "not a Bayer mosaic")
         return out
     if want > 1.0:
+        if mode == "drizzle":                          # the user chose Bayer drizzle at this scale explicitly: honoured (Siril drizzle docs: pixfrac ~ 1 / scale)
+            out.update(scale=float(want), pixfrac=round(1.0 / float(want), 3), kernel="square")
+            out["reason"] = f"{want:g}x drizzle requested explicitly (pixfrac {1.0 / want:.2f})"
+            return out
         ok = n_included >= DRIZZLE2_MIN_FRAMES and median_fwhm is not None and median_fwhm < DRIZZLE2_MAX_FWHM
         if ok:
             out.update(DRIZZLE_2X)
@@ -432,7 +436,7 @@ def stack_script(process_dir: str, seq: str, rej: dict, n_stacked: int, out: str
     args = [f"stack r_{seq}", f"rej {rej['type']} {rej['low']:g} {rej['high']:g}", "-norm=addscale"]
     if output_norm:
         args.append("-output_norm")
-    args += ["-rgb_equal", "-maximize", "-32b"]
+    args += ["-rgb_equal", "-maximize", "-32b", "-rejmap"]          # -rejmap: one merged rejection map (Siril docs), shown in the Diagnostics tab
     if weight:
         args.append(f"-weight={weight}")
     args.append("-filter-included")

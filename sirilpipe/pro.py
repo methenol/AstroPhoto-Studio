@@ -243,6 +243,20 @@ class Finisher:
                 if os.path.exists(f):
                     os.remove(f)
 
+    def mono(self, name: str, plane: np.ndarray) -> str:
+        """Write a single-plane FITS ``<name>.fit`` into the Siril working folder (``rgbcomp -lum=`` needs a MONOCHROME luminance image); returns its path."""
+        from astropy.io import fits as _fits
+        path = os.path.join(self.cwd, f"{name}.fit")
+        hdr = _fits.Header()
+        try:
+            for k in ("ROWORDER",):
+                if k in self.header:
+                    hdr[k] = self.header[k]
+        except Exception:                                             # noqa: BLE001
+            pass
+        _fits.PrimaryHDU(np.ascontiguousarray(plane, np.float32), header=hdr).writeto(path, overwrite=True)
+        return path
+
     def picture(self, name: str, arr: np.ndarray, linear: bool = False) -> str | None:
         """``steps/NN_<name>.png``: the picture after a step (linear steps through a linked autostretch)."""
         if not self.keep:
@@ -571,7 +585,12 @@ class Finisher:
         lum = finish.luminance(arr)
         newl = np.clip((1.0 - s_) * lum + s_ * ha, 0.0, 1.0).astype(np.float32)
         lines = ["rgbcomp -lum=hl_l hl_in -out=hl_out"]
-        out = self.siril("hl", arr, lines, "Ha luminance", out="hl_out", extra={"hl_l": np.stack([newl, newl, newl])})
+        lp = self.mono("hl_l", newl)
+        try:
+            out = self.siril("hl", arr, lines, "Ha luminance", out="hl_out")
+        finally:
+            if os.path.exists(lp):
+                os.remove(lp)
         self.record("Ha luminance", "siril rgbcomp -lum", out, commands=lines, seconds=time.time() - t0, params={"synthetic_luminance": s_},
                     source="rgbcomp -lum (Siril LRGB composition): lightness = (1 - s) image + s Ha; pro-workflow.md Chain B (NBN Lightness: Ha)")
         return out
@@ -712,10 +731,13 @@ class Finisher:
             lum = finish.luminance(out)
             lines2 = ["rgbcomp -lum=sc_l sc_c -out=sc_lrgb", "load sc_lrgb", f'pm "{1.0 - c:.4f}*$sc_in$+{c:.4f}*$sc_lrgb$"']
             colour = np.clip(stars / np.maximum(stars.max(0, keepdims=True), 1e-9), 0, 1).astype(np.float32)
-            out2 = self.siril("sc", out, lines2, "Star colour", extra={"sc_l": np.stack([lum, lum, lum]), "sc_c": colour})
-            fp = os.path.join(self.cwd, "sc_lrgb.fit")
-            if os.path.exists(fp):
-                os.remove(fp)
+            lp = self.mono("sc_l", lum)
+            try:
+                out2 = self.siril("sc", out, lines2, "Star colour", extra={"sc_c": colour})
+            finally:
+                for fp in (lp, os.path.join(self.cwd, "sc_lrgb.fit")):
+                    if os.path.exists(fp):
+                        os.remove(fp)
             self.record("stars colour preservation", "siril rgbcomp -lum / pm", out2, commands=lines2, seconds=time.time() - t0, params={"star_color_preservation": c},
                         source="LRGB composition of the stretched lightness with the linear colour ratios (the arcsinh / colour-preserving star stretch: PixInsight ArcsinhStretch, Seti Star Stretch colour boost)")
             return out2

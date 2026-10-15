@@ -41,6 +41,9 @@ async function init() {
   const dev = S.system.devices;
   const gpu = (dev.gpus || [])[0];
   $("#deviceBadge").textContent = gpu ? `⚡ ${gpu.name}${gpu.vram_gb ? " · " + gpu.vram_gb + " GB" : ""}` : "CPU only";
+  const ds = $("#sp-device");
+  if (ds) ds.innerHTML = `<option value="auto">auto (${(dev.gpus || []).length ? "GPU" : "CPU"})</option>` +
+    (dev.gpus || []).map(g => `<option value="gpu${g.id}">${esc(g.name)}</option>`).join("") + `<option value="cpu">CPU</option>`;
   buildParamUI();
   buildPresets();
   bindUI();
@@ -314,6 +317,7 @@ function stackParams() {
     deconv_method: g("deconv_method").value, ai_deconvolution: on,
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
+    device: g("device") ? g("device").value : "auto",
   };
 }
 function exportOpts() {
@@ -605,6 +609,11 @@ async function refreshDiag() {
   ref.onload = () => ($("#diagRefBox").hidden = false);
   ref.onerror = () => ($("#diagRefBox").hidden = true);
   ref.src = `/api/diagnostic?kind=reference&${q}`;
+  for (const [k, id] of [["coverage", "Cov"], ["rejection", "Rej"]]) {
+    const im = $("#diag" + id), box = $("#diag" + id + "Box");
+    im.onload = () => (box.hidden = false); im.onerror = () => (box.hidden = true);
+    im.src = `/api/diagnostic?kind=${k}&${q}`;
+  }
   let li = {};
   try { li = await api(`/api/linear_info?folder=${encodeURIComponent(S.folder)}`); } catch { }
   $("#diagInfo").textContent = JSON.stringify({ stack: S.status?.stack_meta, processing: li }, null, 1);

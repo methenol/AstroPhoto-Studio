@@ -35,7 +35,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from . import finish, gates, pro
+from . import finish, looks, gates, pro
 
 CLIP_LIMIT = 0.0005                    # 0.05 % (FINISH-SPEC)
 STAR_DENSITY = ((150.0, 0.4), (600.0, 0.5))      # per MP: sparse (< 150), normal (<= 600); dense above -> 0.6
@@ -48,6 +48,11 @@ SCNR_AMOUNT = 0.6
 STAR_COLOUR_MIN = 0.10
 STAR_BOOSTS = (1.0, 1.5, 2.0)
 STATS_SIDE = 1200
+
+
+GHS_D2_SMALL, GHS_D2_FILLING = 2.5, 1.5      # second GHS pass D by subject coverage (measured 2026-10-15; see autofinish.run)
+SATU_BROADBAND_MAX = 0.3
+SATU_CANDIDATES = (0.25, 0.3, 0.5)                 # Siril tutorial satu values                     # satu amount cap for broadband (Siril tutorial 0.25-0.5; the middle value keeps SPCC's calibration)
 
 
 def star_settings(per_mp: float) -> tuple[float, str]:
@@ -128,6 +133,9 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     base = layers.base
     lum_lin = finish.luminance(base)
     snr = _snr(session, lum_lin)
+    ref_looks, ref_agg, ref_desc, ref_sources = looks.reference_looks((meta or {}).get("object"), dual)
+    if progress:
+        progress(state["i"], steps_total, f"Auto-finish: references: {ref_desc}")
     cov = finish.object_coverage(lum_lin)
     method = "ghs2" if str(p0.get("stretch_method")) in ("ghs", "") else str(p0.get("stretch_method"))
     decide("stretch_method", method, "object_snr", round(snr, 2), None, "the GHS two-pass recipe by Siril ght (Siril GHS tutorial, ghsastro): the default; the settings may name another published tool")
@@ -137,6 +145,11 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
            + (f"; the target covers {cov * 100:.0f} % of the frame: a small target, so Statistical Stretch would send its median to {pro.STAT_SMALL}" if small else
               f"; the target fills {cov * 100:.0f} % of the frame: Statistical Stretch would use its default median {pro.STAT_FILLING}"))
     decide("black_point", 0.0, "sky_L", pro.SKY_TARGET, None, "the black point is part of the stretch (linstretch -BP at the histogram toe) and of the last step")
+    # the second GHS pass's D (contrast of the subject): measured on the 2026-10-15 renders - 2.5 on a small emission nebula (IC 1805, M 42) gives the structure its
+    # range, the same on a frame-filling bright object (M 31) blows the core; 1.5 there.  The GHS docs leave D to taste ("until the object has the contrast you want").
+    d2 = GHS_D2_SMALL if small else GHS_D2_FILLING
+    decide("ghs_d2", d2, "object_frac", round(cov, 3), None,
+           f"second GHS pass D {d2} ({'small subject' if small else 'frame-filling subject'}: 2.5 measured right on IC 1805 / M 42, 1.5 on M 31 whose core blew at 2.5)")
 
     # stretch without highlight protection: clipping measure
     tick("stretch")
@@ -193,6 +206,23 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         col = s0
     sat0 = subject_saturation(col, mask)
     amount = satu_amount(sat0)
+    if not dual:
+        amount = min(amount, SATU_BROADBAND_MAX)                   # a galaxy / reflection nebula: the stronger satu tinted M 31's disc magenta; 0.3 is the published middle value
+    if ref_agg and "C50" in ref_agg:
+        # the references' colourfulness (median OKLab chroma of the object, C50) decides among the published satu values: the one whose render lands nearest
+        best, best_d, tried = amount, None, {}
+        for cand in SATU_CANDIDATES:
+            if (not dual) and cand > SATU_BROADBAND_MAX:
+                continue
+            sat_img = pro.Finisher(work, layers.header, {**p1, "saturation": 1.0 + cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False).saturation(col)
+            c50 = looks.look_stats(np.moveaxis(sat_img, 0, -1))["C50"]
+            tried[cand] = round(c50, 4)
+            d = abs(c50 - ref_agg["C50"])
+            if best_d is None or d < best_d:
+                best, best_d = cand, d
+        amount = best
+        steps.append({"step": "saturation (references)", "from": None, "to": round(1.0 + amount, 2), "measured": "C50 per satu amount", "before": tried, "target": round(ref_agg["C50"], 4),
+                      "why": f"{ref_desc}: median object chroma C50 {ref_agg['C50']:.3f}; satu {amount} lands nearest among the published 0.25 / 0.3 / 0.5"})
     decide("saturation", round(1.0 + amount, 2), "C50", round(sat0, 3), None,
            f"subject saturation {sat0:.2f} after the palette: Siril satu {amount} (published 0.25-0.5; >= 0.35 -> 0.25, >= 0.20 -> 0.3, else 0.5)")
 
@@ -250,8 +280,28 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     tuned_full = {**p0, **tuned, "stretch_method": method, "grade_temperature": 0.0, "grade_contrast": 0.0}
     tuned_full["saturation"] = round(1.0 + amount, 2)
     cls = ("dual-band " if dual else "broadband ") + ("nebula" if 0.0 < cov < 0.8 else "field")
+    nearest, score_before, score_after = None, None, None
+    if ref_looks:
+        # the distance to the reference photographs of the target: a check, not the objective (the original Auto-finish's report)
+        try:
+            img0, _ = pro.Finisher(work, layers.header, {**p0, "hdr": p0.get("hdr", 0.0)}, dual, external=False, checkpoint=checkpoint, keep_pictures=False).run(base, layers.stars)
+            img1, _ = pro.Finisher(work, layers.header, tuned_full, dual, external=False, checkpoint=checkpoint, keep_pictures=False).run(base, layers.stars)
+            st0_, st1_ = looks.look_stats(np.moveaxis(img0, 0, -1)), looks.look_stats(np.moveaxis(img1, 0, -1))
+            ow = looks.object_weight(st1_)
+            score_before, _ = looks.score(st0_, ref_looks, ow)
+            score_after, terms = looks.score(st1_, ref_looks, ow)
+            n_ = terms.get("_nearest", 0)
+            src_ = ref_sources[n_] if n_ < len(ref_sources) else {}
+            nearest = {"title": src_.get("title") or src_.get("file") or f"reference {n_}", "url": src_.get("url"), "author": src_.get("author"), "licence": src_.get("license") or src_.get("licence")}
+            steps.append({"step": "distance to the references", "from": round(score_before, 1), "to": round(score_after, 1), "measured": "look_stats", "before": {k: round(v, 4) for k, v in st0_.items() if isinstance(v, float) and k in ("sky_L", "C50", "C90", "star_frac", "sky_noise", "peak_L")},
+                          "after": {k: round(v, 4) for k, v in st1_.items() if isinstance(v, float) and k in ("sky_L", "C50", "C90", "star_frac", "sky_noise", "peak_L")}, "target": {k: round(ref_agg[k], 4) for k in ("sky_L", "C50", "C90", "star_frac", "sky_noise", "peak_L") if ref_agg and k in ref_agg},
+                          "why": f"compared with {ref_desc} (statistics of freely licensed photographs; reported, not optimised)"})
+        except Exception as e:                                        # noqa: BLE001  the report never stops the job
+            steps.append({"step": "distance to the references", "why": f"not measured: {type(e).__name__}: {str(e)[:120]}"})
     report = {
-        "reference": "published values by fixed rules (research/pro-workflow.md), no fitting", "class": cls, "nearest": None, "seconds": round(time.time() - t0, 1), "steps": steps,
+        "reference": ref_desc if ref_looks else "published values by fixed rules (research/pro-workflow.md), no references for this target", "class": cls, "nearest": nearest,
+        "score_before": None if score_before is None else round(score_before, 2), "score_after": None if score_after is None else round(score_after, 2),
+        "references": {"description": ref_desc, "sources": ref_sources[:60]}, "seconds": round(time.time() - t0, 1), "steps": steps,
         "stats_after_stretch": st1, "coverage": round(cov, 4), "snr": round(snr, 2), "star_field": cls_stars, "created": datetime.now().isoformat(timespec="seconds"),
         "summary": f"{cls}: {method}, background {pro.SKY_TARGET}, " + ("HDR on, " if hdr_value else "") + f"NXT {nxt}, saturation {tuned_full['saturation']}",
     }
