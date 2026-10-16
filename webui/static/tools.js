@@ -106,10 +106,21 @@ const Tools = (() => {
     return card("rcastro", "RC-Astro", t, body + note("rcastro"), t.version ? "CLI " + t.version : "");
   }
 
+  function gaiaCard(t) {
+    t = t || {};
+    const gb = v => v ? (v / 1e9).toFixed(2) + " GB" : "0 GB";
+    const chunks = (t.chunks || []).length ? (t.chunks || []).join(", ") : "none yet";
+    return card("gaia", "Gaia SPCC data (cached per field)", { ok: true }, kv([["Sky chunks cached", esc(`${t.installed || 0} of ${t.total || 48} (${chunks})`)], ["Size", gb(t.bytes)], ["Folder", esc(t.path)]]) +
+      `<div class="small muted">Colour calibration (Siril SPCC) uses Gaia DR3 spectra from Zenodo. The first field calibrated in a region fetches that region's chunk of the catalogue (one of 48, 27-626 MB compressed) and keeps it, so later fields there calibrate offline and in seconds. If the fetch fails the run reads Zenodo directly as before.</div>` +
+      (t.paused_until ? `<div class="tmsg err">Fetching is paused until ${new Date(t.paused_until * 1000).toLocaleTimeString()} after a failed download (${esc(t.paused_why || "")}); calibration runs online meanwhile.</div>` : "") +
+      ((t.installed || 0) ? `<div class="row gap"><button class="btn small" data-act="gaiaclear" ${T.busy ? "disabled" : ""}>Clear the cache</button></div>` : "") +
+      note("gaia"), `${t.installed || 0} chunks`);
+  }
+
   function render() {
     const d = T.data; if (!d) return;
     $("#toolsBody").className = "";
-    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro);
+    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro) + gaiaCard(d.gaia);
     $$("#toolsBody details.tool").forEach(el => el.ontoggle = () => el.open ? T.open.add(el.dataset.tool) : T.open.delete(el.dataset.tool));
     const code = $("#rcCode"); if (code) code.oninput = () => (T.code = code.value);
     const acc = $("#starnetAccept"); if (acc) acc.onchange = () => (T.starnetOk = acc.checked);
@@ -145,6 +156,11 @@ const Tools = (() => {
     if (act === "deactivate") {
       if (!confirm(`Free this computer's ${ds.product.toUpperCase()} activation? You can activate it again later.`)) return;
       return licenceCall("/api/tools/rcastro/deactivate", { product: ds.product }, "Deactivating " + ds.product.toUpperCase());
+    }
+    if (act === "gaiaclear") {
+      if (!confirm("Remove the cached Gaia catalogue chunks? They are fetched again on the next calibration in that part of the sky.")) return;
+      try { const r = await api("/api/tools/gaia/clear", { method: "POST", body: {} }); toast(`Removed ${r.removed} files`); await load(); } catch (e) { say("gaia", e.message, true); }
+      return;
     }
     if (act === "dl") {
       const tool = ds.tool, body = { tool };

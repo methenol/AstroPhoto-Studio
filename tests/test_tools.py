@@ -392,7 +392,7 @@ def test_tools_status_shape(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "x"))
     tools.rcastro._info_cache = None                      # the singleton caches info() for a few seconds
     st = tools.tools_status()
-    assert set(st) == {"siril", "graxpert", "starnet", "rcastro"}
+    assert set(st) == {"siril", "graxpert", "starnet", "rcastro", "gaia"}
     assert set(st["siril"]) >= {"ok", "version", "path"}
     assert set(st["graxpert"]) == {"ok", "version", "models", "gpu"}
     assert set(st["graxpert"]["models"]) == {"bge", "denoise", "deconv_obj", "deconv_stellar"}

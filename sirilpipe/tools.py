@@ -12,6 +12,7 @@ cited in the comments).
 """
 from __future__ import annotations
 
+import bz2
 import hashlib
 import json
 import os
@@ -23,6 +24,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -975,12 +977,148 @@ class RCAstro:
 
 # --------------------------------------------------------------------------- module singletons
 
+# --------------------------------------------------------------------------- Gaia DR3 SPCC catalogue: a per-field cache
+# Siril 1.4's SPCC reads Gaia DR3 xp_sampled spectra from Zenodo by HTTP range requests on every run (minutes per field; a dropped connection fails or crashes the
+# command) or from a local copy of the catalogue.  The local copy is split into 48 level-1 HEALPix chunks (nested order; Siril_Catalog_Installer.py's layout
+# "<siril user data>/siril_cat1_healpix8_xpsamp/siril_cat1_healpix8_xpsamp_<n>.dat", registered as core.catalogue_gaia_photo).  A partial set is legitimate:
+# Siril's own installer offers chunks by latitude or by area.  Here the chunks covering a field are fetched when that field is first colour calibrated and kept,
+# so the cache grows only with the sky the user images (27-626 MB compressed, about twice that unpacked, per chunk) instead of the whole 21 GB.
+GAIA_SPCC_RECORD = 14738271
+GAIA_SPCC_CHUNKS = 48
+GAIA_SPCC_NAME = "siril_cat1_healpix8_xpsamp"
+GAIA_SPCC_ATTEMPTS = 3
+GAIA_SPCC_MARGIN_DEG = 0.5               # around the field's radius: the stars SPCC samples near the edge
+GAIA_SPCC_TIMEOUT = 45                   # s per connection / read: Zenodo resets TLS connections when it is overloaded; SPCC itself runs online meanwhile
+GAIA_SPCC_BACKOFF = 1800                 # s: after a failed fetch no further fetch is tried (every queued job would otherwise wait the attempts out)
+
+
+def healpix1_pixels(ra_deg: float, dec_deg: float, radius_deg: float) -> list[int]:
+    """The level-1 (nside 2, nested) HEALPix pixels within ``radius_deg`` of (ra, dec): the catalogue chunks a field needs."""
+    from astropy import units as u
+    from astropy_healpix import HEALPix
+    hp = HEALPix(nside=2, order="nested")
+    px = hp.cone_search_lonlat(ra_deg * u.deg, dec_deg * u.deg, radius_deg * u.deg)
+    return sorted(int(i) for i in np.atleast_1d(px))
+
+
+@dataclass
+class GaiaCatalog:
+    """The cached chunks of the offline Gaia DR3 SPCC catalogue in Siril's user data folder."""
+
+    def dir(self) -> str:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        return os.path.join(home, ".local", "share", "siril", GAIA_SPCC_NAME)
+
+    def chunk_path(self, n: int) -> str:
+        return os.path.join(self.dir(), f"{GAIA_SPCC_NAME}_{n}.dat")
+
+    def installed(self) -> list[int]:
+        return [n for n in range(GAIA_SPCC_CHUNKS) if os.path.isfile(self.chunk_path(n))]
+
+    def covers(self, pixels: list[int]) -> bool:
+        return all(os.path.isfile(self.chunk_path(n)) for n in pixels)
+
+    def status(self) -> dict:
+        inst = self.installed()
+        size = sum(os.path.getsize(self.chunk_path(n)) for n in inst)
+        partial = sum(os.path.getsize(os.path.join(self.dir(), f)) for f in os.listdir(self.dir()) if f.endswith((".bz2", ".part"))) if os.path.isdir(self.dir()) else 0
+        return {"ok": bool(inst), "chunks": inst, "installed": len(inst), "total": GAIA_SPCC_CHUNKS, "bytes": size, "partial_bytes": partial, "path": self.dir(),
+                "record": f"https://zenodo.org/records/{GAIA_SPCC_RECORD}",
+                "paused_until": GaiaCatalog._backoff_until if time.time() < GaiaCatalog._backoff_until else None, "paused_why": GaiaCatalog._backoff_why if time.time() < GaiaCatalog._backoff_until else None}
+
+    def clear(self) -> dict:
+        n = 0
+        if os.path.isdir(self.dir()):
+            for f in os.listdir(self.dir()):
+                if f.startswith(GAIA_SPCC_NAME):
+                    os.remove(os.path.join(self.dir(), f))
+                    n += 1
+        return {"removed": n}
+
+    _backoff_until: float = 0.0
+    _backoff_why: str = ""
+
+    def ensure_field(self, ra_deg: float, dec_deg: float, radius_deg: float, progress: Progress | None = None,
+                     checkpoint: Callable[[], None] | None = None) -> dict:
+        """Make sure the chunks covering the field are cached (download, sha256, decompress).  Returns the pixel list and what was fetched; raises ToolError when
+        a chunk cannot be fetched (and then declines further fetches for ``GAIA_SPCC_BACKOFF`` seconds: the caller runs SPCC online)."""
+        pixels = healpix1_pixels(ra_deg, dec_deg, radius_deg + GAIA_SPCC_MARGIN_DEG)
+        missing = [n for n in pixels if not os.path.isfile(self.chunk_path(n))]
+        if missing and time.time() < self._backoff_until:
+            raise ToolError("gaia", f"not retried until {time.strftime('%H:%M', time.localtime(self._backoff_until))}: {self._backoff_why}")
+        os.makedirs(self.dir(), exist_ok=True)
+        try:
+            for i, n in enumerate(missing):
+                self._install_chunk(n, i, len(missing), progress, checkpoint)
+        except ToolError as e:
+            GaiaCatalog._backoff_until, GaiaCatalog._backoff_why = time.time() + GAIA_SPCC_BACKOFF, str(e)[:160]
+            raise
+        return {"pixels": pixels, "fetched": missing}
+
+    def _install_chunk(self, n: int, i: int, total: int, progress, checkpoint) -> None:
+        name = f"{GAIA_SPCC_NAME}_{n}.dat"
+        url = f"https://zenodo.org/records/{GAIA_SPCC_RECORD}/files/{name}.bz2"
+        bz, part = os.path.join(self.dir(), name + ".bz2"), os.path.join(self.dir(), name + ".part")
+        last: Exception | None = None
+        for attempt in range(GAIA_SPCC_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(url + ".sha256sum", timeout=GAIA_SPCC_TIMEOUT) as r:
+                    want = r.read().decode("ascii", "replace").split()[0].lower()
+                have = os.path.getsize(bz) if os.path.exists(bz) else 0
+                try:
+                    req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+                    with urllib.request.urlopen(req, timeout=GAIA_SPCC_TIMEOUT) as r:
+                        resumed = have > 0 and r.status == 206
+                        if not resumed:
+                            have = 0
+                        total_b = int(r.headers.get("Content-Length") or 0) + have
+                        got = have
+                        with open(bz, "ab" if resumed else "wb") as f:
+                            while True:
+                                chunk = r.read(1 << 20)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                got += len(chunk)
+                                if progress:
+                                    progress(i + 0.9 * got / max(total_b, got), total, f"Gaia SPCC catalogue: sky chunk {n} ({got / 1e6:.0f} of {total_b / 1e6:.0f} MB), cached for every later field here")
+                                if checkpoint:
+                                    checkpoint()
+                except urllib.error.HTTPError as e:
+                    if e.code != 416 or not have:                   # 416: the partial file already is the whole file
+                        raise
+                sha = hashlib.sha256()
+                with open(bz, "rb") as f:
+                    for blk in iter(lambda: f.read(1 << 22), b""):
+                        sha.update(blk)
+                if sha.hexdigest() != want:
+                    os.remove(bz)
+                    raise ToolError("gaia", f"chunk {n}: checksum mismatch (removed)")
+                if progress:
+                    progress(i + 0.92, total, f"Gaia SPCC catalogue: unpacking sky chunk {n}")
+                with bz2.BZ2File(bz, "rb") as fi, open(part, "wb") as fo:
+                    shutil.copyfileobj(fi, fo, 1 << 22)
+                os.replace(part, self.chunk_path(n))
+                os.remove(bz)
+                return
+            except (OSError, ToolError) as e:
+                last = e
+                if os.path.exists(part):
+                    os.remove(part)
+                if checkpoint:
+                    checkpoint()
+                time.sleep(5.0 * (attempt + 1))
+        raise ToolError("gaia", f"sky chunk {n} could not be cached after {GAIA_SPCC_ATTEMPTS} attempts: {last}")
+
+
+
 graxpert = GraXpert()
 starnet = StarNet()
 rcastro = RCAstro()
+gaia = GaiaCatalog()
 
 
 def tools_status() -> dict:
     """The ``GET /api/tools`` document (DESIGN section 5)."""
     return {"siril": siril_status(), "graxpert": graxpert.status(), "starnet": starnet.status(),
-            "rcastro": rcastro.status()}
+            "rcastro": rcastro.status(), "gaia": gaia.status()}

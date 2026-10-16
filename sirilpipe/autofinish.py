@@ -18,7 +18,9 @@ scnr                   broadband: 0.6 (SW Skies 0.60-0.75, low end) when the sub
                        (green is the OIII; NBN never applies SCNR to HOO)
 local_contrast         the blend of the Siril ``clahe`` passes: 0.2 (0.5, the lowest published strength: Sh2-140 / IC 417) for noisy data (SNR <= 3), 0.35 (0.875, M51's second
                        pass) for clean data (SNR >= 15), between by log SNR (Brecher: after the noise reduction, under a background mask)
-saturation             Siril ``satu`` amount from the published 0.25-0.5: the subject's mean saturation after the palette >= 0.35 -> 0.25, >= 0.20 -> 0.3, else 0.5
+saturation             the factor by which the GHS saturation stretch (Siril ``ght -sat``) raises the subject's mean HSL saturation so that it reaches 0.45 on a dual-band
+                       HOO render (the accepted C 20 render measured 0.58; the muted IC 1805 / C 33 renders 0.09-0.11) and 0.25 on broadband (M 31's disc tinted at more);
+                       1 .. 4
 star_reduction         by star density: sparse (< 150 per MP) 0.4 (Brecher StarReduction 0.4), normal 0.5, dense (> 600) 0.6 (DSA value 0.2 = strength 0.6)
 star_stretch           Seti Astro Star Stretch amount 5 (default; documented range 0-8)
 star_saturation        Seti colour boost 1.0 (default) unless the stretched stars' flux colour is below 0.10 saturation: then 1.5, and 2.0 (the documented maximum) if still short
@@ -42,7 +44,6 @@ STAR_DENSITY = ((150.0, 0.4), (600.0, 0.5))      # per MP: sparse (< 150), norma
 STAR_REDUCTION_DENSE = 0.6
 NXT_DN = (0.85, 0.60)                  # noisy -> clean
 LC_BLEND = (0.5, 0.875)                # local_contrast: the lowest published strength (x 0.4 = 0.2) -> M51's 0.35
-SATU_AMOUNTS = ((0.35, 0.25), (0.20, 0.30))      # (saturation of the subject at least ..., satu amount); below the last: 0.5
 SCNR_CAST = 0.01
 SCNR_AMOUNT = 0.6
 STAR_COLOUR_MIN = 0.10
@@ -51,9 +52,8 @@ STATS_SIDE = 1200
 
 
 GHS_D2_SMALL, GHS_D2_FILLING = 2.5, 1.5      # second GHS pass D by subject coverage (measured 2026-10-15; see autofinish.run)
-SATU_BROADBAND_MAX = 0.3                     # satu amount cap for broadband (Siril tutorial 0.25-0.5; the middle value keeps SPCC's calibration)
-SATU_CANDIDATES = (0.25, 0.3, 0.5)           # Siril tutorial satu values
-SATU_DUAL_MIN = 0.45                         # HOO renders judged right at satu 0.45 (the Siril tutorial range ends at 0.5)
+SAT_TARGET_DUAL = 0.45                       # mean HSL saturation of the subject after the saturation step, HOO (the accepted C 20 render 0.58; IC 1805 / C 33 came out at 0.09-0.11 and grey)
+SAT_TARGET_BROADBAND = 0.25                  # broadband: a galaxy's natural colour is weaker (M 31's disc tinted magenta when pushed)
 HDR_DUAL_DEFAULT = 0.5                       # GHS HP protection at half strength on dual-band nebulae (see run)
 STAR_BOOST_BROADBAND_MAX = 1.2               # colour boost 1.5 made M 31's faint stars green / magenta (chroma noise); 1.2 at most on broadband
 
@@ -79,11 +79,10 @@ def local_contrast_amount(snr: float) -> float:
     return round(finish.snr_ladder(snr, *LC_BLEND), 2)
 
 
-def satu_amount(subject_saturation: float) -> float:
-    for floor, amount in SATU_AMOUNTS:
-        if subject_saturation >= floor:
-            return amount
-    return 0.5
+def saturation_factor(subject_saturation: float, dual: bool) -> tuple[float, float]:
+    """(``saturation`` setting, target): the factor that brings the subject's mean HSL saturation to the target, within the setting's range 1 .. SAT_FACTOR_MAX."""
+    target = SAT_TARGET_DUAL if dual else SAT_TARGET_BROADBAND
+    return round(float(np.clip(target / max(subject_saturation, 1e-3), 1.0, pro.SAT_FACTOR_MAX)), 2), target
 
 
 def green_cast(img: np.ndarray, mask: np.ndarray | None) -> float:
@@ -92,8 +91,15 @@ def green_cast(img: np.ndarray, mask: np.ndarray | None) -> float:
     return float(np.median(g[mask])) if mask is not None and mask.sum() > 100 else float(np.median(g))
 
 
+SAT_SMOOTH_PX = 9                            # the measurement is made on the stretch before the noise reduction: a box mean of this size takes the pixel noise out of the
+                                             # saturation (measured on C 33: 0.071 smoothed vs 0.066 after NoiseXTerminator; the raw per-pixel value was 0.23)
+
+
 def subject_saturation(img: np.ndarray, mask: np.ndarray | None) -> float:
-    return finish.mean_saturation(img, mask)
+    """Mean HSL saturation over the subject (the plane Siril's ``ght -sat`` stretches), of the box-smoothed image: what the denoised image will show."""
+    sm = np.stack([cv2.boxFilter(np.ascontiguousarray(img[c], dtype=np.float32), -1, (SAT_SMOOTH_PX, SAT_SMOOTH_PX)) for c in range(3)])
+    sat = pro.hsl_saturation(sm)
+    return float(sat[mask].mean()) if mask is not None and mask.sum() > 50 else float(sat.mean())
 
 
 def star_boost(sat_after_stretch: float) -> float:
@@ -208,11 +214,11 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         decide("palette", "natural", "broadband filter", None, None, "broadband: natural colour")
         col = s0
     sat0 = subject_saturation(col, mask)
-    amount = satu_amount(sat0)
-    if not dual:
-        amount = min(amount, SATU_BROADBAND_MAX)                   # a galaxy / reflection nebula: the stronger satu tinted M 31's disc magenta; 0.3 is the published middle value
-    else:
-        amount = max(amount, SATU_DUAL_MIN)                        # HOO: at least the published upper value (judged on IC 1805 / M 42 2026-10-15; 0.25 left the nebula muted)
+    k_sat, sat_target = saturation_factor(sat0, dual)
+    decide("saturation", k_sat, "subject_S", round(sat0, 3), sat_target,
+           f"the subject's mean HSL saturation after the palette is {sat0:.3f}; the GHS saturation stretch (Siril ght -sat, D fitted) multiplies it by {k_sat} towards "
+           f"{sat_target} ({'HOO: the accepted C 20 render measured 0.58, the grey IC 1805 / C 33 renders 0.09-0.11' if dual else 'broadband: natural colour, M 31 tinted when pushed further'}"
+           f"; the setting's range is 1-{pro.SAT_FACTOR_MAX:g})")
     # stars
     tick("stars")
     star_info = _star_density(layers, session)
@@ -265,7 +271,6 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     # gradient report (information)
     tick("final measurements")
     tuned_full = {**p0, **tuned, "stretch_method": method, "grade_temperature": 0.0, "grade_contrast": 0.0}
-    tuned_full["saturation"] = round(1.0 + amount, 2)
     cls = ("dual-band " if dual else "broadband ") + ("nebula" if 0.0 < cov < 0.8 else "field")
     report = {
         "reference": "published values by fixed rules (research/pro-workflow.md); no reference images (those grade the Experiments tab's trials only)", "class": cls, "nearest": None,

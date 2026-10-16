@@ -21,7 +21,8 @@ step   tool and published parameters (source)
        by Siril ``pm``; NBN (Blanshan / Cranfield, Cuiv's script: ``nbn.py``) when ``oiii_boost`` != 1.  Broadband: ``rmgreen 3 <scnr>`` (SCNR).
 5      local contrast under a background mask, after the noise reduction: Siril ``clahe`` (contrast limit 1.5 = Brecher's LHE limit), 150 px then 40 px tiles
        (Brecher M51 / IC 1848 / Sh2-140 scales), blended at 0.4 x ``local_contrast`` (0.5 -> 0.2 = the lowest published strengths 0.18-0.2).
-6      saturation: ``satu <0.25-0.5> 1`` (Siril tutorial; background factor 1 touches only pixels above median + sigma), after the chroma noise reduction.
+6      saturation: ``ght -sat`` (Siril's GHS saturation stretch, ghsastro) with D fitted so the subject's mean HSL saturation is multiplied by the ``saturation`` setting, under the
+       range mask, after the chroma noise reduction (``satu``'s linear gain, gated at median + sigma, left faint subjects grey: C 33 2026-10-15).
 7      stars: Seti Astro Star Stretch = ``mtf 0 1/(3^a+1) 1`` on the linear stars (a = 5: ``mtf 0 0.004098 1``); dual-band: invert, ``rmgreen``, invert (Brecher, IC 1848);
        reduction by the DSA star-reduction formula (siril-scripts DSA-Star_Reduction.py, Rich Stevenson: value 0.2 default); recombination by screen
        ``pm "~(~$starless$*~$stars$)"`` (RC-Astro, Brecher).
@@ -63,7 +64,10 @@ NXT_DN = (0.60, 0.85)              # NXT --dn on stretched starless (RC-Astro / 
 CLAHE_CLIP = 1.5                   # Brecher's LHE contrast limit
 CLAHE_SCALES = (150, 40)           # px, Brecher's LHE scales (M51: 150 then 40; IC 1848 40 then 150)
 LC_STRENGTH = 0.4                  # blend per unit of ``local_contrast`` (0.5 -> 0.2, the lowest published strength)
-SATU_BACKGROUND = 1                # satu background factor
+SAT_B, SAT_SP = 0.0, 0.0           # GHS saturation stretch (ght -sat): the plain hyperbolic curve on the saturation channel, strongest at 0 (grey gains most, saturated pixels are compressed, nothing clips)
+SAT_D_MAX = 1.5                    # Siril -D scale (GHS D 3.5), the fit's cap: measured 2026-10-16 on C 33 / IC 1805, 1.5 vivid and still textured, 2.0 flattens IC 1805, 6.0 posterised both
+SAT_FACTOR_MAX = 4.0               # the ``saturation`` setting: the subject's mean saturation x 1 .. x 4 (C 33: 0.09 after the palette, the HOO target 0.45)
+SAT_MEAN_MAX = 0.9                 # the fit's target never exceeds this mean saturation
 STAR_STRETCH = 5.0                 # Seti Astro Star Stretch amount (0-8, default 5)
 MASK_SIGMA = 8.0                   # px, smoothing of the lightness the nebula / local contrast masks are taken from
 MASK_K = 3.0                       # the subject = more than 3 sigma of the smoothed sky scatter above the sky (finish.object_coverage)
@@ -157,6 +161,35 @@ def ghs_scalar(x: float, b: float, d_siril: float, sp: float, lp: float = 0.0, h
     if d_siril < 1e-9:
         return float(x)
     return float(finish.ghs(np.array([x], np.float64), b, float(np.expm1(d_siril)), sp, lp, hp)[0])
+
+
+def hsl_saturation(arr: np.ndarray) -> np.ndarray:
+    """HSL saturation of a CHW image: what Siril's ``ght -sat`` stretches (verified: the numpy GHS of this plane reproduces ``ght -sat`` to 1e-6, lightness unchanged)."""
+    mx, mn = arr.max(0), arr.min(0)
+    l, d = 0.5 * (mx + mn), mx - mn
+    return np.where(d > 1e-6, d / np.maximum(1.0 - np.abs(2.0 * l - 1.0), 1e-6), 0.0).astype(np.float32)
+
+
+def fit_saturation_d(s_subject: np.ndarray, factor: float, weight: np.ndarray | None = None) -> tuple[float, float]:
+    """(Siril -D, target): D of ``ght -D -B=SAT_B -SP=SAT_SP -sat`` such that the mean of the subject's saturation values, after the blend by the range mask
+    ``weight`` (s + w (ghs(s) - s)), becomes ``factor`` x the present mean (capped at ``SAT_MEAN_MAX``); bisection on the numpy mirror.  D 0 when already there."""
+    s = np.asarray(s_subject, np.float64)
+    w = np.ones_like(s) if weight is None else np.asarray(weight, np.float64)
+    now = float(s.mean())
+    target = min(SAT_MEAN_MAX, now * factor)
+    if target <= now + 1e-4:
+        return 0.0, target
+    mean_at = lambda d: float((s + w * (finish.ghs(s, SAT_B, float(np.expm1(d)), SAT_SP, 0.0, 1.0) - s)).mean())      # noqa: E731
+    lo, hi = 0.0, SAT_D_MAX
+    if mean_at(hi) <= target:
+        return hi, target
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if mean_at(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi), target
 
 
 def fit_ghs2(h: dict, neb_med: float, neb_hi: float, *, b1: float, b2: float, d2: float, target: float, use_hp: bool) -> dict:
@@ -654,11 +687,8 @@ class Finisher:
         lum = finish.luminance(arr)
         h = _hist_stats(lum)
         mask, mi = nebula_mask(lum, h["mode"])
-        sm = cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), MASK_SIGMA)
-        lo = float(mi["threshold"])
-        hi = float(np.percentile(sm[mask], 95)) if mask.any() else lo + 0.1
-        w = np.clip((sm - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-        w = (w * w * (3.0 - 2.0 * w)).astype(np.float32)                   # range mask (PixInsight RangeSelection + blur): 0 on the sky, 1 on the subject
+        w = self.range_mask(lum, mask, mi)
+        lo, hi = float(mi["threshold"]), float(np.percentile(cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), MASK_SIGMA)[mask], 95)) if mask.any() else float(mi["threshold"]) + 0.1
         k = LC_STRENGTH * amount
         longside = max(arr.shape[1:])
         grids = [max(2, int(round(longside / s))) for s in CLAHE_SCALES]
@@ -704,17 +734,54 @@ class Finisher:
 
     # ---- 6. saturation ------------------------------------------------------------------------------------------------------
     def saturation(self, arr: np.ndarray) -> np.ndarray:
-        amount = float(self.p.get("saturation", 1.3)) - 1.0
-        if abs(amount) < 1e-3:
+        """Siril's GHS saturation stretch (``ght -sat``: the hyperbolic stretch applied to the HSL saturation, lightness kept) with D fitted so that the subject's
+        mean saturation is multiplied by the ``saturation`` setting, under the range mask (the sky's chroma noise is not raised).  Replaces ``satu``: its gain is
+        linear and gated at median + sigma, so on a faint subject (C 33 2026-10-15) +45 % came out as +17 % and the filaments stayed grey."""
+        k = float(np.clip(self.p.get("saturation", 1.45), 1.0, SAT_FACTOR_MAX))
+        if k - 1.0 < 1e-3:
             self.record("saturation", "none", None, status="skipped", note="saturation=1")
             return arr
         self._say("Colour")
-        line = f"satu {amount:.3f} {SATU_BACKGROUND}"
+        lum = finish.luminance(arr)
+        h = _hist_stats(lum)
+        mask, mi = nebula_mask(lum, h["mode"])
+        w = self.range_mask(lum, mask, mi)
+        s = hsl_saturation(arr)
+        use = mask if mask.sum() > 50 else np.ones(mask.shape, bool)
+        step = max(1, int(use.sum()) // 200000)
+        sub, wsub = s[use][::step], w[use][::step]
+        before = float(sub.mean())
+        d, target = fit_saturation_d(sub, k, wsub)
+        capped = d >= SAT_D_MAX - 1e-9
+        if d <= 0:
+            self.record("saturation", "none", None, status="skipped", params={"subject_saturation": round(before, 4), "factor": k},
+                        note=f"the subject's mean saturation {before:.3f} already reaches {target:.3f}")
+            return arr
+        lines = ["save sa_a", f"ght -D={d:.6f} -B={SAT_B:g} -SP={SAT_SP:g} -LP=0 -HP=1 -sat", "save sa_b", 'pm "$sa_a$+$sa_m$*($sa_b$-$sa_a$)"']
         t0 = time.time()
-        out = self.siril("satu", arr, [line], "Saturation")
-        self.record("saturation", "siril satu", out, commands=[line], seconds=time.time() - t0, params={"amount": round(amount, 3), "background_factor": SATU_BACKGROUND},
-                    source="Siril tutorial (tuto-scripts): satu 0.25-0.5, background factor 1 (only pixels above median + sigma), after the chroma noise reduction")
+        out = self.siril("sa", arr, lines, "Saturation", extra={"sa_m": np.stack([w, w, w])})
+        for f in ("sa_a", "sa_b"):
+            fp = os.path.join(self.cwd, f + ".fit")
+            if os.path.exists(fp):
+                fpr = fp
+                os.remove(fpr)
+        after = float(hsl_saturation(out)[mask].mean()) if mask.sum() > 50 else float(hsl_saturation(out).mean())
+        self.record("saturation", "siril ght -sat + pm (range mask)", out, commands=lines, seconds=time.time() - t0,
+                    params={"D_siril": round(d, 4), "D": round(float(np.expm1(d)), 2), "b": SAT_B, "SP": SAT_SP, "factor": k, "subject_saturation_before": round(before, 4),
+                            "target": round(target, 4), "subject_saturation_after": round(after, 4), "subject_coverage": round(mi["coverage"], 3), "D_capped": capped},
+                    note=f"D at its cap {SAT_D_MAX:g} (the target {target:.3f} would need a flattening stretch)" if capped else "",
+                    source="Siril ght -sat (GHS saturation mode, ghsastro: the stretch on the saturation channel with the lightness restored); D fitted on the subject's "
+                           "saturation histogram (the numpy GHS mirror reproduces Siril's -sat on HSL saturation to 1e-6, C 33 2026-10-15); under the range mask as Brecher's "
+                           "saturation under a background-protecting mask")
         return out
+
+    def range_mask(self, lum: np.ndarray, mask: np.ndarray, mi: dict) -> np.ndarray:
+        """Range mask (PixInsight RangeSelection + blur): 0 on the sky, 1 on the subject, smooth between the nebula mask's threshold and the subject's 95th percentile."""
+        sm = cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), MASK_SIGMA)
+        lo = float(mi["threshold"])
+        hi = float(np.percentile(sm[mask], 95)) if mask.any() else lo + 0.1
+        w = np.clip((sm - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        return (w * w * (3.0 - 2.0 * w)).astype(np.float32)
 
     # ---- 7. stars -----------------------------------------------------------------------------------------------------------
     def stars(self, stars: np.ndarray) -> np.ndarray:

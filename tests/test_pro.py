@@ -124,7 +124,7 @@ def test_autofinish_rules_use_published_values_only():
     assert af.hdr_rule(0.0006, 0.0) and af.hdr_rule(0.0, 0.0006) and not af.hdr_rule(0.0004, 0.0004)
     assert af.nxt_strength(0.0) == 0.85 and af.nxt_strength(100.0) == 0.6 and 0.6 <= af.nxt_strength(6.0) <= 0.85
     assert af.local_contrast_amount(0.0) == 0.5 and af.local_contrast_amount(100.0) == pytest.approx(0.875, abs=0.006)
-    assert af.satu_amount(0.5) == 0.25 and af.satu_amount(0.25) == 0.3 and af.satu_amount(0.1) == 0.5
+    assert af.saturation_factor(0.5, True) == (1.0, 0.45) and af.saturation_factor(0.1, True) == (4.0, 0.45) and af.saturation_factor(0.2, False) == (1.25, 0.25)
     assert af.star_boost(0.2) == 1.0 and af.star_boost(0.08) == 1.5 and af.star_boost(0.01) == 2.0
     img = np.zeros((3, 50, 50), np.float32)
     img[1] = 0.3

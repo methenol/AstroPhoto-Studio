@@ -62,7 +62,7 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    pass 2 SP on the nebula mask's median, b 4, D 1, LP = background, HP < 1 when `hdr` is on) — alternatives `statstretch` (`pyscript Statistical_Stretch.py -median 0.10|0.25 -sigma 5 -linked`),
    `autoghs`, `modasinh`, `autostretch`, `hms`; highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless
    (`--di --dn`, `--dc 0.95`; GraXpert fallback); palette (HOO classic / improved / foraxx / hoo_warm by `pm`; NBN port when `oiii_boost` != 1) or `rmgreen 3`; local contrast by `clahe`
-   under a mask (150 and 40 px); `satu 0.25-0.5`; stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
+   under a mask (150 and 40 px); the GHS saturation stretch (`ght -sat`, D fitted so the subject's mean saturation reaches its target, under the range mask); stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
    (`pm "~(~$starless$*~$stars$)"`); black point at the toe and `icc_convert_to sRGB relative`; sRGB JPEG + 16-bit TIFF + the JSON sidecar.  The exporter computes and prints the
    **gates** of research/FINISH-SPEC.md (`gates.py`) and stores them in the sidecar.  The preview runs the same chain without the AI steps.  The outer 24 px of the stack are trimmed.
 
@@ -87,7 +87,7 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 | Device choice | *Integration & compute options* > Device (RC-Astro tools, GraXpert, ImageMM) |
 | Calibration panel | masters found beside the session, DWARF CALI_FRAME matching, overrides |
 | Frames tab | per-frame FWHM, roundness, background, star count from Siril's registration; overrides |
-| Colour calibration from the stars' physics | Siril SPCC with the Siril SPCC database (narrowband mode for dual-band) |
+| Colour calibration from the stars' physics | Siril SPCC with the Siril SPCC database (narrowband mode for dual-band), online Gaia DR3; the chunk of the Gaia catalogue covering the field (1 of 48) is fetched once and cached under `.home/.local/share/siril/siril_cat1_healpix8_xpsamp` so later fields in that region calibrate offline (`-catalog=localgaia`); a failed SPCC is retried once, then the stars white balance + neutralisation |
 | Gradient removal against a sky survey | NSNS DR0.2 through CDS hips2fits (`sirilpipe/skyref.py`), `bg_method` auto / reference |
 | Auto-finish | published rules on the image's own measurements (no reference images) |
 | Reference looks | the 58 reference photographs' statistics (`sirilpipe/looks.py`) grade the Experiments tab's finishing trials (`look_distance`) |

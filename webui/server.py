@@ -231,7 +231,7 @@ def tools_status() -> dict:
     try:
         return clean_json(tools_mod.tools_status())
     except Exception as e:  # the tools package must never take the server down
-        return {n: {"ok": False, "error": f"{type(e).__name__}: {e}"} for n in ("siril", "graxpert", "starnet", "rcastro")}
+        return {n: {"ok": False, "error": f"{type(e).__name__}: {e}"} for n in ("siril", "graxpert", "starnet", "rcastro", "gaia")}
 
 
 # ------------------------------------------------------------------ pages
@@ -961,6 +961,14 @@ def rcastro_deactivate(body: dict = Body(...)):
     except Exception as e:
         _tool_error(e)
     return JSONResponse(clean_json({"report": report, "tools": tools_status().get("rcastro")}))
+
+
+@app.post("/api/tools/gaia/clear")
+def tools_gaia_clear():
+    """Remove the cached chunks of the Gaia DR3 SPCC catalogue (they are fetched again when a field in that part of the sky is calibrated)."""
+    if any(j.get("state") in ("running",) for j in JOBS.values()):
+        raise HTTPException(409, "a job is running: clear the cache when the queue is idle")
+    return {**tools_mod.gaia.clear(), "status": clean_json(tools_mod.gaia.status())}
 
 
 @app.post("/api/tools/models/download")

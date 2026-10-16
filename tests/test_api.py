@@ -119,7 +119,9 @@ def fake_tools_module():
         "siril": {"ok": True, "version": "1.4.4", "path": "/usr/local/bin/siril-cli"},
         "graxpert": {"ok": True, "version": "3.2.0a3", "models": {"bge": True, "denoise": False, "deconv_obj": False, "deconv_stellar": False}, "gpu": False},
         "starnet": {"ok": False, "version": None, "path": None, "licence_accepted": False},
-        "rcastro": RC_STATUS}
+        "rcastro": RC_STATUS,
+        "gaia": {"ok": False, "chunks": [], "installed": 0, "total": 48, "bytes": 0, "partial_bytes": 0, "path": "/x", "record": "https://zenodo.org/records/14738271"}}
+    m.gaia = types.SimpleNamespace(clear=lambda: {"removed": 0}, status=lambda: {"ok": False, "installed": 0})
     return m
 
 
@@ -796,7 +798,7 @@ def test_explore_routes(env, monkeypatch):
 
 def test_tools_status(env):
     t = env.client.get("/api/tools").json()
-    assert set(t) == {"siril", "graxpert", "starnet", "rcastro"}
+    assert set(t) == {"siril", "graxpert", "starnet", "rcastro", "gaia"}
     assert t["rcastro"]["products"][0]["message"] == "Trial: 27 days left"
     assert t["rcastro"]["activationUrl"].startswith("https://www.rc-astro.com")
 

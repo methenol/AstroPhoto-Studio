@@ -95,7 +95,9 @@ docker compose down                               # stop
   sharing*; `/Volumes` covers mounted NAS shares).
 - **Tools:** `STARNET_ACCEPT_LICENSE=yes` downloads the StarNet2 CLI from starnetastro.com at build time
   (you accept its licence); the RC-Astro CLI installer goes to `vendor/` before the build; GraXpert's
-  AI models are downloaded on first use into `OUTPUT_DIR/.home` (or from the Tools card).
+  AI models are downloaded on first use into `OUTPUT_DIR/.home` (or from the Tools card). Colour calibration (Siril SPCC) uses Gaia DR3 online;
+  the sky chunk covering a field (1 of 48, 27-626 MB) is fetched on first use and cached in `OUTPUT_DIR/.home` so later fields in that region need
+  no download (the Tools card shows and clears the cache).
 - **ImageMM:** `IMAGEMM=cuda|cpu|off` adds PyTorch for the multi-frame restoration (`deconv_method = imagemm`).
 - **Calibration library elsewhere:** set `ASTROPHOTO_CALIB` to its path *inside* the container
   (under `/data/images`), or set it per dataset in the UI's *Calibration* panel.
@@ -386,7 +388,7 @@ source above the sliders:
 | Noise reduction | NoiseXTerminator 0.6–0.85 on the stretched starless image by the measured SNR (RC-Astro, Brecher), colour denoise 0.95 |
 | Local contrast | Siril `clahe` under a background mask at the lowest published LHE strengths |
 | Palette / SCNR | HOO for dual-band (no SCNR: the green is OIII); natural colour and SCNR only against a measured green cast for broadband |
-| Saturation | Siril `satu` 0.25 / 0.3 / 0.5 (Siril tutorial); HOO at least 0.45, broadband at most 0.3 |
+| Saturation | Siril `ght -sat` (GHS saturation stretch) under the subject mask, D fitted so the subject's mean HSL saturation reaches 0.45 (HOO) / 0.25 (broadband); the `saturation` setting is the factor 1-3 |
 | Stars | Seti Star Stretch amount 5 (lowered to 4 / 3 against clipping), colour boost by the measured star saturation, reduction by star density, checked against the linear star count |
 
 Auto-finish uses no reference images: every value comes from the image's own measurements.  The 58 reference

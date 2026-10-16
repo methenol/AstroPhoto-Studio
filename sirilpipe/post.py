@@ -31,6 +31,8 @@ from .tools import ToolError, ToolUnavailable
 from .util import Cancelled
 
 PLATESOLVE_PAUSE = float(os.environ.get("PLATESOLVE_PAUSE", 20))   # seconds between catalogue retries
+SPCC_ATTEMPTS = 2                                                      # SPCC once more after a failed / crashed catalogue download (Siril resumes from its spcc-cache)
+SPCC_RETRY_PAUSE = float(os.environ.get("SPCC_RETRY_PAUSE", 5))
 RL_TIMEOUT = float(os.environ.get("RL_TIMEOUT", 1800))      # Siril's Richardson-Lucy: ~40 s / iteration on a loaded 8 MP frame
 
 # Siril failing = a failed script, or the binary not being startable at all (no Siril on a dev machine)
@@ -114,7 +116,7 @@ PARAM_SPEC: list[dict] = [
     _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (NBN runs when this is not 1)", 0.5, 3, 0.05),
     _R("Colour", "synthetic_luminance", "Ha as luminance (dual-band): share of the lightness taken from the Ha plane (Siril rgbcomp -lum)", 0, 1, 0.05),
     _B("Colour", "oiii_unmix", "Remove the Ha leak from OIII (palette auto: Improved OIII = (G + B - 0.3 R) / 2 instead of Classic)"),
-    _R("Colour", "saturation", "Saturation (Siril satu amount = this - 1; published 0.25-0.5)", 1, 2, 0.05),
+    _R("Colour", "saturation", "Colour strength: the subject's mean saturation x this (Siril ght -sat, the GHS saturation stretch, under the subject mask)", 1, 4, 0.05),
     _R("Colour", "chroma_denoise", "Colour noise reduction (NoiseXTerminator --dc, 0.9-1.0)", 0, 1, 0.05),
     _R("Colour", "scnr", "SCNR (Siril rmgreen, broadband only)", 0, 1, 0.05),
     _B("Stars", "star_separation", "Process stars separately"),
@@ -348,6 +350,19 @@ def spcc_arguments(header, meta: dict, p: dict) -> tuple[list[str], str]:
     return args, desc
 
 
+def field_circle(header, shape_hw) -> tuple[float, float, float]:
+    """(RA, Dec, radius) in degrees of the plate-solved field: the WCS reference point and half the diagonal from the CD / CDELT scale."""
+    ra, dec = float(header["CRVAL1"]), float(header["CRVAL2"])
+    if "CD1_1" in header:
+        scale = float(np.sqrt(abs(float(header["CD1_1"]) * float(header.get("CD2_2", header["CD1_1"])) - float(header.get("CD1_2", 0.0)) * float(header.get("CD2_1", 0.0)))))
+    else:
+        scale = float(abs(float(header["CDELT1"])))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("no pixel scale in the WCS")
+    h, w = shape_hw
+    return ra, dec, 0.5 * scale * float(np.hypot(h, w))
+
+
 def _spcc_database_present() -> bool:
     home = os.environ.get("HOME") or os.path.expanduser("~")
     return os.path.isdir(os.path.join(home, ".local", "share", "siril-spcc-database"))
@@ -560,9 +575,25 @@ class Restorer:
                 if not _spcc_database_present():
                     raise SirilError("the SPCC sensor/filter database is not installed")
                 args, desc = spcc_arguments(self.header, self.meta, p)
+                cache = self._gaia_cache(s)
+                if cache:                                            # the field's chunk of the Gaia catalogue is cached: SPCC reads it, no Zenodo range requests
+                    args = [a if not a.startswith("-catalog=") else "-catalog=localgaia" for a in args]
+                    desc += " (cached Gaia chunk)"
                 body = "spcc " + " ".join(f'"{a}"' for a in args)
-                out, _, log = _siril_image(self.work, s, "spcc", self.arr, self.header, body,
-                                           "Colour calibration (SPCC)", with_log=True)
+                if cache:
+                    body = f'set "core.catalogue_gaia_photo={tools.gaia.dir()}"\n' + body
+                for attempt in range(SPCC_ATTEMPTS):
+                    try:
+                        out, _, log = _siril_image(self.work, s, "spcc", self.arr, self.header, body,
+                                                   "Colour calibration (SPCC)", with_log=True)
+                        break
+                    except SIRIL_FAILS as e:
+                        # the Gaia DR3 xp_sampled catalogue is fetched from Zenodo chunk by chunk; a dropped connection fails (or crashes) the command once,
+                        # and the next attempt continues from Siril's cache (spcc-cache)
+                        if attempt + 1 >= SPCC_ATTEMPTS:
+                            raise
+                        s.add("colour", "siril spcc", "retry", time.time() - t0, note=str(e).splitlines()[0], attempt=attempt + 1)
+                        time.sleep(SPCC_RETRY_PAUSE)
                 self.arr = _sanitize(out)
                 self.info["spcc"] = {"args": args, "description": desc, "log": log}
                 s.add("colour", "siril spcc", seconds=time.time() - t0, sensor=desc, catalog="gaia")
@@ -575,19 +606,36 @@ class Restorer:
                 self.info["spcc"] = {"failed": note}
                 mode = "fallback"
         t0 = time.time()
-        if mode == "stars":
+        if mode in ("stars", "fallback"):
+            # the fallback after a failed SPCC is the "stars" calibration, not neutralisation alone: without the channel gains a dual-band OSC stack keeps its raw
+            # Bayer balance (G strongest) and every star turns green (M 42 2026-10-15, SPCC crashed on the catalogue download)
             self.arr, det = finish.star_white_balance(self.arr)
             self.arr, det2 = finish.neutralize_background(self.arr)
-            s.add("colour", "stars + background neutralisation", seconds=time.time() - t0, **det, **det2)
-        else:                                                        # "background", or the fallback after a failed SPCC
+            s.add("colour", "stars + background neutralisation", seconds=time.time() - t0,
+                  note="SPCC failed: white balance from the stars' mean colour (gains normalised to G)" if mode == "fallback" else "", **det, **det2)
+        else:                                                        # "background"
             self.arr, det = finish.neutralize_background(self.arr)
-            note = ""
-            if mode == "fallback":
-                note = "SPCC failed: background neutralisation" + ("" if self.dual else " + rmgreen")
-                if not self.dual:
-                    self.arr = finish.rmgreen_np(self.arr, 0.5)      # average-neutral SCNR (= Siril rmgreen type 0)
-            s.add("colour", "background neutralisation", seconds=time.time() - t0, note=note, **det)
+            s.add("colour", "background neutralisation", seconds=time.time() - t0, **det)
         self.arr = _sanitize(self.arr)
+
+    def _gaia_cache(self, s) -> dict | None:
+        """Fetch (once) and keep the chunks of the Gaia DR3 SPCC catalogue that cover this field (tools.GaiaCatalog); None when the field cannot be placed or the
+        download fails: SPCC then reads Zenodo directly as before."""
+        t0 = time.time()
+        try:
+            ra, dec, radius = field_circle(self.header, self.arr.shape[-2:])
+        except (KeyError, ValueError, TypeError) as e:
+            s.add("colour", "gaia cache", "skipped", note=f"field centre unknown: {e}")
+            return None
+        try:
+            info = tools.gaia.ensure_field(ra, dec, radius, progress=s.sub, checkpoint=s.checkpoint)
+        except Cancelled:
+            raise
+        except (ToolError, OSError) as e:
+            s.add("colour", "gaia cache", "failed", time.time() - t0, note=str(e)[:200])
+            return None
+        s.add("colour", "gaia cache", seconds=time.time() - t0, pixels=info["pixels"], fetched=info["fetched"], ra=round(ra, 3), dec=round(dec, 3), radius_deg=round(radius, 2))
+        return info
 
     def deconvolve(self) -> None:
         s, p = self.steps, self.p

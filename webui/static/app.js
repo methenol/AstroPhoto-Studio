@@ -124,7 +124,20 @@ function applyParamsToUI() {
 function syncParamOutputs() {
   $$("#paramGroups input[type=range]").forEach(inp => { inp.parentElement.querySelector("output").textContent = (+inp.value).toFixed(inp.step < 0.05 ? 3 : 2); });
 }
-function saveParams() { if (S.folder) store.set("params:" + S.folder, S.params); }
+/* Per-dataset settings are stored as the values the user changed away from the defaults of the day ({changed, base}); on load only the changes are kept over the
+   current defaults.  A plain object from an older build is discarded: it froze that build's defaults (asinh, synthetic luminance 0.8, colour preservation 0.7 ...)
+   as if the user had chosen them. */
+function saveParams() {
+  if (!S.folder) return;
+  const base = currentDefaults(), changed = {};
+  for (const [k, v] of Object.entries(S.params)) if (JSON.stringify(base[k]) !== JSON.stringify(v)) changed[k] = v;
+  store.set("params:" + S.folder, { changed, base });
+}
+function storedParams(folder) {
+  const rec = store.get("params:" + folder, null);
+  if (!rec || typeof rec !== "object" || !rec.changed || !rec.base) { if (rec) store.set("params:" + folder, null); return {}; }
+  return rec.changed;
+}
 
 function buildPresets() {
   const bar = $("#presets");
@@ -145,7 +158,7 @@ async function openDataset(folder) {
     S.folder = folder; store.set("lastFolder", folder);
     if (typeof Explore !== "undefined") Explore.reset();
     S.status = r.status; S.frames = r.frames;
-    S.params = { ...currentDefaults(), ...store.get("params:" + folder, {}) };
+    S.params = { ...currentDefaults(), ...storedParams(folder) };
     applyParamsToUI();
     const parts = r.status.folders || [folder];
     $("#datasetTitle").textContent = `${r.status.object || ""} · ${parts.length > 1 ? `${parts.length} sessions stacked together` : folder}`;
