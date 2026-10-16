@@ -7,8 +7,8 @@ setting                rule (source)
 =====================  ======================================================================================================================================
 stretch_method         ``statstretch`` (Seti Astro Statistical Stretch) unless the settings name another published tool (the GHS two-pass flattened frame-filling
                        nebulosity into a red wall: IC 1805 2026-10-16; Statistical Stretch kept the Heart's shape)
-stretch_boost          Statistical Stretch's curves boost: 0, raised through 0.25 / 0.5 / 0.75 / 1 until the subject's p90 stands 2.5 x the sky above it (the accepted Heart
-                       render; a small faint subject such as C 33 measured 1.6 at 0)
+stretch_boost          Statistical Stretch's curves boost: 0, raised through 0.25 / 0.5 until the subject's p90 stands 2.5 x the sky above it (the accepted Heart render; a
+                       small faint subject such as C 33 measured 1.6 at 0), same sky / subject pixels, stopped by the clipping gate
 stretch                the background after the stretch: 0.10 (Brecher's five finished images 0.09 / 0.10 / 0.10 / 0.11 / 0.11); for Statistical Stretch the median target
                        follows the size of the target: 0.10 when it covers less than half of the frame, 0.25 (the script's default) when it fills it (pro-workflow.md A8)
 hdr                    on (1 = the published values: GHS HP < 1, Statistical Stretch -hdr 0.15 / 0.75, Wavescale HDR 5 / 1.5 / 5.0) when, after the stretch, more than 0.05 % of
@@ -60,7 +60,7 @@ SAT_TARGET_DUAL = 0.45                       # mean HSL saturation of the subjec
 SAT_TARGET_BROADBAND = 0.25                  # broadband: a galaxy's natural colour is weaker (M 31's disc tinted magenta when pushed)
 HDR_DUAL_DEFAULT = 0.5                       # GHS HP protection at half strength on dual-band nebulae (see run)
 STAT_CONTRAST_MIN = 2.5                      # subject p90 over the sky, as a multiple of the sky: the accepted Heart nebula render (statstretch) measured 2.5, the muted C 33 1.6
-STAT_BOOSTS = (0.25, 0.5, 0.75, 1.0)         # Statistical_Stretch.py curves boost (its slider's range)
+STAT_BOOSTS = (0.25, 0.5)                    # Statistical_Stretch.py curves boost candidates: above 0.5 its curve sends the upper midtones to white (1.0 clipped C 33's filaments)
 STAR_BOOST_BROADBAND_MAX = 1.2               # colour boost 1.5 made M 31's faint stars green / magenta (chroma noise); 1.2 at most on broadband
 
 
@@ -108,12 +108,20 @@ def subject_saturation(img: np.ndarray, mask: np.ndarray | None) -> float:
     return float(sat[mask].mean()) if mask is not None and mask.sum() > 50 else float(sat.mean())
 
 
-def subject_contrast(img: np.ndarray) -> float:
-    """(90th percentile of the subject - sky) / sky of a stretched image's lightness: how far the nebula stands above the background."""
+def contrast_sets(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(sky pixels, subject pixels) of a stretched image: the pixels within one noise sigma of the sky mode, and the nebula mask."""
     lum = finish.luminance(img)
     h = pro._hist_stats(lum)
     mask, _ = pro.nebula_mask(lum, h["mode"])
-    sky = max(float(h["sky"]), 1e-3)
+    sky = np.abs(lum - h["mode"]) <= max(float(h["sigma"]), 1e-4)
+    return sky, mask
+
+
+def subject_contrast(img: np.ndarray, sets: tuple[np.ndarray, np.ndarray] | None = None) -> float:
+    """(90th percentile of the subject - sky) / sky of a stretched image's lightness, over fixed pixel sets: how far the nebula stands above the background."""
+    sky_px, mask = sets if sets is not None else contrast_sets(img)
+    lum = finish.luminance(img)
+    sky = max(float(np.median(lum[sky_px])) if sky_px.sum() > 50 else float(np.median(lum)), 1e-3)
     p90 = float(np.percentile(lum[mask], 90)) if mask.sum() > 100 else float(np.percentile(lum, 99))
     return (p90 - sky) / sky
 
@@ -183,23 +191,30 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     fin = pro.Finisher(work, layers.header, p1, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
     s0 = fin.stretch(base)
     if method == "statstretch":
-        # Statistical Stretch pins the image median at the target; a small faint subject (C 33) then stays close to the sky.  The script's curves boost (0-1) lifts the
-        # midtones above the median; it is raised through its range until the subject's contrast over the sky reaches the accepted level.
-        c0 = subject_contrast(s0)
-        boost, c = 0.0, c0
-        for boost in ([0.0] + list(STAT_BOOSTS)):
-            if boost > 0:
-                p1["stretch_boost"] = boost
-                fin = pro.Finisher(work, layers.header, p1, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
-                s0 = fin.stretch(base)
-                c = subject_contrast(s0)
+        # Statistical Stretch pins the image median at the target; a small faint subject (C 33) then stays close to the sky.  The script's curves boost lifts the
+        # midtones above the median; it is raised through 0.25 / 0.5 until the subject's contrast over the sky reaches the accepted level.  The sky and subject
+        # pixel sets come from the unboosted stretch (a boosted image's own sky estimate rises with the boost and the measure would fall while the picture
+        # blows out: C 33 2026-10-16 ended at boost 1, the script's curve then sends everything above 0.33 to white).
+        sets = contrast_sets(s0)
+        c0 = subject_contrast(s0, sets)
+        boost, c, kept = 0.0, c0, s0
+        for cand in STAT_BOOSTS:
             if c >= STAT_CONTRAST_MIN:
                 break
+            fin = pro.Finisher(work, layers.header, {**p1, "stretch_boost": cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+            s_b = fin.stretch(base)
+            st_b = pro.level_stats(s_b)
+            if hdr_rule(st_b["clipped"], st_b["white"]):
+                break                                                      # the boost clips the subject: the previous value stands
+            boost, c, kept = cand, subject_contrast(s_b, sets), s_b
+        s0 = kept
+        p1["stretch_boost"] = boost
         tuned["stretch_boost"] = boost
         steps.append({"step": "stretch_boost", "from": float(p0.get("stretch_boost") or 0.0), "to": boost, "measured": "subject_contrast", "before": round(c0, 2), "after": round(c, 2),
                       "target": STAT_CONTRAST_MIN,
                       "why": f"the subject's 90th percentile sits {c0:.2f} x the sky above it after Statistical Stretch at median {pro.SKY_TARGET}; the Heart nebula render judged right measured "
-                             f"{STAT_CONTRAST_MIN}, so the script's curves boost is raised through {STAT_BOOSTS} until the contrast reaches it" + (f" (reached {c:.2f} at boost {boost})" if boost else " (not needed)")})
+                             f"{STAT_CONTRAST_MIN}, so the script's curves boost is raised through {STAT_BOOSTS} (same sky / subject pixels, no clipping) until the contrast reaches it"
+                             + (f" (reached {c:.2f} at boost {boost})" if boost else " (not needed)")})
     st0 = pro.level_stats(s0)
     hdr_on = hdr_rule(st0["clipped"], st0["white"])
     hdr_value, st1 = (HDR_DUAL_DEFAULT if dual else 0.0), st0
