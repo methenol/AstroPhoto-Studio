@@ -77,6 +77,7 @@ IGNORED_KEYS: tuple = ()
 # Statistical_Stretch.py curves boost (0 when absent), ``hdr_method`` the highlight tool (auto: the stretch's own, GHS HP / Statistical Stretch -hdr; wavescale: Seti Wavescale
 # HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1).
 EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride")
+EXTRA_DEFAULTS = {"stretch_boost": 0.0}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
 
 
 def _R(group, key, label, lo, hi, step):
@@ -108,6 +109,7 @@ PARAM_SPEC: list[dict] = [
     _S("Stretch", "stretch_method", "Stretch tool (statstretch: Seti Astro Statistical Stretch, the default; ghs2: Siril ght, the GHS two-pass recipe; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
        ["statstretch", "ghs2", "autoghs", "modasinh", "autostretch", "hms"]),
     _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
+    _R("Stretch", "stretch_boost", "Statistical Stretch curves boost (the script's 0-1): lifts the midtones above the median; auto-finish raises it until the subject stands 2.5 x the sky above it", 0, 1, 0.05),
     _R("Stretch", "hdr", "Highlights (bright cores): 0 = off, 1 = the published values (GHS HP < 1, Statistical Stretch -hdr 0.15, Wavescale HDR 1.5)", 0, 1.5, 0.05),
     _R("Stretch", "contrast", "GHS second pass: local intensity b (3-5, ghsastro)", 0.25, 13, 0.25),
     _B("Stretch", "auto_stretch", "Adapt the background to the object's size (frame-filling object: top of Brecher's band)"),

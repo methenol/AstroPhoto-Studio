@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 from sirilpipe import __version__  # noqa: E402
 from sirilpipe import finish as finish_mod  # noqa: E402
 from sirilpipe import tools as tools_mod  # noqa: E402
-from sirilpipe.post import DEFAULTS, PARAM_SPEC  # noqa: E402
+from sirilpipe.post import DEFAULTS, EXTRA_DEFAULTS, PARAM_SPEC  # noqa: E402
 from sirilpipe.session import Cancelled, Session  # noqa: E402
 from sirilpipe.util import clean_json, dataset_slug, restoration_done, slugify, split_folders  # noqa: E402
 
@@ -248,7 +248,7 @@ def index():
 
 @app.get("/api/system")
 def system():
-    return clean_json({"version": __version__, "backend": "siril", "devices": device_info(), "defaults": DEFAULTS,
+    return clean_json({"version": __version__, "backend": "siril", "devices": device_info(), "defaults": {**DEFAULTS, **EXTRA_DEFAULTS},
                        "stack_defaults": STACK_DEFAULTS, "param_spec": list(PARAM_SPEC), "presets": PRESETS,
                        "images_root": CONFIG["images"], "tools": tools_status(), "job_kinds": JOB_KINDS})
 

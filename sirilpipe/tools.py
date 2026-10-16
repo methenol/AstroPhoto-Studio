@@ -990,6 +990,7 @@ GAIA_SPCC_ATTEMPTS = 3
 GAIA_SPCC_MARGIN_DEG = 0.5               # around the field's radius: the stars SPCC samples near the edge
 GAIA_SPCC_TIMEOUT = 45                   # s per connection / read: Zenodo resets TLS connections when it is overloaded; SPCC itself runs online meanwhile
 GAIA_SPCC_BACKOFF = 1800                 # s: after a failed fetch no further fetch is tried (every queued job would otherwise wait the attempts out)
+GAIA_SPCC_BUDGET = 300                   # s of fetching per job: a slow Zenodo day (0.2 MB/s seen 2026-10-16) must not stall the queue; the partial file resumes next time
 
 
 def healpix1_pixels(ra_deg: float, dec_deg: float, radius_deg: float) -> list[int]:
@@ -999,6 +1000,10 @@ def healpix1_pixels(ra_deg: float, dec_deg: float, radius_deg: float) -> list[in
     hp = HEALPix(nside=2, order="nested")
     px = hp.cone_search_lonlat(ra_deg * u.deg, dec_deg * u.deg, radius_deg * u.deg)
     return sorted(int(i) for i in np.atleast_1d(px))
+
+
+class _FetchBudget(Exception):
+    """The per-job fetch budget ran out (the partial download stays for the next job)."""
 
 
 @dataclass
@@ -1047,15 +1052,18 @@ class GaiaCatalog:
         if missing and time.time() < self._backoff_until:
             raise ToolError("gaia", f"not retried until {time.strftime('%H:%M', time.localtime(self._backoff_until))}: {self._backoff_why}")
         os.makedirs(self.dir(), exist_ok=True)
+        deadline = time.time() + GAIA_SPCC_BUDGET
         try:
             for i, n in enumerate(missing):
-                self._install_chunk(n, i, len(missing), progress, checkpoint)
+                self._install_chunk(n, i, len(missing), progress, checkpoint, deadline)
+        except _FetchBudget as e:
+            raise ToolError("gaia", str(e))                        # no back-off: the partial file is kept and the next job continues it
         except ToolError as e:
             GaiaCatalog._backoff_until, GaiaCatalog._backoff_why = time.time() + GAIA_SPCC_BACKOFF, str(e)[:160]
             raise
         return {"pixels": pixels, "fetched": missing}
 
-    def _install_chunk(self, n: int, i: int, total: int, progress, checkpoint) -> None:
+    def _install_chunk(self, n: int, i: int, total: int, progress, checkpoint, deadline: float | None = None) -> None:
         name = f"{GAIA_SPCC_NAME}_{n}.dat"
         url = f"https://zenodo.org/records/{GAIA_SPCC_RECORD}/files/{name}.bz2"
         bz, part = os.path.join(self.dir(), name + ".bz2"), os.path.join(self.dir(), name + ".part")
@@ -1084,6 +1092,8 @@ class GaiaCatalog:
                                     progress(i + 0.9 * got / max(total_b, got), total, f"Gaia SPCC catalogue: sky chunk {n} ({got / 1e6:.0f} of {total_b / 1e6:.0f} MB), cached for every later field here")
                                 if checkpoint:
                                     checkpoint()
+                                if deadline and time.time() > deadline:
+                                    raise _FetchBudget(f"sky chunk {n}: {got / 1e6:.0f} of {total_b / 1e6:.0f} MB fetched within the {GAIA_SPCC_BUDGET:.0f} s budget; the rest next time")
                 except urllib.error.HTTPError as e:
                     if e.code != 416 or not have:                   # 416: the partial file already is the whole file
                         raise

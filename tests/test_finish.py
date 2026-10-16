@@ -165,14 +165,16 @@ def test_export_flips_bottom_up_rows(tmp_path):
 def test_params_spec_only_lists_known_effective_keys():
     keys = [s["key"] for s in post.PARAM_SPEC]
     assert len(keys) == len(set(keys))
-    assert set(keys) <= set(post.DEFAULTS)
+    assert set(keys) <= set(post.DEFAULTS) | set(post.EXTRA_DEFAULTS)
+    assert set(post.EXTRA_DEFAULTS) <= set(post.EXTRA_KEYS)
     assert not set(keys) & set(post.IGNORED_KEYS)
+    d = {**post.DEFAULTS, **post.EXTRA_DEFAULTS}
     for s in post.PARAM_SPEC:
         assert s["type"] in ("bool", "range", "select") and s["group"] in ("Linear", "Stretch", "Colour", "Stars", "Detail", "Finish", "Grade")
         if s["type"] == "range":
-            assert s["min"] <= post.DEFAULTS[s["key"]] <= s["max"]
+            assert s["min"] <= d[s["key"]] <= s["max"]
         if s["type"] == "select":
-            assert post.DEFAULTS[s["key"]] in s["options"]
+            assert d[s["key"]] in s["options"]
     for preset in post.PRESETS.values():
         assert set(preset) <= set(post.DEFAULTS)
 
