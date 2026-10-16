@@ -5,7 +5,8 @@ each decision with the measurement, the rule and its source (the web UI renders 
 =====================  ======================================================================================================================================
 setting                rule (source)
 =====================  ======================================================================================================================================
-stretch_method         ``ghs2`` (the GHS two-pass recipe, Siril GHS tutorial + ghsastro) unless the settings name another published tool
+stretch_method         ``statstretch`` (Seti Astro Statistical Stretch) unless the settings name another published tool (the GHS two-pass flattened frame-filling
+                       nebulosity into a red wall: IC 1805 2026-10-16; Statistical Stretch kept the Heart's shape)
 stretch                the background after the stretch: 0.10 (Brecher's five finished images 0.09 / 0.10 / 0.10 / 0.11 / 0.11); for Statistical Stretch the median target
                        follows the size of the target: 0.10 when it covers less than half of the frame, 0.25 (the script's default) when it fills it (pro-workflow.md A8)
 hdr                    on (1 = the published values: GHS HP < 1, Statistical Stretch -hdr 0.15 / 0.75, Wavescale HDR 5 / 1.5 / 5.0) when, after the stretch, more than 0.05 % of
@@ -51,7 +52,8 @@ STAR_BOOSTS = (1.0, 1.5, 2.0)
 STATS_SIDE = 1200
 
 
-GHS_D2_SMALL, GHS_D2_FILLING = 2.5, 1.5      # second GHS pass D by subject coverage (measured 2026-10-15; see autofinish.run)
+GHS_D2_SMALL, GHS_D2_FILLING = pro.GHS2_D, pro.GHS2_D_FILLING      # second GHS pass D by subject coverage (measured 2026-10-15 / 16; the chain's own rule)
+GHS_D2_FILLING_COVERAGE = pro.GHS2_FILLING_COVERAGE
 SAT_TARGET_DUAL = 0.45                       # mean HSL saturation of the subject after the saturation step, HOO (the accepted C 20 render 0.58; IC 1805 / C 33 came out at 0.09-0.11 and grey)
 SAT_TARGET_BROADBAND = 0.25                  # broadband: a galaxy's natural colour is weaker (M 31's disc tinted magenta when pushed)
 HDR_DUAL_DEFAULT = 0.5                       # GHS HP protection at half strength on dual-band nebulae (see run)
@@ -143,8 +145,11 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     lum_lin = finish.luminance(base)
     snr = _snr(session, lum_lin)
     cov = finish.object_coverage(lum_lin)
-    method = "ghs2" if str(p0.get("stretch_method")) in ("ghs", "") else str(p0.get("stretch_method"))
-    decide("stretch_method", method, "object_snr", round(snr, 2), None, "the GHS two-pass recipe by Siril ght (Siril GHS tutorial, ghsastro): the default; the settings may name another published tool")
+    method = str(p0.get("stretch_method") or "statstretch")
+    method = {"ghs": "ghs2", "mtf": "statstretch", "asinh": "statstretch", "log": "statstretch"}.get(method, method)
+    decide("stretch_method", method, "object_snr", round(snr, 2), None,
+           "Seti Astro Statistical Stretch: the default (the GHS two-pass flattened a frame-filling nebula into a red wall, IC 1805 2026-10-16); the settings may name another published tool"
+           if method == "statstretch" else f"the settings name {method}")
     small = cov < pro.STAT_FILLING_COVERAGE
     decide("stretch", pro.SKY_TARGET, "object_frac", round(cov, 3), pro.SKY_TARGET,
            f"the background after the stretch is {pro.SKY_TARGET} (Brecher: 0.10 / 0.11 / 0.09 / 0.11 / 0.10 on five finished images)"
@@ -153,9 +158,10 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     decide("black_point", 0.0, "sky_L", pro.SKY_TARGET, None, "the black point is part of the stretch (linstretch -BP at the histogram toe) and of the last step")
     # the second GHS pass's D (contrast of the subject): measured on the 2026-10-15 renders - 2.5 on a small emission nebula (IC 1805, M 42) gives the structure its
     # range, the same on a frame-filling bright object (M 31) blows the core; 1.5 there.  The GHS docs leave D to taste ("until the object has the contrast you want").
-    d2 = GHS_D2_SMALL if small else GHS_D2_FILLING
-    decide("ghs_d2", d2, "object_frac", round(cov, 3), None,
-           f"second GHS pass D {d2} ({'small subject' if small else 'frame-filling subject'}: 2.5 measured right on IC 1805 / M 42, 1.5 on M 31 whose core blew at 2.5)")
+    d2 = GHS_D2_SMALL if cov < GHS_D2_FILLING_COVERAGE else GHS_D2_FILLING
+    decide("ghs_d2", d2, "object_frac", round(cov, 3), GHS_D2_FILLING_COVERAGE,
+           f"second GHS pass D {d2} ({'small subject' if cov < GHS_D2_FILLING_COVERAGE else 'frame-filling subject'}: 2.5 measured right on a small IC 1805 / M 42, 1.5 on M 31 whose core blew "
+           f"and on the frame-filling IC 1805 2026-10-16 that turned into a red wall at 2.5)")
 
     # stretch without highlight protection: clipping measure
     tick("stretch")

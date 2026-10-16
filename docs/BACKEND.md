@@ -58,9 +58,9 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
 8. **Export** — `pro.py`, the professional chain, every step a Siril command, a pyscript or an rc-astro call, a picture saved after each step
    (`process/finish/steps/NN_<step>.png`) and the verbatim commands in the sidecar (`linear_info.chain`):
    colour-gradient removal (`subsky 2`, mean model added back) and background neutralisation (per-channel offsets) on the linear starless;
-   **GHS two-pass stretch** by `ght` (pass 1 SP at the histogram's left half-maximum, b 10, D raised until the background reaches 0.10; `linstretch -BP` at the histogram toe;
+   **Statistical Stretch** (Seti Astro, `pyscript Statistical_Stretch.py`, median 0.10 for a small subject / 0.25 frame-filling) as the default; or the **GHS two-pass stretch** by `ght` (pass 1 SP at the histogram's left half-maximum, b 10, D raised until the background reaches 0.10; `linstretch -BP` at the histogram toe;
    pass 2 SP on the nebula mask's median, b 4, D 1, LP = background, HP < 1 when `hdr` is on) — alternatives `statstretch` (`pyscript Statistical_Stretch.py -median 0.10|0.25 -sigma 5 -linked`),
-   `autoghs`, `modasinh`, `autostretch`, `hms`; highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless
+   `autoghs`, `modasinh`, `autostretch`, `hms` (each after `linstretch -BP` at the histogram toe, its one parameter raised until the background is 0.10); highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless
    (`--di --dn`, `--dc 0.95`; GraXpert fallback); palette (HOO classic / improved / foraxx / hoo_warm by `pm`; NBN port when `oiii_boost` != 1) or `rmgreen 3`; local contrast by `clahe`
    under a mask (150 and 40 px); the GHS saturation stretch (`ght -sat`, D fitted so the subject's mean saturation reaches its target, under the range mask); stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
    (`pm "~(~$starless$*~$stars$)"`); black point at the toe and `icc_convert_to sRGB relative`; sRGB JPEG + 16-bit TIFF + the JSON sidecar.  The exporter computes and prints the

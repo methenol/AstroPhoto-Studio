@@ -157,7 +157,10 @@ def auto_crop(stack: np.ndarray, hmats: list[list[float]] | None, sub_size: tupl
             cg, _ = frame_coverage(hg, sub_size[0], sub_size[1], scale, (W, H), info["convention"], origin=origin)
             f = cg.astype(np.float32) / max(len(hg), 1)
             frac = f if frac is None else np.minimum(frac, f)
-        cov, n_ref = frac, 1
+        # as a count against the smallest group: ``crop_box`` keeps pixels with coverage >= threshold x n_ref (a fraction with n_ref = 1 would
+        # collapse to "every frame of every group", 855 x 444 px out of 4170 x 2591 on a two-night IC 1805, 2026-10-16)
+        n_ref = max(1, min(len(hg) for hg in group_hmats))
+        cov = frac * n_ref
         info["groups_all_cover"] = True
     box = crop_box(valid, cov, threshold, n_ref)
     return box, info
@@ -534,6 +537,7 @@ def align_to_reference(ref: np.ndarray, img: np.ndarray, valid_ref: np.ndarray, 
     both = valid_ref & valid_img
     rep = []
     moved = False
+    vm = valid_img.copy()
     for c in range(img.shape[0]):
         M_tot = np.zeros((2, 3))
         cur = img[c]
@@ -550,7 +554,7 @@ def align_to_reference(ref: np.ndarray, img: np.ndarray, valid_ref: np.ndarray, 
                 break
             mx = (gx + M_tot[0, 0] * gx + M_tot[0, 1] * gy + M_tot[0, 2]).astype(np.float32)   # sample img where its star sits
             my = (gy + M_tot[1, 0] * gx + M_tot[1, 1] * gy + M_tot[1, 2]).astype(np.float32)
-            cur = cv2.remap(np.ascontiguousarray(img[c]), mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            cur, w_c = _remap_weighted(img[c], valid_img, mx, my)
         centre = M_tot @ np.array([W / 2.0, H / 2.0, 1.0])
         if not n_st:
             rep.append(None)
@@ -558,12 +562,34 @@ def align_to_reference(ref: np.ndarray, img: np.ndarray, valid_ref: np.ndarray, 
         rep.append({"stars": int(n_st), "dx": float(centre[0]), "dy": float(centre[1]), "affine": M_tot.round(8).tolist()})
         if cur is not img[c]:
             out[c] = cur
+            vm &= w_c
             moved = True
     if not moved:
         return img, valid_img, rep
-    vm = cv2.erode(valid_img.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0       # interpolation reaches 3 px out
     out *= vm[None]
     return out, vm & valid_mask(out), rep
+
+
+def _remap_weighted(plane: np.ndarray, valid: np.ndarray, mx: np.ndarray, my: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Cubic resampling with the validity as a weight map (normalised interpolation): the value is the weighted mean of the valid source pixels, so a
+    rejected (zero) pixel neither darkens its neighbours nor invalidates them; a pixel is valid where more than half of its interpolation weight came
+    from data.  The group stacks hold tens of thousands of single-pixel rejection holes (IC 1805 two nights 2026-10-16: 36 000 in one group); eroding
+    the mask around each one fragmented the common footprint and the crop fell to 855 x 444 px."""
+    w = valid.astype(np.float32)
+    num = cv2.remap(np.ascontiguousarray(plane * w), mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    den = cv2.remap(w, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    ok = den > 0.5
+    return np.where(ok, num / np.maximum(den, 1e-3), 0.0).astype(np.float32), ok
+
+
+def _blur_weighted(plane: np.ndarray, valid: np.ndarray, sigma: float) -> tuple[np.ndarray, np.ndarray]:
+    """Gaussian convolution with the validity as a weight map (normalised convolution, the weight-map coadd practice): rejection holes take the mean of
+    their valid neighbours instead of pulling the blurred value down; valid where more than half of the kernel weight was data."""
+    w = valid.astype(np.float32)
+    num = cv2.GaussianBlur(np.ascontiguousarray(plane * w), (0, 0), sigma)
+    den = cv2.GaussianBlur(w, (0, 0), sigma)
+    ok = den > 0.5
+    return np.where(ok, num / np.maximum(den, 1e-3), 0.0).astype(np.float32), ok
 
 
 def psf_match_sigma(ref: np.ndarray, img: np.ndarray, valid: np.ndarray, sat_ref: float | None = None,
@@ -635,15 +661,15 @@ def match_psf(ref: np.ndarray, img: np.ndarray, valid_ref: np.ndarray, valid_img
     out = img.copy()
     both = valid_ref & valid_img
     sig = []
+    vm = valid_img.copy()
     for c in range(img.shape[0]):
         sg = psf_match_sigma(ref[c], img[c], both, sats_ref[c], sats_img[c])
         sig.append(round(sg, 3))
         if sg >= 0.3:
-            out[c] = cv2.GaussianBlur(np.ascontiguousarray(img[c]), (0, 0), sg)
-    k = int(math.ceil(3.0 * max(sig))) if max(sig) >= 0.3 else 0
-    if k == 0:
+            out[c], ok = _blur_weighted(img[c], valid_img, sg)      # normalised convolution: holes and edges do not darken the data
+            vm &= ok
+    if max(sig) < 0.3:
         return img, valid_img, sig
-    vm = cv2.erode(valid_img.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
     out *= vm[None]
     return out, vm & valid_mask(out), sig
 

@@ -57,7 +57,7 @@ DEFAULTS: dict = {
     "denoise": 0.95, "deconvolution": 0.7, "restored_resolution": 1.0,
     # non-linear stage (the professional chain of pro.py; the published values, source at each use there)
     "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.0,
-    "stretch_method": "ghs2", "stretch": 0.10, "auto_stretch": True, "hdr": 0.5, "contrast": 4.0,
+    "stretch_method": "statstretch", "stretch": 0.10, "auto_stretch": True, "hdr": 0.5, "contrast": 4.0,
     "color_preservation": 0.2,
     "star_separation": True, "star_removal": "auto", "star_reduction": 0.4, "star_intensity": 1.0,
     "star_saturation": 1.2, "halo_suppress": 0.6, "star_color_preservation": 0.0,
@@ -105,8 +105,8 @@ PARAM_SPEC: list[dict] = [
     _S("Linear", "spcc_white_ref", "Colour calibration: white reference", ["average_spiral_galaxy", "g2v"]),
     _R("Linear", "denoise", "Light denoise before stretch (NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
     _R("Linear", "deconvolution", "Deconvolution (BlurXTerminator, else Richardson-Lucy)", 0, 1, 0.05),
-    _S("Stretch", "stretch_method", "Stretch tool (ghs2: Siril ght, the GHS two-pass recipe; statstretch: Seti Astro Statistical Stretch; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
-       ["ghs2", "statstretch", "autoghs", "modasinh", "autostretch", "hms"]),
+    _S("Stretch", "stretch_method", "Stretch tool (statstretch: Seti Astro Statistical Stretch, the default; ghs2: Siril ght, the GHS two-pass recipe; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
+       ["statstretch", "ghs2", "autoghs", "modasinh", "autostretch", "hms"]),
     _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
     _R("Stretch", "hdr", "Highlights (bright cores): 0 = off, 1 = the published values (GHS HP < 1, Statistical Stretch -hdr 0.15, Wavescale HDR 1.5)", 0, 1.5, 0.05),
     _R("Stretch", "contrast", "GHS second pass: local intensity b (3-5, ghsastro)", 0.25, 13, 0.25),
@@ -946,7 +946,7 @@ def _render(layers: _Layers, p: dict, dual: bool, external: bool, work: str, sp:
     """The finishing chain on the loaded layers: ``pro.Finisher`` (``external``: with the AI noise reduction of the stretched image)."""
     base, stars = layers.base, layers.stars
     if str(p.get("stretch_method")) in ("mtf", "asinh", "log"):      # the old numpy statistical stretches are gone: the default recipe runs
-        p = {**p, "stretch_method": "ghs2"}
+        p = {**p, "stretch_method": "statstretch"}
     fin = pro.Finisher(work, layers.header, p, dual, external=external, progress=(steps.sub if steps else None), checkpoint=(steps.checkpoint if steps else None), tick=tick,
                        device=_device_gpu(sp), steps=steps, keep_pictures=pictures)
     img, info = fin.run(base, stars)

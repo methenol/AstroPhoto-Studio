@@ -255,3 +255,16 @@ def test_psf_match_and_subpixel_alignment_make_groups_agree():
     m[:, :20] = m[:, -20:] = False
     d = (img3[1] - ref3[1])[m]
     assert np.abs(d).max() < 0.06 * ref3[1].max() and np.median(np.abs(d)) < 1e-3
+
+
+def test_auto_crop_with_groups_uses_the_threshold_not_every_frame():
+    """Two dithered groups: the kept area is where >= 30 % of each group's frames cover, not where every frame of both groups does
+    (a fractional coverage with n_ref = 1 collapsed the threshold to 100 %: a two-night IC 1805 came out 855 x 444 px)."""
+    W, H = 400, 300
+    hm_a = [[1, 0, 4.0 * i, 0, 1, 3.0 * i, 0, 0, 1] for i in range(20)]        # drifts 0..76 px in x, 0..57 in y
+    hm_b = [[1, 0, 4.0 * i, 0, 1, 3.0 * i, 0, 0, 1] for i in range(20)]
+    cw, ch = W + 80, H + 60
+    stack = np.ones((3, ch, cw), np.float32)
+    box, info = sp.auto_crop(stack, hm_a + hm_b, (W, H), 1.0, 0.3, [hm_a, hm_b])
+    assert info.get("groups_all_cover")
+    assert box[2] >= W - 0.3 * 76 - 12 and box[3] >= H - 0.3 * 57 - 12       # at least the 30 %-coverage area, not the 100 % one (W - 76)

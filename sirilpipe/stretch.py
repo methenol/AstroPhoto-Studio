@@ -27,8 +27,10 @@ SIGNAL_SIGMA = 4.0                  # "signal" = more than this many sigmas abov
 METHODS = ("ghs2", "autoghs", "modasinh", "autostretch", "statstretch", "hms")
 TRIAL_SIDE = 900                    # px: the trial stretches of the non-analytic methods run on a copy reduced to this long side
 TRIAL_POINTS = 9                    # values of the method's parameter tried per Siril run
-AUTOGHS_K = 0.0                     # autoghs shadowsclip (SP = median + k sigma of each channel)
+AUTOGHS_K = -1.2                    # autoghs shadowsclip k: SP = median + k sigma = the left half-maximum of the sky peak (median - 1.18 sigma), the GHS tutorial's "just left of the
+                                    # peak" that the two-pass recipe uses too; at k 0 the sky sits on SP, where GHS keeps it near 0 whatever D (IC 1805 2026-10-16: dark at D 15)
 AUTOGHS_B, AUTOGHS_HP = 13.0, 0.7   # Siril's own defaults (siril command reference)
+AUTOGHS_MAX_PASSES = 4              # repeated autoghs passes at most (D 10 x 2 passes put the Heart's sky at 0.116, 4 passes of D 3 at 0.114)
 AUTOSTRETCH_CLIP = -2.8             # autostretch's own default shadowsclip
 STAT_SIGMA = 5.0                    # Statistical_Stretch.py's default black point sigma
 STAT_HDR_KNEE = 0.75                # Statistical_Stretch.py's default HDR knee
@@ -37,7 +39,8 @@ HMS_ENTRY = "process_veralux_v6"                          # the function the scr
 HMS_B = 6.0                                               # "Protect highlights b": the GUI's default
 HMS_CONVERGENCE = 3.5                                     # "Color convergence": the GUI's default (only matters for colour images)
 HMS_PROFILE = "Rec.709 (Recommended)"
-MODASINH_SP_SIGMAS = 3.0            # modasinh: SP this many (band) noise sigmas above the sky (GHS tutorial: SP above the noise you want to hide)
+MODASINH_SP_SIGMAS = -1.2           # modasinh: SP this many noise sigmas from the sky mode: the left half-maximum of the sky peak (as autoghs / the GHS recipe); above the sky the
+                                    # sky maps below SP and no D within Siril's 0-10 reaches the 0.10 background (IC 1805 2026-10-16)
 
 
 def community_python() -> str | None:
@@ -175,9 +178,11 @@ class SirilStretcher:
                     f"Color convergence {HMS_CONVERGENCE:g}, Color grip 1, Shadow convergence 0, Linear expansion 0, Adaptive anchor on; called headless as "
                     f"community_worker.py --entry {HMS_ENTRY} --kwargs '{json.dumps(self.hms_kwargs(value))}'"]
         if method == "autoghs":
-            return [f"autoghs -linked {AUTOGHS_K:g} {value:.6f} -b={AUTOGHS_B:g} -hp={AUTOGHS_HP:g} -lp=0 -clipmode=clip"]
+            # autoghs's stretchamount is a linear D of at most 10: one pass lifts a black-pointed deep-sky stack by ~11x at best (IC 1805 2026-10-16: sky 0.005 at D 10),
+            # so the command is repeated ``passes`` times with the same D (GHS practice: several moderate stretches), the pass count chosen by the fit
+            return [f"autoghs -linked {AUTOGHS_K:g} {value:.6f} -b={AUTOGHS_B:g} -hp={AUTOGHS_HP:g} -lp=0 -clipmode=clip"] * int(ctx.get("passes", 1))
         if method == "modasinh":
-            sp = float(np.clip(ctx["sky"] + MODASINH_SP_SIGMAS * ctx.get("band", ctx["noise"]), 0.001, 0.9))
+            sp = float(np.clip(ctx["sky"] + MODASINH_SP_SIGMAS * ctx.get("band", ctx["noise"]), 0.0, 0.9))
             return [f"modasinh -D={value:.6f} -LP=0 -SP={sp:.6f} -HP=1 -clipmode=clip -independent"]
         if method == "autostretch":
             return [f"autostretch -linked {AUTOSTRETCH_CLIP:g} {value:.6f}"]
@@ -195,37 +200,44 @@ class SirilStretcher:
         """The free parameter of ``method`` that lands the sky on ``aims['sky']`` (autostretch / statstretch: the median-based ones) or the nebula's 90th percentile
         above the sky on ``aims['neb'] - aims['sky']`` (autoghs / modasinh): two Siril runs of ``TRIAL_POINTS`` trials each (coarse log grid, then a fine one) on a copy
         of the lightness reduced to ``TRIAL_SIDE``."""
-        lo, hi = {"autoghs": (0.05, 10.0), "modasinh": (0.05, 10.0), "autostretch": (0.01, 0.9), "statstretch": (0.02, 0.9), "hms": (0.3, 6.0)}[method]
-        in_lum = _reduce(ctx["lum"], TRIAL_SIDE)
+        lo_min, hi_max = {"autoghs": (0.05, 10.0), "modasinh": (0.05, 10.0), "autostretch": (0.01, 0.9), "statstretch": (0.02, 0.9), "hms": (0.3, 6.0)}[method]
+        in_lum = _reduce(ctx["lum"], TRIAL_SIDE)                      # lo_min / hi_max: the tool's own limits (modasinh / autoghs: Siril rejects D > 10)
         ctx_t = {**ctx, "lum": in_lum}
         mono = [np.clip(in_lum, 0.0, 1.0).astype(np.float32)]
         by_sky = method in ("autostretch", "statstretch", "hms") or aims.get("neb") is None
+        target = aims["sky"] if by_sky else aims["neb"] - aims["sky"]
         trials: list[tuple[float, float, float]] = []
-        for rnd in range(2):
-            vals = list(np.exp(np.linspace(np.log(lo), np.log(hi), TRIAL_POINTS)))
-            if method == "hms":
-                outs = [[o] for o in self._run_worker(mono[0], [self.hms_kwargs(v) for v in vals], f"fit{rnd}")]
-            else:
-                outs = self._run(mono, [self.command(method, v, ctx_t) for v in vals], f"fit{rnd}", must_log=None)
-            for v, o in zip(vals, outs):
-                sky, neb = self._levels(o[0], in_lum, ctx_t)
-                trials.append((v, sky, neb))
-            ys = np.array([(t[1] if by_sky else t[2] - t[1]) for t in trials[-TRIAL_POINTS:]])
-            target = aims["sky"] if by_sky else aims["neb"] - aims["sky"]
-            xs = np.array(vals)
-            order = np.argsort(ys)
-            if ys.max() < target or ys.min() > target:
-                best = float(xs[int(np.argmin(np.abs(ys - target)))])
-                lo, hi = best / 1.5, best * 1.5
-                continue
-            v = float(np.exp(np.interp(target, ys[order], np.log(xs[order]))))
-            lo, hi = v / 1.12, v * 1.12
+        for passes in (range(1, AUTOGHS_MAX_PASSES + 1) if method == "autoghs" else (1,)):
+            ctx_t["passes"] = ctx["passes"] = passes                  # the apply repeats the command as often as the fit did
+            lo, hi = lo_min, hi_max
+            reachable = True
+            for rnd in range(2):
+                vals = list(np.exp(np.linspace(np.log(lo), np.log(hi), TRIAL_POINTS)))
+                if method == "hms":
+                    outs = [[o] for o in self._run_worker(mono[0], [self.hms_kwargs(v) for v in vals], f"fit{rnd}")]
+                else:
+                    outs = self._run(mono, [self.command(method, v, ctx_t) for v in vals], f"fit{rnd}_p{passes}", must_log=None)
+                for v, o in zip(vals, outs):
+                    sky, neb = self._levels(o[0], in_lum, ctx_t)
+                    trials.append((v, sky, neb))
+                ys = np.array([(t[1] if by_sky else t[2] - t[1]) for t in trials[-TRIAL_POINTS:]])
+                xs = np.array(vals)
+                order = np.argsort(ys)
+                if ys.max() < target or ys.min() > target:
+                    reachable = reachable and not (rnd == 0 and ys.max() < target)    # the strongest value of the tool stays short: one more pass (autoghs)
+                    best = float(xs[int(np.argmin(np.abs(ys - target)))])
+                    lo, hi = max(lo_min, best / 1.5), min(hi_max, best * 1.5)
+                    continue
+                v = float(np.exp(np.interp(target, ys[order], np.log(xs[order]))))
+                lo, hi = max(lo_min, v / 1.12), min(hi_max, v * 1.12)
+            if reachable or method != "autoghs":
+                break
         fine = trials[-TRIAL_POINTS:]
         ys = np.array([(t[1] if by_sky else t[2] - t[1]) for t in fine])
         xs = np.array([t[0] for t in fine])
         order = np.argsort(ys)
-        value = float(np.exp(np.interp(target, ys[order], np.log(xs[order]))))
-        return value, {"trials": len(trials), "target": round(float(target), 4), "range": [round(float(xs.min()), 5), round(float(xs.max()), 5)]}
+        value = float(np.clip(np.exp(np.interp(target, ys[order], np.log(xs[order]))), lo_min, hi_max))
+        return value, {"trials": len(trials), "target": round(float(target), 4), "range": [round(float(xs.min()), 5), round(float(xs.max()), 5)], "passes": int(ctx.get("passes", 1))}
 
     def stretch_to_sky(self, us: list[np.ndarray], ctx: dict, method: str) -> tuple[list[np.ndarray], dict]:
         """The alternative community stretches of the default chain (``autoghs``, ``modasinh``, ``autostretch``, ``hms``): ONE free parameter of the tool, raised until the
@@ -241,7 +253,7 @@ class SirilStretcher:
             out = [res[i] for i in range(3)]
         else:
             out = self._run(us, [lines], "apply")[0]
-        rec = {"method": method, "commands": lines, "value": round(value, 6), "trial_fit": fi, "seconds": round(time.time() - t0, 1),
+        rec = {"method": method, "commands": lines, "value": round(value, 6), "trial_fit": fi, "passes": int(ctx.get("passes", 1)), "seconds": round(time.time() - t0, 1),
                "tool": {"autoghs": "siril autoghs", "modasinh": "siril modasinh", "autostretch": "siril autostretch",
                         "hms": "VeraLux HyperMetric Stretch (siril-scripts, process_veralux_v6 headless)"}[method]}
         return [np.clip(o, 0, 1) for o in out], rec

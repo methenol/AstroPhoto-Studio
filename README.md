@@ -6,7 +6,7 @@ astronomy camera into a finished image, built on **Siril 1.4** (headless) with *
 from the web UI).  It handles the whole chain: calibration, frame grading, registration with alt-az
 field rotation, Bayer-drizzle integration with rejection, plate solving, gradient removal (GraXpert or
 the NSNS sky survey), spectrophotometric colour calibration (Siril SPCC), deconvolution, noise reduction,
-star separation, the community's finishing workflow (GHS two-pass stretch, highlight protection,
+star separation, the community's finishing workflow (Statistical Stretch or the GHS two-pass stretch, highlight protection,
 HOO / Foraxx palettes, Seti Astro star stretch, screen recombination) and export to a full-resolution
 JPEG + 16-bit TIFF with a sidecar that lists every Siril command and tool call.  Every step is a named
 community tool with its published parameters; the sources are cited in the code.  It includes a web UI,
@@ -383,7 +383,7 @@ source above the sliders:
 
 | Setting | Rule |
 |---|---|
-| Stretch | Siril GHS two-pass recipe (Siril GHS tutorial, ghsastro): background 0.10 (Brecher's finished images 0.09–0.11), second pass D 2.5 for a small subject / 1.5 for a frame-filling one |
+| Stretch | Seti Astro Statistical Stretch (median 0.10 small subject / 0.25 frame-filling) by default; alternatives: Siril GHS two-pass recipe (background 0.10, second pass D 2.5 small subject / 1.5 above 30 % coverage), `autoghs`, `modasinh`, `autostretch`, VeraLux HMS, each after a black point at the histogram toe |
 | Highlights | GHS HP < 1 at half strength on dual-band nebulae; full when more than 0.05 % of the stretched pixels clip |
 | Noise reduction | NoiseXTerminator 0.6–0.85 on the stretched starless image by the measured SNR (RC-Astro, Brecher), colour denoise 0.95 |
 | Local contrast | Siril `clahe` under a background mask at the lowest published LHE strengths |

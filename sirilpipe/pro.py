@@ -53,6 +53,8 @@ SKY_TARGET = 0.10                  # background after the stretch (Brecher: 0.10
 GHS1_B = 10.0                      # pass 1 local intensity: b 15 -> 10 (ghsastro "perhaps around 10")
 GHS2_B = 4.0                       # pass 2: b 3-5 (ghsastro) / 2-6 (Siril); the ``contrast`` setting
 GHS2_D = 2.5                       # pass 2 D (Siril -D scale 0-10; the ``ghs_d2`` setting): 2.5 measured on IC 1805 / M 42 / M 31 2026-10-15 (1 left the nebula flat, 4 posterised it)
+GHS2_D_FILLING = 1.5               # pass 2 D when the subject covers more than GHS2_FILLING_COVERAGE: M 31's core blew at 2.5 and the frame-filling IC 1805 (2026-10-16) became a red wall
+GHS2_FILLING_COVERAGE = 0.3        # = SKY_STEPS_MAX_COVERAGE
 TOE_PERCENTILE = 0.1               # "linear black point just left of the histogram rise": the level below which 0.1 % of the pixels lie (the clipping limit of Siril / fas37, VeraLux)
 HP_PERCENTILE = 99.5               # HP < 1 (highlight protection) starts at this percentile of the subject
 STAT_SMALL, STAT_FILLING = 0.10, 0.25   # Statistical_Stretch median target: small target (pro-workflow.md A8 route 2 / SW Skies) / frame-filling target (script default)
@@ -439,7 +441,8 @@ class Finisher:
         neb_hi = float(np.percentile(sel, HP_PERCENTILE)) if sel.size else h["mode"]
         hdr_on = float(p.get("hdr", 0.0)) > 0 and str(p.get("hdr_method", "auto")) != "wavescale"
         b2 = float(np.clip(p.get("contrast", GHS2_B), 0.25, 13.0))
-        d2 = float(np.clip(p.get("ghs_d2", GHS2_D), 0.05, 10.0))
+        d2_default = GHS2_D if mi["coverage"] < GHS2_FILLING_COVERAGE else GHS2_D_FILLING     # autofinish's rule, also without autofinish (a plain export)
+        d2 = float(np.clip(p.get("ghs_d2") or d2_default, 0.05, 10.0))
         target = float(np.clip(p.get("stretch", SKY_TARGET), 0.02, 0.4))
         if p.get("auto_stretch", True) and mi["coverage"] >= FRAME_FILLING:
             target = max(target, SKY_BAND[1])                    # a frame-filling object: the background at the top of Brecher's band (0.11), the midtones get the room
@@ -493,15 +496,23 @@ class Finisher:
 
     def _stretch_alt(self, base: np.ndarray, method: str) -> np.ndarray:
         from . import stretch as stretch_mod
+        t0 = time.time()
+        lum = finish.luminance(base)
+        h0 = _hist_stats(lum)
+        # black point first (= ``linstretch -BP`` at the histogram toe, what the GHS recipe does after its first pass): the linear stack carries a pedestal
+        # (IC 1805 2026-10-16: median 0.05 with the nebula 0.001 above it); a stretch whose symmetry point sits at that median only maps the pedestal to 0.10
+        # and leaves the nebula at the sky level (autoghs / modasinh showed stars only)
+        bp = float(np.clip(h0["toe"], 0.0, 0.5))
+        base = np.clip((base - bp) / max(1.0 - bp, 1e-6), 0.0, 1.0).astype(np.float32)
         lum = finish.luminance(base)
         h = _hist_stats(lum)
         st = stretch_mod.SirilStretcher(os.path.join(self.work, "stretch"), self.steps)
-        t0 = time.time()
         planes, rec = st.stretch_to_sky([base[0], base[1], base[2]], {"lum": lum, "sky": h["mode"], "noise": max(h["sigma"], 1e-6), "sky_aim": float(self.p.get("stretch", SKY_TARGET))}, method)
         out = np.stack(planes)
-        self.record(f"stretch ({method})", rec["tool"], out, commands=rec["commands"], seconds=time.time() - t0,
-                    params={"value": rec["value"], "trial_fit": rec["trial_fit"], "target_background": float(self.p.get("stretch", SKY_TARGET))},
-                    source="the tool's published command; its one free parameter raised until the background reaches 0.10")
+        self.record(f"stretch ({method})", rec["tool"], out, commands=[f"linstretch -BP={bp:.6f}"] + list(rec["commands"]), seconds=time.time() - t0,
+                    params={"value": rec["value"], "trial_fit": rec["trial_fit"], "target_background": float(self.p.get("stretch", SKY_TARGET)), "black_point": round(bp, 6),
+                            "sky_after_black_point": round(float(h["mode"]), 6)},
+                    source="linstretch -BP at the histogram toe (the pedestal of the linear stack), then the tool's published command with its one free parameter raised until the background reaches 0.10")
         self.info["stretch"] = {"method": method, "value": rec["value"]}
         return out
 

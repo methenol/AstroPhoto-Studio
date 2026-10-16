@@ -179,7 +179,7 @@ def test_params_spec_only_lists_known_effective_keys():
 
 def test_defaults_keep_the_contract_keys():
     d = post.DEFAULTS
-    assert d["stretch"] == 0.10 and d["denoise"] == 0.95 and d["deconvolution"] == 0.7 and d["palette"] == "auto" and d["stretch_method"] == "ghs2"
+    assert d["stretch"] == 0.10 and d["denoise"] == 0.95 and d["deconvolution"] == 0.7 and d["palette"] == "auto" and d["stretch_method"] == "statstretch"
     assert d["saturation"] == 1.45 and d["scnr"] == 0.0 and d["star_reduction"] == 0.4 and d["star_intensity"] == 1.0 and d["hdr"] == 0.5
     assert len(d) == 47
 
