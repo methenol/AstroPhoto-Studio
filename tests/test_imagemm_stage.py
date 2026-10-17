@@ -350,3 +350,68 @@ def test_registered_set_prepare_and_restore_end_to_end(tmp_path):
     assert info["n_exposures"] == len(es.usable()) and info["tiles"]
     es.cleanup()
     assert not os.path.exists(str(tmp_path / "work"))
+
+
+# --------------------------------------------------------------------------- noise model and latent resolution
+def test_ptc_fit_per_pair_read_noise_and_shared_gain():
+    """c0 drifts with the sensor's temperature (IC 1805: -48 % over the night) while the gain is one: with a c0
+    per pair the fit recovers both, where one c0 for the night collapsed the level slope to 0."""
+    pytest.importorskip("scipy")
+    from astrophoto.exposures import ExposureSet
+    rng = np.random.default_rng(3)
+    c1 = 3e-5
+    acc = {"X": [], "v": [], "n": [], "pair": []}
+    c0s = np.linspace(9e-8, 5e-8, 6)
+    for p, c0 in enumerate(c0s):
+        Ta, Tb = 0.06 * (1 + 0.02 * rng.normal()), 0.06 * (1 + 0.02 * rng.normal())
+        for lev in np.linspace(0.003, 0.006, 16):                   # a narrow, sky-like range of levels
+            for c in range(3):
+                X = (c, 1 / Ta ** 2 + 1 / Tb ** 2, lev / Ta + lev / Tb)
+                v = c0 * X[1] + c1 * X[2]
+                acc["X"].append(X)
+                acc["v"].append(v * (1 + 0.003 * rng.normal()))
+                acc["n"].append(100000)
+                acc["pair"].append((p, p + 1))
+    out = ExposureSet._ptc_fit(acc, n=len(c0s) + 1)
+    assert out["model"] == "per-pair c0"
+    np.testing.assert_allclose(out["c1"], c1, rtol=0.15)
+    assert out["chi2_red"].max() < 5
+    fr = out["c0_frames"]
+    assert fr.shape == (7, 3) and fr[0, 0] > 1.4 * fr[-1, 0]           # the drift is kept per frame
+    # without the pairs: the old global model, still accepted
+    old = ExposureSet._ptc_fit({k: v for k, v in acc.items() if k != "pair"})
+    assert old["model"] == "global" and "c0_frames" not in old
+
+
+def _ring_psf(k=41, r0=2.2, w=1.4, sig=2.6):
+    yy, xx = np.mgrid[:k, :k] - k // 2
+    rr = np.hypot(yy, xx)
+    f = np.exp(-0.5 * ((rr - r0) / w) ** 2) + 0.3 * np.exp(-0.5 * (rr / sig) ** 2)
+    return (f / f.sum()).astype(np.float32)
+
+
+def test_choose_sigma_keeps_eq11_for_a_ring_cored_psf():
+    """A slightly defocused PSF (its core a ring, IC 1805 on a DWARF 3) has no peaked Eq. 11 kernel at any
+    sigma; the search must not go on to the cap, where D(h * g_sigma) no longer reproduces the PSF."""
+    pytest.importorskip("torch")
+    from astrophoto import imagemm
+    f = _ring_psf()
+    K = np.repeat(np.repeat(f[None, None], 3, 1), 2, 0)
+    se = [np.full(f.shape, 2e-5, np.float32)] * 3                       # a well-measured PSF
+    sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se, max_sigma=2.0)
+    assert sig == 1.0, info
+    # a Gaussian PSF is peaked at the paper's sigma: kept
+    yy, xx = np.mgrid[:41, :41] - 20
+    g = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 3.0 ** 2)
+    K = np.repeat(np.repeat((g / g.sum()).astype(np.float32)[None, None], 3, 1), 2, 0)
+    sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se, max_sigma=2.0)
+    assert sig == 1.0 and min(info["peak"]) >= 0.9
+
+
+def test_eq11_model_matches_the_solver():
+    pytest.importorskip("torch")
+    from astrophoto import imagemm
+    f = _ring_psf(k=31)
+    h, mse = imagemm.refine_psfs(f[None], 1, 1.0, device="cpu")
+    m = imagemm.eq11_model(h, 1, 1.0)
+    np.testing.assert_allclose(((m[0] - f) ** 2).mean(), mse[0], rtol=0.05, atol=1e-14)

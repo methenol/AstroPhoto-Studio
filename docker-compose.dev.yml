@@ -12,3 +12,7 @@ services:
         source: ./webui
         target: /app/webui
         read_only: true
+      - type: bind
+        source: ./astrophoto
+        target: /app/astrophoto
+        read_only: true

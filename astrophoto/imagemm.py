@@ -1430,36 +1430,96 @@ def superresolved_kernels(K: np.ndarray, r: int, sigma: float, device=None, prog
     return h.reshape(*lead, r * d, r * d) / r ** 2, mse
 
 
-def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float = 0.1, max_sigma: float = 2.5,
-                 min_peak: float = 0.9) -> tuple[float, dict]:
-    """The latent resolution actually usable for these PSFs: the smallest sigma >= ``sigma`` (in steps
-    of ``step``) at which the Eq. 11 kernels h of a sample of the PSFs ``K`` (n, C, k, k) are
-    peaked - median over the sample and every channel of h(centre) / max(h) >= ``min_peak``.
+def eq11_model(h: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None) -> np.ndarray:
+    """D(h * g_sigma) of Eq. 11 for kernels h (N, r d', r d') -> (N, d', d'), exactly as ``refine_psfs``
+    forms it (the valid part of the convolution, r x r average pooling): what the Eq. 11 kernel
+    makes of the PSF it was solved for."""
+    N, m, _ = h.shape
+    if g is None:
+        g = gaussian_psf_mc(sigma, 2 * m - 1)
+    Pf = 1 << (3 * m - 3).bit_length()
+    G = torch.fft.rfft2(torch.from_numpy(np.ascontiguousarray(g, np.float32)), s=(Pf, Pf))
+    hh = torch.from_numpy(np.ascontiguousarray(h, np.float32))
+    full = torch.fft.irfft2(torch.fft.rfft2(hh, s=(Pf, Pf)) * G, s=(Pf, Pf))
+    return pool(full[:, None, m - 1:2 * m - 1, m - 1:2 * m - 1], up)[:, 0].numpy()
 
-    Why: Eq. 11 asks for h >= 0 with D(h * g_sigma) = f.  When the PSF's core is flatter than the
-    Gaussian g_sigma (a boxy core: the M 31 set's optical low-pass / sampling response, centre /
-    first ring 1.2 against a Gaussian's 1.3-1.6), the only non-negative solution is a ring-shaped
-    h - zero at the centre, its weight at r = 1 - and the restoration then carries that ring round
-    every star and a 2-px texture over the whole field (M 31 at sigma = 1: rings to 50 px; at 1.3
-    clean).  The paper's sigma = 1 presumes PSFs broader and smoother than that; a sharper or boxy
-    PSF cannot be restored to it.  Returns (sigma, {"requested", "chosen", "peak": per-channel
-    centre/max at the chosen sigma})."""
+
+def _fit_to(se: np.ndarray, k: int) -> np.ndarray:
+    """A (n, n) standard-error map centred on a k x k grid (inf where it has no value: outside it, and
+    where it holds the 1e30 'unmeasured' marker of ``empirical_psf_field``)."""
+    n = se.shape[-1]
+    out = np.full((k, k), np.inf, np.float64)
+    if n >= k:
+        o = (n - k) // 2
+        out[:] = se[o:o + k, o:o + k]
+    else:
+        o = (k - n) // 2
+        out[o:o + n, o:o + n] = se
+    return np.where(np.isfinite(out) & (out > 0) & (out < 1e29), out, np.inf)
+
+
+def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float = 0.1, max_sigma: float = 2.5,
+                 min_peak: float = 0.9, se: list | None = None) -> tuple[float, dict]:
+    """The latent resolution actually usable for these PSFs (``K`` (n, C, k, k), a sample is used):
+    sigma >= ``sigma`` in steps of ``step`` such that Eq. 11 still holds - D(h * g_sigma) reproduces
+    the PSF within its measurement error - and the Eq. 11 kernel h is peaked.
+
+    Why peaked: Eq. 11 asks for h >= 0 with D(h * g_sigma) = f.  When the PSF's core is flatter than the
+    Gaussian g_sigma (a boxy core: the M 31 set's optical low-pass / sampling response, centre / first
+    ring 1.2 against a Gaussian's 1.3-1.6), the only non-negative solution at the paper's sigma is a
+    ring-shaped h - zero at the centre, its weight at r = 1 - and the restoration then carries that
+    ring round every star and a 2-px texture over the whole field (M 31 at sigma = 1: rings to 50 px;
+    at 1.3 clean).  Peaked: median over the sample of h(centre) / max(h) >= ``min_peak`` in every
+    channel.
+
+    Why Eq. 11 must still hold: a larger sigma is only a coarser latent grid if h can still make up
+    the PSF from g_sigma.  A PSF whose core is a ring itself - a slightly defocused DWARF 3, IC 1805:
+    its profile rises from 1.00 at the centre to 1.09 at 2 px - has no peaked h at any sigma, and the
+    old search went on to the cap of 2.5, where D(h * g_sigma) missed the PSF by 5x its standard error
+    (17 % of its peak): the forward model was then wrong round every star and the restoration bit
+    crescents out of them and drew dark rings.  ``se``: per channel, the PSF's standard error (k, k)
+    (inf where unmeasured; ``empirical_psf_field``'s "se"); sigma is admissible while the median over
+    the sample of rms((D(h * g_sigma) - f) / se) is <= 1 in every channel.  Without ``se`` every sigma
+    up to ``max_sigma`` is admissible.
+
+    The choice: the smallest admissible sigma whose h is peaked; when none is, the admissible sigma
+    with the most peaked h (a ring-cored PSF: the requested one, its h as close to the PSF's own
+    shape as the data allow).  Returns (sigma, {"requested", "chosen", "peak": per-channel centre / max
+    at the chosen sigma, "fit_chi": per channel at the chosen sigma, "tried": [(sigma, peak, chi)]})."""
     n, C = K.shape[:2]
     pick = np.linspace(0, n - 1, min(n, 24)).round().astype(int)
     Ks = K[pick]
+    k = Ks.shape[-1]
+    ses = None if se is None else [None if q is None else _fit_to(np.asarray(q, np.float64), k) for q in se]
     sig = float(sigma)
-    peaks = None
+    tried = []
     while True:
         h, _ = superresolved_kernels(Ks, r, sig, device=device)
-        k = h.shape[-1]
-        c = k // 2
+        hk = h.shape[-1]
+        c = hk // 2
         centre = h[..., c, c]
         mx = h.reshape(*h.shape[:2], -1).max(-1)
         peaks = [float(np.median(centre[:, ch] / np.maximum(mx[:, ch], 1e-30))) for ch in range(C)]
-        if min(peaks) >= min_peak or sig + step > max_sigma + 1e-9:
+        chis = [0.0] * C
+        if ses is not None:
+            g = gaussian_psf_mc(sig, 2 * hk - 1)
+            for ch in range(C):
+                if ses[ch] is None:
+                    continue
+                mdl = eq11_model(h[:, ch] * r ** 2, r, sig, g=g)        # (superresolved_kernels divides by r^2)
+                fin = np.isfinite(ses[ch])
+                z = ((mdl - Ks[:, ch]) / np.where(fin, ses[ch], 1.0))[:, fin]
+                chis[ch] = float(np.median(np.sqrt((z ** 2).mean(-1))))
+        ok = max(chis) <= 1.0
+        tried.append((sig, peaks, chis, ok))
+        if not ok or min(peaks) >= min_peak or sig + step > max_sigma + 1e-9:
             break
         sig = round(sig + step, 3)
-    return sig, {"requested": float(sigma), "chosen": sig, "peak": peaks}
+    admissible = [t for t in tried if t[3]] or tried[:1]       # the requested sigma when none is
+    peaked = [t for t in admissible if min(t[1]) >= min_peak]
+    best = peaked[0] if peaked else max(admissible, key=lambda t: min(t[1]))
+    return best[0], {"requested": float(sigma), "chosen": best[0], "peak": best[1], "fit_chi": best[2],
+                     "tried": [(t[0], [round(v, 3) for v in t[1]], [round(v, 2) for v in t[2]]) for t in tried]}
 
 
 def unit_sum(k: np.ndarray) -> np.ndarray:
@@ -1489,7 +1549,8 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
     ny, nx = K.shape[2], K.shape[3]
     if progress:
         progress(0, 1, f"ImageMM: checking the latent resolution (sigma = {sigma})")
-    sigma_eff, chosen = choose_sigma(K[:, :, ny // 2, nx // 2], r, sigma, device=device)
+    se = [None if (getattr(es, "psf_ref", None) is None or q is None) else q.get("se") for q in (es.psf_ref or [None] * 3)]
+    sigma_eff, chosen = choose_sigma(K[:, :, ny // 2, nx // 2], r, sigma, device=device, se=se)
     if progress and sigma_eff != sigma:
         progress(0, 1, f"ImageMM: latent resolution raised to sigma = {sigma_eff} (the PSF's core is flatter than g_{sigma})")
     sigma = sigma_eff
@@ -1506,6 +1567,7 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
             pass
     kern, mse = superresolved_kernels(K, r, sigma, device=device, progress=progress)
     eq11 = {"sigma": sigma, "sigma_requested": chosen["requested"], "kernel_peak": chosen["peak"],
+            "fit_chi": chosen.get("fit_chi"), "sigma_tried": chosen.get("tried"),
             "mse_max": float(mse.max()), "mse_median": float(np.median(mse))}
     if cache:
         os.makedirs(os.path.dirname(cache), exist_ok=True)

@@ -1606,7 +1606,7 @@ class ExposureSet:
         half_ref = int(math.ceil(3.5 * self.fwhm_max))
         n = len(self.items)
         self.params = [None] * n
-        acc = {"X": [], "v": [], "n": []}        # photon-transfer bins
+        acc = {"X": [], "v": [], "n": [], "pair": []}        # photon-transfer bins
         # Worker processes, each preparing a run of consecutive subs and pairing neighbours itself
         # (photon transfer), so only the small per-sub parameters and the pair bins travel back:
         # shipping every prepared frame (~200 MB) to one process for the pairing left the workers
@@ -1695,7 +1695,7 @@ class ExposureSet:
             for m in shm:
                 m.close()
                 m.unlink()
-        self.ptc = self._ptc_fit(acc)
+        self.ptc = self._ptc_fit(acc, n)
         say("ImageMM: PSF of the exposures' coadd")
         cbs = self.coadd - self.sky_ref
         psf_valid = seen
@@ -1779,12 +1779,13 @@ class ExposureSet:
         """prepare_one for subs k0 .. k1-1 and the photon-transfer bins of each consecutive usable
         pair (k-1, k) with k in [k0, k1), as a serial pass forms them.  Returns (their parameters,
         the bins)."""
-        acc = {"X": [], "v": [], "n": []}
+        acc = {"X": [], "v": [], "n": [], "pair": []}
         prev = None
         if k0 > 0:
             q = self.prepare_one(k0 - 1)
             if q["_y"] is not None:
                 prev = {kk: q[kk] for kk in ("_y", "_valid", "_surf", "T")}
+                prev["_k"] = k0 - 1
         params = []
         for k in range(k0, k1):
             p = self.prepare_one(k)
@@ -1794,8 +1795,9 @@ class ExposureSet:
                 prev = None
             else:
                 if prev is not None:
-                    self._ptc_pair(prev, p, acc)
+                    self._ptc_pair(prev, p, acc, pair=(prev["_k"], k))
                 prev = {kk: p[kk] for kk in ("_y", "_valid", "_surf", "T")}
+                prev["_k"] = k
                 if getattr(self, "_acc", None) is not None:
                     S_, W_, lock = self._acc
                     yb = (p["_y"] / p["T"][None, None, :] - p["_surf"]).astype(np.float32)
@@ -1807,7 +1809,7 @@ class ExposureSet:
         return params, acc
 
     # ------------------------------------------------------------- photon transfer
-    def _ptc_pair(self, a: dict, b: dict, acc: dict, nbins: int = 32):
+    def _ptc_pair(self, a: dict, b: dict, acc: dict, nbins: int = 32, pair: tuple[int, int] | None = None):
         """Variance of the difference of two consecutive exposures (both scaled to the
         reference and background-matched) in star-free pixels, binned by level.
 
@@ -1840,9 +1842,27 @@ class ExposureSet:
                 acc["X"].append((c, 1 / Ta ** 2 + 1 / Tb ** 2, l_a / Ta + l_b / Tb))
                 acc["v"].append(var)
                 acc["n"].append(int(len(sl)))
+                if pair is not None:
+                    acc.setdefault("pair", []).append(tuple(int(q) for q in pair))
 
     @staticmethod
-    def _ptc_fit(acc: dict) -> dict:
+    def _ptc_fit(acc: dict, n: int | None = None) -> dict:
+        """Photon-transfer fit of the pair bins (``_ptc_pair``): var = c0 + c1 L per channel, L the
+        expected level of the exposure.  c1 (the inverse gain, times the resampling's variance factor)
+        is a property of the sensor and shared by all exposures; c0 (read noise and dark-current shot
+        noise) is not: it follows the sensor's temperature, which drifts through a night (IC 1805,
+        DWARF 3, 43 -> 39 C: c0 9.2e-8 -> 4.8e-8, -48 %).  With one c0 for the night the fit could not
+        describe the pairs (reduced chi^2 1100-2500) and the level slope it settled on was 0 - every
+        star then got the sky's variance, so Huber's weights (Algorithm 3) treated star cores as
+        outliers.  So, when the bins carry their pair (``acc["pair"]``), each pair gets its own c0
+        (consecutive exposures share the temperature) and c1 is fitted jointly: reduced chi^2 6 on the
+        same bins, c1 consistent across R, G and B.  The bins are star-free sky and nebula; star
+        pixels are not used, because consecutive frames' star cores also differ by resampling and
+        seeing (a term ~ L^2 that would take over the slope).
+
+        Returns {"c0": median per channel, "c1", "chi2_red", "bins", and with pairs and ``n``:
+        "c0_frames" (n, 3), each exposure's c0 = the mean of its pairs' (NaN rows filled from the
+        nearest exposure with a pair)}."""
         from scipy.optimize import nnls
         if not acc["X"]:
             raise RuntimeError("photon-transfer calibration impossible: no two consecutive usable exposures "
@@ -1850,24 +1870,60 @@ class ExposureSet:
                                "SNR >= 50) with enough star-free pixels")
         X = np.array(acc["X"], float)
         v = np.array(acc["v"], float)
-        n = np.array(acc["n"], float)
+        nn = np.array(acc["n"], float)
+        pairs = acc.get("pair") or []
+        per_pair = len(pairs) == len(v)
+        if per_pair:
+            keys = sorted(set(pairs))
+            pid = np.array([keys.index(q) for q in pairs])
         c0, c1, red = np.zeros(3), np.zeros(3), np.zeros(3)
+        c0_pair = np.full((len(keys) if per_pair else 0, 3), np.nan)
         for c in range(3):
             s = X[:, 0] == c
             if s.sum() < 2:
                 raise RuntimeError(f"photon-transfer calibration impossible in channel {c}: too few level bins")
-            A = X[s, 1:]
+            if per_pair:
+                ps = pid[s]
+                used = np.unique(ps)
+                A = np.concatenate([np.where(ps[:, None] == used[None, :], X[s, 1:2], 0.0), X[s, 2:3]], 1)
+            else:
+                A = X[s, 1:]
             y = v[s]
-            w = np.sqrt(n[s] / 2) / np.maximum(y, 1e-12)        # sd of a variance estimate ~ var sqrt(2/n)
+            w = np.sqrt(nn[s] / 2) / np.maximum(y, 1e-12)       # sd of a variance estimate ~ var sqrt(2/n)
             coef = nnls(A * w[:, None], y * w)[0]              # c0 (read noise^2), c1 (1/gain) >= 0
             for _ in range(3):                                 # reweight with the model variance
                 mdl = A @ coef
-                w = np.sqrt(n[s] / 2) / np.maximum(mdl, 1e-12)
+                w = np.sqrt(nn[s] / 2) / np.maximum(mdl, 1e-12)
                 coef = nnls(A * w[:, None], y * w)[0]
-            c0[c], c1[c] = coef
             mdl = A @ coef
             red[c] = float(np.mean(((y - mdl) * w) ** 2))
-        return {"c0": c0, "c1": c1, "chi2_red": red, "bins": int(len(v))}
+            c1[c] = coef[-1]
+            if per_pair:
+                c0_pair[used, c] = coef[:-1]
+                c0[c] = float(np.median(coef[:-1]))
+            else:
+                c0[c] = coef[0]
+        out = {"c0": c0, "c1": c1, "chi2_red": red, "bins": int(len(v)), "model": "per-pair c0" if per_pair else "global"}
+        if per_pair and n:
+            tot, cnt = np.zeros((n, 3)), np.zeros((n, 1))
+            for q, (a, b) in enumerate(keys):
+                for k in (a, b):
+                    if 0 <= k < n and np.isfinite(c0_pair[q]).all():
+                        tot[k] += c0_pair[q]
+                        cnt[k] += 1
+            have = np.flatnonzero(cnt[:, 0] > 0)
+            if len(have):
+                fr = tot / np.maximum(cnt, 1)
+                near = have[np.abs(np.arange(n)[:, None] - have[None, :]).argmin(1)]
+                out["c0_frames"] = fr[near].astype(np.float64)
+        return out
+
+    def ptc_c0(self, k: int) -> np.ndarray:
+        """c0 (3,) of exposure k: its own (``_ptc_fit``'s c0_frames) or the median."""
+        fr = self.ptc.get("c0_frames") if self.ptc else None
+        if fr is not None and 0 <= k < len(fr):
+            return np.asarray(fr[k], np.float64)
+        return np.asarray(self.ptc["c0"], np.float64)
 
     # ------------------------------------------------------------- persistence
     _STATE = ("params", "ptc", "sky_ref", "sky_info", "fwhm_ref", "cat", "smask", "nodes", "psf_ref", "coadd", "coverage")
@@ -1885,7 +1941,8 @@ class ExposureSet:
     # 12: seeing-mixture kernels, G(sigma_t) * Q (fit_seeing_sigma, _fit_exposure_kernels)
     # 13: (withdrawn: PSF stars restricted by coverage left too few)
     # 14: the exposures' coverage kept in the state
-    PREP_VERSION = 14
+    # 15: photon transfer with a c0 per exposure pair (c0_frames)
+    PREP_VERSION = 15
     SEEING_NORM = "channel"    # normalise_seeing: channel | shared | off (ASTROPHOTO_SEEING_NORM overrides)
 
     def save(self, path: str):
@@ -2181,7 +2238,7 @@ class ExposureSet:
         T = p["T"][None, None, :]
         ybs = y / T - surf - self.sky_ref[y0:y1, x0:x1]
         level = np.maximum(T * (self.ref[y0:y1, x0:x1] + surf), 0)            # expected exposure level, ADU
-        var = (self.ptc["c0"][None, None, :] + self.ptc["c1"][None, None, :] * level) / T ** 2
+        var = (self.ptc_c0(k)[None, None, :] + self.ptc["c1"][None, None, :] * level) / T ** 2
         if censored:
             return ybs.astype(np.float32), var.astype(np.float32), valid.astype(np.float32), cens.astype(np.float32)
         m = np.repeat(valid[..., None], 3, -1).astype(np.float32)

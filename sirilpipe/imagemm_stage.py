@@ -17,8 +17,9 @@ unchanged:
   is measured on the frames (``saturation_level``).
 * photometric scale T, smooth sky deviation, reference sky: as ``ExposureSet.prepare_one`` (aperture photometry
   of isolated stars against the reference = ``stack.fits``), so the latent sky is 0.
-* variances: the photon-transfer curve of consecutive frames (``ExposureSet._ptc_fit``): read + sky noise and
-  shot noise per channel, measured on the data (no gain or read noise is invented).
+* variances: the photon-transfer curve of consecutive frames (``ExposureSet._ptc_fit``): shot noise per channel
+  (one gain for the night) and read + dark noise per frame pair (it follows the sensor's temperature), measured
+  on the data (no gain or read noise is invented).
 * PSF: measured on the frames' *own* coadd (never on ``stack.fits``: the two resampling paths differ by ~3 % of
   a star's flux and that alone made dark rings round stars, see ``ExposureSet.prepare``), seeing-mixture
   kernels G(sigma_t) * Q per frame, unit-sum kernels (``imagemm.unit_sum``).
@@ -457,7 +458,7 @@ def make_set_class():
             self.params = [None] * n
             S = np.zeros((self.H0, self.W0, 3), np.float32)
             Wt = np.zeros((self.H0, self.W0, 3), np.float32)
-            acc = {"X": [], "v": [], "n": []}
+            acc = {"X": [], "v": [], "n": [], "pair": []}
             prev = None
             for k in range(n):
                 if self.checkpoint:
@@ -469,7 +470,8 @@ def make_set_class():
                     prev = None
                     continue
                 if prev is not None:
-                    self._ptc_pair(prev, cur, acc)
+                    self._ptc_pair(prev, cur, acc, pair=(prev["_k"], k))
+                cur["_k"] = k
                 prev = cur
                 v = cur["_valid"]
                 S += cur["_yb"] * v
@@ -479,7 +481,7 @@ def make_set_class():
             self.coadd = np.where(seen, S / np.maximum(Wt, 1), self.ref).astype(np.float32)
             self.coverage = Wt.mean(-1).astype(np.float32)
             del S, prev
-            self.ptc = self._ptc_fit(acc)
+            self.ptc = self._ptc_fit(acc, n)
             usable = [k for k in range(n) if self.params[k] and np.all(np.isfinite(self.params[k]["T"]))]
             if len(usable) < 3:
                 raise RuntimeError(f"ImageMM: only {len(usable)} of {n} frames have a photometric scale in every "
@@ -552,7 +554,7 @@ def make_set_class():
             Mk = np.empty_like(Y)
             Cn = np.empty_like(Y) if censored else None
             refw = np.moveaxis(self.ref[y0:y1, x0:x1], -1, 0)
-            c0, c1 = self.ptc["c0"][:, None, None], self.ptc["c1"][:, None, None]
+            c1 = self.ptc["c1"][:, None, None]
 
             def one(a):
                 k = idx[a]
@@ -566,7 +568,7 @@ def make_set_class():
                 T = np.asarray(p["T"], np.float32)[:, None, None]
                 surf = surface_window(p["surf"], self.H0, self.W0, y0, y1, x0, x1)
                 level = np.maximum(T * (refw + surf), 0)               # the expected level in the frame's units
-                V[a] = (c0 + c1 * level) / T ** 2
+                V[a] = (self.ptc_c0(k)[:, None, None] + c1 * level) / T ** 2
             with ThreadPoolExecutor(max_workers=self.workers) as ex:
                 list(ex.map(one, range(n)))
             return (Y, V, Mk, Cn) if censored else (Y, V, Mk)
@@ -698,8 +700,12 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
                     "fwhm_px": round(float(es.fwhm_ref), 3), "fwhm_latent_px": round(float(info.get("fwhm") or 0), 3),
                     "size": info.get("psf_size"), "stars": [r_.get("n_stars") if r_ else None for r_ in es.psf_ref],
                     "seeing_sigma_median": psf_mix, "unit_sum": True, "eq11": info.get("eq11")},
-            "noise": {"model": "photon transfer curve of consecutive frames, var = c0 + c1 * level per channel",
+            "noise": {"model": "photon transfer curve of consecutive frames, var = c0 + c1 * level per channel"
+                               + (", c0 per frame pair" if es.ptc.get("model") == "per-pair c0" else ""),
                       "c0": [float(v) for v in es.ptc["c0"]], "c1": [float(v) for v in es.ptc["c1"]],
+                      "c0_frames_range": ([[float(v) for v in es.ptc["c0_frames"].min(0)],
+                                           [float(v) for v in es.ptc["c0_frames"].max(0)]]
+                                          if es.ptc.get("c0_frames") is not None else None),
                       "chi2_red": [float(v) for v in es.ptc["chi2_red"]]},
             "saturation": {"level_frames": es.sat_frames, "level_latent": float(es.sat) if es.sat_frames else None,
                            "whyte": bool(es.sat_frames), "saturated_pixels": info.get("saturated_pixels")},

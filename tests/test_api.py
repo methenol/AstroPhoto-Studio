@@ -243,7 +243,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setitem(server.CONFIG, "workdir", str(work))
     monkeypatch.setattr(server, "Session", FakeSession)
     monkeypatch.setattr(server, "tools_mod", fake_tools_module())
-    for d in (server.JOBS, server.SESSIONS, server.PREVIEW_CACHE):
+    for d in (server.JOBS, server.SESSIONS, server.PREVIEW_CACHE, server._SCAN_MEMO):
         d.clear()
     server.QUEUE.clear()
     FakeSession.instances.clear()
@@ -599,6 +599,32 @@ def test_datasets_discovery(env):
     assert d["n_fits"] == 3 and d["object"] == "M 42" and d["filter"] == "Astro" and d["total_min"] == 0.5
     assert d["cached"] == {"analysed": False, "stacked": False, "denoised": False}
     assert env.client.get("/api/datasets", params={"root": "/nonexistent-xyz"}).json()["datasets"] == []
+
+
+def test_datasets_scan_reads_each_header_once(env, monkeypatch):
+    """A network library: one listing per folder, and a sub's header is read only for a new or changed
+    dataset (the summary is cached on the local work disk), not on every call."""
+    from astropy.io import fits
+    calls = []
+    real = server.read_info
+    monkeypatch.setattr(server, "read_info", lambda path: calls.append(path) or real(path))
+    c = env.client
+    assert len(c.get("/api/datasets").json()["datasets"]) == 2 and len(calls) == 2
+    assert len(c.get("/api/datasets", params={"refresh": True}).json()["datasets"]) == 2 and len(calls) == 2
+    # a new night (upper-case extension), a hidden folder and a calibration folder deeper down
+    new = os.path.join(env.images, "M 42", "night3")
+    os.makedirs(os.path.join(new, "flats"))
+    os.makedirs(os.path.join(env.images, ".snapshot", "x"))
+    for d in (new, os.path.join(new, "flats"), os.path.join(env.images, ".snapshot", "x")):
+        h = fits.Header()
+        h["OBJECT"], h["EXPTIME"] = "M 42", 30.0
+        fits.PrimaryHDU(np.zeros((8, 8), np.float32), header=h).writeto(os.path.join(d, "a_0001.FIT"))
+    r = c.get("/api/datasets").json()["datasets"]
+    assert len(r) == 2                                              # still the memoised scan (SCAN_TTL)
+    r = c.get("/api/datasets", params={"refresh": True}).json()["datasets"]
+    assert sorted(d["name"] for d in r) == [os.path.join("M 42", n) for n in ("night1", "night2", "night3")]
+    assert len(calls) == 3 and next(d for d in r if d["name"].endswith("night3"))["total_min"] == 0.5
+    assert os.path.exists(os.path.join(env.work, ".library_cache.json"))
 
 
 def test_open_frames_calibration_thumb(env):

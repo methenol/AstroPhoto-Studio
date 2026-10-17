@@ -175,8 +175,6 @@ def _call(fn, *args, **kw):
 
 # ------------------------------------------------------------------ headers & devices
 
-FITS_GLOBS = ("*.fit", "*.fits", "*.fts")
-
 
 def read_info(path: str) -> dict:
     """object / filter / exptime / instrument / date of one sub, from its FITS header (no pixels
@@ -253,32 +251,132 @@ def system():
                        "images_root": CONFIG["images"], "tools": tools_status(), "job_kinds": JOB_KINDS})
 
 
+CALIB_DIRS = frozenset({"cali_frame", "dwarf_dark", "dark", "darks", "flat", "flats", "bias", "biases", "offsets",
+                        "calib", "restacked", "solving_failed"})   # calibration libraries etc. are not datasets
+FITS_SUFFIXES = (".fit", ".fits", ".fts")
+SCAN_WORKERS = 16            # directory listings in flight: a network share is latency-bound, not bandwidth-bound
+SCAN_TTL = 15.0              # seconds a library scan is reused (the page asks for it on every refresh)
+_SCAN_MEMO: dict = {}
+_SCAN_LOCK = threading.Lock()
+
+
+def _list_dir(d: str) -> tuple[list[str], list[str]]:
+    """(sub-folders to descend into, FITS file names) of one folder, from a single directory listing.
+    ``DirEntry.is_dir()`` comes from the listing itself (d_type) on local disks, NFS and SMB, so no file
+    is stat'ed; hidden folders and calibration folders are not descended into."""
+    subs, fits_names = [], []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                name = e.name
+                if name.startswith("."):
+                    continue
+                try:
+                    if e.is_dir():
+                        if name.lower() not in CALIB_DIRS:
+                            subs.append(e.path)
+                        continue
+                except OSError:
+                    continue
+                if name.lower().endswith(FITS_SUFFIXES):
+                    fits_names.append(name)
+    except OSError:
+        pass
+    return subs, sorted(fits_names)
+
+
+def scan_library(root: str) -> dict[str, list[str]]:
+    """{folder: its FITS file names} for every folder under ``root`` (``root`` included) that holds FITS
+    files.  Breadth-first, every level's listings in parallel; symlinked folders are followed once."""
+    from concurrent.futures import ThreadPoolExecutor
+    found: dict[str, list[str]] = {}
+    seen = {os.path.realpath(root)}
+    level = [root]
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        while level:
+            nxt = []
+            for d, (subs, names) in zip(level, ex.map(_list_dir, level)):
+                if names:
+                    found[d] = names
+                for sd in subs:
+                    rp = os.path.realpath(sd)
+                    if rp not in seen:
+                        seen.add(rp)
+                        nxt.append(sd)
+            level = nxt
+    return found
+
+
+def _library_cache_path() -> str:
+    return os.path.join(CONFIG["workdir"], ".library_cache.json")
+
+
+def _dataset_infos(items: list[tuple[str, list[str]]]) -> dict[str, dict]:
+    """Header summary (object, filter, exptime, instrument, date) of each dataset's first sub.  Kept in
+    ``<workdir>/.library_cache.json`` keyed by folder, first file and number of files, so a header is read
+    over the network only for a new or changed dataset; the reads that are needed run in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    cache = _read_json(_library_cache_path()) or {}
+    out, todo = {}, []
+    for d, names in items:
+        c = cache.get(d)
+        if c and c.get("first") == names[0] and c.get("n") == len(names):
+            out[d] = c.get("info") or {}
+        else:
+            todo.append((d, names))
+
+    def one(item):
+        d, names = item
+        try:
+            fi = read_info(os.path.join(d, names[0]))
+            return d, {k: fi[k] for k in ("object", "filter", "exptime", "instrument", "date")}
+        except Exception:
+            return d, {}
+    if todo:
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            for d, info in ex.map(one, todo):
+                out[d] = info
+        keep = {d: {"first": names[0], "n": len(names), "info": out[d]} for d, names in items}
+        try:
+            os.makedirs(CONFIG["workdir"], exist_ok=True)
+            tmp = _library_cache_path() + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(clean_json({**{k: v for k, v in cache.items() if k not in keep}, **keep}), f)
+            os.replace(tmp, _library_cache_path())
+        except OSError:
+            pass
+    return out
+
+
 @app.get("/api/datasets")
-def datasets(root: str | None = None):
+def datasets(root: str | None = None, refresh: bool = False):
+    """The FITS folders under the images root.  One parallel ``scandir`` walk (``scan_library``) and cached
+    headers (``_dataset_infos``): on a network share the old recursive glob stat'ed every file of the
+    library and globbed every folder once per extension, and the first sub's header was read again for
+    every dataset on every call.  The scan is reused for ``SCAN_TTL`` seconds (``refresh`` forces a new one)."""
     root = os.path.abspath(os.path.expanduser(root or CONFIG["images"]))
-    out = []
     if not os.path.isdir(root):
         return {"root": root, "datasets": []}
-    candidates = [root] + sorted(d for d in glob.glob(os.path.join(root, "**"), recursive=True)
-                                 if os.path.isdir(d) and os.path.abspath(d) != root)
-    for d in candidates:
-        # calibration libraries are not datasets (DWARF CALI_FRAME / DWARF_DARK, darks/ flats/ biases/)
-        parts = {p.lower() for p in os.path.relpath(d, root).replace("\\", "/").split("/")}
-        if parts & {"cali_frame", "dwarf_dark", "dark", "darks", "flat", "flats", "bias", "biases", "offsets",
-                    "calib", "restacked", "solving_failed"}:
-            continue
-        fits_files = [f for ext in FITS_GLOBS for f in glob.glob(os.path.join(d, ext))]
-        if not fits_files:
-            continue
-        info = {"path": d, "name": os.path.relpath(d, root) if d != root else os.path.basename(d),
-                "n_fits": len(fits_files)}
-        try:
-            fi = read_info(sorted(fits_files)[0])
-            info.update({k: fi[k] for k in ("object", "filter", "exptime", "instrument", "date")})
-            info["total_min"] = round(info["exptime"] * len(fits_files) / 60, 1)
-        except Exception:
-            pass
-        cache_dir = os.path.join(CONFIG["workdir"], slugify(d))
+    with _SCAN_LOCK:                      # concurrent requests share one scan
+        memo = _SCAN_MEMO.get(root)
+        if refresh or not memo or time.time() - memo[0] > SCAN_TTL:
+            found = scan_library(root)
+            order = ([root] if root in found else []) + sorted(d for d in found if d != root)
+            items = [(d, found[d]) for d in order]
+            memo = (time.time(), items, _dataset_infos(items))
+            _SCAN_MEMO[root] = memo
+    _, items, infos = memo
+    out = []
+    for d, names in items:
+        info = {"path": d, "name": os.path.relpath(d, root) if d != root else os.path.basename(d), "n_fits": len(names)}
+        fi = infos.get(d) or {}
+        if fi:
+            info.update(fi)
+            try:
+                info["total_min"] = round(float(fi["exptime"]) * len(names) / 60, 1)
+            except (KeyError, TypeError, ValueError):
+                pass
+        cache_dir = os.path.join(CONFIG["workdir"], slugify(d))       # local disk: cheap
         info["cached"] = {"analysed": os.path.exists(os.path.join(cache_dir, "frames.json")),
                           "stacked": os.path.exists(os.path.join(cache_dir, "stack.fits")),
                           "denoised": bool(restoration_done(cache_dir))}
