@@ -190,7 +190,8 @@ class Session:
         profile = {"telescope": f0.telescope or f0.instrument or "", "instrument": f0.instrument,
                    "sensor": fs.sensor, "bayer": f0.bayer, "focallen": f0.focallen, "pixsize": f0.pixsize,
                    "width": f0.width, "height": f0.height, "camera_slot": f0.camera_slot, "bit_depth": 16,
-                   "device_rejected": int(fs.skipped.get("failed", 0)), "kind": fs.kind}
+                   "device_rejected": sum(1 for f in fs.frames + [f for g in fs.exposure_groups for f in g.frames] if f.device_rejected),
+                   "kind": fs.kind}
         out = {"profile": profile, "n_lights": len(fs.frames), "prefs": self.calib_prefs,
                "env": os.environ.get("ASTROPHOTO_CALIB", ""), "error": self.calib_error,
                "report": self.calib_report}
@@ -220,6 +221,18 @@ class Session:
                 frs = [f for f in frames if f.folder == folder]
                 if frs:
                     spec.append((gi, folder, frs))
+        # Siril makes no sequence of a single image ("No sequence `light' found" in calibrate): a night folder that
+        # holds one sub of a group (the DWARF rejected the rest as failed_) cannot be calibrated as a unit of its
+        # own.  It is left out when other units carry the stack; a dataset of one sub fails in _ensure_registered.
+        self.dropped_subs = []
+        if len(spec) > 1:
+            keep = [s for s in spec if len(s[2]) >= 2]
+            if keep:
+                self.dropped_subs = [f.name for s in spec if len(s[2]) < 2 for f in s[2]]
+                if self.dropped_subs:
+                    log.warning("leaving out %d sub(s) alone in their night folder (Siril cannot calibrate a "
+                                "one-image sequence): %s", len(self.dropped_subs), ", ".join(self.dropped_subs))
+                spec = keep
         units: list[workflow.Unit] = []
         for k, (gi, folder, frs) in enumerate(spec):
             single = len(spec) == 1
@@ -343,6 +356,11 @@ class Session:
             self.scan(progress)
         hdr = self._hdr_wanted() if hdr is None else hdr
         units = self._make_units(debayer, hdr)
+        n_subs = sum(len(u.frames) for u in units)
+        if n_subs < dataset.MIN_STACK_SUBS:
+            # (Siril would fail on it with "No sequence `light' found": it makes no sequence of a single image)
+            raise RuntimeError(f"only {n_subs} sub(s) in this dataset; at least {dataset.MIN_STACK_SUBS} are needed to "
+                               f"register and stack")
         self._ensure_masters(units, progress)
         st_path = os.path.join(self.process, "state.json")
         state = read_json(st_path, {}) or {}
@@ -400,6 +418,7 @@ class Session:
                    label="Registering (pass 1/2)", markers=[(r"Trial #|choosing image|Matching stars", "Registering (pass 2/2)")])
         self._time("register", time.time() - t0)
         state = {"signature": sig, "seq": seq, "n": n, "debayer": debayer, "hdr": hdr, "created": time.time(), "banding_requested": band is not None,
+                 "left_out_single_subs": list(getattr(self, "dropped_subs", []) or []),
                  "banding": {"command": f"seqfixbanding <CFA plane> {workflow.BANDING_AMOUNT:g} {workflow.BANDING_SIGMA:g}", "amount": workflow.BANDING_AMOUNT,
                              "sigma": workflow.BANDING_SIGMA, "pattern": band, "sequence": seq, **band_info} if band else None}
         seqd = parse_seq(seqfile)
@@ -427,7 +446,7 @@ class Session:
                          "roundness": s["roundness"], "elongation": (1.0 / s["roundness"]) if s["roundness"] else None,
                          "bkg": s["bkg"], "background": s["bkg"], "nbstars": s["nbstars"], "n_stars": s["nbstars"],
                          "quality": s["quality"], "H": s["H"], "is_reference": i == max(seqd.reference, 0),
-                         "device_rejected": False, "transparency": None, "obstructed": None, "reg_rms": None,
+                         "device_rejected": bool(f.device_rejected), "transparency": None, "obstructed": None, "reg_rms": None,
                          "anomaly": None, "tile_mask": None, "noise": None})
         self._rows = rows
         self._apply_selection(sensitivity)
@@ -566,8 +585,32 @@ class Session:
             seq, n = state["seq"], state["n"]
             inc = [i for i, r in enumerate(rows) if r["included"]]
             if len(inc) < 3:
-                raise RuntimeError(f"only {len(inc)} usable frames after selection; need at least 3")
-            excluded = [i for i, r in enumerate(rows) if not r["included"]]
+                why: dict[str, int] = {}
+                for r in rows:
+                    if not r["included"]:
+                        k = (r.get("reasons") or ["excluded by override"])[0].split(" (")[0]
+                        why[k] = why.get(k, 0) + 1
+                raise RuntimeError(f"only {len(inc)} usable frames of {len(rows)} after selection; need at least 3 ("
+                                   + "; ".join(f"{v} x {k}" for k, v in sorted(why.items(), key=lambda kv: -kv[1])) + ")")
+            hdr_dropped = None
+            if state.get("hdr"):
+                # an exposure group is stacked on its own and needs 3+ usable frames; when fewer than two groups have
+                # them there is nothing to blend: the stack is the viable group's alone (Sh2-132: of the 60 s night's
+                # six subs, most of them live-stack rejects, too few registered), the other frames are left out
+                n_of: dict[int, int] = {}
+                for i in inc:
+                    n_of[rows[i].get("group", 0)] = n_of.get(rows[i].get("group", 0), 0) + 1
+                viable = [g for g, c in n_of.items() if c >= 3]
+                if len(viable) < 2 and viable:
+                    keep_g = max(viable, key=lambda g: n_of[g])
+                    hdr_dropped = [{"group": g, "exptime": rows[next(i for i in inc if rows[i].get("group", 0) == g)]["exptime"],
+                                    "n": c, "why": "fewer than 3 usable frames: no HDR blend"} for g, c in n_of.items() if g != keep_g]
+                    inc = [i for i in inc if rows[i].get("group", 0) == keep_g]
+                    log.warning("HDR: only one exposure group has 3+ usable frames; stacking it alone (%s left out)", hdr_dropped)
+                if len(inc) < 3:
+                    raise RuntimeError(f"no exposure group has 3 usable frames after selection")
+            inc_set = set(inc)
+            excluded = [i for i in range(len(rows)) if i not in inc_set]
             medf = statistics.median([rows[i]["fwhm"] for i in inc if rows[i].get("fwhm")] or [0.0]) or None
             rs = workflow.decide_resampling(sp, len(inc), medf, cfa=True)
             rej = workflow.rejection(sp, rs)
@@ -577,6 +620,15 @@ class Session:
             runner.run(workflow.apply_script(self.process, seq, n, excluded, rs), "apply_registration",
                        expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc),
                        label="Applying registration")
+            if workflow.unstackable_max_framing(os.path.join(self.process, f"r_{seq}_.seq")):
+                # every frame at offset 0 of the max canvas but one a row short: Siril cannot stack that (see
+                # workflow.unstackable_max_framing); the reference frame's framing is the same grid at one size
+                log.info("registered frames all at offset 0 with differing sizes: applying again with -framing=current")
+                rs = {**rs, "framing": "current"}
+                workflow.clean_registered(self.process)
+                runner.run(workflow.apply_script(self.process, seq, n, excluded, rs), "apply_registration",
+                           expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc),
+                           label="Applying registration")
             self._time("apply_registration", time.time() - t0)
             t0 = time.time()
             groups = sorted({rows[i].get("group", 0) for i in inc})
@@ -589,6 +641,8 @@ class Session:
                 arr, hdr = fitsio.read_rgb(os.path.join(self.process, "stack_raw.fit"))
             self._time("stack", time.time() - t0)
             meta = self._finish_stack(arr, hdr, sp, rs, rej, inc, rows, medf, progress, hdr_info)
+            if hdr_dropped:
+                meta["hdr_left_out"] = hdr_dropped
             workflow.clean_registered(self.process)
             self._time("run_stack_total", time.time() - t_all)
             meta["timings"] = dict(self.timings)
@@ -736,7 +790,7 @@ class Session:
             "drizzle": {"scale": scale, "pixfrac": rs.get("pixfrac"), "kernel": rs.get("kernel")} if rs["mode"] == "drizzle" else None,
             "resampling_reason": rs["reason"],
             "rejection": {"type": rej["name"], "low": rej["low"], "high": rej["high"]},
-            "weights": "wfwhm", "normalisation": "addscale", "framing": "max",
+            "weights": "wfwhm", "normalisation": "addscale", "framing": rs.get("framing", "max"),
             "crop": [x, y, w, h], "crop_info": info, "shape": [w, h], "stack_canvas": [W, H],
             "pixel_scale": (ps / scale) if ps else None,
             "fwhm_px": (medf * scale) if medf else None,

@@ -88,6 +88,42 @@ def session(tmp_path, fake_headers, monkeypatch):
     return sess.Session([str(d)], str(tmp_path / "out"))
 
 
+def test_a_lone_sub_in_its_night_folder_is_left_out(tmp_path, fake_headers, monkeypatch):
+    """Siril makes no sequence of one image ("No sequence `light' found", Sh2-132 2026-10-18): a night folder
+    holding a single sub of the dataset is not calibrated as a unit of its own."""
+    heads = load("dwarf_headers.json")
+    base = next(iter(heads.values()))
+    d1, d2 = tmp_path / "night1", tmp_path / "night2"
+    for i in range(5):
+        n = f"M 42_15s60_Duo-Band_2026101004{12 + i:02d}00000_41C.fits"
+        touch(str(d1 / n))
+        fake_headers[n] = {**base, "DATE-OBS": f"2026-10-10T04:{12 + i:02d}:00"}
+    lone = "M 42_15s60_Duo-Band_20261011041200000_41C.fits"
+    touch(str(d2 / lone))
+    fake_headers[lone] = {**base, "DATE-OBS": "2026-10-11T04:12:00"}
+    monkeypatch.setattr(sess, "SirilRunner", FakeRunner)
+    s = sess.Session([str(d1), str(d2)], str(tmp_path / "out"))
+    s.scan()
+    units = s._make_units(debayer=False)
+    assert len(units) == 1 and len(units[0].frames) == 5 and s.dropped_subs == [lone]
+
+
+def test_a_dataset_of_one_sub_fails_before_siril(tmp_path, fake_headers, monkeypatch):
+    heads = load("dwarf_headers.json")
+    base = next(iter(heads.values()))
+    d = tmp_path / "DWARF_RAW_TELE_SNR_x"
+    n = "SNR_60s60_Duo-Band_20261018025859583_37C.fits"
+    touch(str(d / n))
+    fake_headers[n] = {**base, "OBJECT": "SNR", "DATE-OBS": "2026-10-18T02:58:59"}
+    monkeypatch.setattr(sess, "SirilRunner", FakeRunner)
+    FakeRunner.log, FakeRunner.fail_stages = [], set()
+    s = sess.Session([str(d)], str(tmp_path / "out"))
+    s.scan()
+    with pytest.raises(RuntimeError, match="only 1 sub"):
+        s._ensure_registered(None, 1.0)
+    assert not any(st.startswith("calibrate") for st, _ in FakeRunner.log)
+
+
 def test_slug_helpers_keep_old_semantics(tmp_path):
     a, b = str(tmp_path / "n1"), str(tmp_path / "n 2")
     assert slugify(a).startswith("n1-") and len(slugify(a).split("-")[-1]) == 6

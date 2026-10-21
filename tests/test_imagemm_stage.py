@@ -33,7 +33,8 @@ def test_map_params_defaults_and_keys():
     kw = S.map_params({})
     assert kw == {"r": 1, "sigma": 1.0, "psf_model": "empirical", "n_groups": 0, "robust": True, "delta": 2.0,
                   "kappa": 2.0, "epsilon": 1e-6, "stop": "c15", "max_iters": 1000, "accelerate": False,
-                  "background": False}
+                  "background": False, "n2n": True, "tv": 0.0, "point_sources": False, "starlet": 0.0, "psf_steps": 0, "local_psf": False}
+    assert S.map_params({"imagemm_n2n": False, "imagemm_background": "sky"}) == {**kw, "n2n": False, "background": "sky"}
     kw = S.map_params({"imagemm_r": 2, "imagemm_kappa": 3, "imagemm_delta": 1.5, "imagemm_epsilon": 1e-5,
                        "imagemm_stop": "flux", "imagemm_max_iters": 200, "imagemm_psf": "moffat",
                        "imagemm_robust": False})
@@ -48,8 +49,10 @@ def test_map_params_defaults_and_keys():
 
 def test_resampling_of_stack_meta():
     rs = S.resampling_of({"mode": "drizzle", "scale": 1.0, "drizzle": {"scale": 1.0, "pixfrac": 1.0, "kernel": "square"}})
-    assert rs == {"mode": "drizzle", "scale": 1.0, "pixfrac": 1.0, "kernel": "square"}
+    assert rs == {"mode": "drizzle", "scale": 1.0, "pixfrac": 1.0, "kernel": "square", "framing": "max"}
     assert S.resampling_of({"mode": "demosaic", "scale": 1.0})["mode"] == "demosaic"
+    # the frames are registered again with the stack's own framing
+    assert S.resampling_of({"mode": "demosaic", "scale": 1.0, "framing": "current"})["framing"] == "current"
 
 
 # --------------------------------------------------------------------------- frames
@@ -141,6 +144,73 @@ def test_measurement_masks():
 def test_measurement_masks_without_saturation():
     m = S.measurement_masks(_drizzled(), None)
     assert not m["cens"].any()
+
+
+def test_saturation_follows_the_flat_field():
+    """A flat-fielded frame clips at ceiling / flat: a star saturated where the flat is 15 % above the frame's
+    highest plateau sits below 0.94 of that level, and must still be censored, at its own level."""
+    y = _drizzled(h=80, w=90)
+    y[40:43, 50:53] = np.float32(0.0605)                 # the frame's highest plateau (low flat)
+    y[15:19, 15:19] = np.float32(0.0605 / 1.15)          # a plateau where the flat is high
+    y[60, 70] = np.float32(0.05)                         # a sharp unsaturated peak above the gate
+    m = S.measurement_masks(y, 0.0605)
+    assert m["cens"][16, 16].all() and m["cens"][41, 51].all()
+    assert not m["cens"][60, 70].any()
+    pl = m["ceiling"][1]["plateaus"]
+    assert len(pl) == 2 and sorted(np.round(pl[:, 3], 5)) == sorted(np.round([0.0605, 0.0605 / 1.15], 5))
+    np.testing.assert_allclose(S.ceiling_window(m["ceiling"][1], 80, 90, 15, 19, 15, 19), 0.0605 / 1.15, rtol=1e-6)
+
+
+def test_shift_field_recovers_a_residual_rotation():
+    """An exposure's stars offset by a small residual rotation about the field centre: the degree-1 field
+    reproduces it at the nodes, and an outlier star does not move it."""
+    from astrophoto import exposures as E
+    rng = np.random.default_rng(4)
+    H, W = 800, 1200
+    py, px = rng.uniform(0, H, 40), rng.uniform(0, W, 40)
+    th = 2e-4                                                            # rad
+    dy, dx = th * (px - W / 2) + 0.05, -th * (py - H / 2) - 0.03
+    dy = dy + rng.normal(0, 0.005, 40)
+    dx = dx + rng.normal(0, 0.005, 40)
+    dy[0] += 0.6                                                         # a blended star
+    f = E.shift_field((py, px, dy, dx, np.ones(40)), H, W)
+    assert f["deg"] == 1
+    nodes = (np.array([0.0, H / 2, H - 1.0]), np.array([0.0, W / 2, W - 1.0]))
+    got = E.shift_at_nodes(f, nodes, H, W)
+    yy, xx = np.meshgrid(nodes[0], nodes[1], indexing="ij")
+    np.testing.assert_allclose(got[..., 0], th * (xx - W / 2) + 0.05, atol=0.01)
+    np.testing.assert_allclose(got[..., 1], -th * (yy - H / 2) - 0.03, atol=0.01)
+
+
+def test_discrete_gaussian_composes():
+    """The seeing kernels compose like seeing: T(a) * T(b) = T(sqrt(a^2 + b^2)), variance exactly sigma^2."""
+    from astrophoto import exposures as E
+    import cv2 as _cv2
+    a, b = 0.4, 0.9
+    ga, gb = E._gauss(a, 41), E._gauss(b, 41)
+    comp = _cv2.filter2D(ga.astype(np.float64), -1, gb, borderType=_cv2.BORDER_CONSTANT)
+    np.testing.assert_allclose(comp, E._gauss(np.hypot(a, b), 41), atol=1e-7)
+    yy = np.arange(41) - 20
+    assert (ga.sum(1) * yy ** 2).sum() == pytest.approx(a ** 2, rel=1e-6)
+
+
+def test_encircled_energy_of_a_gaussian():
+    """The aperture correction's encircled energy: 1 - exp(-R^2 / 2 s^2) for a Gaussian - here one sampled at
+    the pixel centres and spread over each pixel, i.e. of variance s^2 + 1/12 per axis."""
+    yy, xx = np.mgrid[:61, :61] - 30
+    for s, R in ((2.0, 3.0), (3.0, 9.0), (2.5, 4.0)):
+        g = np.exp(-0.5 * (yy ** 2 + xx ** 2) / s ** 2)
+        assert S.encircled_energy(g, R) == pytest.approx(1 - np.exp(-R ** 2 / (2 * (s ** 2 + 1 / 12))), abs=5e-3)
+
+
+def test_saturated_plateaus_ignore_bright_smooth_nebula():
+    """Bright nebula is no plateau: a broad hill whose top is flat within the noise ramps down within the
+    connected region above the gate."""
+    rng = np.random.default_rng(2)
+    yy, xx = np.mgrid[:100, :100] - 50
+    hill = 0.04 * np.exp(-0.5 * (yy ** 2 + xx ** 2) / 40.0 ** 2)
+    v = (hill * (1 + 0.004 * rng.normal(size=hill.shape))).astype(np.float32)
+    assert len(S.saturated_plateaus(v, np.ones_like(v, bool), 0.03)) == 0
 
 
 def test_fill_holes_only_for_measuring():
@@ -383,6 +453,31 @@ def test_ptc_fit_per_pair_read_noise_and_shared_gain():
     assert old["model"] == "global" and "c0_frames" not in old
 
 
+def test_ptc_pairs_ignore_misregistered_nebula_structure():
+    """Consecutive frames whose nebula differs by a 0.3 px residual registration: the plain difference variance
+    of the bright, structured bins exceeds the noise; the high-pass estimate recovers the noise model."""
+    from astrophoto.exposures import ExposureSet, fourier_shift
+    rng = np.random.default_rng(5)
+    H, W = 256, 256
+    yy, xx = np.mgrid[:H, :W]
+    neb = 0.002 + 0.04 * (1 + np.sin(xx / 3.0) * np.cos(yy / 4.0)) * (xx / W)          # structured, brighter to the right
+    c0, c1 = 4e-8, 3e-5
+    es = ExposureSet.__new__(ExposureSet)
+    es.ref = np.repeat(neb[..., None], 3, -1).astype(np.float32)
+    es.smask = np.zeros((H, W), bool)
+    frames = []
+    for k, sh in enumerate((0.0, 0.3)):
+        img = fourier_shift(neb, 0.0, sh)
+        noisy = img + rng.normal(0, 1, img.shape) * np.sqrt(c0 + c1 * np.maximum(img, 0))
+        y3 = np.repeat(noisy[..., None], 3, -1).astype(np.float32)
+        frames.append({"_y": y3, "_valid": np.ones((H, W), bool), "_surf": np.zeros((H, W, 3), np.float32),
+                       "T": np.ones(3)})
+    acc = {"X": [], "v": [], "n": [], "pair": []}
+    es._ptc_pair(frames[0], frames[1], acc, nbins=12, pair=(0, 1))
+    out = ExposureSet._ptc_fit(acc, n=2)
+    np.testing.assert_allclose(out["c1"], c1, rtol=0.2)
+
+
 def _ring_psf(k=41, r0=2.2, w=1.4, sig=2.6):
     yy, xx = np.mgrid[:k, :k] - k // 2
     rr = np.hypot(yy, xx)
@@ -399,7 +494,12 @@ def test_choose_sigma_keeps_eq11_for_a_ring_cored_psf():
     K = np.repeat(np.repeat(f[None, None], 3, 1), 2, 0)
     se = [np.full(f.shape, 2e-5, np.float32)] * 3                       # a well-measured PSF
     sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se, max_sigma=2.0)
-    assert sig == 1.0, info
+    assert sig == 1.0, info                                             # nothing admissible: the requested sigma
+    # a less precisely known PSF: the coarsest sigma at which Eq. 11 still holds (least mid-frequency ringing)
+    se_l = [np.full(f.shape, 2e-3, np.float32)] * 3
+    sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se_l, max_sigma=2.0)
+    ok = [t[0] for t in info["tried"] if max(t[2]) <= 1.0]
+    assert sig == max(ok) and sig > 1.0 and max(info["fit_chi"]) <= 1.0, info
     # a Gaussian PSF is peaked at the paper's sigma: kept
     yy, xx = np.mgrid[:41, :41] - 20
     g = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 3.0 ** 2)
@@ -415,3 +515,73 @@ def test_eq11_model_matches_the_solver():
     h, mse = imagemm.refine_psfs(f[None], 1, 1.0, device="cpu")
     m = imagemm.eq11_model(h, 1, 1.0)
     np.testing.assert_allclose(((m[0] - f) ** 2).mean(), mse[0], rtol=0.05, atol=1e-14)
+
+
+def test_whyte_segmentation_leaves_unsaturated_stars_to_the_plain_update():
+    """S (Whyte et al. Eq. 23) must hold the latent behind saturated *data*.  A point source whose blurred
+    image peaks at half the ceiling has a latent far above it; thresholding the latent made it "S" and its
+    surroundings were held at the initial guess.  On the blurred model it stays U, so the restoration is the
+    plain one there."""
+    torch = pytest.importorskip("torch")
+    from astrophoto import imagemm
+    d, k, n, L = 48, 15, 3, 1.0
+    yy, xx = np.mgrid[:k, :k] - k // 2
+    ker = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 2.0 ** 2)
+    ker = (ker / ker.sum()).astype(np.float32)
+    K = torch.from_numpy(np.broadcast_to(ker, (n, 1, k, k)).copy())
+    lat = np.zeros((1, 1, d + k - 1, d + k - 1), np.float32)
+    lat[0, 0, (d + k) // 2, (d + k) // 2] = 0.5 * L / ker.max()          # blurred peak 0.5 L, latent ~12 L
+    lat += 1e-3
+    ops = imagemm.Operators(K, 1)
+    y = ops.forward(torch.from_numpy(lat), 0, n).clone()
+    rng = np.random.default_rng(0)
+    y = y + torch.from_numpy(rng.normal(0, 2e-3, y.shape).astype(np.float32))
+    var = torch.full_like(y, 4e-6)
+    mask = torch.ones_like(y)
+    sat = torch.zeros_like(y)
+    sat[:, :, 0, 0] = 1                                                   # one censored pixel far away: the update runs
+    x0 = imagemm.initial_guess(y, mask, k, 1)
+    plain, _ = imagemm.mm_restore(y, var, mask, K, x0, r=1, robust=True, max_iters=150, epsilon=0)
+    wh = {"level": np.full((n, 1), L, np.float32), "saturated": sat, "phi": 0.9, "a": 50.0, "erode": 3, "soft": 3.0}
+    seg, _ = imagemm.mm_restore(y, var, mask, K, x0, r=1, robust=True, max_iters=150, epsilon=0, whyte=dict(wh))
+    old, _ = imagemm.mm_restore(y, var, mask, K, x0, r=1, robust=True, max_iters=150, epsilon=0,
+                                whyte={**wh, "segment": "latent"})
+    c = (d + k) // 2
+    win = (slice(None), slice(None), slice(c - 10, c + 11), slice(c - 10, c + 11))
+    err_seg = float((seg[win] - plain[win]).abs().max())
+    err_old = float((old[win] - plain[win]).abs().max())
+    assert err_seg < 1e-6 < err_old
+
+
+def test_whyte_update_with_super_resolution_and_per_pixel_levels():
+    """Whyte et al.'s update at r = 2 with a saturation level per measurement: a star clipped in the data keeps
+    its flux in the restoration (above the ceiling), where the masked fit alone loses the clipped core."""
+    torch = pytest.importorskip("torch")
+    from astrophoto import imagemm
+    d, r, n = 40, 2, 3
+    kd = 9
+    yy, xx = np.mgrid[:kd, :kd] - kd // 2
+    f = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 1.6 ** 2)
+    f = (f / f.sum()).astype(np.float32)
+    h, _ = imagemm.refine_psfs(f[None], r, 1.1, device="cpu")
+    h = imagemm.unit_sum(h / r ** 2)                                     # (1, 18, 18)
+    K = torch.from_numpy(np.broadcast_to(h[0], (n, 1) + h.shape[-2:]).copy())
+    ks = K.shape[-1]
+    X = r * d + ks - 1
+    lat = np.full((1, 1, X, X), 1e-3, np.float32)
+    lat[0, 0, X // 2, X // 2] = 3.0 / float(h.max())                      # blurred peak ~3 x the ceiling
+    ops = imagemm.Operators(K, r)
+    truth = ops.forward(torch.from_numpy(lat), 0, n).clone()
+    L = 1.0
+    levels = torch.full_like(truth, L) * (1.0 + 0.05 * torch.linspace(-1, 1, d).view(1, 1, 1, d))   # a vignetted ceiling
+    y = torch.minimum(truth, levels)
+    sat = (truth >= levels).float()
+    var = torch.full_like(y, 1e-6)
+    mask = 1.0 - sat
+    x0 = imagemm.initial_guess(y, torch.ones_like(y), ks, r)
+    wh = {"level": levels, "saturated": sat, "phi": 0.9, "a": 50.0, "erode": 3, "soft": 3.0}
+    xw, info = imagemm.mm_restore(y, var, mask, K, x0, r=r, robust=True, max_iters=200, epsilon=0, whyte=wh)
+    assert torch.isfinite(xw).all()
+    fw = float(ops.forward(xw, 0, n).max())
+    assert fw > 1.1 * L                                                  # the clipped core is restored above the ceiling
+

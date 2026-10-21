@@ -130,3 +130,24 @@ def test_plate_solve_reports_failure_only_when_every_attempt_failed(tmp_path, mo
     monkeypatch.setattr(post, "_siril_image", lambda *a, **k: (_ for _ in ()).throw(SirilError("Server unreachable")))
     assert r.plate_solve() is False
     assert len([x for x in r.steps.records if x["step"] == "platesolve" and x["status"] == "failed"]) == 4
+
+
+def test_deconv_method_rl_uses_siril_richardson_lucy_not_bxt(tmp_path, fake_rc, monkeypatch):
+    """The n2n-rl profile / an experiment with deconvolution "rl": BXT is skipped (even when licensed) and Siril's RL
+    runs.  The skip raised ToolUnavailable with one argument - a TypeError that failed every such restoration."""
+    bodies = []
+
+    def fake(work, steps, name, arr, header, body, stage, **kw):
+        bodies.append(body)
+        return arr, header
+
+    monkeypatch.setattr(post, "_siril_image", fake)
+    d = tmp_path / "s"
+    d.mkdir()
+    fitsio.write_rgb(str(d / "stack.fits"), _stack(4e-4), {"ROWORDER": "BOTTOM-UP", "FILTER": "Duo-Band"})
+    r = post.Restorer(str(d), {"filter": "Duo-Band"}, {"deconv_method": "rl"}, dict(post.DEFAULTS), None, None)
+    r.deconvolve()
+    assert not any(c[0] == "bxt" for c in fake_rc.calls)
+    assert any(body.startswith("set core.fftw_timelimit=0") and "rl -iters=" in body for body in bodies)
+    tools_used = [x["tool"] for x in r.steps.records if x["step"] == "deconvolution"]
+    assert tools_used == ["rc-astro bxt", "siril rl"] and r.steps.records[-1]["status"] == "done"

@@ -15,6 +15,7 @@ next one takes over; nothing is ever inpainted or synthesised (project rule): ph
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -479,7 +480,10 @@ class Restorer:
     def _survey_gradient(self):
         """The NSNS maps on the stack's grid (cached in ``skyref.npz``) fitted beside a degree-3 polynomial (skyref.fit); returns (model (H, W, 3), info)."""
         from astropy.wcs import WCS
-        wcs = WCS(self.header)
+        # the celestial axes only: the RGB file's header has NAXIS = 3, and astropy refuses SIP distortions with a
+        # third axis ("SIP distortions only work in 2 dimensions") - the survey gradient was then skipped on every
+        # plate-solved image (IC 1805, 2026-10-16)
+        wcs = WCS(self.header, naxis=2)
         shape = self.arr.shape[1:]
         key = json.dumps([wcs.to_header_string()[:4000], list(shape), skyref_mod.SURVEYS, skyref_mod.FACTOR])
         path = _p(self.session, "skyref.npz")
@@ -653,7 +657,7 @@ class Restorer:
         t0 = time.time()
         try:                                                         # BlurXTerminator sharpening (auto PSF)
             if method == "rl":                                       # the n2n-rl profile: Siril's own deconvolution
-                raise ToolUnavailable("deconv_method=rl: Siril Richardson-Lucy requested")
+                raise ToolUnavailable("rc-astro bxt", "deconv_method=rl: Siril Richardson-Lucy requested")
             tools.rcastro.require("bxt")
             # BXT sharpen with the 1-2 h smart-scope values (research/pro-workflow.md A5/B3: Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; Brecher's 0.5/0.9 are
             # for 15-19 h stacks, AstroPipe's 0.25/0.60/0 for smart-scope data); the lower end on the noisiest data (finish.bxt_ss / bxt_sn).
@@ -789,6 +793,94 @@ def _linear_source(session: str) -> str:
     raise RuntimeError("Nothing to process: stack the dataset first")
 
 
+def _imagemm_sigma(session: str) -> float | None:
+    """The latent resolution (Gaussian sigma, px) of the ImageMM restoration the linear image comes from, or None."""
+    rm = _read_json_quiet(_p(session, "restore_meta.json"))
+    if not rm or rm.get("deconvolution_by") != "imagemm":
+        return None
+    try:
+        sig = float(((rm.get("imagemm_info") or {}).get("psf") or {}).get("eq11", {}).get("sigma") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return sig if sig > 0 else None
+
+
+def _read_json_quiet(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:                                                 # noqa: BLE001
+        return None
+
+
+def _compact_star_layer(lin: np.ndarray, stars: np.ndarray, sigma: float, k_sigma: float = 4.0, nsig: float = 3.0):
+    """The star layer of an ImageMM restoration restricted to its stars' footprints.  A restored star is the
+    latent's Gaussian of ``sigma`` px (Eq. 11: the PSF is in the kernels, not in the image), so its light lies within
+    ``k_sigma`` sigma of its peak; what the star remover put in the star layer beyond that is sky - StarXTerminator,
+    trained on stars with halos, takes a disc of sky out round the compact restored stars (IC 1805: -1.2 % of the
+    sky to 20 px), and the star layer's own processing then turned it into a dark disc round every bright star.
+    That light goes back to the starless layer; starless + stars stays the linear image.  A footprint is kept
+    round every star-layer peak above ``nsig`` x the sky noise (3: the faint stars the restoration resolved
+    stay stars; at 5 they would go back to the starless layer, whose noise reduction removes them).  Peaks are
+    local maxima over the star's own width (2 sigma), so a fainter star within the footprint radius of a
+    brighter one keeps its own footprint.
+
+    Inside a footprint the remover's starless may still sit below the sky round it (the same trained-halo
+    depression, now under the star): the star layer then carries that deficit, and the star reduction of the
+    recombination (pro.recombine, DSA) shrinks it with the star - a dark disc of the footprint's size.  There the
+    starless layer is offset up until its median matches the local sky, the median of the starless layer in
+    the ring 1-4 px outside the footprints (the sky annulus of aperture photometry), never above the image.  Returns (starless, stars, info)."""
+    from scipy.ndimage import maximum_filter
+    R = max(2, int(math.ceil(k_sigma * float(sigma))))
+    lum = np.ascontiguousarray(stars.max(0), np.float32)
+    noise = finish.lower_half_sigma(finish.sample(finish.luminance(np.maximum(lin - stars, 0))))
+    w_pk = 2 * max(1, int(math.ceil(2 * float(sigma)))) + 1
+    thr = nsig * max(noise, 1e-12)
+    peaks = (lum == maximum_filter(lum, size=w_pk)) & (lum > thr)
+    # each star's footprint to where its Gaussian falls to the detection level, sigma sqrt(2 ln(peak / thr)), and
+    # at least k_sigma sigma: a fixed 4 sigma left the outskirts of the brightest restored stars (peaks 1e4 x the
+    # noise: 3 sigma at 4 sigma radius) in the starless layer as faint dots
+    foot_u8 = np.zeros(lum.shape, np.uint8)
+    py_, px_ = np.nonzero(peaks)
+    rad = np.maximum(R, np.ceil(float(sigma) * np.sqrt(2.0 * np.log(np.maximum(lum[py_, px_] / thr, 1.0))))).astype(int)
+    for yq, xq, rq in zip(py_.tolist(), px_.tolist(), rad.tolist()):
+        cv2.circle(foot_u8, (xq, yq), int(rq), 1, -1)
+    foot = foot_u8 > 0
+    stars_c = np.where(foot[None], stars, 0.0).astype(np.float32)
+    moved = float((stars - stars_c).sum())
+    starless = (lin - stars_c).astype(np.float32)
+    # the local sky under each footprint: the median of the starless pixels in the 4 px ring round it that lie
+    # outside every footprint (a median: a neighbour's light or the restored star's own residual wing in the ring
+    # must not lift the sky - with a sky above the star's edge the star would lose its footprint's light)
+    from scipy.ndimage import find_objects, label
+    lab, nlab = label(foot)
+    ring_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    H, W = foot.shape
+    raised = 0.0
+    for q, sl in enumerate(find_objects(lab), start=1):
+        if sl is None:
+            continue
+        y0, y1 = max(0, sl[0].start - 5), min(H, sl[0].stop + 5)
+        x0, x1 = max(0, sl[1].start - 5), min(W, sl[1].stop + 5)
+        comp = lab[y0:y1, x0:x1] == q
+        ring = (cv2.dilate(comp.astype(np.uint8), ring_k) > 0) & ~foot[y0:y1, x0:x1]
+        if ring.sum() < 8:
+            continue
+        for c in range(starless.shape[0]):
+            win = starless[c, y0:y1, x0:x1]
+            # an offset (the footprint's median up to the ring's), not a clip at the sky: the starless texture stays
+            d = float(np.median(win[ring])) - float(np.median(win[comp]))
+            if not d > 0:
+                continue
+            new = np.where(comp, np.minimum(win + d, lin[c, y0:y1, x0:x1]), win)
+            raised += float((new - win).sum())
+            starless[c, y0:y1, x0:x1] = new
+    stars_c = np.where(foot[None], np.maximum(lin - starless, 0.0), 0.0).astype(np.float32)
+    return starless, stars_c, {"radius_px": R, "radius_px_max": int(rad.max()) if len(rad) else R, "stars": int(peaks.sum()),
+                               "moved_flux_fraction": round(moved / max(float(stars.sum()), 1e-12), 4),
+                               "sky_raised_flux_fraction": round(raised / max(float(stars.sum()), 1e-12), 4)}
+
+
 def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params: dict, progress=None, checkpoint=None) -> dict:
     """Separate the stars: ``linear.fits`` -> ``starless.fits`` + ``stars.fits`` (+ ``starnet_meta.json``).
 
@@ -854,10 +946,18 @@ def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params:
         starless, _ = fitsio.read_rgb(starless_path)
         starless = np.clip(np.nan_to_num(starless), 0, 1).astype(np.float32)
         stars = np.maximum(lin - starless, 0).astype(np.float32)
+        # the two layers must add up to the linear image exactly (linear data: starless + stars = linear): where the
+        # remover's starless came out above the image (its inpainting under a removed star), that light was in
+        # neither layer's account and the recombination added it twice
+        starless = np.minimum(starless, lin).astype(np.float32)
         if meta["tool"] == "starnet2":              # StarNet leaves the scattered-light wings of bright stars in the starless layer
             t_w = time.time()
             starless, winfo, stars = finish.subtract_star_wings(lin, starless, stars)
             meta["wing_subtraction"] = {**winfo, "seconds": round(time.time() - t_w, 1)}
+        sig_mm = _imagemm_sigma(session_dir)
+        if sig_mm:
+            starless, stars, cinfo = _compact_star_layer(lin, stars, sig_mm)
+            meta["imagemm_star_footprint"] = cinfo
         fitsio.write_rgb(starless_path, starless, header)
         fitsio.write_rgb(_p(session_dir, "stars.fits"), stars, header)
         sky_noise = finish.lower_half_sigma(finish.sample(finish.luminance(starless)))

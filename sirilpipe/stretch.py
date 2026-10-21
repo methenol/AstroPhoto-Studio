@@ -180,10 +180,14 @@ class SirilStretcher:
         if method == "autoghs":
             # autoghs's stretchamount is a linear D of at most 10: one pass lifts a black-pointed deep-sky stack by ~11x at best (IC 1805 2026-10-16: sky 0.005 at D 10),
             # so the command is repeated ``passes`` times with the same D (GHS practice: several moderate stretches), the pass count chosen by the fit
-            return [f"autoghs -linked {AUTOGHS_K:g} {value:.6f} -b={AUTOGHS_B:g} -hp={AUTOGHS_HP:g} -lp=0 -clipmode=clip"] * int(ctx.get("passes", 1))
+            d = float(np.clip(np.nan_to_num(float(value), nan=1.0), 1e-3, 9.999999))      # Siril: 0 < D <= 10 (see modasinh)
+            return [f"autoghs -linked {AUTOGHS_K:g} {d:.6f} -b={AUTOGHS_B:g} -hp={AUTOGHS_HP:g} -lp=0 -clipmode=clip"] * int(ctx.get("passes", 1))
         if method == "modasinh":
             sp = float(np.clip(ctx["sky"] + MODASINH_SP_SIGMAS * ctx.get("band", ctx["noise"]), 0.0, 0.9))
-            return [f"modasinh -D={value:.6f} -LP=0 -SP={sp:.6f} -HP=1 -clipmode=clip -independent"]
+            # Siril accepts 0 < D <= 10 only: a value printed as 10.000001 (the grid's end in floating point) or a NaN
+            # from a trial fit that saw no sky stopped the whole script ("D must be > 0.0 and <= 10.0", IC 1805)
+            d = float(np.clip(np.nan_to_num(float(value), nan=1.0), 1e-3, 10.0))
+            return [f"modasinh -D={min(d, 9.999999):.6f} -LP=0 -SP={sp:.6f} -HP=1 -clipmode=clip -independent"]
         if method == "autostretch":
             return [f"autostretch -linked {AUTOSTRETCH_CLIP:g} {value:.6f}"]
         if method == "statstretch":
@@ -236,7 +240,13 @@ class SirilStretcher:
         ys = np.array([(t[1] if by_sky else t[2] - t[1]) for t in fine])
         xs = np.array([t[0] for t in fine])
         order = np.argsort(ys)
-        value = float(np.clip(np.exp(np.interp(target, ys[order], np.log(xs[order]))), lo_min, hi_max))
+        fin = np.isfinite(ys)
+        if fin.sum() >= 2:
+            o2 = np.argsort(ys[fin])
+            value = float(np.exp(np.interp(target, ys[fin][o2], np.log(xs[fin][o2]))))
+        else:                                                     # no usable trial: the middle of the tool's range
+            value = float(np.sqrt(lo_min * hi_max))
+        value = float(np.clip(value, lo_min, hi_max))
         return value, {"trials": len(trials), "target": round(float(target), 4), "range": [round(float(xs.min()), 5), round(float(xs.max()), 5)], "passes": int(ctx.get("passes", 1))}
 
     def stretch_to_sky(self, us: list[np.ndarray], ctx: dict, method: str) -> tuple[list[np.ndarray], dict]:

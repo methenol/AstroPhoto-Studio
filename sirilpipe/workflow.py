@@ -57,6 +57,11 @@ BANDING_PATTERNS = ("RGGB", "BGGR", "GRBG", "GBRG")     # seqmerge_cfa's accepte
 # Frames kept by `sensitivity` (DESIGN section 4): 1.0 -> best 90 % by wFWHM, 0.5 -> 97 %, 2.0 -> 75 %
 KEEP_PERCENT = ((0.5, 97.0), (1.0, 90.0), (2.0, 75.0))
 MIN_STARS = 5                    # DESIGN: subs with nbstars < 5 are excluded
+# Narrowest plausible star (Siril's FWHM, px): an optical PSF sampled by the sensor is not narrower than ~1.5 px.
+# Narrower "stars" are single-pixel defects (hot pixels): on a clouded-out night (SNR G180.0-01.7, 2026-10-18) Siril
+# found 12-15 of them at FWHM 1.37 px and "registered" four frames on the sensor (identity transforms), and the stack
+# was of clouds.  Every real DWARF / Seestar session here: median 2.6-9.4 px, single frames >= 2.0 px.
+MIN_STAR_FWHM = 1.6
 FASTNORM_FRAMES = config.FASTNORM_FRAMES   # Siril docs/forums: -fastnorm for > 1000 short subs (siril.md 2.4)
 
 
@@ -135,7 +140,7 @@ def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]
     roundness, wfwhm (from the .seq).  Rules (same semantics as Siril's -filter-* options, evaluated here so the
     UI shows exactly what will be stacked and user overrides compose with them):
       1. registration failed (Siril excluded the frame);
-      2. fewer than MIN_STARS stars;
+      2. fewer than MIN_STARS stars, or "stars" narrower than MIN_STAR_FWHM (pixel defects: no star field);
       3. roundness more than ROUNDNESS_K sigma below the mean (``-filter-round=2.5k``);
       4. worse than the best ``keep_percent(sensitivity)`` % by weighted FWHM (``-filter-wfwhm=N%``)."""
     n = len(stats)
@@ -146,6 +151,9 @@ def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]
             reasons[i].append("registration failed (no matching star field: clouds, or too few stars)")
         elif s.get("nbstars") is None or s["nbstars"] < MIN_STARS:
             reasons[i].append(f"fewer than {MIN_STARS} stars")
+        elif s.get("fwhm") is not None and 0 < s["fwhm"] < MIN_STAR_FWHM:
+            reasons[i].append(f"registered on pixel defects, not stars (FWHM {s['fwhm']:.2f} px < {MIN_STAR_FWHM:g}: "
+                              "hot pixels; clouds, no star field)")
         else:
             alive.append(i)
     rr = [stats[i]["roundness"] for i in alive if stats[i].get("roundness") is not None]
@@ -419,7 +427,7 @@ def apply_script(process_dir: str, seq: str, n: int, excluded: list[int], resamp
     lines = [f"cd {quote(process_dir)}", f"select {seq} 1 {n}"]
     for a, b in ranges(excluded):
         lines.append(f"unselect {seq} {a + 1} {b + 1}")
-    args = [f"seqapplyreg {seq}", "-framing=max", f"-scale={resampling.get('scale', 1.0):g}"]
+    args = [f"seqapplyreg {seq}", f"-framing={resampling.get('framing', 'max')}", f"-scale={resampling.get('scale', 1.0):g}"]
     if resampling["mode"] == "drizzle":
         args += ["-drizzle", f"-pixfrac={resampling['pixfrac']:g}", f"-kernel={resampling['kernel']}"]
     else:
@@ -427,6 +435,29 @@ def apply_script(process_dir: str, seq: str, n: int, excluded: list[int], resamp
     args.append("-filter-included")
     lines.append(" ".join(args))
     return "\n".join(lines) + "\n"
+
+
+def unstackable_max_framing(seq_file: str) -> bool:
+    """Whether a ``seqapplyreg -framing=max`` output cannot be stacked by Siril: its frames differ in size but every
+    registration matrix is the identity.  Frames registered within a fraction of a pixel of each other (an
+    undithered night, SNR G180.0-01.7 2026-10-18: offsets <= 0.02 px) all sit at offset 0 on the max canvas, yet a
+    bounding box rounded one row short (3840 x 2159) makes the sequence variable-size; Siril then reports "No
+    registration data in the sequence" and "The sequence has different image sizes but no registration data, cannot
+    stack".  Such frames are re-applied at the reference frame's size (``-framing=current``): the same pixel grid."""
+    sizes, ident = set(), True
+    try:
+        with open(seq_file, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                p = ln.split()
+                if ln.startswith("I ") and len(p) >= 4 and "," in p[3]:
+                    sizes.add(p[3])
+                elif ln.startswith("R") and " H " in ln:
+                    h = [float(v) for v in ln.split(" H ", 1)[1].split()[:9]]
+                    if len(h) == 9 and max(abs(a - b) for a, b in zip(h, (1, 0, 0, 0, 1, 0, 0, 0, 1))) > 1e-9:
+                        ident = False
+    except (OSError, ValueError):
+        return False
+    return len(sizes) > 1 and ident
 
 
 def stack_script(process_dir: str, seq: str, rej: dict, n_stacked: int, out: str = "stack_raw",

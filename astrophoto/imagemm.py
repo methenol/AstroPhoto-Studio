@@ -3,7 +3,7 @@
 Implementation of Sukurdeep, Budavári, Connolly & Navarro (2025), "ImageMM: Joint
 Multi-Frame Image Restoration and Super-Resolution", arXiv:2501.03002 (v3).
 Equation / algorithm numbers refer to the paper; verification against its own
-model: experiments/test_imagemm.py.
+model: tests/test_imagemm_core.py (and experiments/test_imagemm.py on the main branch).
 
 Data (Sec. 2): n coregistered, background-subtracted exposures y(t) with
 per-pixel variances v(t), binary masks m(t) and PSFs f(t) measured from their
@@ -40,8 +40,12 @@ integration.
 Like the paper (Sec. 5.1), the field is processed in cutouts; here they overlap
 and are blended.
 
-Optional, not part of the paper, each implemented to its own reference:
-* Biggs & Andrews (1997) vector extrapolation of the multiplicative iteration
+Not part of the paper, each implemented to its own reference:
+* saturated pixels (the paper masks them): Whyte, Sivic & Zisserman (2014, IJCV 110, 185), Algorithm 1 -
+  the latent behind saturated data (S) estimated through a smooth saturating response from all the data,
+  the rest (U) only from the measurements S does not reach - with each measurement's own saturation level
+  (``mm_restore``'s ``whyte``; default where the data have saturated pixels);
+* optional: Biggs & Andrews (1997) vector extrapolation of the multiplicative iteration
   (``BiggsAndrews``);
 * seeing groups: inverse-variance coadds of exposures of similar PSF, each a
   single exposure of the same model with the weight-averaged PSF
@@ -70,6 +74,12 @@ def gaussian_psf_mc(sigma: float, size: int, n_samples: int = 200_000_000, seed:
     integration: every pixel holds the fraction of samples of N(0, sigma^2 I) that fall
     inside it (pixel j covers [j - c - 1/2, j - c + 1/2) around the centre c)."""
     assert size % 2 == 1
+    # deterministic for a given seed: computed once per (sigma, size, samples, seed).  Every Eq. 11 solve and every
+    # sigma tried by choose_sigma drew 2e8 samples again (tens of seconds each; a crop restore spent minutes on it)
+    key = (round(float(sigma), 6), int(size), int(n_samples), int(seed))
+    hit = _GAUSS_MC_CACHE.get(key)
+    if hit is not None:
+        return hit.copy()
     rng = np.random.default_rng(seed)
     c = size // 2
     counts = np.zeros(size * size, np.int64)
@@ -81,7 +91,12 @@ def gaussian_psf_mc(sigma: float, size: int, n_samples: int = 200_000_000, seed:
         counts += np.bincount(ij[ok, 0] * size + ij[ok, 1], minlength=size * size)
         left -= k
     g = counts.reshape(size, size).astype(np.float64)
-    return (g / g.sum()).astype(np.float32)
+    g = (g / g.sum()).astype(np.float32)
+    _GAUSS_MC_CACHE[key] = g
+    return g.copy()
+
+
+_GAUSS_MC_CACHE: dict = {}
 
 
 def refine_psf(f: np.ndarray, up: int, sigma: float, g: np.ndarray | None = None, rel_tol: float = 1e-6,
@@ -118,7 +133,8 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
     r = 2), which matters once the PSFs vary over the field (a kernel per exposure, channel and
     node of the field grid: ~10^4).  "adam": the paper's optimiser (``_refine_psfs_adam``).
 
-    ``nonneg``: h >= 0 (projection after every step).  Each kernel stops when its mean squared
+    ``g``: the blur, (2 r d' - 1)^2 for all targets or one per target (N, 2 r d' - 1, 2 r d' - 1); default
+    g_sigma.  ``nonneg``: h >= 0 (projection after every step).  Each kernel stops when its mean squared
     difference is below ``rel_tol`` x mean(f^2) (1e-6: 0.1 % rms, below the PSFs' own
     measurement error; the paper reports 3.9e-8 absolute, ~2e-4 relative, for its HSC PSFs), or
     when it fell by less than ``stall`` over ``stall_window`` iterations.
@@ -131,14 +147,19 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
     if g is None:
         g = gaussian_psf_mc(sigma, 2 * m - 1)
     Pf = 1 << (3 * m - 3).bit_length()                    # >= full linear convolution size 3m - 2
-    G = torch.fft.rfft2(torch.from_numpy(np.ascontiguousarray(g, np.float32)).to(device), s=(Pf, Pf))
-    L = 1.0 / (up * up)
+    # g: one (2m - 1)^2 kernel for all, or one per target (N, 2m - 1, 2m - 1)
+    G_all = torch.fft.rfft2(torch.from_numpy(np.ascontiguousarray(g, np.float32)).to(device), s=(Pf, Pf))
+    per_g = G_all.ndim == 3
     outs, mses = [], []
     for a in range(0, N, chunk):
         ft = torch.from_numpy(np.ascontiguousarray(fs[a:a + chunk], np.float32)).to(device)
         B = ft.shape[0]
         scale = ft.abs().amax(dim=(1, 2)).view(B, 1, 1).clamp_min(1e-30)
         f = ft / scale
+        G = G_all[a:a + B] if per_g else G_all
+        # Lipschitz constant ||A||^2 = max |G|^2 / r^2 (1 / r^2 for a non-negative unit-sum g; a shifted mixture,
+        # ExposureSet._fit_exposure_kernels, carries small negative lobes)
+        L = max(float(G.abs().max()) ** 2, 1e-12) / (up * up)
 
         def A(h):                       # D(h * g_sigma), the valid part (output j at full index j + m - 1)
             full = torch.fft.irfft2(torch.fft.rfft2(h, s=(Pf, Pf)) * G, s=(Pf, Pf))
@@ -329,7 +350,7 @@ class Operators:
     kernels: (n, C, k, k), one per exposure and channel.  The convolution is computed
     directly, as conv2d does it: im2col (``F.unfold``: every k x k latent patch as a
     column) times the matrix of all exposures' flipped kernels - the true convolution
-    h * x, identical to conv2d (tests: experiments/test_imagemm.py).  The adjoint is the
+    h * x, identical to conv2d (tests: tests/test_imagemm_core.py).  The adjoint is the
     exact transpose: kernel matrix transposed times the residuals, then col2im
     (``F.fold``, which sums the overlapping patches).  One matrix product per channel
     covers every exposure; latent rows are processed in bands to bound memory."""
@@ -432,22 +453,27 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
                x0: torch.Tensor, r: int = 1, kappa: float = 2.0, robust: bool = True, delta: float = 2.0,
                max_iters: int = 1000, epsilon: float = 1e-6, mu: float = 0.1, chunk: int | None = None,
                accelerate: bool = False, stop: str = "c15", min_iters: int = 0, log=None,
-               bg: torch.Tensor | None = None, stars: dict | None = None, smooth: float = 0.0,
+               bg: torch.Tensor | None = None, stars: dict | None = None, smooth: float = 0.0, tv: float = 0.0,
+               starlet: float = 0.0, starlet_scales: int = 5, psf_steps: int = 0, psf_every: int = 25,
                smooth_sigma: float = 1.0, pedestal=0.0,
                whyte: dict | None = None) -> tuple[torch.Tensor, dict]:
     """Algorithms 1-3 on one cutout.
 
-    ``whyte`` (r = 1), optional: the update of Whyte, Sivic & Zisserman for images with saturated pixels
+    ``whyte`` (any r), optional: the update of Whyte, Sivic & Zisserman for images with saturated pixels
     ("Deblurring shaken and partially saturated images", IJCV 110:185, 2014, Algorithm 1), in this multi-
-    frame form: {"level": (n, C) each exposure's saturation in its units, "saturated": (n, C, d, d) its pixels
+    frame form: {"level": (n, C) each exposure's saturation in its units, or (n, C, d, d) each measurement's (the
+    ceiling of flat-fielded data follows the flat), "saturated": (n, C, d, d) its pixels
     whose resampling uses a saturated raw sample (their recorded values in ``y``), "phi": 0.9, "a": 50,
-    "erode": 3, "soft": 3}.  Every iteration the latent is split (their Eqs. 23-25, Sec. 5.5) into the pixels
-    U at most phi x the saturation level, eroded by a disk of "erode" px, and the rest S; the mask of U
-    blurred by a Gaussian of "soft" px.  U is updated from the valid measurements S cannot reach - outside S
-    dilated by the kernels' non-zero footprint (their V) - each pixel by the share of its footprint V holds,
+    "erode": 3, "soft": 3, "segment": "blurred", "foot_eps": 1e-3}.  Every iteration the latent is split (their
+    Eqs. 23-25, Sec. 5.5) into the pixels U at most phi x the saturation level ("segment", below), eroded by a
+    disk of "erode" image pixels, and the rest S; the mask of U blurred by a Gaussian of "soft" image pixels
+    (r latent pixels each).  U is updated from the valid measurements S cannot reach - D H_foot S = 0, the
+    footprint the disk holding all but "foot_eps" of every kernel's light (their V, the PSF's non-zeros) -
+    each pixel by the share of its footprint V holds,
     1 for the rest (Eq. 18); S from all the data through the smooth saturation response
-    R(x) = x - log(1 + exp(a (x/L - 1))) L / a, L the exposure's saturation (Eqs. 19-22): a measurement the
-    model saturates no longer pulls.  A bright latent pixel behind saturation is estimated from incomplete
+    R(x) = x - log(1 + exp(a (x/L - 1))) L / a, L the measurement's saturation (Eqs. 19-22), each pixel by the
+    share of its footprint's weight R' leaves, 1 for the rest (Eq. 20's 1 - A^T R'): a measurement the model
+    saturates no longer pulls.  A bright latent pixel behind saturation is estimated from incomplete
     data, and its errors, spread by the blur, rang round every saturated star - dark crescents, rings, a
     plateau - even with the saturated pixels discarded (their Secs. 3-4; M 42, 2026-10-07).
 
@@ -539,6 +565,50 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         # than the plain run stopped at epsilon
         epsilon = epsilon / 100
     x = x0.clone()
+    if tv > 0:
+        # total-variation regularisation of the latent: Richardson-Lucy with TV (Dey et al. 2006, Microsc. Res. Tech.
+        # 69, 260; the corrected scheme of Laasmaa, Vendelin & Peterson 2011, J. Microsc. 243, 124), one-step-late,
+        # in its normalised form u = [H^T W y / H^T W H x] / (1 - lambda div(grad x / |grad x|)) with lambda = ``tv``
+        # (dimensionless; Laasmaa et al. find the optimum ~ 50 / SNR) - the "penalized estimation" ImageMM's paper
+        # names against the Gibbs ringing of the maximum-likelihood restoration
+        def tv_div(z):            # div(grad z / |grad z|) per channel, forward differences, backward divergence
+            gy = F.pad(z[..., 1:, :] - z[..., :-1, :], (0, 0, 0, 1))
+            gx = F.pad(z[..., :, 1:] - z[..., :, :-1], (0, 1, 0, 0))
+            eps = 1e-3 * float(z.abs().median()) + 1e-12
+            nrm = torch.sqrt(gy * gy + gx * gx + eps * eps)
+            py, px = gy / nrm, gx / nrm
+            dy = py - F.pad(py[..., :-1, :], (0, 0, 1, 0))
+            dx = px - F.pad(px[..., :, :-1], (1, 0, 0, 0))
+            return dy + dx
+    if starlet > 0 and stars is not None:
+        # STARRED's extended channel (Michalewicz et al. 2023, JOSS 8, 5340; Millon et al. 2024): with the point
+        # sources as explicit components at the target resolution, the pixel channel is regularised by the l1 norm of
+        # its starlet (isotropic undecimated B3-spline wavelet; Starck & Murtagh) coefficients, weighted per scale by
+        # the noise there (lambda = ``starlet``, 1-3 in STARRED), which is soft-thresholding each scale at lambda x its
+        # noise.  Applied here as the proximal step after each majorization step (forward-backward), the scale noise
+        # frozen once the latent has formed (iteration 20: the median absolute coefficient / 0.6745 per scale and
+        # channel, Starck & Murtagh's estimator); the coarsest scale is not thresholded.
+        b3 = torch.tensor([1, 4, 6, 4, 1], device=x0.device, dtype=x0.dtype) / 16.0
+
+        def _atrous(z, j):            # separable B3 smoothing with holes 2^j, reflect padding
+            k = int(2 ** j)
+            ker = torch.zeros(4 * k + 1, device=z.device, dtype=z.dtype)
+            ker[::k] = b3
+            p_ = 2 * k
+            C_ = z.shape[1]
+            zz = F.pad(z, (p_, p_, 0, 0), mode="reflect") if z.shape[-1] > p_ else F.pad(z, (p_, p_, 0, 0), mode="replicate")
+            zz = F.conv2d(zz, ker.view(1, 1, 1, -1).repeat(C_, 1, 1, 1), groups=C_)
+            zz = F.pad(zz, (0, 0, p_, p_), mode="reflect") if zz.shape[-2] > p_ else F.pad(zz, (0, 0, p_, p_), mode="replicate")
+            return F.conv2d(zz, ker.view(1, 1, -1, 1).repeat(C_, 1, 1, 1), groups=C_)
+
+        def starlet_fwd(z):
+            ws, c_ = [], z
+            for j in range(int(starlet_scales)):
+                c1 = _atrous(c_, j)
+                ws.append(c_ - c1)
+                c_ = c1
+            return ws, c_
+        st_noise = None
     if smooth > 0:
         curv = torch.zeros_like(x0)
         for a, b in ops.ranges():
@@ -603,27 +673,86 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             stamps = st_stamps if stamps is None else stamps
             return torch.stack([(z[0, :, st_iy[q]:st_iy[q] + ss, st_ix[q]:st_ix[q] + ss] * stamps[q]).sum((-2, -1))
                                 for q in range(len(st_iy))])
-    if whyte is not None and (r != 1 or not bool((whyte["saturated"] > 0).any())):
+    if whyte is not None and not bool((whyte["saturated"] > 0).any()):
         whyte = None                   # (the update is for data with saturated pixels; without any it is the paper's)
     if whyte is not None:
-        w_L = torch.as_tensor(np.asarray(whyte["level"], np.float32), device=x0.device).view(n, -1, 1, 1)
+        # each exposure's saturation, (n, C) or per measurement (n, C, d, d): on flat-fielded data the ceiling is the
+        # raw one over the flat, and the level of a measurement is where its own raw sample clips
+        lv_ = whyte["level"]
+        w_L = (lv_.to(device=x0.device, dtype=x0.dtype) if torch.is_tensor(lv_)
+               else torch.as_tensor(np.asarray(lv_, np.float32), device=x0.device, dtype=x0.dtype))
+        if w_L.ndim == 2:
+            w_L = w_L.view(n, -1, 1, 1)
+        # the data and the model carry the pedestal from here on, so the ceiling does too
+        w_L = w_L + ped.to(w_L.dtype)
         w_sat = whyte["saturated"]
+        # Eq. C15's effective mask over the data this update uses: the saturated measurements are data here (through
+        # R), and the latent behind them - where S's update acts - would otherwise never enter the stopping rule
+        frac_w = torch.zeros_like(x0)
+        for a, b in ops.ranges():
+            frac_w += ops.adjoint_sum(((mask[a:b] > 0) | (w_sat[a:b] > 0)).to(x0.dtype), a, b)
+        m_eff = (frac_w / n > mu).to(m_eff.dtype)
+        del frac_w
         w_phi, w_a = float(whyte.get("phi", 0.9)), float(whyte.get("a", 50.0))
-        w_er = int(whyte.get("erode", 3))
+        # their erosion disk (3 px) and mask blur (3 px) are in image pixels: r latent pixels each when super-resolved
+        w_er = int(round(float(whyte.get("erode", 3)) * r))
         dd_ = torch.arange(-w_er, w_er + 1, device=x0.device, dtype=x0.dtype)
         w_disk = ((dd_[:, None] ** 2 + dd_[None, :] ** 2) <= w_er ** 2).to(x0.dtype)[None, None]
-        if whyte.get("support"):            # the PSF's measured support (beyond it the kernels hold numerical residue)
-            sr_ = int(np.ceil(float(whyte["support"])))
-            dd2 = torch.arange(-sr_, sr_ + 1, device=x0.device, dtype=x0.dtype)
-            w_foot = ((dd2[:, None] ** 2 + dd2[None, :] ** 2) <= sr_ ** 2).to(x0.dtype)[None, None]
-        else:
-            w_foot = (kernels.abs().amax((0, 1)) > 0).to(x0.dtype)[None, None]           # the kernels' non-zeros
-        o_e = int(round(exposure_origin(kernels.shape[-1], 1)))
-        ws_ = float(whyte.get("soft", 3.0))
+        # V (their Eq. 15): the measurements no S pixel reaches through the blur, {i : (A f_S)_i = 0}.  Found with
+        # the forward operator itself, a binary footprint in place of the kernels: D H_foot S > 0 - exact for any r
+        # (each exposure pixel pools r x r outputs, each a kernel window).  The footprint: Whyte et al. take the
+        # PSF's non-zeros; the kernels here (Eq. 11 solutions, seeing mixtures) are positive by a numerical residue
+        # over their whole window, so the disk that holds all but ``foot_eps`` of every kernel's light - (A f_S)_i
+        # is then below foot_eps of f_S's flux, the extended wing included where the PSF has one
+        ks_ = kernels.shape[-1]
+        cc_ = (ks_ - 1) / 2.0
+        dd2 = torch.arange(ks_, device=x0.device, dtype=x0.dtype) - cc_
+        rr_ = torch.sqrt(dd2[:, None] ** 2 + dd2[None, :] ** 2).flatten()
+        order_ = torch.argsort(rr_)
+        kf_ = kernels.reshape(-1, ks_ * ks_).clamp_min(0)[:, order_]
+        cum_ = kf_.cumsum(-1) / kf_.sum(-1, keepdim=True).clamp_min(1e-30)
+        eps_ = float(whyte.get("foot_eps", 1e-3))
+        first_ = (cum_ >= 1.0 - eps_).to(torch.int64).argmax(-1)                  # per kernel: the enclosing pixel
+        sr_ = float(rr_[order_][first_].max())
+        foot_ = (rr_.view(ks_, ks_) <= sr_ + 1e-6).to(x0.dtype)
+        del kf_, cum_, first_
+        w_fops = Operators(foot_[None, None], r)
+        # latent index of the centre of valid output 0 (exposure pixel i pools outputs r i .. r i + r - 1): exact
+        # for odd kernels (r = 1), half a latent pixel low for the even ones of Eq. 11 (r = 2)
+        o_e = (ks_ - 1) // 2
+        X_, Y_ = x0.shape[-2:]
+
+        def w_to_latent(m):             # exposure-grid map (1, c, d, d) onto the latent grid, continued into the padding
+            mu = unpool(m, r)
+            return F.pad(mu, (o_e, Y_ - mu.shape[-1] - o_e, o_e, X_ - mu.shape[-2] - o_e), mode="replicate")
+        ws_ = float(whyte.get("soft", 3.0)) * r
         wk_ = int(2 * np.ceil(3 * ws_) + 1)
         wg1 = torch.exp(-((torch.arange(wk_, device=x0.device, dtype=x0.dtype) - wk_ // 2) ** 2) / (2 * ws_ ** 2))
         wg1 = wg1 / wg1.sum()
-        w_Lmin = w_L.amin(0, keepdim=True)                                                 # (1, C, 1, 1)
+        w_Lmin = w_L.amin(0, keepdim=True)                                       # (1, C, 1, 1) or (1, C, d, d)
+        if w_Lmin.shape[-1] > 1 or w_Lmin.shape[-2] > 1:
+            w_Lmin = w_to_latent(w_Lmin)
+        w_seg = str(whyte.get("segment", "blurred"))
+
+        def w_peak(fx_, a, b):
+            """(1, 1, d, d): the largest fraction of its own saturation level the model of exposures a..b-1 reaches
+            at each pixel, over the exposures and channels (the sharpest exposure saturates first: a mean kernel
+            missed the stars that clip only in the good-seeing frames)."""
+            return ((fx_ - ped) / (w_L[a:b] - ped).clamp_min(1e-30)).amax(dim=(0, 1), keepdim=True)
+
+        w_ratio = None
+        if w_seg == "blurred":                              # the model of the initial guess
+            xm0 = x0 if bg is None else x0 + bg
+            if stars is not None:
+                xm0 = xm0 + star_image(st_a)
+            for a, b in ops.ranges():
+                fx0 = ops.forward(xm0, a, b)
+                if stars is not None and stars.get("halo") is not None:
+                    fx0 = fx0 + halo_image(st_a)[None]
+                wr = w_peak(fx0, a, b)
+                w_ratio = wr if w_ratio is None else torch.maximum(w_ratio, wr)
+                del fx0, wr
+            del xm0
 
         def w_blur(z):
             p_ = wk_ // 2
@@ -645,24 +774,40 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         den = torch.zeros_like(x0)
         split = None
         if whyte is not None:
-            # U: latent pixels at most phi x the saturation (any channel above it: S), eroded (Eqs. 23, 29)
-            Sb = ((xe - ped) > w_phi * w_Lmin).any(1, keepdim=True).to(x0.dtype)
+            # U / S (Eq. 23): S holds the latent pixels that cause the saturation.  Whyte et al. threshold the
+            # latent itself (f > phi), which presumes latent and data share one intensity scale - true of a
+            # shaken photograph, whose light the blur only spreads along a path.  A point-source latent at
+            # the paper's sigma peaks ~12x above its blurred image (IC 1805, DWARF 3: PSF peak 0.013 of the
+            # flux), so every bright star became "S" although its data never saturate, and the pixels round
+            # it lost their normal update (Eq. 18 holds U pixels whose footprint V barely covers): discs of
+            # unrestored or emptied sky, 12-30 px, round stars at 0.5-0.8 of the ceiling.  "blurred": S is
+            # where the model A_t f of any exposure reaches phi x that measurement's saturation, i.e. the latent
+            # behind saturated data (the forward models of the previous iterate, exposure pixel i <-> latent
+            # r i + o_e ... r i + o_e + r - 1); "latent": the paper's test on f.
+            if w_seg == "blurred":
+                Sb = (w_to_latent(w_ratio) > w_phi).to(x0.dtype)
+            else:
+                Sb = ((xe - ped) > w_phi * (w_Lmin - ped)).any(1, keepdim=True).to(x0.dtype)   # (no pedestal)
             if bool(Sb.any()):
-                Sb = (F.conv2d(Sb, w_disk, padding=w_er) > 0).to(x0.dtype)
+                Sb = (F.conv2d(Sb, w_disk, padding=w_disk.shape[-1] // 2) > 0).to(x0.dtype)
                 u_soft = (1.0 - w_blur(Sb)).clamp(0, 1)
-                kh = w_foot.shape[-1] // 2
-                reach = (F.conv2d(Sb, w_foot, padding=kh) > 0).to(x0.dtype)
-                V_exp = (1.0 - reach)[0, :, o_e:o_e + y.shape[-2], o_e:o_e + y.shape[-1]]   # (1, d, d): their V
+                V_exp = (w_fops.forward(Sb, 0, 1) <= 0).to(x0.dtype)                # (1, 1, d, d): their V
                 num_S, den_S = torch.zeros_like(x0), torch.zeros_like(x0)
+                fS, fS0 = torch.zeros_like(x0), torch.zeros_like(x0)
                 fV, fA = torch.zeros_like(x0), torch.zeros_like(x0)
                 split = True
         loss = 0.0                     # float64 accumulation of float32 chunk sums (MPS has no float64)
         if stars is not None and stars.get("halo") is not None:
             E_ = halo_image(st_a)
+        wr_next = None
         for a, b in ops.ranges():
             fx = ops.forward(xm, a, b)
             if stars is not None and stars.get("halo") is not None:
                 fx = fx + E_[None]
+            if whyte is not None and w_seg == "blurred":          # S of the next iteration (above)
+                wr = w_peak(fx, a, b)
+                wr_next = wr if wr_next is None else torch.maximum(wr_next, wr)
+                del wr
             Wk = W_(a, b)
             z = (y[a:b] - fx) / var[a:b].clamp_min(1e-30).sqrt()
             za = z.abs()
@@ -675,21 +820,26 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
                 # S (Eq. 20): every measurement, the saturated ones included, through R
                 Rf, dR = w_R(fx, w_L[a:b])
                 allm = ((mask[a:b] > 0) | (w_sat[a:b] > 0)).to(fx.dtype)
-                WS = allm / var[a:b].clamp_min(1e-30) * dR
+                W0 = allm / var[a:b].clamp_min(1e-30)
                 if robust:
                     zS = (y[a:b] - Rf) / var[a:b].clamp_min(1e-30).sqrt()
-                    WS = WS * huber_psi(zS, delta)
+                    W0 = W0 * huber_psi(zS, delta)
+                WS = W0 * dR
                 num_S += ops.adjoint_sum(WS * y[a:b], a, b)
                 den_S += ops.adjoint_sum(WS * Rf, a, b)
-                del Rf, dR, allm, WS
+                fS += ops.adjoint_sum(WS, a, b)
+                fS0 += ops.adjoint_sum(W0, a, b)
+                del Rf, dR, allm, W0, WS
                 # U (Eq. 18): the valid measurements outside S's reach, and the share of each footprint they hold
                 fA += ops.adjoint_sum(Wk, a, b)
-                Wk = Wk * V_exp[None]
+                Wk = Wk * V_exp
                 fV += ops.adjoint_sum(Wk, a, b)
             if robust or whyte is not None:
                 num += ops.adjoint_sum(Wk * y[a:b], a, b)
             den += ops.adjoint_sum(Wk * fx, a, b)
             del fx, Wk, z, za, rho
+        if wr_next is not None:
+            w_ratio = wr_next
         losses.append(loss)
         # (a rise above float32 summation noise, ~1e-7 relative)
         if acc is not None and loss > loss_prev * (1 + 1e-6) and acc.alpha > 0:
@@ -699,6 +849,10 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             loss_prev = float("inf")
             continue
         loss_prev = loss
+        den_data = den                                     # the data term alone: the point sources' update below
+        if tv > 0:                                         # one-step-late TV: den (1 - lambda div(grad x / |grad x|))
+            # (Laasmaa et al.: where the factor would turn negative the update is not defined - floored at 0.1)
+            den = den * (1.0 - float(tv) * tv_div(xe - ped)).clamp_min(0.1)
         if smooth > 0:                                     # one-step-late MCS smoothing of the pixel channel
             d_ = xe - G_(xe)
             den = (den + lam * (d_ - G_(d_))).clamp_min(1e-3 * den.clamp_min(0) + 1e-30)
@@ -708,19 +862,35 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             # Eq. 18: A^T(v g / A f) + 1 - A^T v - the ratio over V weighted by the share of each pixel's
             # (weighted) footprint V holds, 1 for the rest; Eq. 20 for S; combined through the blurred mask of U
             share = torch.where(fA > 0, fV / fA.clamp_min(1e-30), torch.zeros_like(fA)).clamp(0, 1)
+            # Eq. 20: A^T(g R'(Af) / R(Af)) + 1 - A^T R'(Af) - likewise the ratio over the measurements weighted by
+            # R', taken by the share of each footprint's weight R' leaves (A^T R'), 1 for the rest: a pixel whose
+            # every measurement the model saturates (R' ~ 0) is held, not set by a ratio of vanishing sums
+            share_S = torch.where(fS0 > 0, fS / fS0.clamp_min(1e-30), torch.zeros_like(fS0)).clamp(0, 1)
             uS = torch.where(den_S > 0, num_S / den_S.clamp_min(1e-30), torch.ones_like(den_S)).clamp(1.0 / kappa, kappa)
+            uS = share_S * uS + (1.0 - share_S)
             u = u_soft * (share * u + (1.0 - share)) + (1.0 - u_soft) * uS
             # the stopping rule over the pixels the data update (held pixels' u is 1 by construction and would
             # make the mean look converged: 37 iterations instead of ~110 on a synthetic field, far rms doubled)
-            m_crit = m_eff * ((u_soft * share) > 0.5).to(m_eff.dtype)
-            del num_S, den_S, fV, fA
+            m_crit = m_eff * ((u_soft * share + (1.0 - u_soft) * share_S) > 0.5).to(m_eff.dtype)
+            del num_S, den_S, fV, fA, fS, fS0
         else:
             m_crit = m_eff
         if stars is not None:
-            ua = star_dot(num) / star_dot(den).clamp_min(1e-30)
+            # the regularisation R(x) is of the pixel channel only (MCS Eq. 7): the amplitudes' majorization uses the
+            # data term's denominator - with the smoothing's one-step-late term in it every star's amplitude was
+            # pulled down by the pixel channel's curvature under it, and its light stayed in the smoothed pixels
+            ua = star_dot(num) / star_dot(den_data).clamp_min(1e-30)
             a_prev = st_a
             st_a = st_a * ua.clamp(1.0 / kappa, kappa)
         x_new = xe * u                                                                  # Eq. 7
+        if starlet > 0 and stars is not None:
+            ws_, coarse_ = starlet_fwd(x_new - ped)
+            if st_noise is None and k >= 20:
+                st_noise = [(w_.abs().flatten(-2).median(-1).values / 0.6745)[..., None, None] for w_ in ws_]
+            if st_noise is not None:
+                ws_ = [torch.sign(w_) * (w_.abs() - starlet * n_).clamp_min(0) for w_, n_ in zip(ws_, st_noise)]
+                z_ = coarse_ + sum(ws_)
+                x_new = (z_ + ped).clamp_min(1e-12)          # (the multiplicative update needs x > 0)
         if acc is not None:
             acc.update(x, xe, x_new)
         if stop == "flux":
@@ -743,6 +913,37 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         else:
             crit = None
         x = x_new
+        if psf_steps > 0 and r == 1 and k % int(psf_every) == 0 and k // int(psf_every) <= int(psf_steps):
+            # myopic step (blind Richardson-Lucy, Holmes 1992 / Fish et al. 1995, JOSA A 12, 58; myopic deconvolution,
+            # Jefferies & Christou 1993): with the latent fixed, each exposure's kernel takes the same multiplicative
+            # majorization as the latent, h_t <- h_t (x (*) W y_t) / (x (*) W H_t x), (*) the correlation over the kernel's
+            # support, clipped by kappa, then unit sum.  It corrects the measured PSF where the data say it is wrong
+            # (a field model's wing 10-30 % off a bright star's own) instead of the latent ringing to make up for it;
+            # started from the measured kernels and taken only every ``psf_every`` latent steps, ``psf_steps`` times.
+            xm_ = x if bg is None else x + bg
+            if stars is not None:
+                xm_ = xm_ + star_image(st_a)
+            kk = kernels.shape[-1]
+            Xs, Ys = xm_.shape[-2:]
+            Fx = torch.fft.rfft2(xm_, s=(Xs, Ys))
+            newk = kernels.clone()
+            for a, b in ops.ranges():
+                fx_ = ops.forward(xm_, a, b)
+                Wk_ = W_(a, b)
+                cA = torch.fft.irfft2(Fx * torch.conj(torch.fft.rfft2(Wk_ * y[a:b], s=(Xs, Ys))), s=(Xs, Ys))[..., :kk, :kk]
+                cB = torch.fft.irfft2(Fx * torch.conj(torch.fft.rfft2(Wk_ * fx_, s=(Xs, Ys))), s=(Xs, Ys))[..., :kk, :kk]
+                num_h, den_h = cA.flip(-2, -1), cB.flip(-2, -1)
+                ratio = torch.where(den_h > 0, num_h / den_h.clamp_min(1e-30), torch.ones_like(den_h)).clamp(1.0 / kappa, kappa)
+                newk[a:b] = kernels[a:b] * ratio
+                del fx_, Wk_, cA, cB, num_h, den_h, ratio
+            newk = newk / newk.sum((-2, -1), keepdim=True).clamp_min(1e-30)
+            kernels = newk
+            ops = Operators(kernels, r, chunk)
+            del Fx, newk
+            if not robust and whyte is None:              # Eq. 8's fixed numerator depends on the kernels
+                num = torch.zeros_like(x0)
+                for a, b in ops.ranges():
+                    num += ops.adjoint_sum(W_(a, b) * y[a:b], a, b)
         if crit is not None:
             hist.append(crit)
             if log:
@@ -832,12 +1033,14 @@ def coadd_groups(Y, V, Mk, K, groups):
 def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None = None, r: int = 1,
                    kernels: np.ndarray | None = None, robust: bool = True, psf_model: str = "empirical",
                    n_groups: int = 0, device=None, background: bool = False, saturated: str = "whyte",
-                   init: str = "exposures", **kw):
+                   init: str = "exposures", stars_sigma: float | None = None, stars_smooth: float = 0.0, **kw):
     """ImageMM (Algorithm 3 by default) of the prepared exposures ``es``
     (exposures.ExposureSet) on the reference-grid window [y0, y1) x [x0, x1).
 
-    ``init``: "exposures" (default) - x0 the median of the exposures, every recorded value (Sec. 4.1: "the
-    mean or median of the input exposures", non-positive pixels replaced); "valid" - the median over the
+    ``init``: "exposures" (default) - x0 the median of the exposures, every recorded value, saturated ones
+    included (Sec. 4.1: "the mean or median of the input exposures", non-positive pixels replaced); pixels
+    without a measurement (outside a frame's footprint) are left out where the set says which they are
+    (``windows(censored=True)``); "valid" - the median over the
     valid measurements only.  A saturated star's core is masked in every exposure: started from the valid
     ones it began at the floor - a black disc ringed by its own light on M 42 (2026-10-07).
 
@@ -846,9 +1049,16 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     alone, under which every saturated star of M 42 had a dark crescent above it (its errors in the
     bright, saturated latent pixels spread by the blur).
 
-    ``background``: restore on a pedestal (``mm_restore``: 50 x the exposures' median pixel noise
-    per channel, added to the data and taken off the result), so that the latent's sky keeps its
-    noise instead of being clipped at 0.
+    ``background``: restore on a pedestal (``mm_restore``: added to the data and taken off the result), so
+    that the latent's sky keeps its noise instead of being clipped at 0.  True: 50 x the exposures' median
+    pixel noise per channel.  "sky": the sky the exposures had before their background was taken off
+    (``es.sky_floor``, the least over the exposures), i.e. the non-negativity of the sky itself - sources
+    plus sky glow.  Not the default: the lower bound at the background level itself (x >= 0 on sky-subtracted
+    exposures; the Lower Bound Constraint Algorithm, Lanteri et al. 2001, Roche et al. 2003) is what suppresses
+    the multiplicative iteration's ringing round bright sources on a high background; with the floor at
+    minus the sky the ringing below the background shows (IC 1805: rings of -3e-3 round the cluster's stars).
+    Under x >= 0 the latent's sky noise is clipped (38-66 % of IC 1805's sky pixels): its noise, not its
+    level - the Noise2Noise pass (``n2n``) removes it.
 
     ``kernels``: latent-grid kernels for super-resolution (Eq. 11), aligned with ``idx``;
     default: the exposures' PSFs f(t) (``psf_model`` "empirical" or "moffat").
@@ -857,13 +1067,16 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     device = device or pick_device()
     idx = es.usable() if idx is None else idx
     import inspect
-    use_w = (saturated == "whyte" and r == 1 and not n_groups and hasattr(es, "sat")
-             and "censored" in inspect.signature(es.windows).parameters)
-    if use_w:          # the pixels whose resampling used a saturated raw sample, with their recorded values
+    has_c = hasattr(es, "sat") and "censored" in inspect.signature(es.windows).parameters and not n_groups
+    use_w = saturated == "whyte" and has_c
+    if has_c:          # the pixels whose resampling used a saturated raw sample, with their recorded values
         Y, V, Mk, Cs = es.windows(idx, y0, y1, x0, x1, censored=True)
     else:
         Y, V, Mk = es.windows(idx, y0, y1, x0, x1)
         Cs = None
+    # the recorded values (x0 below): valid or saturated.  A pixel with neither holds no measurement - outside a
+    # frame's footprint, a drizzle hole - and the window carries -(sky) there, not data
+    rec = None if Cs is None else ((Mk > 0) | (Cs > 0)).astype(np.float32)
     at = ((y0 + y1 - 1) / 2, (x0 + x1 - 1) / 2)                # the PSFs where the cutout is
     # unit sum whatever the source: the sky pedestal below assumes it (``unit_sum``)
     k = unit_sum(es.kernels(idx, psf_model, at=at) if kernels is None else kernels)
@@ -873,14 +1086,28 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     yt, vt, mt = (torch.from_numpy(z).to(device) for z in (Y, V, Mk))
     kt = torch.from_numpy(k).to(device)
     ks = k.shape[-1]
-    x0_ = initial_guess(yt, torch.ones_like(mt) if init == "exposures" else mt, ks, r)
+    if init == "exposures":
+        x0_ = initial_guess(yt, torch.ones_like(mt) if rec is None else torch.from_numpy(rec).to(device), ks, r)
+    else:
+        x0_ = initial_guess(yt, mt, ks, r)
+    del rec
     whyte = None
-    if Cs is not None and Cs.any():
+    if use_w and Cs.any():
         T = np.stack([np.asarray(es.params[k_]["T"], np.float64) for k_ in idx])          # (n, C)
-        support = [float(es.psf_ref[c].get("support") or 0) for c in range(3) if es.psf_ref and es.psf_ref[c] is not None]
-        whyte = {"level": (float(es.sat) / T).astype(np.float32),     # each exposure's saturation in its units
+        if hasattr(es, "saturation_levels"):
+            # each measurement's own saturation level, in the window's units (the ceiling follows the flat field)
+            level = np.asarray(es.saturation_levels(idx, y0, y1, x0, x1), np.float32)
+        else:
+            level = (float(es.sat) / T).astype(np.float32)[:, :, None, None] * np.ones((1, 1) + Y.shape[-2:], np.float32)
+        # a saturated measurement is at its ceiling: the level is at least what it recorded (a drizzled pixel mixing
+        # saturated and unsaturated drops is below it, and the level must not fall under the value it models)
+        level = np.where(Cs > 0, np.maximum(level, Y), level).astype(np.float32)
+        # V (Whyte et al.: the measurements S does not reach) over the kernels' real extent (mm_restore's
+        # "foot_eps": the extended wing included - a saturated star's wing light reaches that far, and the U
+        # pixels there must not be fitted to it)
+        whyte = {"level": torch.from_numpy(level).to(device),          # each measurement's saturation, (n, C, h, w)
                  "saturated": torch.from_numpy(Cs).to(device), "phi": 0.9, "a": 50.0, "erode": 3, "soft": 3.0,
-                 "support": max(support) if support and max(support) > 0 else None}
+                 "foot_eps": 1e-3}
     del Cs
     # output sample j sits at exposure coordinate j / r: latent index exposure_origin + j (an
     # integer for r = 1 with odd, and r = 2 with even, kernels)
@@ -888,12 +1115,37 @@ def restore_cutout(es, y0: int, y1: int, x0: int, x1: int, idx: list[int] | None
     assert abs(o - round(o)) < 1e-9
     o = int(round(o))
     ped = 0.0
-    if background:
+    if background == "sky" and hasattr(es, "sky_floor"):
+        ped = torch.as_tensor(np.asarray(es.sky_floor(idx, y0, y1, x0, x1), np.float32), device=device).view(1, -1, 1, 1).clamp_min(0)
+    elif background == "sky":
+        background = False
+    elif background:
         sd = vt.clamp_min(0).sqrt()
         ped = torch.stack([50.0 * sd[:, c][mt[:, c] > 0].median() if bool((mt[:, c] > 0).any()) else sd.new_tensor(0.0)
                            for c in range(vt.shape[1])]).view(1, -1, 1, 1)
+    if stars_sigma is not None:
+        # the cutout's stars as MCS point sources (``point_sources``): each exactly the restoration's g_sigma at
+        # its fitted sub-pixel position, with its own PSF residual, so that no star has to be built from latent
+        # pixels - the pixel latent cannot hold a point source of a ring-cored PSF without ringing round it
+        st_ = point_sources(es, r, float(stars_sigma), (y0, y1, x0, x1), o, tuple(x0_.shape[-2:]))
+        if st_ is not None:
+            kw = {**kw, "stars": st_, "smooth": float(stars_smooth), "smooth_sigma": float(stars_sigma)}
+            # MCS's starting point: the pixel channel holds the data *less* the point sources (the median of
+            # the exposures already contains every star; started from it, the pixel channel keeps a blurred copy
+            # of each star that the smoothing term then protects, and the star's light is split arbitrarily)
+            Km = torch.as_tensor(unit_sum(k).mean(0), device=device, dtype=x0_.dtype)          # (C, ks, ks)
+            simg = torch.zeros_like(x0_)
+            ss_ = st_["stamps"].shape[-1]
+            for q in range(len(st_["iy"])):
+                iy_, ix_ = int(st_["iy"][q]), int(st_["ix"][q])
+                a_ = torch.as_tensor(st_["a"][q], device=device, dtype=x0_.dtype)
+                simg[0, :, iy_:iy_ + ss_, ix_:ix_ + ss_] += a_[:, None, None] * torch.as_tensor(st_["stamps"][q], device=device, dtype=x0_.dtype)
+            simg = F.conv2d(simg, Km.flip(-2, -1)[:, None], padding=Km.shape[-1] // 2, groups=Km.shape[0])
+            floor_ = x0_.amin(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+            x0_ = torch.maximum(x0_ - simg, floor_)
     x, info = mm_restore(yt, vt, mt, kt, x0_, r=r, robust=robust, pedestal=ped, whyte=whyte, **kw)
     info["saturated_pixels"] = 0 if whyte is None else int((whyte["saturated"].amax(0) > 0).sum())
+    info["point_sources"] = 0 if stars_sigma is None or "stars" not in kw else int(len(kw["stars"]["iy"]))
     if background:
         info["pedestal"] = [float(v) for v in ped.flatten()]
     h, w = (y1 - y0) * r, (x1 - x0) * r
@@ -956,6 +1208,23 @@ def stack_forward(x: torch.Tensor, kernels: torch.Tensor, s: int) -> tuple[torch
 
 
 # ----------------------------------------------------------------- saturated stars
+def _coadd_and_ceiling(es) -> tuple[np.ndarray, float]:
+    """The exposures' own coadd less the sky (the stack where there is none) and the saturation in its units
+    (the exposures' ceiling / T, as restore_cutout's Whyte level): what the kernels describe and how bright a
+    star may be there before its core is clipped.  (es.sat is in the exposures' units; comparing a coadd's peak
+    with it took every star but the faintest for saturated.)"""
+    img = getattr(es, "coadd", None)
+    img = es.ref if img is None else img
+    ceil = float(getattr(es, "sat", 1e30))
+    try:
+        Tm = float(np.median([np.median(es.params[k]["T"]) for k in es.usable()]))
+        if np.isfinite(Tm) and Tm > 0 and ceil < 1e20:
+            ceil = ceil / Tm
+    except Exception:
+        pass
+    return (img - es.sky_ref).astype(np.float32), ceil
+
+
 def local_psf_correction(es, window: tuple[int, int, int, int], margin: int = 128, R: int = 16,
                          min_stars: int = 3) -> np.ndarray | None:
     """Radial correction C(r) (3, R + 1) of the field PSF model for a cutout, from the cutout's own stars
@@ -972,13 +1241,13 @@ def local_psf_correction(es, window: tuple[int, int, int, int], margin: int = 12
     from .exposures import interp_nodes
     y0, y1, x0, x1 = window
     cat = es.cat
-    ref = (es.ref - es.sky_ref).astype(np.float32)
+    ref, ceil = _coadd_and_ceiling(es)
     H, W = ref.shape[:2]
     xs, ys = np.asarray(cat["x"], float), np.asarray(cat["y"], float)
     sel = (xs > x0 - margin) & (xs < x1 + margin) & (ys > y0 - margin) & (ys < y1 + margin)
     sel &= (xs > R + 1) & (xs < W - R - 2) & (ys > R + 1) & (ys < H - R - 2)
     peak = np.asarray(cat["peak"], float)
-    sel &= peak < 0.5 * float(es.sat)
+    sel &= peak < 0.5 * ceil
     if sel.sum() == 0:
         return None
     sel &= peak >= np.percentile(peak[sel], 50)             # the brighter half: their wings rise out of the noise
@@ -1040,12 +1309,12 @@ def local_psf_residual(es, window: tuple[int, int, int, int], margin: int = 256,
     from .exposures import interp_nodes
     y0, y1, x0, x1 = window
     cat = es.cat
-    ref = (es.ref - es.sky_ref).astype(np.float32)
+    ref, ceil = _coadd_and_ceiling(es)
     H, W = ref.shape[:2]
     xs, ys = np.asarray(cat["x"], float), np.asarray(cat["y"], float)
     peak = np.asarray(cat["peak"], float)
     sel = (xs > x0 - margin) & (xs < x1 + margin) & (ys > y0 - margin) & (ys < y1 + margin)
-    sel &= (xs > R + 1) & (xs < W - R - 2) & (ys > R + 1) & (ys < H - R - 2) & (peak < 0.5 * float(es.sat))
+    sel &= (xs > R + 1) & (xs < W - R - 2) & (ys > R + 1) & (ys < H - R - 2) & (peak < 0.5 * ceil)
     if sel.sum() < min_stars:
         return None
     sel &= peak >= np.percentile(peak[sel], 50)
@@ -1124,11 +1393,21 @@ def point_sources(es, r: int, sigma: float, window: tuple[int, int, int, int], o
     from scipy.special import erf
     y0, y1, x0, x1 = window
     cat = es.cat
+    # the stars are measured on the exposures' own coadd where there is one (the stack is resampled differently:
+    # ~3 % of a star's flux at 2-4 px, see ExposureSet.prepare); the ceiling in the coadd's units is the
+    # exposures' saturation / T (restore_cutout's Whyte level)
+    img = getattr(es, "coadd", None)
+    img = es.ref if img is None else img
+    try:
+        Tm = float(np.median([np.median(es.params[k]["T"]) for k in es.usable()]))
+        ceil = float(es.sat) / Tm if np.isfinite(Tm) and Tm > 0 and float(es.sat) < 1e20 else float(es.sat)
+    except Exception:
+        ceil = float(es.sat)
     xs, ys = list(np.asarray(cat["x"], float)), list(np.asarray(cat["y"], float))
     if "all_x" in cat and len(cat["all_x"]):
         ax, ay = np.asarray(cat["all_x"], float), np.asarray(cat["all_y"], float)
         ix, iy = np.clip(np.round(ax).astype(int), 0, es.ref.shape[1] - 1), np.clip(np.round(ay).astype(int), 0, es.ref.shape[0] - 1)
-        sat = es.ref[iy, ix].max(-1) >= 0.5 * float(es.sat)
+        sat = (img[iy, ix] - es.sky_ref[iy, ix]).max(-1) >= 0.5 * ceil          # (the ceiling has no sky in it)
         known = np.c_[ys, xs] if xs else np.zeros((0, 2))
         for x, y in zip(ax[sat], ay[sat]):
             if not len(known) or np.hypot(*(known - [y, x]).T).min() > 2:
@@ -1140,7 +1419,7 @@ def point_sources(es, r: int, sigma: float, window: tuple[int, int, int, int], o
     if not len(xs):
         return None
     fw = float(getattr(es, "fwhm_ref", 4.0))
-    ref = (es.ref - es.sky_ref).astype(np.float32)
+    ref = (img - es.sky_ref).astype(np.float32)
     h = int(np.ceil(4 * sigma)) + 1
     ss = 2 * h + 1
     stamps, iys, ixs, amps, offs, halos = [], [], [], [], [], []
@@ -1155,7 +1434,7 @@ def point_sources(es, r: int, sigma: float, window: tuple[int, int, int, int], o
         iy, ix = int(round(y)), int(round(x))
         if iy < HR + 1 or ix < HR + 1 or iy > ref.shape[0] - HR - 2 or ix > ref.shape[1] - HR - 2:
             return None
-        if ref[iy, ix].max() >= 0.5 * float(es.sat):
+        if ref[iy, ix].max() >= 0.5 * ceil:
             return None
         out = np.zeros((3, 2 * HR + 1, 2 * HR + 1), np.float32)
         for c in range(3):
@@ -1187,7 +1466,7 @@ def point_sources(es, r: int, sigma: float, window: tuple[int, int, int, int], o
         the luminance position by 0.05 - 0.1 px - and one position for all three left a coloured cap on
         one side of every bright star.  Saturated stars (no core) keep the catalogue position."""
         iy, ix = int(round(y)), int(round(x))
-        if iy < 7 or ix < 7 or iy > ref.shape[0] - 8 or ix > ref.shape[1] - 8 or ref[iy, ix].max() >= 0.5 * float(es.sat):
+        if iy < 7 or ix < 7 or iy > ref.shape[0] - 8 or ix > ref.shape[1] - 8 or ref[iy, ix].max() >= 0.5 * ceil:
             return np.tile([y, x], (3, 1))
         out = []
         for c in range(3):
@@ -1296,7 +1575,8 @@ def smooth_background(es, r: int, origin: tuple[float, float], shape: tuple[int,
 
 
 def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128, batch: int = 16,
-             device=None, progress=None, cancel=None, seed: int = 0) -> tuple[np.ndarray, dict]:
+             device=None, progress=None, cancel=None, seed: int = 0, star_sigma: float = 1.0,
+             star_nsig: float = 5.0) -> tuple[np.ndarray, dict]:
     """Noise2Noise (Lehtinen et al. 2018) on two ImageMM restorations of disjoint sets of
     subs, whose noise is therefore independent.
 
@@ -1355,12 +1635,17 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     opt = torch.optim.Adam(net.parameters(), lr=3e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=1e-3, total_steps=iters, pct_start=0.15)
     h, w = xa.shape[:2]
+    # training patches fit the image (a multiple of 8, the U-Net's three poolings): on a crop of 128 px or less
+    # rng.integers(0, h - patch) had no valid range and the pass raised
+    patch = min(int(patch), (min(h, w) // 8) * 8)
+    if patch < 16:
+        raise RuntimeError(f"ImageMM Noise2Noise pass: the restored region ({h} x {w} px) is too small to train on")
     t0 = time.time()
     for it in range(iters):
         if cancel and cancel():
             raise RuntimeError("cancelled")
-        ys = rng.integers(0, h - patch, batch)
-        xs = rng.integers(0, w - patch, batch)
+        ys = rng.integers(0, h - patch + 1, batch)
+        xs = rng.integers(0, w - patch + 1, batch)
         inp, tgt, lin_in = [], [], []
         for y0, x0, sw in zip(ys, xs, rng.random(batch) < 0.5):
             src = (tub, ta, tb) if sw else (tua, tb, ta)
@@ -1407,6 +1692,23 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
     mean = 0.5 * (xa + xb)
     g = maximum_filter(np.abs(np.arcsinh(mean / k)).max(-1, keepdims=True), size=(5, 5, 1))
     keep = np.clip((g - 3.5) / 1.5, 0, 1).astype(np.float32)
+    # the stars the full data detect: a network trained for E[x_B | x_A] shrinks a point source that is ambiguous in
+    # one half (sqrt 2 less signal-to-noise than the whole) towards the smooth sky - the faint stars of the
+    # restoration fade.  Where the mean of the halves (the data of every sub) holds a local peak at least
+    # ``star_nsig`` x its noise (s / sqrt 2) above the network's output, that star's footprint (``star_sigma``,
+    # the latent's g_sigma: 4 sigma, softened over 1 px) takes the mean, as the bright cores above
+    # (a point source, not a noise spike: the latent's noise is heavy-tailed under x >= 0, so the excess must also
+    # hold over the 3 x 3 pixels round the peak - a star of sigma >= 1 latent px does, a lone spike does not)
+    if star_nsig and star_nsig > 0:
+        exc = np.ascontiguousarray(((mean - out) / (s / np.sqrt(2.0))[None, None, :]).max(-1), np.float32)
+        pk = ((exc == maximum_filter(exc, size=3)) & (exc > float(star_nsig))
+              & (cv2.blur(exc, (3, 3)) > 0.4 * float(star_nsig)))     # (g_1: 0.54 x its peak, a spike ~0.11)
+        if pk.any():
+            R_ = max(2, int(math.ceil(4.0 * float(star_sigma))))
+            disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * R_ + 1, 2 * R_ + 1))
+            fp = cv2.dilate(pk.astype(np.uint8), disk).astype(np.float32)
+            fp = np.clip(cv2.GaussianBlur(fp, (0, 0), 1.0) * 2.0, 0, 1)[..., None]
+            keep = np.maximum(keep, fp)
     out = out * (1 - keep) + mean * keep
     resid = (resid * (1 - keep) + 0.5 * (xa - xb) * keep).astype(np.float32)
     return out.astype(np.float32), {"noise_scale": s.tolist(), "iters": iters, "residual": resid}
@@ -1459,7 +1761,7 @@ def _fit_to(se: np.ndarray, k: int) -> np.ndarray:
 
 
 def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float = 0.1, max_sigma: float = 2.5,
-                 min_peak: float = 0.9, se: list | None = None) -> tuple[float, dict]:
+                 min_peak: float = 0.9, se: list | None = None, se_index: np.ndarray | None = None) -> tuple[float, dict]:
     """The latent resolution actually usable for these PSFs (``K`` (n, C, k, k), a sample is used):
     sigma >= ``sigma`` in steps of ``step`` such that Eq. 11 still holds - D(h * g_sigma) reproduces
     the PSF within its measurement error - and the Eq. 11 kernel h is peaked.
@@ -1469,35 +1771,52 @@ def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float =
     ring 1.2 against a Gaussian's 1.3-1.6), the only non-negative solution at the paper's sigma is a
     ring-shaped h - zero at the centre, its weight at r = 1 - and the restoration then carries that
     ring round every star and a 2-px texture over the whole field (M 31 at sigma = 1: rings to 50 px;
-    at 1.3 clean).  Peaked: median over the sample of h(centre) / max(h) >= ``min_peak`` in every
-    channel.
+    at 1.3 clean).  Peaked: median over the sample of max(h within 0.75 px of its centroid) / max(h) >=
+    ``min_peak`` in every channel.
 
     Why Eq. 11 must still hold: a larger sigma is only a coarser latent grid if h can still make up
     the PSF from g_sigma.  A PSF whose core is a ring itself - a slightly defocused DWARF 3, IC 1805:
     its profile rises from 1.00 at the centre to 1.09 at 2 px - has no peaked h at any sigma, and the
     old search went on to the cap of 2.5, where D(h * g_sigma) missed the PSF by 5x its standard error
     (17 % of its peak): the forward model was then wrong round every star and the restoration bit
-    crescents out of them and drew dark rings.  ``se``: per channel, the PSF's standard error (k, k)
-    (inf where unmeasured; ``empirical_psf_field``'s "se"); sigma is admissible while the median over
-    the sample of rms((D(h * g_sigma) - f) / se) is <= 1 in every channel.  Without ``se`` every sigma
-    up to ``max_sigma`` is admissible.
+    crescents out of them and drew dark rings.  ``se``: per channel, the PSF's standard error (k, k), or one
+    per field node (N, k, k) with ``se_index`` the node of each row of ``K`` (inf where unmeasured;
+    ``empirical_psf_field``'s "se_noise" / "se_noise_nodes"); sigma is admissible while the median over
+    the sample of rms((D(h * g_sigma) - f) / se), over the pixels where f >= 2 se, is <= 1 in every channel.
+    Without ``se`` every sigma up to ``max_sigma`` is admissible.
 
-    The choice: the smallest admissible sigma whose h is peaked; when none is, the admissible sigma
-    with the most peaked h (a ring-cored PSF: the requested one, its h as close to the PSF's own
-    shape as the data allow).  Returns (sigma, {"requested", "chosen", "peak": per-channel centre / max
+    The choice: the smallest admissible sigma whose h is peaked; when none is - a ring-cored PSF - the
+    largest admissible sigma.  A ring core makes the PSF's transfer function weak in a band of mid
+    frequencies (period ~4-5 px on IC 1805), and restoring them amplifies the PSF's own errors there into
+    concentric rings round every bright star (a dark ring at 3-5 px, a bright one at 8: -3 to -7 sigma of
+    the stack's sky at sigma = 1).  The amplification falls with sigma, so the coarsest latent grid on which
+    Eq. 11 still reproduces the PSF within its error is the exact model with the least ringing (IC 1805:
+    -0.6 sigma at 1.4).  Returns (sigma, {"requested", "chosen", "peak": per-channel centre / max
     at the chosen sigma, "fit_chi": per channel at the chosen sigma, "tried": [(sigma, peak, chi)]})."""
     n, C = K.shape[:2]
     pick = np.linspace(0, n - 1, min(n, 24)).round().astype(int)
     Ks = K[pick]
     k = Ks.shape[-1]
-    ses = None if se is None else [None if q is None else _fit_to(np.asarray(q, np.float64), k) for q in se]
+    # per channel (N_se, k, k); each sampled kernel's own map: its node's, or the one map there is
+    ses = None if se is None else [
+        None if q is None else np.stack([_fit_to(qq, k) for qq in np.asarray(q, np.float64).reshape(-1, *np.shape(q)[-2:])])
+        for q in se]
+    s_at = (np.zeros(len(pick), int) if se_index is None else np.asarray(se_index, int)[pick])
     sig = float(sigma)
     tried = []
     while True:
         h, _ = superresolved_kernels(Ks, r, sig, device=device)
         hk = h.shape[-1]
-        c = hk // 2
-        centre = h[..., c, c]
+        # peaked: the largest value within 0.75 latent px of the kernel's centroid against its maximum (the exposures'
+        # kernels sit at their residual registration, not exactly on the centre pixel; a ring-shaped h has its
+        # centroid in the dip)
+        yy_, xx_ = np.mgrid[:hk, :hk].astype(np.float64)
+        hs = np.clip(h, 0, None).astype(np.float64)
+        tot = np.maximum(hs.sum((-2, -1)), 1e-30)
+        cy_ = (hs * yy_).sum((-2, -1)) / tot
+        cx_ = (hs * xx_).sum((-2, -1)) / tot
+        near = np.hypot(yy_ - cy_[..., None, None], xx_ - cx_[..., None, None]) <= 0.75
+        centre = np.where(near, h, -np.inf).reshape(*h.shape[:2], -1).max(-1)
         mx = h.reshape(*h.shape[:2], -1).max(-1)
         peaks = [float(np.median(centre[:, ch] / np.maximum(mx[:, ch], 1e-30))) for ch in range(C)]
         chis = [0.0] * C
@@ -1507,9 +1826,13 @@ def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float =
                 if ses[ch] is None:
                     continue
                 mdl = eq11_model(h[:, ch] * r ** 2, r, sig, g=g)        # (superresolved_kernels divides by r^2)
-                fin = np.isfinite(ses[ch])
-                z = ((mdl - Ks[:, ch]) / np.where(fin, ses[ch], 1.0))[:, fin]
-                chis[ch] = float(np.median(np.sqrt((z ** 2).mean(-1))))
+                se_s = ses[ch][s_at if len(ses[ch]) > 1 else np.zeros(len(pick), int)]      # (samples, k, k)
+                # over the PSF's measured structure, the pixels where it is at least 2 standard errors: the misfit
+                # of Eq. 11 sits in the core, and averaged with the hundreds of far-wing pixels where both are ~0
+                # a core missed by 5 standard errors still came out "within the error"
+                fin = np.isfinite(se_s) & (Ks[:, ch] >= 2.0 * np.where(np.isfinite(se_s), se_s, np.inf))
+                z2 = np.where(fin, ((mdl - Ks[:, ch]) / np.where(fin, se_s, 1.0)) ** 2, 0.0)
+                chis[ch] = float(np.median(np.sqrt(z2.sum((-2, -1)) / np.maximum(fin.sum((-2, -1)), 1))))
         ok = max(chis) <= 1.0
         tried.append((sig, peaks, chis, ok))
         if not ok or min(peaks) >= min_peak or sig + step > max_sigma + 1e-9:
@@ -1517,7 +1840,14 @@ def choose_sigma(K: np.ndarray, r: int, sigma: float, device=None, step: float =
         sig = round(sig + step, 3)
     admissible = [t for t in tried if t[3]] or tried[:1]       # the requested sigma when none is
     peaked = [t for t in admissible if min(t[1]) >= min_peak]
-    best = peaked[0] if peaked else max(admissible, key=lambda t: min(t[1]))
+    if peaked:
+        best = peaked[0]
+    elif ses is None:
+        # no measurement error to hold Eq. 11 to: every sigma would count as admissible and the largest is the cap,
+        # where the kernels need not reproduce the PSF at all (the IC 1805 failure) - the most peaked instead
+        best = max(admissible, key=lambda t: min(t[1]))
+    else:
+        best = max(admissible, key=lambda t: t[0]) if admissible[0][3] else admissible[0]
     return best[0], {"requested": float(sigma), "chosen": best[0], "peak": best[1], "fit_chi": best[2],
                      "tried": [(t[0], [round(v, 3) for v in t[1]], [round(v, 2) for v in t[2]]) for t in tried]}
 
@@ -1549,8 +1879,14 @@ def field_kernels(es, idx: list[int], r: int, sigma: float | None, psf_model: st
     ny, nx = K.shape[2], K.shape[3]
     if progress:
         progress(0, 1, f"ImageMM: checking the latent resolution (sigma = {sigma})")
-    se = [None if (getattr(es, "psf_ref", None) is None or q is None) else q.get("se") for q in (es.psf_ref or [None] * 3)]
-    sigma_eff, chosen = choose_sigma(K[:, :, ny // 2, nx // 2], r, sigma, device=device, se=se)
+    # the coadd PSF model's standard error at each node (the field polynomial is less certain towards the edges)
+    se = [None if (getattr(es, "psf_ref", None) is None or q is None)
+          else q.get("se_noise_nodes", q.get("se_noise", q.get("se"))) for q in (es.psf_ref or [None] * 3)]
+    # every node of the field grid, not the centre alone: one sigma must hold Eq. 11 everywhere, and the core's
+    # shape changes over the field (coma, a defocus that deepens towards the edge)
+    Kall = np.moveaxis(K, 1, -3).reshape(-1, K.shape[1], K.shape[-2], K.shape[-1])         # (n ny nx, C, k, k)
+    node_of = np.tile(np.arange(ny * nx), K.shape[0])                                     # row -> node (ny nx order)
+    sigma_eff, chosen = choose_sigma(Kall, r, sigma, device=device, se=se, se_index=node_of)
     if progress and sigma_eff != sigma:
         progress(0, 1, f"ImageMM: latent resolution raised to sigma = {sigma_eff} (the PSF's core is flatter than g_{sigma})")
     sigma = sigma_eff
@@ -1588,7 +1924,9 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
             robust: bool = True, delta: float = 2.0, kappa: float = 2.0, epsilon: float = 1e-6,
             max_iters: int = 1000, accelerate: bool = False, stop: str = "c15", tile: int = 384, device: str = "auto",
             n2n: bool = False, n2n_iters: int = 2000, min_iters: int = 0, kernel_cache: str | None = None,
-            halves: np.ndarray | None = None, background: bool = False,
+            halves: np.ndarray | None = None, background: bool = False, point_sources: bool = False,
+            stars_smooth: float = 0.0, tv: float = 0.0, starlet: float = 0.0, psf_steps: int = 0,
+            local_psf: bool = False,
             region: tuple[int, int, int, int] | None = None, progress=None, cancel=None) -> tuple[np.ndarray, dict]:
     """ImageMM over the whole field of the prepared exposures ``es`` (exposures.ExposureSet).
 
@@ -1639,9 +1977,11 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         sets = [np.arange(0, len(idx), 2), np.arange(1, len(idx), 2)]
     n_exp = max(len(q) for q in sets)
     n_exp = min(n_exp, n_groups) if n_groups else n_exp
+    # with saturated stars (Whyte et al.) every exposure also carries its censored map and saturation levels
+    per_exp = _PERSISTENT + (2 if (not n_groups and float(getattr(es, "sat", 1e30)) < 1e20) else 0)
     if free is not None:
         def need(t):              # bytes: exposures of the cutout + one chunk + ~12 latent-size arrays
-            return 4 * 3 * t * t * (_PERSISTENT * n_exp + _PER_CHUNK) + 4 * 3 * (t * r + ks) ** 2 * 12
+            return 4 * 3 * t * t * (per_exp * n_exp + _PER_CHUNK) + 4 * 3 * (t * r + ks) ** 2 * 12
         while tile > 3 * overlap and need(tile) > 0.85 * free:
             tile = max(3 * overlap, int(tile * 0.85))
         if need(tile) > 0.85 * free:
@@ -1668,10 +2008,20 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
                 y1, x1 = min(y0 + tile, H0), min(x0 + tile, W0)
                 sub_kern = interp_nodes(kern[sel], es.nodes, RY0 + (y0 + y1 - 1) / 2,
                                         RX0 + (x0 + x1 - 1) / 2).astype(np.float32)
+                if local_psf:
+                    # the field model's radial profile against the cutout's own bright stars (Magain et al. 1998;
+                    # Cantale et al. 2016: the PSF from the stars of the image being deconvolved): where the field
+                    # polynomial's wing is 10-40 % off the stars actually there, the latent otherwise rings or
+                    # empties a disc round each to make up for it (M 42's cluster, IC 1805's)
+                    Cr = local_psf_correction(es, (RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1))
+                    if Cr is not None:
+                        sub_kern = apply_psf_correction(sub_kern, Cr).astype(np.float32)
                 x, info = restore_cutout(es, RY0 + y0, RY0 + y1, RX0 + x0, RX0 + x1, idx=sub_idx, r=r, kernels=sub_kern, robust=robust,
                                          psf_model=psf_model, n_groups=n_groups, device=dev, delta=delta,
                                          kappa=kappa, epsilon=epsilon, max_iters=max_iters, accelerate=accelerate,
-                                         stop=stop, min_iters=min_iters, log=_iteration_check, background=background)
+                                         stop=stop, min_iters=min_iters, log=_iteration_check, background=background,
+                                         stars_sigma=(float(eq11["sigma"]) if point_sources and eq11 is not None else None),
+                                         stars_smooth=stars_smooth, tv=tv, starlet=starlet, psf_steps=psf_steps)
                 wy = _edge_weights((y1 - y0) * r, overlap * r, y0 > 0, y1 < H0)
                 wx = _edge_weights((x1 - x0) * r, overlap * r, x0 > 0, x1 < W0)
                 wgt = np.outer(wy, wx)[..., None]
@@ -1701,7 +2051,8 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
         # difference - the noise scale the pass is normalised by - collapsed to ~0 wherever it
         # dominated, and the network returned garbage (M 42: 1e5 ADU over the whole region)
         b_ = bgmap if background else 0.0
-        out, n2n_info = n2n_pass(outs[0] - b_, outs[1] - b_, iters=n2n_iters, device=dev, progress=progress, cancel=cancel)
+        out, n2n_info = n2n_pass(outs[0] - b_, outs[1] - b_, iters=n2n_iters, device=dev, progress=progress, cancel=cancel,
+                                 star_sigma=(float(eq11["sigma"]) if eq11 is not None else 1.0))   # (latent px)
         out = out + b_
         resid = n2n_info.pop("residual")
     else:

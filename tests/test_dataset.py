@@ -27,8 +27,9 @@ def test_dwarf_session(tmp_path, fake_headers):
     fake_headers["failed_M 42_15s60_Duo-Band_20261010-041927508_41C.fits"] = load("dwarf_failed_headers.json")[
         next(iter(load("dwarf_failed_headers.json")))]
     fs = dataset.scan([d])
-    assert len(fs.frames) == len(heads)
-    assert fs.skipped["failed"] == 1
+    # the live stack's reject is read and graded like every other sub (README), marked as such
+    assert len(fs.frames) == len(heads) + 1 and "failed" not in fs.skipped
+    assert [f.name for f in fs.frames if f.device_rejected] == ["failed_M 42_15s60_Duo-Band_20261010-041927508_41C.fits"]
     assert fs.kind == "dwarf" and fs.is_dualband
     assert (fs.object, fs.filter, fs.exptime, fs.gain, fs.bayer) == ("M 42", "Duo-Band", 15.0, 60.0, "RGGB")
     assert fs.size == (3840, 2160)
@@ -67,17 +68,33 @@ def test_asi585_generic_rig(tmp_path, fake_headers):
     assert fs.first.temp == -16.5
 
 
-def test_exposure_groups_for_hdr(tmp_path, fake_headers):
-    d, heads = _install(tmp_path, fake_headers, "dwarf_headers.json", "a")
+def _sixty(tmp_path, fake_headers, heads, n):
     d2 = tmp_path / "b"
-    for i, (n, cards) in enumerate(list(heads.items())[:1]):
+    for i, (_, cards) in enumerate(list(heads.items())[:n]):
         name = f"M 42_60s60_Duo-Band_2026101004130{i}000_41C.fits"
         touch(str(d2 / name))
         fake_headers[name] = {**cards, "EXPTIME": 60.0, "DATE-OBS": f"2026-10-10T05:00:0{i}"}
-    fs = dataset.scan([d, str(d2)])
-    assert len(fs.frames) == len(heads)                  # 6 x 15 s = 90 s > 1 x 60 s: 15 s is the dataset
-    assert [g.exptime for g in fs.exposure_groups] == [60.0]
+    return str(d2)
+
+
+def test_exposure_groups_for_hdr(tmp_path, fake_headers):
+    d, heads = _install(tmp_path, fake_headers, "dwarf_headers.json", "a")
+    d2 = _sixty(tmp_path, fake_headers, heads, 3)
+    fs = dataset.scan([d, d2])
+    assert fs.exptime == 60.0 and len(fs.frames) == 3    # 3 x 60 s = 180 s > 6 x 15 s: 60 s is the dataset
+    assert [g.exptime for g in fs.exposure_groups] == [15.0]
     assert [g.exptime for g in fs.hdr_groups()] == [15.0, 60.0]
+
+
+def test_a_lone_sub_of_another_exposure_is_no_hdr_group(tmp_path, fake_headers):
+    """Sh2-132 (2026-10-18): one 60 s sub beside the 30 s set (the DWARF had rejected the other 60 s subs as
+    failed_) became an HDR group of one frame, a calibration unit Siril cannot make a sequence of."""
+    d, heads = _install(tmp_path, fake_headers, "dwarf_headers.json", "a")
+    d2 = _sixty(tmp_path, fake_headers, heads, 1)
+    fs = dataset.scan([d, d2])
+    assert len(fs.frames) == len(heads) and fs.exptime == 15.0
+    assert fs.exposure_groups == [] and fs.hdr_groups() == []
+    assert any(o["exptime"] == 60.0 and o["n"] == 1 and "reason" in o for o in fs.other_groups)
 
 
 def test_size_mismatch_and_other_object_left_out(tmp_path, fake_headers):

@@ -2,14 +2,16 @@
 
 Only FITS headers are read here (fast, no pixels).  Rules, all from the research notes:
 
-* skipped by name: ``failed_*`` (the DWARF's own rejected subs), thumbnails (``*_thn.*``,
+* ``failed_*`` (the DWARF live stack's rejects, usually a passing cloud) are read like every other sub and
+  marked ``device_rejected``: the frame analysis grades them (README), they are not dropped unseen;
+* skipped by name: thumbnails (``*_thn.*``,
   ``thumbnail``), ``stacked*`` / ``Stacked_*`` (the telescope's live stack), ``master*``,
   DWARF ``img_*`` previews, our own ``pp_``/``r_`` products; jpg/png never match the FITS globs;
 * skipped by header: ``RESTACK`` != 0 (DWARF restacked products), non-light ``IMAGETYP``,
   debayered cubes (NAXIS != 2) and subs whose size differs from the dataset;
 * grouped by (OBJECT, FILTER, EXPTIME, GAIN, size, BAYERPAT); the group with the most total
   exposure is *the dataset*, the other exposure groups of the same object/filter/size are kept
-  for the HDR blend (DWARF 15 s + 60 s of M 42);
+  for the HDR blend (DWARF 15 s + 60 s of M 42) when they hold at least ``MIN_STACK_SUBS`` subs;
 * a folder named ``rejected`` (``lights/rejected``, the device-rejected set) is ignored when there
   are other folders.
 """
@@ -25,6 +27,7 @@ from datetime import datetime
 from astropy.io import fits
 
 FITS_EXT = (".fit", ".fits", ".fts")
+MIN_STACK_SUBS = 3          # the fewest subs a stack (or an HDR exposure group) is made of (session.stack_and_finish)
 
 # Names that are never lights.  ``stack`` is matched as a prefix only: a sub of "Stacking test"
 # would otherwise vanish (the old pipeline matched it anywhere).
@@ -268,8 +271,12 @@ def _read_frame(path: str, folder: str | None = None):
     folder = folder or os.path.dirname(os.path.abspath(path))
     if _CALIB_NAME.search(name):
         return "calibration frame"
-    if _SKIP_NAME.search(name):
-        return "failed" if re.match(r"failed[_\-]", name, re.I) else "telescope/derived product"
+    # ``failed_``: a sub the DWARF's live stack rejected (usually a passing cloud).  It is read and graded like
+    # every other sub (README; the frames table notes it), not dropped unseen: on a cloudy night the live stack
+    # fails most subs, and dropping them left datasets of one sub (SNR G180.0-01.7, Sh2-132's 60 s night)
+    rej = re.match(r"failed[_\-]", name, re.I)
+    if _SKIP_NAME.search(name[rej.end():] if rej else name):
+        return "telescope/derived product"
     try:
         h = fits.getheader(path)
     except Exception:
@@ -323,7 +330,7 @@ def _read_frame(path: str, folder: str | None = None):
         bayer=(str(h.get("BAYERPAT", "") or "").strip() or (prof[2] if prof else "")).upper(),
         width=width, height=height, binning=binning, ra=ra, dec=dec,
         focallen=_num(h, "FOCALLEN") or (prof[0] if prof else None), pixsize=pixsize,
-        instrument=str(h.get("INSTRUME", "") or "").strip(),
+        instrument=str(h.get("INSTRUME", "") or "").strip(), device_rejected=bool(rej),
         telescope=telescop or str(h.get("CREATOR", "") or "").strip(),
         kind=kind,
         camera_slot=("cam_1" if (kind == "dwarf" and (os.path.basename(folder).upper().find("WIDE") >= 0
@@ -399,11 +406,15 @@ def scan(folders: list[str], limit: int | None = None, progress=None, workers: i
         same_target = (k[0], k[1], k[4], k[5], k[6]) == (best_key[0], best_key[1], best_key[4], best_key[5], best_key[6])
         eg = ExposureGroup(g[0].exptime, g[0].gain, sorted(g, key=lambda f: (f.timestamp, f.name)), key=k)
         ratio = max(eg.exptime, ref.exptime) / max(min(eg.exptime, ref.exptime), 1e-6)
-        if same_target and ratio >= 2.0:
+        # an HDR group is stacked on its own: it needs the stack's minimum of subs (a single 60 s sub beside
+        # the 30 s set - the DWARF rejected the others as failed_ - made a one-frame unit Siril cannot calibrate)
+        if same_target and ratio >= 2.0 and len(g) >= MIN_STACK_SUBS:
             hdr.append(eg)
         else:
             other.append({"object": g[0].object, "filter": g[0].filter, "exptime": g[0].exptime, "n": len(g),
-                          "size": [g[0].width, g[0].height]})
+                          "size": [g[0].width, g[0].height],
+                          **({"reason": f"fewer than {MIN_STACK_SUBS} subs for an HDR group"}
+                             if same_target and ratio >= 2.0 else {})})
     if limit:
         best = _limit_per_folder(best, limit)
     _unique_names(best + [f for g in hdr for f in g.frames])

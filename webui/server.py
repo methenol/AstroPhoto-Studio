@@ -88,7 +88,12 @@ STACK_DEFAULTS = {
     "imagemm_groups": 0,
     "imagemm_accelerate": False,
     "imagemm_n2n": True,
-    "imagemm_background": False,
+    "imagemm_point_sources": False,   # MCS / STARRED: stars as point sources at the latent resolution
+    "imagemm_starlet": 0.0,        # STARRED: starlet l1 weight of the extended channel (1-3), with point sources
+    "imagemm_local_psf": False,    # radial PSF correction from each cutout's own bright stars (Magain et al. 1998)
+    "imagemm_psf_steps": 0,        # myopic kernel steps (blind RL, Fish et al. 1995) during the restoration; 0 = off
+    "imagemm_tv": 0.0,             # RL-TV lambda of the latent (Dey et al. 2006; Laasmaa et al. 2011: optimum ~ 50 / SNR); 0 = off
+    "imagemm_background": False,   # False: x >= 0 above the fitted sky (lower bound at the background, LBCA); "sky": x >= -sky
     "n2n_split": "alternate",
     "n2n_loss": "asinh_mse",
     "star_remover": True,
@@ -115,11 +120,13 @@ def default_scale(deconv_method: str) -> float:
 #                  rl      = Siril Richardson-Lucy even when BlurXTerminator is licensed
 #                  imagemm = ImageMM multi-frame restoration of the registered subs (slow; needs IMAGEMM=cuda)
 #                  none    = no deconvolution
-# ai_deconvolution and imagemm_n2n are accepted for compatibility and have no effect.
+# ai_deconvolution is accepted for compatibility and has no effect; imagemm_n2n switches ImageMM's Noise2Noise pass.
 PROFILES = {
     "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
+    # (with its Noise2Noise pass, the stage's default: without it the latent's sky noise, clipped at the x >= 0
+    # bound, is left to the finishing denoiser, which smears it - IC 1805)
     "imagemm": {"label": "ImageMM: multi-frame restoration of every registered sub (slow, GPU)",
-                "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": False}},
+                "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-imagemm": {"label": "ImageMM multi-frame restoration (same as imagemm with this backend)",
                     "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-network": {"label": "Fast restoration: BlurXTerminator + NoiseXTerminator when licensed, else Siril "

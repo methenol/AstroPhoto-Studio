@@ -23,6 +23,13 @@ def test_keep_percent_matches_design_points():
     assert 90 > w.keep_percent(1.5) > 75 and w.keep_percent(0.1) == 100.0 and w.keep_percent(10) >= 50
 
 
+def test_frames_registered_on_hot_pixels_are_excluded():
+    """SNR G180.0-01.7 (2026-10-18, clouded out): Siril matched 12-15 hot pixels (FWHM 1.37 px) as stars."""
+    st = _stats(12, {i: {"fwhm": 1.37, "nbstars": 13} for i in range(4)})
+    why = w.select_frames(st, 1.0)
+    assert all("pixel defects" in why[i][0] for i in range(4)) and not any(why[i] for i in range(4, 12))
+
+
 def test_select_frames_rules():
     st = _stats(40, {3: {"registered": False}, 4: {"nbstars": 2}, 5: {"roundness": 0.2}})
     why = w.select_frames(st, 1.0)
@@ -79,6 +86,22 @@ def test_apply_script_unselect_ranges_are_one_based_and_filter_included():
     assert last.endswith("-filter-included")
     d = w.apply_script("/p", "pp_light", 5, [], w.decide_resampling({"mode": "demosaic"}, 5, 3.0))
     assert "-drizzle" not in d and "-interp=lanczos4" in d
+
+
+def test_max_framing_without_offsets_is_detected(tmp_path):
+    """SNR G180.0-01.7 (2026-10-18): four frames within 0.02 px of each other, all at offset 0 on the max canvas, one a
+    row short - Siril: "different image sizes but no registration data, cannot stack"."""
+    bad = tmp_path / "r_bad_.seq"
+    bad.write_text("S 'r_pp_light_' 1 3 3 5 2 6 1 0 1\nL 3\nI 1 1 3840,2160\nI 2 1 3840,2159\nI 3 1 3840,2160\n"
+                   "R1 1.3 1.7 0.98 0 0.0008 13 H 1 0 -0 0 1 0 0 0 1\nR1 1.3 1.5 0.97 0 0.0008 14 H 1 0 -0 0 1 -0 0 0 1\n"
+                   "R1 1.3 1.3 0.96 0 0.0008 15 H 1 0 0 0 1 0 0 0 1\n")
+    assert w.unstackable_max_framing(str(bad))
+    ok = tmp_path / "r_ok_.seq"
+    ok.write_text("S 'r_pp_light_' 1 2 2 5 1 6 1 0 1\nL 3\nI 1 1 100,80\nI 2 1 98,76\n"
+                  "R1 3.5 4 0.8 0 0.0004 100 H 1 0 -1 0 1 0 0 0 1\nR1 3.5 4 0.8 0 0.0004 100 H 1 0 3 0 1 2 0 0 1\n")
+    assert not w.unstackable_max_framing(str(ok))
+    rs = {**w.decide_resampling({}, 20, 3.0), "framing": "current"}
+    assert "-framing=current" in w.apply_script("/p", "pp_light", 4, [], rs)
 
 
 def test_stack_script_flags():
