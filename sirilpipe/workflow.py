@@ -101,6 +101,12 @@ def decide_resampling(params: dict, n_included: int, median_fwhm: float | None, 
     mode = str(params.get("mode", "auto") or "auto").lower()
     want = float(params.get("scale", 1.0) or 1.0)
     out: dict = {"mode": "drizzle", "requested_scale": want, "reason": ""}
+    if want > 1.0 and str(params.get("superres_method") or "drizzle") == "cosmic_clarity":
+        # the super-resolution is Cosmic Clarity's, on the finished image (post._superres_final): the stack itself is integrated at 1x
+        out = decide_resampling({**params, "scale": 1.0, "superres_method": "drizzle"}, n_included, median_fwhm, cfa)
+        out.update(requested_scale=want, superres="cosmic_clarity",
+                   reason=out["reason"] + f"; the {want:g}x super-resolution is Cosmic Clarity's, on the finished image")
+        return out
     if mode == "demosaic" or not cfa:
         out.update(mode="demosaic", scale=1.0, pixfrac=None, kernel=None, interp="lanczos4",
                    reason="demosaic + Lanczos4 registration" if cfa else "not a Bayer mosaic")

@@ -34,6 +34,8 @@ from .util import Cancelled
 PLATESOLVE_PAUSE = float(os.environ.get("PLATESOLVE_PAUSE", 20))   # seconds between catalogue retries
 SPCC_ATTEMPTS = 2                                                      # SPCC once more after a failed / crashed catalogue download (Siril resumes from its spcc-cache)
 SPCC_RETRY_PAUSE = float(os.environ.get("SPCC_RETRY_PAUSE", 5))
+GRAXPERT_DECONV = {"graxpert_obj": ("obj",), "graxpert_stellar": ("stellar",), "graxpert_both": ("obj", "stellar")}   # deconv_method -> GraXpert models, in order
+CC_SUPERRES_SCALES = (2, 3, 4)   # the scales the Cosmic Clarity super-resolution models exist for
 RL_TIMEOUT = float(os.environ.get("RL_TIMEOUT", 1800))      # Siril's Richardson-Lucy: ~40 s / iteration on a loaded 8 MP frame
 
 # Siril failing = a failed script, or the binary not being startable at all (no Siril on a dev machine)
@@ -76,9 +78,13 @@ IGNORED_KEYS: tuple = ()
 
 # Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount (5 when absent), ``stretch_boost`` the
 # Statistical_Stretch.py curves boost (0 when absent), ``hdr_method`` the highlight tool (auto: the stretch's own, GHS HP / Statistical Stretch -hdr; wavescale: Seti Wavescale
-# HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1).
-EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride")
-EXTRA_DEFAULTS = {"stretch_boost": 0.0}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
+# HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1), ``hubble_formula`` the formula preset of Hubble_Palette_from_Dual-Band_OSC.py (auto: Classic,
+# Improved with oiii_unmix / hoo_improved).
+EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride", "hubble_formula",
+              "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "cc_denoise", "cc_denoise_model")
+# Cosmic Clarity (siril-scripts CosmicClarity_Native.py) on the stretched image: off by default (an optional path); the amounts and the model are the script's defaults
+EXTRA_DEFAULTS = {"stretch_boost": 0.0, "hubble_formula": "auto", "cc_sharpen": "off", "cc_stellar_amount": 0.5, "cc_nonstellar_amount": 0.5,
+                  "cc_denoise": False, "cc_denoise_model": "full"}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
 
 
 def _R(group, key, label, lo, hi, step):
@@ -105,8 +111,8 @@ PARAM_SPEC: list[dict] = [
     _S("Linear", "spcc_sensor", "Colour calibration: camera sensor", ["auto"]),
     _S("Linear", "spcc_filter", "Colour calibration: filter", ["auto"]),
     _S("Linear", "spcc_white_ref", "Colour calibration: white reference", ["average_spiral_galaxy", "g2v"]),
-    _R("Linear", "denoise", "Light denoise before stretch (NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
-    _R("Linear", "deconvolution", "Deconvolution (BlurXTerminator, else Richardson-Lucy)", 0, 1, 0.05),
+    _R("Linear", "denoise", "Light denoise before stretch (the tool: Integration & options > Noise reduction; NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
+    _R("Linear", "deconvolution", "Deconvolution strength (the tool: Integration & options > Deconvolution; BlurXTerminator on/off, Richardson-Lucy blend, GraXpert -strength)", 0, 1, 0.05),
     _S("Stretch", "stretch_method", "Stretch tool (statstretch: Seti Astro Statistical Stretch, the default; ghs2: Siril ght, the GHS two-pass recipe; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
        ["statstretch", "ghs2", "autoghs", "modasinh", "autostretch", "hms"]),
     _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
@@ -115,21 +121,31 @@ PARAM_SPEC: list[dict] = [
     _R("Stretch", "contrast", "GHS second pass: local intensity b (3-5, ghsastro)", 0.25, 13, 0.25),
     _B("Stretch", "auto_stretch", "Adapt the background to the object's size (frame-filling object: top of Brecher's band)"),
     _R("Stretch", "color_preservation", "Colour model of the GHS stretch (Siril ght: <0.33 independent channels, <0.66 even luminance, else human-weighted luminance = colour preserving)", 0, 1, 0.05),
-    _S("Colour", "palette", "Palette (dual-band: HOO classic ha=R oiii=(G+B)/2; hoo_improved; foraxx; hoo_warm; nbn: narrowband normalisation)", ["auto", "natural", "hoo", "hoo_improved", "foraxx", "hoo_warm", "nbn"]),
+    _S("Colour", "palette", "Palette (dual-band; hoo, hoo_improved and the Hubble-like sho / hso / osh / ohs / hos with a synthetic SII are made by the Hubble_Palette_from_Dual-Band_OSC.py "
+              "script; foraxx; hoo_warm; nbn: narrowband normalisation)", ["auto", "natural", "hoo", "hoo_improved", "sho", "hso", "osh", "ohs", "hos", "foraxx", "hoo_warm", "nbn"]),
+    _S("Colour", "hubble_formula", "Hubble palette formulas (the script's presets; auto: Classic, Improved with the Ha-leak removal): classic OIII = (G+B)/2, SII = (Ha+OIII)/2; "
+              "improved OIII = (G+B-0.3R)/2, SII = 0.3R; advanced; nonlinear_s2 SII = 0.3 R^1.4", ["auto", "classic", "improved", "advanced", "nonlinear_s2"]),
     _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (NBN runs when this is not 1)", 0.5, 3, 0.05),
     _R("Colour", "synthetic_luminance", "Ha as luminance (dual-band): share of the lightness taken from the Ha plane (Siril rgbcomp -lum)", 0, 1, 0.05),
     _B("Colour", "oiii_unmix", "Remove the Ha leak from OIII (palette auto: Improved OIII = (G + B - 0.3 R) / 2 instead of Classic)"),
     _R("Colour", "saturation", "Colour strength: the subject's mean saturation x this (Siril ght -sat, the GHS saturation stretch, under the subject mask)", 1, 4, 0.05),
-    _R("Colour", "chroma_denoise", "Colour noise reduction (NoiseXTerminator --dc, 0.9-1.0)", 0, 1, 0.05),
-    _R("Colour", "scnr", "SCNR (Siril rmgreen, broadband only)", 0, 1, 0.05),
+    _R("Colour", "chroma_denoise", "Colour noise reduction (NoiseXTerminator --dc, 0.9-1.0; Cosmic Clarity's colour strength)", 0, 1, 0.05),
+    _R("Colour", "scnr", "SCNR (Siril rmgreen; broadband, and the dual-band palettes with Ha in green: sho, ohs)", 0, 1, 0.05),
     _B("Stars", "star_separation", "Process stars separately"),
-    _S("Stars", "star_removal", "Star removal (auto: StarXTerminator, else StarNet2)", ["auto", "sxt", "starnet", "none"]),
+    _S("Stars", "star_removal", "Star removal (auto: StarXTerminator, else StarNet2; darkstar: Cosmic Clarity DarkStar)", ["auto", "sxt", "starnet", "darkstar", "none"]),
     _R("Stars", "star_reduction", "Star reduction strength (DSA star reduction value = 0.5 x (1 - this); published 0.4-0.6; 1 = starless)", 0, 1, 0.05),
     _R("Stars", "star_intensity", "Star brightness (1 = as stretched)", 0, 1.5, 0.05),
     _R("Stars", "star_saturation", "Star colour (Siril satu on the stars, 1 = none)", 0, 2.5, 0.05),
     _R("Stars", "star_color_preservation", "Colour-preserving star stretch (LRGB: stretched lightness with the linear colour ratios, blended by this)", 0, 1, 0.05),
     _R("Stars", "halo_suppress", "Halo suppression (Siril unpurple with a star mask: blue / purple halos)", 0, 1, 0.05),
-    _R("Detail", "luminance_denoise", "Noise reduction of the stretched starless image (NoiseXTerminator --dn, 0.6-0.85; GraXpert denoise as the fallback)", 0, 1, 0.05),
+    _R("Detail", "luminance_denoise", "Noise reduction of the stretched starless image (NoiseXTerminator --dn, 0.6-0.85, or Cosmic Clarity's luminance strength; GraXpert denoise as the fallback)", 0, 1, 0.05),
+    # Cosmic Clarity Sharpen / Denoise: shown in the Integration & options panel beside the linear Deconvolution / Noise reduction tools ("host": "options")
+    {**_S("Detail", "cc_sharpen", "Cosmic Clarity Sharpen (on the stretched image; in addition to or, with Deconvolution off, instead of the linear deconvolution)",
+          ["off", "both", "stellar", "nonstellar"]), "host": "options"},
+    {**_R("Detail", "cc_stellar_amount", "Cosmic Clarity Sharpen: stellar amount (script default 0.5)", 0, 1, 0.05), "host": "options"},
+    {**_R("Detail", "cc_nonstellar_amount", "Cosmic Clarity Sharpen: non-stellar amount (script default 0.5)", 0, 1, 0.05), "host": "options"},
+    {**_B("Detail", "cc_denoise", "Cosmic Clarity Denoise instead of NoiseXTerminator on the stretched starless image (strengths: the two noise sliders)"), "host": "options"},
+    {**_S("Detail", "cc_denoise_model", "Cosmic Clarity Denoise model (the script's Full / Lite / Walking Noise)", ["full", "lite", "walking"]), "host": "options"},
     _R("Detail", "local_contrast", "Local contrast (Siril clahe under a background mask; blend 0.4 x this, 0.5 = the lowest published strength)", 0, 2, 0.05),
     _R("Detail", "sharpen", "Final sharpening (Siril unsharp under the subject mask, after the noise reduction)", 0, 1.5, 0.05),
     _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
@@ -208,6 +224,21 @@ def normalise_scale(arr: np.ndarray) -> tuple[np.ndarray, float]:
         k = float(min(1.0 / float(arr.max()), 64.0)) if arr.max() > 0 else 1.0
         return (arr * np.float32(k)).astype(np.float32), k
     return arr, 1.0
+
+
+def cc_superres_factor(stack_params: dict | None) -> float:
+    """The Cosmic Clarity super-resolution factor asked for (``superres_method`` = cosmic_clarity, ``scale`` > 1), else 0.  Its models exist for 2, 3 and 4 only:
+    another scale is returned as it is and the export records that it cannot run (no rounding to a scale nobody chose)."""
+    sp = stack_params or {}
+    if str(sp.get("superres_method") or "drizzle") != "cosmic_clarity":
+        return 0
+    try:
+        want = float(sp.get("scale", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return 0
+    if want <= 1.0:
+        return 0
+    return int(want) if want in CC_SUPERRES_SCALES else want
 
 
 def _has_wcs(header) -> bool:
@@ -411,6 +442,12 @@ class Restorer:
                                  checkpoint=s.checkpoint, **params)
         return _sanitize(fitsio.read_rgb(dst)[0]), meta
 
+    def _cc(self, mode: str, arr: np.ndarray, cli: list[str]) -> tuple[np.ndarray, dict]:
+        """One Cosmic Clarity run on ``arr`` (siril-scripts' CosmicClarity_Native.py, ``tools.CosmicClarity``); raises ToolUnavailable / ToolError for the caller's fallback."""
+        s = self.steps
+        out, meta = tools.cosmic_clarity.run(mode, arr, cli, work=self.work, device=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+        return _sanitize(out), meta
+
     def snr(self) -> float:
         """Per-pixel signal-to-noise of the object (``finish.object_snr``), measured once on the background-corrected stack: the strengths of BXT and the
         denoiser follow it (RC-Astro: sharpen less and denoise more on noisy data)."""
@@ -422,6 +459,24 @@ class Restorer:
         return self._snr
 
     # ---- steps
+    def satellite(self) -> None:
+        """Cosmic Clarity satellite-trail removal on the stack (``satellite_removal``, off by default: the stack's sigma rejection removes trails when there are enough
+        frames; the remover is for the trails that survive it).  The script's defaults: full colour, trail clipping on, sensitivity 0.1."""
+        s = self.steps
+        if not self.sp.get("satellite_removal"):
+            return
+        s.begin("Satellite trails")
+        t0 = time.time()
+        cli = ["--sat-mode", "full", "--sensitivity", "0.1"]
+        try:
+            self.arr, meta = self._cc("satellite", self.arr, cli)
+            s.add("satellite", "cosmic clarity satellite", seconds=time.time() - t0, command=meta["command"], trails_detected=meta.get("trails_detected"),
+                  backend=meta.get("backend"), device=meta.get("device"))
+        except Cancelled:
+            raise
+        except (ToolUnavailable, ToolError) as e:
+            s.add("satellite", "cosmic clarity satellite", "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, note=str(e))
+
     def background(self) -> None:
         s, p = self.steps, self.p
         s.begin("Removing gradient")
@@ -555,6 +610,9 @@ class Restorer:
         if float(p["deconvolution"]) <= 0 or (self.sp.get("deconv_method") or "auto") == "none":
             s.add("psf-correction", "none", "skipped", note="deconvolution off")
             return
+        if (self.sp.get("deconv_method") or "auto") not in ("auto", "bxt"):
+            s.add("psf-correction", "none", "skipped", note=f"deconv_method={self.sp.get('deconv_method')}: no BlurXTerminator")
+            return
         t0 = time.time()
         try:
             tools.rcastro.require("bxt")
@@ -644,6 +702,9 @@ class Restorer:
         return info
 
     def deconvolve(self) -> None:
+        """``deconv_method``: auto = BlurXTerminator when licensed, else Siril Richardson-Lucy; bxt / rl = that tool only; graxpert_obj / graxpert_stellar /
+        graxpert_both = GraXpert's AI deconvolution models (objects, stars, objects then stars); imagemm (session.py); none.  A tool chosen explicitly that cannot
+        run is recorded and the image is left as it is - nothing else runs in its place (the user chooses what runs)."""
         s, p = self.steps, self.p
         s.begin("Deconvolution")
         if self.source == "imagemm.fits":
@@ -653,6 +714,9 @@ class Restorer:
         method = (self.sp.get("deconv_method") or "auto")
         if d <= 0 or method == "none":
             s.add("deconvolution", "none", "skipped", note="deconvolution=0" if d <= 0 else "deconv_method=none")
+            return
+        if method in GRAXPERT_DECONV:
+            self._graxpert_deconvolve(d, method)
             return
         t0 = time.time()
         try:                                                         # BlurXTerminator sharpening (auto PSF)
@@ -675,6 +739,8 @@ class Restorer:
             raise
         except (ToolUnavailable, ToolError) as e:
             s.add("deconvolution", "rc-astro bxt", "unavailable", time.time() - t0, note=str(e))
+        if method == "bxt":
+            return
         t0 = time.time()
         # DESIGN: rl -iters=10..30 -alpha=3000 -tv.  fftw_timelimit=0 = FFTW "estimate" planning: with Siril's default
         # (measure, 60 s per plan) the first run on every new image size spent 10+ minutes planning FFTs (measured:
@@ -692,12 +758,55 @@ class Restorer:
         except SIRIL_FAILS as e:
             s.add("deconvolution", "siril rl", "failed", time.time() - t0, note=str(e).splitlines()[0])
 
+    def image_fwhm(self) -> float | None:
+        """The image's star FWHM in px, measured on the linear image itself (lab.metrics.star_fwhm: twice the half-light radius of isolated, unsaturated stars) -
+        GraXpert's "Image FWHM (in pixels)".  The registration's per-sub FWHM in stack_meta is not used: it is measured on the subs by Siril's PSF fit and need not
+        match the stack (Sh2-131 two nights: 8.9 px recorded, 4.5 px on the stack)."""
+        from .lab import metrics as MX
+        try:
+            v = float(MX.star_fwhm(np.ascontiguousarray(np.moveaxis(self.arr, 0, -1)), float(self.arr.max())))
+        except Exception:                                             # noqa: BLE001
+            return None
+        return v if np.isfinite(v) and v > 0 else None
+
+    def _graxpert_deconvolve(self, d: float, method: str) -> None:
+        """GraXpert AI deconvolution (``graxpert -cmd deconv-obj`` / ``deconv-stellar``, its models since 3.1) on the linear image: ``-strength`` = the Deconvolution
+        slider (GraXpert: 0 none .. 1 maximum), ``-psfsize`` = the image FWHM in px (GraXpert / Siril's GraXpert interface: "Image FWHM (in pixels)").  GraXpert works on
+        each tile through a log transform and its inverse, so it takes linear data as it is."""
+        s = self.steps
+        try:
+            fwhm = float(self.sp.get("graxpert_psfsize") or 0) or None       # the user's -psfsize; 0 = measured
+        except (TypeError, ValueError):
+            fwhm = None
+        if fwhm is None:
+            fwhm = self.image_fwhm()
+        if fwhm is None:
+            s.add("deconvolution", "graxpert", "failed", note="the image FWHM could not be measured (too few isolated stars): set GraXpert PSF size in the options")
+            return
+        for kind in GRAXPERT_DECONV[method]:
+            t0 = time.time()
+            try:
+                src, dst = self._file(self.arr, f"gxdc_{kind}_in.fits"), self._out(f"gxdc_{kind}_out.fits")
+                meta = tools.graxpert.deconvolve(src, dst, kind=kind, strength=d, psfsize=fwhm, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+                self.arr = _sanitize(fitsio.read_rgb(dst)[0])
+                s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})", seconds=time.time() - t0, strength=round(d, 3),
+                      psfsize=round(fwhm, 2), model=meta.get("model"), providers=meta.get("providers"))
+            except Cancelled:
+                raise
+            except (ToolUnavailable, ToolError) as e:
+                s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})",
+                      "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, note=str(e))
+                return
+
     def denoise(self) -> None:
+        """``denoise_method`` (the linear image): auto = NoiseXTerminator when licensed, else GraXpert, else Siril; nxt / graxpert / siril = that tool only (recorded
+        and left out when it cannot run); none.  Cosmic Clarity Denoise is a finishing setting (``cc_denoise``) on the stretched image."""
         s, p = self.steps, self.p
         s.begin("Noise reduction")
         d = float(np.clip(p["denoise"], 0, 1))
-        if d <= 0:
-            s.add("denoise", "none", "skipped", note="denoise=0")
+        method = self.sp.get("denoise_method") or "auto"
+        if d <= 0 or method == "none":
+            s.add("denoise", "none", "skipped", note="denoise=0" if d <= 0 else "denoise_method=none")
             return
         # THE noise reduction of the picture (the render's wavelet pass only removes the grain this leaves): an AI denoiser on the linear data, strength by
         # the measured signal-to-noise (NXT --dn 0.9 .. 0.6, GraXpert 1.0 .. 0.6; finish.nxt_dn / graxpert_strength), scaled by the ``denoise`` setting (1 at its
@@ -705,38 +814,42 @@ class Restorer:
         # GraXpert 1.0 on the same linear data resolves the Heart's filaments.
         snr = self.snr()
         scale = min(1.0, d / 0.95)
-        t0 = time.time()
-        try:
-            tools.rcastro.require("nxt")
-            dn = round(finish.nxt_dn(snr) * scale, 3)
-            self.arr, meta = self._rc("nxt", self.arr, "nxt", dn=dn)
-            s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, snr=round(snr, 2), flags=meta.get("flags"))
-            return
-        except Cancelled:
-            raise
-        except (ToolUnavailable, ToolError) as e:
-            s.add("denoise", "rc-astro nxt", "unavailable", time.time() - t0, note=str(e))
-        t0 = time.time()
-        try:
-            src, dst = self._file(self.arr, "gxd_in.fits"), self._out("gxd_out.fits")
-            strength = round(finish.graxpert_strength(snr) * scale, 3)
-            meta = tools.graxpert.denoise(src, dst, strength=strength, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
-            self.arr = _sanitize(fitsio.read_rgb(dst)[0])
-            s.add("denoise", "graxpert", seconds=time.time() - t0, strength=strength, snr=round(snr, 2), model=meta.get("model"),
-                  providers=meta.get("providers"))
-            return
-        except Cancelled:
-            raise
-        except (ToolUnavailable, ToolError) as e:
-            s.add("denoise", "graxpert", "unavailable", time.time() - t0, note=str(e))
-        t0 = time.time()
-        mod = round(min(1.0, 0.85 * d), 2)
-        try:
-            out, _ = _siril_image(self.work, s, "dn", self.arr, self.header, f"denoise -mod={mod}", "Noise reduction")
-            self.arr = _sanitize(out)
-            s.add("denoise", "siril denoise", seconds=time.time() - t0, mod=mod)
-        except SIRIL_FAILS as e:
-            s.add("denoise", "siril denoise", "failed", time.time() - t0, note=str(e).splitlines()[0])
+        order = {"nxt": ["nxt"], "graxpert": ["graxpert"], "siril": ["siril"]}.get(method, ["nxt", "graxpert", "siril"])
+        for tool in order:
+            t0 = time.time()
+            if tool == "nxt":
+                try:
+                    tools.rcastro.require("nxt")
+                    dn = round(finish.nxt_dn(snr) * scale, 3)
+                    self.arr, meta = self._rc("nxt", self.arr, "nxt", dn=dn)
+                    s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, snr=round(snr, 2), flags=meta.get("flags"))
+                    return
+                except Cancelled:
+                    raise
+                except (ToolUnavailable, ToolError) as e:
+                    s.add("denoise", "rc-astro nxt", "unavailable", time.time() - t0, note=str(e))
+            elif tool == "graxpert":
+                try:
+                    src, dst = self._file(self.arr, "gxd_in.fits"), self._out("gxd_out.fits")
+                    strength = round(finish.graxpert_strength(snr) * scale, 3)
+                    meta = tools.graxpert.denoise(src, dst, strength=strength, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+                    self.arr = _sanitize(fitsio.read_rgb(dst)[0])
+                    s.add("denoise", "graxpert", seconds=time.time() - t0, strength=strength, snr=round(snr, 2), model=meta.get("model"),
+                          providers=meta.get("providers"))
+                    return
+                except Cancelled:
+                    raise
+                except (ToolUnavailable, ToolError) as e:
+                    s.add("denoise", "graxpert", "unavailable", time.time() - t0, note=str(e))
+            else:
+                mod = round(min(1.0, 0.85 * d), 2)
+                try:
+                    out, _ = _siril_image(self.work, s, "dn", self.arr, self.header, f"denoise -mod={mod}", "Noise reduction")
+                    self.arr = _sanitize(out)
+                    s.add("denoise", "siril denoise", seconds=time.time() - t0, mod=mod)
+                    return
+                except SIRIL_FAILS as e:
+                    s.add("denoise", "siril denoise", "failed", time.time() - t0, note=str(e).splitlines()[0])
 
     def save(self) -> dict:
         s = self.steps
@@ -749,6 +862,7 @@ class Restorer:
         ran = [r["tool"] for r in s.records if r["status"] == "done" and r["tool"] != "none"]
         return {"created": datetime.now().isoformat(timespec="seconds"), "steps": s.records, "tools": ran,
                 "scale": self.scale, "wcs": _has_wcs(self.header), "dual_band": self.dual, "spcc": self.info["spcc"], "snr": self.info.get("snr"),
+                "deconv_method": str(self.sp.get("deconv_method") or "auto"), "denoise_method": str(self.sp.get("denoise_method") or "auto"),
                 "stats": {"median": round(float(np.median(finish.sample(lum))), 6),
                           "noise_sigma": round(finish.lower_half_sigma(finish.sample(lum)), 6),
                           "max": round(float(self.arr.max()), 4)},
@@ -758,16 +872,21 @@ class Restorer:
 
 
 def restore(session_dir: str, stack_meta: dict, stack_params: dict, params: dict, progress=None, checkpoint=None) -> dict:
-    """Linear restoration: gradient -> plate solve -> [BXT correct only] -> colour calibration -> deconvolution
+    """Linear restoration: [satellite trails] -> gradient -> plate solve -> [BXT correct only] -> colour calibration -> deconvolution
     -> light denoise, ``stack.fits`` -> ``linear.fits`` (+ ``restore_meta.json``).
 
     Each step tries its best tool and falls back (GraXpert -> Siril RBF; SPCC -> background neutralisation +
-    rmgreen; BXT -> Siril Richardson-Lucy; NXT -> GraXpert -> Siril denoise) and records what ran.  RC-Astro's
+    rmgreen; auto: BXT -> Siril Richardson-Lucy; NXT -> GraXpert -> Siril denoise) and records what ran; a deconvolution / denoise tool chosen explicitly
+    (``deconv_method`` bxt / rl / graxpert_*, ``denoise_method`` nxt / graxpert / siril) runs alone.  Cosmic Clarity (SetiAstro, through siril-scripts'
+    CosmicClarity_Native.py) is the optional path: here ``satellite_removal`` (on the stack) and, in remove_stars, DarkStar; its Sharpen / Denoise (``cc_sharpen``,
+    ``cc_denoise``) and Super-Resolution (``superres_method``) run on the stretched image (pro.Finisher / export), where they keep the flux - on this pipeline's
+    linear data they did not (6.2 x / 2.2 x / 0.75 x the flux, Sh2-131 2026-10-24).  RC-Astro's
     BlurXTerminator manual puts "Correct Only" before colour calibration (it makes SPCC more consistent), so
     that half of BXT runs before SPCC and the sharpening half after it."""
     p = {**DEFAULTS, **(params or {})}
     r = Restorer(session_dir, stack_meta or {}, stack_params or {}, p, progress, checkpoint)
     t0 = time.time()
+    r.satellite()
     r.background()
     solved = r.plate_solve()
     r.psf_correction()
@@ -950,7 +1069,8 @@ def _compact_star_layer(lin: np.ndarray, stars: np.ndarray, sigma: float, k_sigm
 def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params: dict, progress=None, checkpoint=None) -> dict:
     """Separate the stars: ``linear.fits`` -> ``starless.fits`` + ``stars.fits`` (+ ``starnet_meta.json``).
 
-    Order: StarXTerminator (licensed; RC-Astro: best on linear data) -> StarNet2 ``--linear`` -> none.  The
+    Order: StarXTerminator (licensed; RC-Astro: best on linear data) -> StarNet2 ``--linear`` -> none; ``star_removal`` darkstar puts Cosmic Clarity DarkStar
+    alone.  The
     star layer is ``linear - starless`` clipped at 0, exact for linear data (RC-Astro: unscreen is for stretched
     images only).  When StarNet2 cannot run on linear data the meta says ``stage: stretched`` and the export
     removes the stars after the stretch instead."""
@@ -967,7 +1087,7 @@ def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params:
         meta["reason"] = "star_separation=false" if not p["star_separation"] else f"star_removal={wanted}"
         _save_json(_p(session_dir, "starnet_meta.json"), meta)
         return meta
-    order = {"sxt": ["sxt"], "starnet": ["starnet"]}.get(wanted, ["sxt", "starnet"])
+    order = {"sxt": ["sxt"], "starnet": ["starnet"], "darkstar": ["darkstar"]}.get(wanted, ["sxt", "starnet"])
     work = _p(session_dir, "process", "stars")
     os.makedirs(work, exist_ok=True)
     src = _linear_source(session_dir)
@@ -986,6 +1106,13 @@ def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params:
                 if side and os.path.exists(side):
                     os.remove(side)                                   # recomputed below, the same way for every tool
                 meta.update(tool="sxt", stage="linear", flags=m.get("flags"))
+            elif tool == "darkstar":
+                # Cosmic Clarity DarkStar (siril-scripts CosmicClarity_Native.py) on the linear image: the script stretches it itself and undoes the stretch; additive
+                # mode, the star layer is linear - starless below as for every remover (unscreen is for stretched images)
+                sl, m = tools.cosmic_clarity.run("darkstar", lin, ["--darkstar-mode", "additive"], work=work, device=_device_gpu(sp), progress=steps.sub,
+                                                 checkpoint=steps.checkpoint)
+                fitsio.write_rgb(starless_path, np.clip(sl, 0, 1).astype(np.float32), header)
+                meta.update(tool="darkstar", stage="linear", command=m["command"], backend=m.get("backend"), device=m.get("device"))
             else:
                 try:
                     m = tools.starnet.run(src, starless_path, linear=True, stride=int(p.get("starnet_stride", 256) or 256), progress=steps.sub, checkpoint=steps.checkpoint)
@@ -1126,6 +1253,36 @@ def _render(layers: _Layers, p: dict, dual: bool, external: bool, work: str, sp:
     return img, info
 
 
+def _superres_final(img: np.ndarray, sp: dict | None, work: str, steps, info: dict) -> np.ndarray | None:
+    """Cosmic Clarity Super-Resolution 2 / 3 / 4x (``superres_method`` cosmic_clarity at stack time, factor from ``scale``) on the finished image: its models keep the
+    flux on a stretched image (1.00 on Sh2-131), while on this pipeline's linear data the script's own stretch / unstretch round trip lost a quarter of it (0.75).  The
+    stack was integrated at 1x (workflow.decide_resampling).  None when not asked or when it cannot run (recorded)."""
+    f = cc_superres_factor(sp)
+    if not f:
+        return None
+    t0 = time.time()
+    if f not in CC_SUPERRES_SCALES:
+        note = f"Cosmic Clarity has 2x / 3x / 4x super-resolution models; scale {f:g} was chosen: not enlarged"
+        steps.add("super-resolution", "cosmic clarity superres", "unavailable", note=note)
+        info["superres"] = {"tool": "cosmic clarity superres", "factor": f, "status": "unavailable", "note": note}
+        return None
+    h0, w0 = img.shape[1:]
+    try:
+        out, m = tools.cosmic_clarity.run("superres", img, ["--scale", str(f)], work=work, device=_device_gpu(sp), progress=steps.sub, checkpoint=steps.checkpoint)
+        if out.shape[1:] != (h0 * f, w0 * f):
+            raise ToolError("cosmic clarity superres", f"output {out.shape[2]}x{out.shape[1]} is not {f} x {w0}x{h0}")
+        info["superres"] = {"tool": "cosmic clarity superres", "factor": f, "from": [w0, h0], "to": [w0 * f, h0 * f], "command": m["command"],
+                            "backend": m.get("backend"), "device": m.get("device"), "seconds": round(time.time() - t0, 1)}
+        steps.add("super-resolution", "cosmic clarity superres", seconds=time.time() - t0, factor=f, size=f"{w0 * f}x{h0 * f}", command=m["command"])
+        return np.clip(out, 0, 1).astype(np.float32)
+    except Cancelled:
+        raise
+    except (ToolUnavailable, ToolError) as e:
+        steps.add("super-resolution", "cosmic clarity superres", "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, note=str(e))
+        info["superres"] = {"tool": "cosmic clarity superres", "factor": f, "status": "failed", "note": str(e)[:300]}
+        return None
+
+
 def _chain_record(info: dict) -> list[dict]:
     """The chain's steps for the sidecar: command lines verbatim, parameters, levels after the step, the picture saved for it."""
     out = []
@@ -1170,6 +1327,9 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
             fitsio.write_rgb(_p(work, "finish.fits"), img, layers.header)
         except Exception as e:                                           # noqa: BLE001  the gates never stop an export
             gate_report = {"error": str(e)}
+    superres = _superres_final(img, sp, work, steps, info)
+    if superres is not None:
+        img = superres
     disp = export_mod.display_image(img, export_mod.bottom_up(layers.header))
     lum = finish.sample(finish.luminance(layers.base))
     restore_meta = _load_json(_p(session_dir, "restore_meta.json"))
@@ -1183,6 +1343,8 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
         "steps": steps.records, "render_seconds": info["render_seconds"], "seconds": round(time.time() - t_all, 1),
         "siril_tools": sorted({r["tool"] for r in steps.records if r["status"] == "done"}),
     }
+    if info.get("superres"):
+        linear_info["superres"] = info["superres"]
     ignored = sorted(k for k in given if k in IGNORED_KEYS or (k not in DEFAULTS and k not in EXTRA_KEYS))
     files = export_mod.write_outputs(session_dir, disp, meta=meta, params_full=p, linear_info=linear_info,
                                      quality=int(opts["quality"]), upscale=float(opts["upscale"] or 1.0),

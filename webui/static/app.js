@@ -77,9 +77,23 @@ function currentDefaults() { return { ...S.system.defaults }; }
 
 function buildParamUI() {
   const groups = {};
-  for (const p of S.system.param_spec) (groups[p.group] ||= []).push(p);
+  for (const p of S.system.param_spec) if (p.host !== "options") (groups[p.group] ||= []).push(p);
   const host = $("#paramGroups");
   host.innerHTML = "";
+  // settings shown in the Integration & options panel (Cosmic Clarity Sharpen / Denoise beside the linear tools): same data-key binding as the Process tab's
+  const opt = $("#optParams");
+  if (opt) {
+    opt.innerHTML = "";
+    for (const p of S.system.param_spec.filter(q => q.host === "options")) {
+      const el = document.createElement("label");
+      el.title = p.label;
+      const short = p.label.split(" (")[0];
+      if (p.type === "range") el.innerHTML = `${short} <input type="range" min="${p.min}" max="${p.max}" step="${p.step}" data-key="${p.key}"><output></output>`;
+      else if (p.type === "bool") { el.className = "check"; el.innerHTML = `<input type="checkbox" data-key="${p.key}"> ${short}`; }
+      else el.innerHTML = `${short} <select data-key="${p.key}">${p.options.map(o => `<option>${o}</option>`).join("")}</select>`;
+      opt.appendChild(el);
+    }
+  }
   Object.entries(groups).forEach(([g, items], gi) => {
     const det = document.createElement("details");
     det.className = "pgroup"; det.open = gi < 4;
@@ -102,7 +116,7 @@ function buildParamUI() {
     host.appendChild(det);
   });
   if (typeof Tools !== "undefined") Tools.renderPlan();
-  $$("#paramGroups [data-key]").forEach(inp => {
+  $$("#paramGroups [data-key], #optParams [data-key]").forEach(inp => {
     const ev = inp.type === "range" ? "input" : "change";
     inp.addEventListener(ev, () => {
       const k = inp.dataset.key;
@@ -115,14 +129,14 @@ function buildParamUI() {
 }
 
 function applyParamsToUI() {
-  $$("#paramGroups [data-key]").forEach(inp => {
+  $$("#paramGroups [data-key], #optParams [data-key]").forEach(inp => {
     const v = S.params[inp.dataset.key];
     if (inp.type === "checkbox") inp.checked = !!v; else inp.value = v;
   });
   syncParamOutputs();
 }
 function syncParamOutputs() {
-  $$("#paramGroups input[type=range]").forEach(inp => { inp.parentElement.querySelector("output").textContent = (+inp.value).toFixed(inp.step < 0.05 ? 3 : 2); });
+  $$("#paramGroups input[type=range], #optParams input[type=range]").forEach(inp => { inp.parentElement.querySelector("output").textContent = (+inp.value).toFixed(inp.step < 0.05 ? 3 : 2); });
 }
 /* Per-dataset settings are stored as the values the user changed away from the defaults of the day ({changed, base}); on load only the changes are kept over the
    current defaults.  A plain object from an older build is discarded: it froze that build's defaults (asinh, synthetic luminance 0.8, colour preservation 0.7 ...)
@@ -360,6 +374,8 @@ function stackParams() {
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
     local_norm: g("local_norm").checked, pattern_correction: g("pattern_correction").checked,
     deconv_method: g("deconv_method").value, ai_deconvolution: on,
+    denoise_method: g("denoise_method").value, superres_method: g("superres_method").value, satellite_removal: g("satellite_removal").checked,
+    graxpert_psfsize: parseFloat(g("graxpert_psfsize").value) || 0,
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
     device: g("device") ? g("device").value : "auto",

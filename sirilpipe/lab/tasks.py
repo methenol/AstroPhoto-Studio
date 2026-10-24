@@ -214,12 +214,12 @@ def _truth_scores(ds: Dataset, s, result: np.ndarray, sigma_eval: float, stars_i
 
 def _processing_params(keys: list[str], tune: set[str]) -> list[dict]:
     """Task parameters taken from the UI's PARAM_SPEC so that ranges and labels follow the pipeline."""
-    from ..post import DEFAULTS, PARAM_SPEC
+    from ..post import DEFAULTS, EXTRA_DEFAULTS, PARAM_SPEC
     out = []
     spec = {s["key"]: s for s in PARAM_SPEC}
     for k in keys:
         sp = spec.get(k)
-        d = DEFAULTS.get(k)
+        d = DEFAULTS.get(k, EXTRA_DEFAULTS.get(k))
         if sp is None:
             continue
         p = {"name": k, "label": sp["label"], "default": d, "tune": k in tune, "processing": k}
@@ -243,7 +243,7 @@ class FinishTask(Task):
                    "the finishing gates (sky level, clipping, sky chroma, sky noise, star count / shape / colour), the nebula contrast and the distance to the "
                    "reference looks of the target.  Trial images are the finished renders (one chain, same data).  Option 'external': run NoiseXTerminator / GraXpert "
                    "on the stretched image in every trial (slower, the export's result).")
-    params = _processing_params(["stretch_method", "stretch", "contrast", "hdr", "color_preservation", "luminance_denoise", "chroma_denoise", "palette", "oiii_boost",
+    params = _processing_params(["stretch_method", "stretch", "contrast", "hdr", "color_preservation", "luminance_denoise", "chroma_denoise", "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "palette", "hubble_formula", "oiii_boost",
                                  "synthetic_luminance", "saturation", "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "scnr",
                                  "black_point", "brightness"],
                                 {"stretch", "contrast", "hdr", "saturation", "local_contrast", "star_reduction"})
@@ -328,7 +328,8 @@ class RestoreTask(Task):
                    "denoise strength (NoiseXTerminator / GraXpert), colour calibration.  Scored on the result: star FWHM, background noise, Krotkov sharpness, aperture "
                    "photometry against the stack (bright / faint bias) and, on synthetic data, the truth.  Each trial runs the whole linear stage (1-2 min).")
     params = _processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance"], {"deconvolution", "denoise", "bg_smoothing"})
-    params.append({"name": "deconv_method", "label": "Deconvolution tool", "type": "categorical", "choices": ["auto", "rl", "none"], "default": "auto", "tune": False, "pipeline": "deconv_method"})
+    params.append({"name": "deconv_method", "label": "Deconvolution tool", "type": "categorical", "choices": ["auto", "bxt", "rl", "graxpert_obj", "graxpert_stellar", "graxpert_both", "none"], "default": "auto", "tune": False, "pipeline": "deconv_method"})
+    params.append({"name": "denoise_method", "label": "Noise reduction tool", "type": "categorical", "choices": ["auto", "nxt", "graxpert", "siril", "none"], "default": "auto", "tune": False, "pipeline": "denoise_method"})
     metrics = {
         "fwhm": {"label": "Star FWHM (px)", "direction": "minimize"},
         "bg_noise": {"label": "Background noise", "direction": "minimize"},
@@ -352,8 +353,8 @@ class RestoreTask(Task):
         ctx["n"] += 1
         wd = os.path.join(ctx["study_dir"], "work", f"restore_{ctx['n']}")
         _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
-        prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k != "deconv_method"}}
-        sp = {**(s.meta.get("params") or {}), "deconv_method": p.get("deconv_method", "auto"), "device": str(ctx["device"])}
+        prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k not in ("deconv_method", "denoise_method")}}
+        sp = {**(s.meta.get("params") or {}), "deconv_method": p.get("deconv_method", "auto"), "denoise_method": p.get("denoise_method", "auto"), "device": str(ctx["device"])}
         t = time.time()
         try:
             def checkpoint():
@@ -448,11 +449,11 @@ class StackTask(Task):
 class StarsTask(Task):
     name = "stars"
     label = "Star separation"
-    description = ("Star removal (post.remove_stars: StarXTerminator, else StarNet2) on the dataset's linear image, scored against the stars the detector finds in it: "
+    description = ("Star removal (post.remove_stars: StarXTerminator, else StarNet2; Cosmic Clarity DarkStar) on the dataset's linear image, scored against the stars the detector finds in it: "
                    "their flux left in the starless image (local-background apertures), the fraction still detected, and the change away from every star (damage to "
                    "nebula and sky, × the image's noise).  Synthetic data: the starless image against the true sky without stars.")
     params = [
-        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet"], "default": "auto", "tune": True, "processing": "star_removal"},
+        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"], "default": "auto", "tune": True, "processing": "star_removal"},
         {"name": "starnet_stride", "label": "StarNet2 stride", "type": "categorical", "choices": [64, 128, 256], "default": 256, "tune": False, "processing": "starnet_stride"},
     ]
     metrics = {

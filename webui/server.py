@@ -67,7 +67,8 @@ CONTROL: dict[str, threading.Event] = {}   # job id -> "pause requested" (the se
 
 STACK_DEFAULTS = {
     "mode": "auto",          # auto | drizzle | demosaic
-    "scale": 1.0,            # output up-sampling (1, 1.5, 2)
+    "scale": 1.0,            # output up-sampling (1, 1.5, 2; 3, 4 with Cosmic Clarity)
+    "superres_method": "drizzle",   # drizzle = Siril Bayer drizzle at `scale`; cosmic_clarity = stack at 1x, Cosmic Clarity Super-Resolution 2/3/4x on the finished image
     "sigma_low": 4.0,
     "sigma_high": 3.0,
     "local_norm": True,
@@ -75,7 +76,11 @@ STACK_DEFAULTS = {
     "pattern_correction": True,
     "denoise_iters": 2000,
     "ai_deconvolution": True,
-    "deconv_method": "auto",   # auto = BlurXTerminator when licensed, else Siril RL; imagemm = VeraLux ImageMM (needs torch)
+    "deconv_method": "auto",   # auto = BlurXTerminator when licensed, else Siril RL; bxt | rl | graxpert_obj | graxpert_stellar | graxpert_both (that tool only);
+                               # imagemm = VeraLux ImageMM (needs torch); none.  Cosmic Clarity Sharpen is the finishing setting cc_sharpen (stretched image)
+    "denoise_method": "auto",  # linear noise reduction: auto = NXT when licensed, else GraXpert / Siril; nxt | graxpert | siril (that tool only); none.  CC Denoise: cc_denoise
+    "satellite_removal": False,  # Cosmic Clarity satellite-trail removal on the stack before the restoration
+    "graxpert_psfsize": 0.0,   # GraXpert deconvolution -psfsize (Image FWHM, px); 0 = the star FWHM measured on the linear image
     # VeraLux ImageMM (sirilpipe/veralux_imagemm.py; the script's GUI defaults).  The 1.x ImageMM keys (imagemm_delta,
     # imagemm_stop, imagemm_max_iters, imagemm_n2n, ...) stay accepted and are ignored.
     "imagemm_r": 1,                # super-resolution factor (1..3); restored_resolution sets it too
@@ -132,6 +137,7 @@ def default_scale(deconv_method: str) -> float:
 #                  rl      = Siril Richardson-Lucy even when BlurXTerminator is licensed
 #                  imagemm = VeraLux ImageMM multi-frame restoration of the subs (slow; needs IMAGEMM=cuda)
 #                  none    = no deconvolution
+#                  bxt / graxpert_obj / graxpert_stellar / graxpert_both = that tool only (not used by the 1.x profiles)
 # ai_deconvolution and imagemm_n2n (the 1.x ImageMM's Noise2Noise pass) are accepted for compatibility and have no effect.
 PROFILES = {
     "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
@@ -246,7 +252,7 @@ def tools_status() -> dict:
     try:
         return clean_json(tools_mod.tools_status())
     except Exception as e:  # the tools package must never take the server down
-        return {n: {"ok": False, "error": f"{type(e).__name__}: {e}"} for n in ("siril", "graxpert", "starnet", "rcastro", "gaia")}
+        return {n: {"ok": False, "error": f"{type(e).__name__}: {e}"} for n in ("siril", "graxpert", "starnet", "rcastro", "cosmic_clarity", "gaia")}
 
 
 # ------------------------------------------------------------------ pages
@@ -743,9 +749,9 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
 def _tool_member(tool: str, attr: str):
     """``sirilpipe.tools.<tool>.<attr>``: the module's singleton (``graxpert`` / ``starnet`` /
     ``rcastro``, which share their status caches), else the wrapper class instantiated."""
-    names = {"graxpert": "GraXpert", "rcastro": "RCAstro", "starnet": "StarNet"}
+    names = {"graxpert": "GraXpert", "rcastro": "RCAstro", "starnet": "StarNet", "cosmic_clarity": "CosmicClarity"}
     if tool not in names:
-        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet)")
+        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet | cosmic_clarity)")
     obj = getattr(tools_mod, tool, None) or getattr(tools_mod, names[tool])     # the module's singleton, else the class
     if inspect.isclass(obj):
         obj = obj()
@@ -761,8 +767,10 @@ def _run_tools_job(params: dict, progress) -> dict:
         fn = _tool_member("rcastro", "download_models")
     elif tool == "starnet":
         fn = _tool_member("starnet", "download")
+    elif tool == "cosmic_clarity":
+        fn = _tool_member("cosmic_clarity", "download_models")
     else:
-        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet)")
+        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet | cosmic_clarity)")
     progress(0, 1, f"Downloading {tool} models" if tool != "starnet" else "Downloading StarNet")
     ret = _call(fn, progress=progress, accept_licence=bool(params.get("accept_licence")),
                 kinds=params.get("models"))
@@ -1089,11 +1097,11 @@ def tools_gaia_clear():
 @app.post("/api/tools/models/download")
 def tools_download(body: dict = Body(...)):
     """Queue a model / tool download (job kind ``tools``): GraXpert's models, RC-Astro's
-    (download-models), or StarNet2 (needs ``accept_licence: true``: the download comes from
-    starnetastro.com under their licence)."""
+    (download-models), Cosmic Clarity's (the siril-scripts script's own download, ~2.4 GB), or StarNet2
+    (needs ``accept_licence: true``: the download comes from starnetastro.com under their licence)."""
     tool = body.get("tool")
-    if tool not in ("graxpert", "rcastro", "starnet"):
-        raise HTTPException(400, "tool: graxpert | rcastro | starnet")
+    if tool not in ("graxpert", "rcastro", "starnet", "cosmic_clarity"):
+        raise HTTPException(400, "tool: graxpert | rcastro | starnet | cosmic_clarity")
     if tool == "starnet" and not body.get("accept_licence"):
         raise HTTPException(400, "StarNet is downloaded from starnetastro.com under their licence: send accept_licence: true")
     opts = {k: body[k] for k in ("accept_licence", "models", "product") if k in body}

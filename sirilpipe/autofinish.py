@@ -255,10 +255,20 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
             decide("palette", "hoo", "dual-band filter", None, None, "dual-band: HOO Classic, Ha = R and OIII = (G + B) / 2 (Hubble_Palette_from_Dual-Band_OSC.py)")
         else:
             decide("palette", user_pal, "settings", None, None, f"the settings name the palette {user_pal}")
-        decide("scnr", 0.0, "dual-band filter", None, None, "no SCNR on HOO: the green is the OIII (NarrowbandNormalization.py applies SCNR to SHO-type palettes only)")
         decide("oiii_boost", float(p0.get("oiii_boost", 1.0)), "dual-band filter", None, None, "NBN (OIII boost != 1) is only run on request")
-        col = pro.Finisher(work, layers.header, {**p1, "palette": tuned["palette"], "oiii_boost": float(p0.get("oiii_boost", 1.0)), "hdr": hdr_value}, True, external=False,
-                           checkpoint=checkpoint, keep_pictures=False).colour(s0)
+        pal_p = {**p1, "palette": tuned["palette"], "oiii_boost": float(p0.get("oiii_boost", 1.0)), "hdr": hdr_value, "scnr": 0.0}
+        col = pro.Finisher(work, layers.header, pal_p, True, external=False, checkpoint=checkpoint, keep_pictures=False).colour(s0)
+        if tuned["palette"] in pro.HA_GREEN_PALETTES:
+            # Ha in the green channel (SHO / OHS of the Hubble palette script): the green cast rule of the broadband branch, measured after the palette
+            cast = green_cast(col, mask)
+            scnr = SCNR_AMOUNT if cast > SCNR_CAST else 0.0
+            decide("scnr", scnr, "green cast", round(cast, 4), SCNR_CAST,
+                   f"{tuned['palette'].upper()} puts Ha in green; median G - (R + B) / 2 over the subject {cast:+.3f}: "
+                   + (f"SCNR {SCNR_AMOUNT} (SW Skies 0.60-0.75; NarrowbandNormalization.py applies SCNR to SHO-type palettes)" if scnr else "no green cast, no SCNR"))
+            if scnr:
+                col = pro.Finisher(work, layers.header, {**pal_p, "scnr": scnr}, True, external=False, checkpoint=checkpoint, keep_pictures=False).colour(s0)
+        else:
+            decide("scnr", 0.0, "dual-band filter", None, None, "no SCNR on HOO: the green is the OIII (NarrowbandNormalization.py applies SCNR to SHO-type palettes only)")
     else:
         cast = green_cast(s0, mask)
         scnr = SCNR_AMOUNT if cast > SCNR_CAST else 0.0

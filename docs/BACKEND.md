@@ -1,7 +1,8 @@
 # The Siril backend (branch `backend`)
 
 AstroPhoto Studio 2.x processes with Siril 1.4 (headless), GraXpert, StarNet2 and the RC-Astro tools
-(BlurXTerminator, NoiseXTerminator, StarXTerminator). Everything is installed inside the Docker image;
+(BlurXTerminator, NoiseXTerminator, StarXTerminator), with SetiAstro's Cosmic Clarity models (Sharpen, Denoise,
+Super-Resolution, DarkStar, satellite-trail removal) as an optional path next to them. Everything is installed inside the Docker image;
 nothing is needed on the host. The web UI, the `/api/v1` job API and the job queue are unchanged, so a
 client written against 1.x keeps working.
 
@@ -18,7 +19,7 @@ docker compose up -d --build         # NVIDIA profile (default); --profile cpu f
 | `IMAGES_DIR` | session folders, read-only at `/data/images` (API paths resolve here, as in 1.x) |
 | `OUTPUT_DIR` | caches, exports, **and `.home/`: tool licences, models, Siril config** (keep it across rebuilds) |
 | `STARNET_ACCEPT_LICENSE=yes` | download the StarNet2 CLI from starnetastro.com at build time (you accept its licence) |
-| `IMAGEMM=cuda\|cpu\|off` | add PyTorch for the optional ImageMM multi-frame restoration (cuda adds ~4 GB) |
+| `IMAGEMM=cuda\|cpu\|off` | add PyTorch for the optional ImageMM multi-frame restoration and for Cosmic Clarity (+ torchvision, onnxruntime; cuda adds ~4 GB) |
 | `LOCAL_COPY=true` | copy a dataset's subs to the output volume before a job (NAS shares) |
 
 The container's hostname is fixed (`astrophoto-studio`) because the RC-Astro licence is bound to the
@@ -52,7 +53,34 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    SPCC colour calibration (sensor and filter from the headers; narrowband mode for dual-band filters); BlurXTerminator sharpen with
    the 1-2 h values of research/pro-workflow.md (Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; the lower end on noisy data); NoiseXTerminator `--dn` 0.8 .. 0.5 on the linear
    data (GraXpert denoise 0.8 .. 0.6, or Siril, as fallbacks).  `deconv_method = imagemm` runs VeraLux ImageMM (`sirilpipe/veralux_imagemm.py`) on the subs instead: the stack's own calibrated, cosmetic-corrected Bayer-drizzle frames with its registration, per-colour saturation masks (pixels within `imagemm_bloom_grow` px of them left out, and within 0.75 x the equivalent radius of a large saturated patch), then the multi-frame restoration with per-frame kernels (plus the optics' static asymmetry and an extended wing to 80 px joined from unsaturated and saturated stars, with its per-channel colour and lobe measured on the saturated stars); a saturated star starts as a point at the light PSF photometry of its unsaturated wings measures, centred on its missing data, and where the frames' data are sparse it becomes the restored image's PSF at its wings' colour, joined to the restoration with the restoration's own structure kept and the PSF's tail fading on; saturated galaxy nuclei get their colour from their wings; the result is put on the stack's photometric scale per channel from the unsaturated stars' flux ratios (sky offset from the median); no BlurXTerminator.
-6. **Stars** — StarXTerminator on the linear data (or StarNet2 `--linear`), no unscreen: `stars = linear - starless`.
+6. **Stars** — StarXTerminator on the linear data (or StarNet2 `--linear`; Cosmic Clarity DarkStar with `star_removal = darkstar`), no unscreen: `stars = linear - starless`.
+   **Linear tools are the user's choice** (*Integration & options*): `deconv_method` auto (BlurXTerminator when licensed, else
+   Siril RL) / bxt / rl / **graxpert_obj / graxpert_stellar / graxpert_both** (GraXpert's AI deconvolution models, `-strength`
+   = the Deconvolution slider, `-psfsize` = `graxpert_psfsize`, or when 0 the star FWHM measured on the linear image, GraXpert's
+   "Image FWHM (in pixels)"; BlurXTerminator's correct-only pass runs only with auto / bxt; measured on Sh2-131 at strength 0.5,
+   PSF 4.48 px: the objects model keeps the flux and leaves the star FWHM almost unchanged, the stars model takes the FWHM from
+   4.5 to 2.0 px and keeps 19-27 % of the stars' flux, independent of the data's scale) /
+   imagemm / none; `denoise_method` auto (NXT, else GraXpert, else Siril) / nxt / graxpert / siril / none. A tool chosen
+   explicitly that cannot run is recorded and nothing else runs in its place; the same holds for DarkStar, Cosmic Clarity's steps,
+   the Hubble palette script and a super-resolution scale Cosmic Clarity has no model for (2x / 3x / 4x only).
+
+   **Cosmic Clarity** (optional, instead of or in addition to the RC-Astro tools): siril-scripts' `CosmicClarity_Native.py`
+   ("Cosmic Clarity AI4 for Siril", engines and models © SetiAstro) — its processing functions run headless by
+   `sirilpipe/cosmic_clarity_worker.py` in Siril's pyscript environment, which is given the image's PyTorch / torchvision /
+   onnxruntime (a `.pth` file). `satellite_removal` runs on the stack before the gradient, DarkStar (`star_removal =
+   darkstar`) on the linear image; **Sharpen** (`cc_sharpen` off / both / stellar / nonstellar, `cc_stellar_amount`,
+   `cc_nonstellar_amount`, the script's defaults 0.5) and **Denoise** (`cc_denoise`, model `cc_denoise_model` full / lite /
+   walking, strengths = the two noise sliders) are settings in *Integration & options* applied to the stretched image, and
+   **Super-Resolution** (`superres_method = cosmic_clarity`, 2/3/4x from `scale`; the stack integrates at 1x) enlarges the
+   finished image in the export. Why not on the linear image: the script stretches linear input itself and inverts the stretch
+   afterwards, and on this pipeline's background-subtracted linear data (sky ~1e-4 above the minimum, stars up to 1) that
+   inversion is so steep round the stars that Sharpen came back with 6.2x the flux, Denoise 2.2x, Super-Resolution 0.75x
+   (Sh2-131 two nights, 2026-10-24); on the stretched image they keep it (0.96 / 1.00 / 1.00), and DarkStar's linear starless
+   matched StarXTerminator's (nebula p99 above the sky 8.8e-5 vs 8.3e-5 after BXT + NXT). DarkStar is sensitive to the linear
+   image's noise: after GraXpert's denoise (sky noise 2.4e-5) its starless kept 35 % of the nebula StarXTerminator's did, after
+   NXT (1.0e-5) all of it. The models (2.4 GB, the script's own *Download Models*: SetiAstro's files mirrored on HuggingFace)
+   are installed from the Tools card into `OUTPUT_DIR/.home/.local/share/siril/cosmic_clarity`; DarkStar is published as ONNX
+   only and runs through onnxruntime-gpu (CUDA 12 build).
 7. **Auto-finish** — `autofinish.py` picks among published values by stated rules (small vs frame-filling target, clipping -> HDR, dual-band vs broadband -> palette / SCNR,
    star density -> reduction, SNR -> NXT strength); every decision is in the report with its rule.
 8. **Export** — `pro.py`, the professional chain, every step a Siril command, a pyscript or an rc-astro call, a picture saved after each step
@@ -61,7 +89,11 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    **Statistical Stretch** (Seti Astro, `pyscript Statistical_Stretch.py`, median 0.10 for a small subject / 0.25 frame-filling) as the default; or the **GHS two-pass stretch** by `ght` (pass 1 SP at the histogram's left half-maximum, b 10, D raised until the background reaches 0.10; `linstretch -BP` at the histogram toe;
    pass 2 SP on the nebula mask's median, b 4, D 1, LP = background, HP < 1 when `hdr` is on) — alternatives `statstretch` (`pyscript Statistical_Stretch.py -median 0.10|0.25 -sigma 5 -linked`),
    `autoghs`, `modasinh`, `autostretch`, `hms` (each after `linstretch -BP` at the histogram toe, its one parameter raised until the background is 0.10); highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless
-   (`--di --dn`, `--dc 0.95`; GraXpert fallback); palette (HOO classic / improved / foraxx / hoo_warm by `pm`; NBN port when `oiii_boost` != 1) or `rmgreen 3`; local contrast by `clahe`
+   (`--di --dn`, `--dc 0.95`; GraXpert fallback; Cosmic Clarity Denoise instead with `cc_denoise`); Cosmic Clarity Sharpen on the recombined image with `cc_sharpen`; dual-band palette by
+   **Hubble_Palette_from_Dual-Band_OSC.py** itself (siril-scripts, Carlo Mollicone – AstroBOH; GUI-only, run headless inside Siril by
+   `sirilpipe/hubble_palette_worker.py`, which selects the palette and formula preset and presses its *Apply*): HOO (default, Classic or
+   Improved) and the Hubble-like SHO / HSO / OSH / OHS / HOS with its synthetic SII, presets Classic / Improved / Advanced / NonLinear S2
+   (`hubble_formula`); SCNR after the Ha-in-green palettes (SHO, OHS); foraxx / hoo_warm by `pm`; NBN port when `oiii_boost` != 1; broadband `rmgreen 3`; local contrast by `clahe`
    under a mask (150 and 40 px); the GHS saturation stretch (`ght -sat`, D fitted so the subject's mean saturation reaches its target, under the range mask); stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
    (`pm "~(~$starless$*~$stars$)"`); black point at the toe and `icc_convert_to sRGB relative`; sRGB JPEG + 16-bit TIFF + the JSON sidecar.  The exporter computes and prints the
    **gates** of research/FINISH-SPEC.md (`gates.py`) and stores them in the sidecar.  The preview runs the same chain without the AI steps.  The outer 24 px of the stack are trimmed.
@@ -83,7 +115,7 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 |---|---|
 | Process tab, presets, live preview | the preview runs the export's finishing chain (`sirilpipe/pro.py`) without the AI noise reduction |
 | Every processing control (stretch, highlights, colour, stars, detail, finish, colour grade) | steps of the finishing chain; nothing is ignored (`sirilpipe/post.py` PARAM_SPEC) |
-| Super-resolution 1.5x / 2x | Siril Bayer drizzle at the chosen scale when picked explicitly; `auto` keeps 1x unless the data supports more |
+| Super-resolution 1.5x / 2x | Siril Bayer drizzle at the chosen scale when picked explicitly; `auto` keeps 1x unless the data supports more; or Cosmic Clarity Super-Resolution 2x / 3x / 4x of the finished image (`superres_method`) |
 | Device choice | *Integration & compute options* > Device (RC-Astro tools, GraXpert, ImageMM) |
 | Calibration panel | masters found beside the session, DWARF CALI_FRAME matching, overrides |
 | Frames tab | per-frame FWHM, roundness, background, star count from Siril's registration; overrides |
@@ -91,7 +123,8 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 | Gradient removal against a sky survey | NSNS DR0.2 through CDS hips2fits (`sirilpipe/skyref.py`), `bg_method` auto / reference |
 | Auto-finish | published rules on the image's own measurements (no reference images) |
 | Reference looks | the 58 reference photographs' statistics (`sirilpipe/looks.py`) grade the Experiments tab's finishing trials (`look_distance`) |
-| AI star remover | StarXTerminator, else StarNet2 (`star_removal`) |
+| AI star remover | StarXTerminator, else StarNet2 (`star_removal`); Cosmic Clarity DarkStar on request |
+| Cosmic Clarity | Sharpen / Denoise / Super-Resolution / DarkStar / satellite trails, chosen in *Integration & options* and *Stars*; models from the Tools card |
 | Diagnostics | stage logs, reference frame, integration coverage map, Siril rejection map |
 | Explore | plate solution from Siril's WCS (own solver as fallback), Gaia DR3 + SIMBAD annotation |
 | Experiments (Optuna) | `sirilpipe/lab/`: finishing chain, linear restoration, registration & integration, star separation, gradient removal; synthetic datasets with truth; *From experiment* in the Process tab |

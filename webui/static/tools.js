@@ -1,5 +1,5 @@
-/* Tools panel: Siril, GraXpert, StarNet and the RC-Astro licence (BlurXTerminator, NoiseXTerminator,
-   StarXTerminator).  The server runs the tools; this only shows what /api/tools reports and sends the
+/* Tools panel: Siril, GraXpert, StarNet, the RC-Astro licence (BlurXTerminator, NoiseXTerminator,
+   StarXTerminator) and Cosmic Clarity (SetiAstro's models, run by siril-scripts' CosmicClarity_Native.py).  The server runs the tools; this only shows what /api/tools reports and sends the
    user's actions (activation code, activate / deactivate, model downloads). */
 const Tools = (() => {
   const T = { data: null, open: new Set(["rcastro"]), busy: "", msg: {}, starnetOk: false, code: "" };
@@ -21,13 +21,24 @@ const Tools = (() => {
     const d = T.data || {}, rc = d.rcastro || {}, prod = {};
     for (const p of rc.products || []) prod[p.key] = p;
     const live = k => prod[k] && pcls(prod[k]) === "ok" && ok(rc);
-    const gx = d.graxpert || {}, sn = d.starnet || {};
+    const gx = d.graxpert || {}, sn = d.starnet || {}, cc = d.cosmic_clarity || {};
     const bge = ok(gx) && (!gx.models || gx.models.bge !== false);
+    const ccOk = m => !!(cc.torch && cc.models && cc.models[m]);
+    const sel = id => document.getElementById("sp-" + id)?.value;
+    const deconvAuto = live("bxt") ? "BlurXTerminator (licensed)" : "Richardson-Lucy (Siril)";
+    const denoiseAuto = live("nxt") ? "NoiseXTerminator (licensed)" : ok(gx) && gx.models?.denoise !== false ? "GraXpert denoising" : "Siril denoising";
+    const starsAuto = live("sxt") ? "StarXTerminator (licensed)" : ok(sn) ? "StarNet2" : "none installed: the stars stay in the image";
+    const dm = sel("deconv_method"), nm = sel("denoise_method"), sm = S.params?.star_removal;
+    const gxOk = k => ok(gx) && (!gx.models || gx.models[k] !== false);
+    const deconvNames = { bxt: "BlurXTerminator" + (live("bxt") ? "" : " (not licensed: nothing runs)"), rl: "Richardson-Lucy (Siril)", imagemm: "ImageMM", none: "off",
+      graxpert_obj: "GraXpert deconvolution (objects)", graxpert_stellar: "GraXpert deconvolution (stars)", graxpert_both: "GraXpert deconvolution (objects + stars)" };
+    const denoiseNames = { nxt: "NoiseXTerminator" + (live("nxt") ? "" : " (not licensed: nothing runs)"), graxpert: "GraXpert denoising", siril: "Siril denoising", none: "off" };
+    const ccSharpen = S.params?.cc_sharpen && S.params.cc_sharpen !== "off", ccDenoise = !!S.params?.cc_denoise;
     return {
       background: bge ? "GraXpert background extraction" : "Siril background extraction (RBF)",
-      deconv: live("bxt") ? "BlurXTerminator (licensed)" : "Richardson-Lucy (Siril)",
-      denoise: live("nxt") ? "NoiseXTerminator (licensed)" : ok(gx) && gx.models?.denoise !== false ? "GraXpert denoising" : "Siril denoising",
-      stars: live("sxt") ? "StarXTerminator (licensed)" : ok(sn) ? "StarNet2" : "none installed: the stars stay in the image",
+      deconv: (deconvNames[dm] || deconvAuto) + (ccSharpen ? (ccOk("sharpen") ? "; Cosmic Clarity Sharpen on the stretched image" : "; Cosmic Clarity Sharpen (models not installed)") : ""),
+      denoise: (denoiseNames[nm] || denoiseAuto) + (ccDenoise ? (ccOk("denoise") ? "; Cosmic Clarity Denoise on the stretched image" : "; Cosmic Clarity Denoise (models not installed)") : ""),
+      stars: sm === "darkstar" ? (ccOk("darkstar") ? "Cosmic Clarity DarkStar" : "Cosmic Clarity DarkStar (models not installed), then " + starsAuto) : starsAuto,
     };
   }
   function renderPlan() {
@@ -75,6 +86,21 @@ const Tools = (() => {
       note("starnet"), t.version);
   }
 
+  function ccCard(t) {
+    t = t || {};
+    const names = { sharpen: "Sharpen", denoise: "Denoise", superres: "Super-resolution", darkstar: "DarkStar", satellite: "Satellite trails" };
+    const models = Object.entries(t.models || {}).map(([k, v]) => `<span class="pstat ${v ? "ok" : "warn"}" title="${v ? "installed (" + v + ")" : "not installed"}">${v ? "✓" : "–"} ${esc(names[k] || k)}</span>`).join(" ");
+    const any = Object.values(t.models || {}).some(Boolean);
+    let body = kv([["Script", t.version ? "CosmicClarity_Native.py " + esc(t.version) : ""], ["PyTorch", t.torch === undefined ? "" : (t.torch ? "yes" : "no")],
+                   ["onnxruntime", t.onnxruntime === undefined ? "" : (t.onnxruntime ? "yes" : "no")], ["Models", esc(t.models_dir)]]) +
+      (t.models ? `<div>AI models: ${models}</div>` : "");
+    if (t.torch === false) body += `<div class="tmsg err">${esc(t.reason || "This image has no PyTorch: build it with IMAGEMM=cuda (or cpu) to use Cosmic Clarity.")}</div>`;
+    else if (t.script) body += `<div class="row gap"><button class="btn small" data-act="dl" data-tool="cosmic_clarity" ${T.busy ? "disabled" : ""}>${any ? "Download / update models" : "Download models (2.4 GB)"}</button></div>`;
+    else body += `<div class="tmsg err">${esc(t.reason || "siril-scripts' CosmicClarity_Native.py is missing")}</div>`;
+    body += `<div class="small muted">SetiAstro's Cosmic Clarity AI4 models (Sharpen, Denoise, Super-resolution, DarkStar, satellite-trail removal), run by the siril-scripts script CosmicClarity_Native.py. An optional path next to the RC-Astro tools: Sharpen, Denoise, Super-resolution and satellite trails are chosen under Integration &amp; options, DarkStar under Stars &gt; Star removal.</div>`;
+    return card("cosmic_clarity", "Cosmic Clarity", t, body + note("cosmic_clarity"), t.version ? "script " + t.version : "");
+  }
+
   function productRow(p, canAct) {
     const c = pcls(p);
     const can = canAct && !T.busy;
@@ -120,7 +146,7 @@ const Tools = (() => {
   function render() {
     const d = T.data; if (!d) return;
     $("#toolsBody").className = "";
-    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro) + gaiaCard(d.gaia);
+    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro) + ccCard(d.cosmic_clarity) + gaiaCard(d.gaia);
     $$("#toolsBody details.tool").forEach(el => el.ontoggle = () => el.open ? T.open.add(el.dataset.tool) : T.open.delete(el.dataset.tool));
     const code = $("#rcCode"); if (code) code.oninput = () => (T.code = code.value);
     const acc = $("#starnetAccept"); if (acc) acc.onchange = () => (T.starnetOk = acc.checked);
@@ -193,6 +219,11 @@ const Tools = (() => {
 
   function init() {
     $("#toolsRefresh").onclick = load;
+    // the plan names the tool each step will use: follow the choices that change it
+    document.addEventListener("change", e => {
+      const t = e.target;
+      if (["sp-deconv_method", "sp-denoise_method"].includes(t.id) || ["star_removal", "cc_sharpen", "cc_denoise"].includes(t.dataset?.key)) renderPlan();
+    });
     load();
   }
   return { init, load, renderPlan, plan };

@@ -8,7 +8,7 @@
 #   STARNET_ACCEPT_LICENSE  "yes" = you accept the StarNet2 licence and the image downloads the official zip
 #                           from download.starnetastro.com (not redistributable otherwise); empty = skipped,
 #                           the app offers the download at run time into $HOME/tools/starnet2.
-#   IMAGEMM                 off (default) | cuda | cpu - installs torch into the app environment for the optional
+#   IMAGEMM                 off (default) | cuda | cpu - installs torch (+ torchvision, onnxruntime for Cosmic Clarity) for the optional
 #                           ImageMM restoration (deconv_method = imagemm): cuda = the cu128 wheels (~7 GB with the
 #                           NVIDIA libraries), cpu = the CPU wheels (~0.3 GB, slow).  off: the image has no torch and
 #                           a request for ImageMM falls back to BlurXTerminator / Siril RL (recorded in restore_meta.json).
@@ -141,6 +141,17 @@ RUN case "${IMAGEMM}" in \
       cpu)  pip install torch --index-url https://download.pytorch.org/whl/cpu ;; \
       off|"") echo "IMAGEMM=off: torch not installed (deconv_method=imagemm falls back to BXT / RL)" ;; \
       *) echo "IMAGEMM must be cuda, cpu or off (got '${IMAGEMM}')"; exit 1 ;; \
+    esac
+# Cosmic Clarity (SetiAstro's models, run by siril-scripts' CosmicClarity_Native.py in Siril's pyscript environment, which is
+# given this torch: sirilpipe/tools.CosmicClarity): torchvision for its satellite-trail detectors, pinned to the torch above
+# through the same index, and onnxruntime for the models published as ONNX only (DarkStar).  onnxruntime-gpu 1.23 is the last
+# CUDA 12 build: it uses the CUDA 12.8 / cuDNN 9 wheels torch brought (1.24+ want CUDA 13 and fall back to the CPU).
+RUN case "${IMAGEMM}" in \
+      cuda) pip install "torch==$(python -c 'import torch; print(torch.__version__)')" torchvision --index-url https://download.pytorch.org/whl/cu128 \
+            && pip install onnxruntime-gpu==1.23.2 ;; \
+      cpu)  pip install "torch==$(python -c 'import torch; print(torch.__version__)')" torchvision --index-url https://download.pytorch.org/whl/cpu \
+            && pip install onnxruntime==1.23.2 ;; \
+      *)    echo "IMAGEMM=off: no torch, Cosmic Clarity unavailable" ;; \
     esac
 
 COPY sirilpipe ./sirilpipe

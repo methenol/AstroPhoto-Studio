@@ -3,11 +3,12 @@
 An end-to-end pipeline that turns the raw one-shot-colour FITS subs from a smart telescope or an
 astronomy camera into a finished image, built on **Siril 1.4** (headless) with **GraXpert**,
 **StarNet2** and the **RC-Astro** tools (BlurXTerminator, NoiseXTerminator, StarXTerminator; licensed
-from the web UI).  It handles the whole chain: calibration, frame grading, registration with alt-az
+from the web UI), with SetiAstro's **Cosmic Clarity** models (Sharpen, Denoise, Super-Resolution, DarkStar,
+satellite-trail removal) as an optional path instead of or next to them.  It handles the whole chain: calibration, frame grading, registration with alt-az
 field rotation, Bayer-drizzle integration with rejection, plate solving, gradient removal (GraXpert or
 the NSNS sky survey), spectrophotometric colour calibration (Siril SPCC), deconvolution, noise reduction,
 star separation, the community's finishing workflow (Statistical Stretch or the GHS two-pass stretch, highlight protection,
-HOO / Foraxx palettes, Seti Astro star stretch, screen recombination) and export to a full-resolution
+HOO and Hubble-like SHO palettes by the Hubble_Palette_from_Dual-Band_OSC.py script on dual-band data, Foraxx, Seti Astro star stretch, screen recombination) and export to a full-resolution
 JPEG + 16-bit TIFF with a sidecar that lists every Siril command and tool call.  Every step is a named
 community tool with its published parameters; the sources are cited in the code.  It includes a web UI,
 a programmatic API (`/api/v1`), an Explore tab (Gaia / SIMBAD annotation), an Experiments tab (Optuna
@@ -95,7 +96,8 @@ docker compose down                               # stop
   sharing*; `/Volumes` covers mounted NAS shares).
 - **Tools:** `STARNET_ACCEPT_LICENSE=yes` downloads the StarNet2 CLI from starnetastro.com at build time
   (you accept its licence); the RC-Astro CLI installer goes to `vendor/` before the build; GraXpert's
-  AI models are downloaded on first use into `OUTPUT_DIR/.home` (or from the Tools card). Colour calibration (Siril SPCC) uses Gaia DR3 online;
+  AI models are downloaded on first use into `OUTPUT_DIR/.home` (or from the Tools card); Cosmic Clarity's models (2.4 GB) are
+  downloaded from the Tools card and need an image built with `IMAGEMM=cuda` (or `cpu`) for PyTorch. Colour calibration (Siril SPCC) uses Gaia DR3 online;
   the sky chunk covering a field (1 of 48, 27-626 MB) is fetched on first use and cached in `OUTPUT_DIR/.home` so later fields in that region need
   no download (the Tools card shows and clears the cache).
 - **ImageMM:** `IMAGEMM=cuda|cpu|off` adds PyTorch for the multi-frame restoration (`deconv_method = imagemm`).

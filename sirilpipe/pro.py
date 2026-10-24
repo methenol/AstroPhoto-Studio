@@ -15,10 +15,13 @@ step   tool and published parameters (source)
        when the target fills the frame), ``autoghs``, ``modasinh``, ``autostretch``, ``hms`` (one parameter raised until the sky reaches 0.10).
 2      highlights: GHS HP < 1 in pass 2 / Statistical Stretch ``-hdr -hdramount 0.15 -hdrknee 0.75`` / Wavescale HDR (``compute_wavescale_hdr``: 5 scales, compression 1.5,
        mask gamma 5.0, Seti Astro, HDR_multiscale.py), switched on by ``hdr`` (autofinish: clipped > 0.05 % or lightness >= 0.97 > 0.05 %).
+3b     ``cc_sharpen``: Cosmic Clarity Sharpen (Both / Stellar Only / Non-Stellar Only, the script's amounts) on the stretched image after the recombination (step 7).
 3      NoiseXTerminator on the stretched starless (RC-Astro / Brecher ``--dn`` 0.6-0.85) with its own colour separation (``--di`` / ``--dc`` at 0.95); fallback GraXpert
-       denoise 0.6-0.8.  (This replaces any chroma shrinkage of our own.)
-4      palette (dual-band): HOO Classic Ha = R, OIII = (G + B) / 2; Improved OIII = (G + B - 0.3 R) / 2 (Hubble_Palette_from_Dual-Band_OSC.py); Foraxx (The Coldest Nights);
-       by Siril ``pm``; NBN (Blanshan / Cranfield, Cuiv's script: ``nbn.py``) when ``oiii_boost`` != 1.  Broadband: ``rmgreen 3 <scnr>`` (SCNR).
+       denoise 0.6-0.8.  ``cc_denoise``: Cosmic Clarity Denoise instead (luminance / colour strengths = the same two settings; model ``cc_denoise_model``).  (This replaces any chroma shrinkage of our own.)
+4      palette (dual-band): Hubble_Palette_from_Dual-Band_OSC.py itself (siril-scripts, run headless by ``hubble_palette_worker.py``): HOO (default; Classic Ha = R,
+       OIII = (G + B) / 2, or Improved OIII = (G + B - 0.3 R) / 2) and the Hubble-like SHO / HSO / OSH / OHS / HOS with its synthetic SII, formula preset
+       ``hubble_formula`` (Classic / Improved / Advanced / NonLinear S2); Foraxx (The Coldest Nights) and HOO warm by Siril ``pm``; NBN (Blanshan / Cranfield,
+       Cuiv's script: ``nbn.py``) when ``oiii_boost`` != 1; SCNR (``scnr``) after the Ha-in-green palettes SHO / OHS.  Broadband: ``rmgreen 3 <scnr>`` (SCNR).
 5      local contrast under a background mask, after the noise reduction: Siril ``clahe`` (contrast limit 1.5 = Brecher's LHE limit), 150 px then 40 px tiles
        (Brecher M51 / IC 1848 / Sh2-140 scales), blended at 0.4 x ``local_contrast`` (0.5 -> 0.2 = the lowest published strengths 0.18-0.2).
 6      saturation: ``ght -sat`` (Siril's GHS saturation stretch, ghsastro) with D fitted so the subject's mean HSL saturation is multiplied by the ``saturation`` setting, under the
@@ -74,6 +77,22 @@ STAR_STRETCH = 5.0                 # Seti Astro Star Stretch amount (0-8, defaul
 MASK_SIGMA = 8.0                   # px, smoothing of the lightness the nebula / local contrast masks are taken from
 MASK_K = 3.0                       # the subject = more than 3 sigma of the smoothed sky scatter above the sky (finish.object_coverage)
 ALT_METHODS = ("autoghs", "modasinh", "autostretch", "hms")
+# Hubble_Palette_from_Dual-Band_OSC.py (siril-scripts processing/, Carlo Mollicone - AstroBOH, v2.0.4 read): the dual-band palette step runs the script itself
+# (hubble_palette_worker.py); its palettes (rgbcomp R G B of Ha / synthetic SII / OIII) and formula presets (Ha, OIII and SII from the OSC's R, G, B by pm)
+HUBBLE_SCRIPT = "processing/Hubble_Palette_from_Dual-Band_OSC.py"
+HUBBLE_PALETTES = {"hoo": "HOO", "hoo_improved": "HOO", "sho": "SHO", "hso": "HSO", "osh": "OSH", "ohs": "OHS", "hos": "HOS"}
+HUBBLE_MAPPING = {"HSO": ("Ha", "S2_synt", "Oiii"), "SHO": ("S2_synt", "Ha", "Oiii"), "OSH": ("Oiii", "S2_synt", "Ha"), "OHS": ("Oiii", "Ha", "S2_synt"),
+                  "HOS": ("Ha", "Oiii", "S2_synt"), "HOO": ("Ha", "Oiii", "Oiii")}
+HUBBLE_PRESETS = {"classic": "Classic", "improved": "Improved", "advanced": "Advanced", "nonlinear_s2": "NonLinear S2"}
+HUBBLE_FORMULAS = {      # the script's preset_formulas, verbatim (shown in the sidecar; the fallback runs them when the script itself cannot)
+    "Classic": {"HA": "R", "OIII": "(G + B) * 0.5", "S2": "(HA + OIII) * 0.5"},
+    "Improved": {"HA": "R", "OIII": "(G + B - 0.3 * R) * 0.5", "S2": "R * 0.3"},
+    "Advanced": {"HA": "R", "OIII": "max((G + B - 0.3 * R) * 0.5, 0)", "S2": "(R * 0.4 + ((G + B) * 0.1)) * 0.6"},
+    "NonLinear S2": {"HA": "R", "OIII": "(G + B) * 0.5", "S2": "pow(R, 1.4) * 0.3"},
+}
+HA_GREEN_PALETTES = ("sho", "ohs")
+CC_SHARPEN_AMOUNT = 0.5            # Cosmic Clarity Sharpen stellar / non-stellar amount: CosmicClarity_Native.py's GUI and CLI default
+  # Ha in the green channel: the palettes NarrowbandNormalization.py applies SCNR to
 SHARPEN_SIGMA = 1.0                # px, Siril unsharp sigma for the final sharpening (PixInsight UnsharpMask default 2.0 px std dev at 1x; 1.0 for 2.3-2.8"/px smart-scope data)
 SHARPEN_GAIN = 0.5                 # unsharp amount per unit of ``sharpen`` (0.25 -> 0.125: Brecher's MMT sharpening 0.03-0.06 per layer is the lower end)
 UNPURPLE_THRESH = 0.4              # Siril unpurple threshold (its default)
@@ -572,9 +591,29 @@ class Finisher:
         self._say("Noise reduction")
         dn = float(np.clip(p.get("luminance_denoise", 0.7), NXT_DN[0] - 0.1, 1.0))
         dc = float(np.clip(p.get("chroma_denoise", NXT_DC), 0.0, 1.0))
+        t0 = time.time()
+        if self.p.get("cc_denoise"):
+            # Cosmic Clarity Denoise (``cc_denoise``) instead of NoiseXTerminator on the stretched starless - its models' own domain (it denoises linear data through a
+            # temporary stretch, which on this pipeline's linear data came back with 2.2 x the flux round the stars; here it keeps it, 1.00).  Luminance strength =
+            # ``luminance_denoise``, colour strength = ``chroma_denoise`` (the two amounts NXT takes as --di / --dc); model = ``cc_denoise_model``, the script's
+            # Full / Lite / Walking Noise variants (--lite / --walking).  Chosen and unable to run: recorded, no other denoiser in its place.
+            model = str(self.p.get("cc_denoise_model") or "full").lower()
+            cli = ["--denoise-mode", "full", "--denoise-strength", f"{dn:g}", "--denoise-color", f"{dc:g}"] + {"lite": ["--lite"], "walking": ["--walking"]}.get(model, [])
+            try:
+                out, m = tools.cosmic_clarity.run("denoise", arr, cli, work=self.cwd, device=self.device, checkpoint=self.checkpoint,
+                                                  progress=(lambda i, n, msg: self.progress(msg) if self.progress else None))
+                out = np.clip(out, 0, 1)
+                self.record("noise reduction (stretched)", "cosmic clarity denoise", out, commands=[m["command"]], seconds=time.time() - t0,
+                            params={"denoise_strength": dn, "denoise_color": dc, "model": model, "backend": m.get("backend"), "device": m.get("device")},
+                            source=f"SetiAstro Cosmic Clarity AI4 denoise, {model} model (siril-scripts CosmicClarity_Native.py, full mode: mono model on the luminance, colour model on the chroma)")
+                return out
+            except Cancelled:
+                raise
+            except (ToolUnavailable, ToolError) as e:
+                self.record("noise reduction (stretched)", "cosmic clarity denoise", None, status="unavailable", note=str(e)[:200])
+                return arr
         src, dst = os.path.join(self.cwd, "nxt_in.fits"), os.path.join(self.cwd, "nxt_out.fits")
         fitsio.write_rgb(src, arr, self.header)
-        t0 = time.time()
         try:
             tools.rcastro.require("nxt")
             m = tools.rcastro.run("nxt", src, dst, device=self.device, progress=(lambda i, n, msg: self.progress(msg) if self.progress else None), checkpoint=self.checkpoint,
@@ -604,12 +643,52 @@ class Finisher:
                 if os.path.exists(f):
                     os.remove(f)
 
+    # ---- 3b. Cosmic Clarity Sharpen on the stretched image (cc_sharpen) -----------------------------------------------------------------------
+    def cc_sharpen(self, arr: np.ndarray) -> np.ndarray:
+        """Cosmic Clarity Sharpen (siril-scripts CosmicClarity_Native.py) on the stretched, recombined image (``cc_sharpen`` both / stellar / nonstellar = the script's
+        Both / Stellar Only / Non-Stellar Only, amounts ``cc_stellar_amount`` / ``cc_nonstellar_amount``, PSF measured per tile by its auto-PSF).  On the stretched image
+        the model keeps the flux (0.96 on Sh2-131); on this pipeline's linear data the script's own stretch / unstretch round trip came back with 6.2 x the flux
+        (bloated stars), so it is not offered there.  Independent of the linear deconvolution (``deconv_method``): with BlurXTerminator / GraXpert it runs in
+        addition, with deconv_method none instead.  Skipped in the preview (an AI step, like the noise reduction)."""
+        mode = {"both": "Both", "stellar": "Stellar Only", "nonstellar": "Non-Stellar Only"}.get(str(self.p.get("cc_sharpen") or "off").lower())
+        if mode is None:
+            return arr
+        if not self.external:
+            self.record("sharpening (Cosmic Clarity)", "none", None, status="skipped", note="preview: no AI steps")
+            return arr
+        self._say("Sharpening")
+        st_amt = round(float(np.clip(self.p.get("cc_stellar_amount", CC_SHARPEN_AMOUNT), 0.0, 1.0)), 3)
+        ns_amt = round(float(np.clip(self.p.get("cc_nonstellar_amount", CC_SHARPEN_AMOUNT), 0.0, 1.0)), 3)
+        cli = ["--sharpening-mode", mode, "--stellar-amount", f"{st_amt:g}", "--nonstellar-amount", f"{ns_amt:g}"]
+        t0 = time.time()
+        try:
+            out, m = tools.cosmic_clarity.run("sharpen", arr, cli, work=self.cwd, device=self.device, checkpoint=self.checkpoint,
+                                              progress=(lambda i, n, msg: self.progress(msg) if self.progress else None))
+            out = np.clip(out, 0, 1)
+            self.record("sharpening (Cosmic Clarity)", "cosmic clarity sharpen", out, commands=[m["command"]], seconds=time.time() - t0,
+                        params={"mode": mode, "stellar_amount": st_amt, "nonstellar_amount": ns_amt, "auto_psf": True, "backend": m.get("backend"), "device": m.get("device")},
+                        source="SetiAstro Cosmic Clarity AI4 sharpen (siril-scripts CosmicClarity_Native.py; its default amounts are 0.5, auto PSF)")
+            return out
+        except Cancelled:
+            raise
+        except (ToolUnavailable, ToolError) as e:
+            self.record("sharpening (Cosmic Clarity)", "cosmic clarity sharpen", None, status="unavailable", note=str(e)[:200])
+            return arr
+
     # ---- 4. colour: palette / SCNR -----------------------------------------------------------------------------------------
     def palette_name(self) -> str:
         pal = str(self.p.get("palette", "auto"))
         if pal in ("", "auto"):
             pal = ("hoo_improved" if self.p.get("oiii_unmix", True) else "hoo") if self.dual else "natural"
         return pal
+
+    def hubble_preset(self, pal: str) -> str:
+        """The Hubble palette script's formula preset: ``hubble_formula`` (classic / improved / advanced / nonlinear_s2); auto = Improved for ``hoo_improved`` or with
+        ``oiii_unmix`` (OIII cleaned of the Ha leak), else Classic (the script's default)."""
+        f = str(self.p.get("hubble_formula", "auto") or "auto").lower()
+        if f in HUBBLE_PRESETS:
+            return HUBBLE_PRESETS[f]
+        return "Improved" if (pal == "hoo_improved" or self.p.get("oiii_unmix", False)) else "Classic"
 
     def colour(self, arr: np.ndarray) -> np.ndarray:
         self._say("Colour")
@@ -618,7 +697,19 @@ class Finisher:
         boost = float(p.get("oiii_boost", 1.0))
         if self.dual and pal != "natural":
             ha = arr[0].copy()
-            out = self._palette_nbn(arr, boost) if (pal == "nbn" or abs(boost - 1.0) > 1e-6) else self._palette_pm(arr, pal)
+            if pal == "nbn" or abs(boost - 1.0) > 1e-6:
+                out = self._palette_nbn(arr, boost)
+            elif pal in HUBBLE_PALETTES:
+                out = self._palette_hubble(arr, pal)
+            else:
+                out = self._palette_pm(arr, pal)
+            scnr = float(np.clip(p.get("scnr", 0.0), 0.0, 1.0))
+            if pal in HA_GREEN_PALETTES and scnr > 0:
+                line = f"rmgreen 3 {scnr:.3f}"
+                t0 = time.time()
+                out = self.siril("scnr", out, [line], "SCNR")
+                self.record("SCNR", "siril rmgreen", out, commands=[line], seconds=time.time() - t0, params={"type": 3, "amount": scnr},
+                            source="Siril rmgreen on an Ha-in-green palette (NarrowbandNormalization.py applies SCNR to SHO-type palettes)")
             return self.ha_luminance(out, ha)
         scnr = float(np.clip(p.get("scnr", 0.0), 0.0, 1.0))
         if not self.dual and scnr > 0:
@@ -676,6 +767,43 @@ class Finisher:
                 os.remove(fp)
         self.record(f"palette ({pal})", "siril split / pm / rgbcomp", out, commands=lines, seconds=time.time() - t0, params={"palette": pal}, source=src)
         return out
+
+    def _palette_hubble(self, arr: np.ndarray, pal: str) -> np.ndarray:
+        """The dual-band palette by Hubble_Palette_from_Dual-Band_OSC.py itself (siril-scripts, Carlo Mollicone - AstroBOH), run headless in Siril by
+        ``hubble_palette_worker.py``: the starless image is loaded, the script splits it, derives Ha / OIII / synthetic SII with its formula preset (``pm``) and composes
+        the palette with ``rgbcomp``; its result file is the output.  When the script cannot run (no pyscript environment, Qt missing, ...) the step is recorded as
+        failed and the image is left as it is."""
+        t0 = time.time()
+        letters, preset = HUBBLE_PALETTES[pal], self.hubble_preset(pal)
+        forms = HUBBLE_FORMULAS[preset]
+        script = _community_script(HUBBLE_SCRIPT)
+        worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hubble_palette_worker.py")
+        result = f"hp_in_result_{letters}_{preset}"
+        line = f"pyscript {worker} --script {script} --palette {letters} --preset {preset.replace(' ', '_')}"
+        params = {"palette": letters, "preset": preset, "Ha": forms["HA"], "OIII": forms["OIII"], "SII (synthetic)": forms["S2"],
+                  "rgb": " / ".join(HUBBLE_MAPPING[letters])}
+        src = (f"Hubble_Palette_from_Dual-Band_OSC.py v2.0.4 (Carlo Mollicone - AstroBOH, siril-scripts): {letters} = R {HUBBLE_MAPPING[letters][0]}, "
+               f"G {HUBBLE_MAPPING[letters][1]}, B {HUBBLE_MAPPING[letters][2]}; preset {preset}: Ha = {forms['HA']}, OIII = {forms['OIII']}, SII = {forms['S2']}")
+        try:
+            if not script:
+                raise SirilError(f"siril-scripts' {HUBBLE_SCRIPT} is missing")
+            out = self.siril("hp", arr, [line], "Hubble palette", out=result)
+            self.record(f"palette ({pal})", "siril pyscript Hubble_Palette_from_Dual-Band_OSC.py", out, commands=[line], seconds=time.time() - t0,
+                        params=params, source=src)
+            return out
+        except (SirilError, OSError) as e:
+            # the palette chosen is the script's: when it cannot run, that is recorded and the image keeps its colours (nothing else runs in its place)
+            self.record(f"palette ({pal})", "siril pyscript Hubble_Palette_from_Dual-Band_OSC.py", None, status="failed", commands=[line], params=params,
+                        note=str(e).splitlines()[0][:200], source=src)
+            return arr
+        finally:
+            import glob as _glob
+            for pat in ("Ha.fit", "Oiii.fit", "S2_synt.fit", "Temporary_Image_*.fit", "hp_in_result_*.fit", "hp_?.fit", "hpf_*.fit"):
+                for f in _glob.glob(os.path.join(self.cwd, pat)):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
 
     def _palette_nbn(self, arr: np.ndarray, boost: float) -> np.ndarray:
         t0 = time.time()
@@ -928,6 +1056,7 @@ class Finisher:
         out = self.recombine(s, t)
         if t is not None:
             out = self.halos(out)
+        out = self.cc_sharpen(out)
         out = self.grade(out)
         out = self.finalise(out)
         self.info.update(chain=self.records, starless=starless_display)

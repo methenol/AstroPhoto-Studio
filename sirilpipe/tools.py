@@ -1,4 +1,4 @@
-"""Wrappers for the external tools: GraXpert, StarNet2 and the RC-Astro CLI (BXT / NXT / SXT).
+"""Wrappers for the external tools: GraXpert, StarNet2, the RC-Astro CLI (BXT / NXT / SXT) and Cosmic Clarity (SetiAstro, via siril-scripts).
 
 Every wrapper talks to its tool as a separate process (that is what the tools' licences allow for
 StarNet2 and RC-Astro) and raises :class:`ToolUnavailable` when the tool cannot be used right now
@@ -80,6 +80,26 @@ def _cuda_lib_dirs() -> list[str]:
     return out
 
 
+def _system_site_packages() -> str | None:
+    """The site-packages folder of the app's own Python that holds PyTorch (installed with IMAGEMM=cuda|cpu), found without importing it."""
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("torch")
+    except (ImportError, ValueError):
+        return None
+    if not spec or not spec.origin:
+        return None
+    return os.path.dirname(os.path.dirname(spec.origin))
+
+
+def _system_nvidia_lib_dirs() -> list[str]:
+    sp = _system_site_packages()
+    root = os.path.join(sp, "nvidia") if sp else ""
+    if not root or not os.path.isdir(root):
+        return []
+    return [os.path.join(root, p, "lib") for p in sorted(os.listdir(root)) if os.path.isdir(os.path.join(root, p, "lib"))]
+
+
 def tool_env(extra: dict | None = None, kind: str = "graxpert") -> dict:
     """Environment of a tool subprocess: HOME set, and the CUDA libraries on LD_LIBRARY_PATH *per tool*:
 
@@ -95,6 +115,10 @@ def tool_env(extra: dict | None = None, kind: str = "graxpert") -> dict:
     tool_dirs = [d for d in config.get("TOOL_LD_LIBRARY_PATH").split(os.pathsep) if d]
     if kind == "starnet":
         dirs = []
+    elif kind == "cosmic_clarity":
+        # the pyscript virtualenv's Python with the image's PyTorch (CosmicClarity.link_system_torch): onnxruntime-gpu's CUDA provider (DarkStar is ONNX-only)
+        # must load the SAME cuBLAS / cuDNN as the torch already in the process, so the nvidia wheels next to that torch, not GraXpert's
+        dirs = _system_nvidia_lib_dirs()
     elif kind == "rcastro":
         dirs = tool_dirs + _cuda_lib_dirs()
     else:
@@ -584,6 +608,228 @@ class StarNet:
         return {"ok": exe is not None, "version": self.version() if exe else None,
                 "path": os.path.dirname(exe) if exe else self.install_dirs()[-1],
                 "licence_accepted": self.licence_accepted()}
+
+
+# --------------------------------------------------------------------------- Cosmic Clarity (SetiAstro, through siril-scripts)
+
+CC_SCRIPT = "processing/CosmicClarity_Native.py"     # siril-scripts: "Cosmic Clarity AI4 for Siril" (A. Knagg-Baugh, engines and models (c) SetiAstro), 1.2.0 read
+CC_MODES = ("sharpen", "denoise", "superres", "darkstar", "satellite")
+CC_SYSTEM_SITE_PTH = "zz_astrophoto_system_site.pth"
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _script_literal(path: str, name: str):
+    """A top-level literal assignment of a script (``MODEL_FILES``, ``MODE_MODELS``, ``VERSION``), read without importing it (the import needs torch and Qt)."""
+    import ast
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    for node in tree.body:
+        target = node.target if isinstance(node, ast.AnnAssign) else (node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else None)
+        if isinstance(target, ast.Name) and target.id == name and node.value is not None:
+            return ast.literal_eval(node.value)
+    raise KeyError(f"{name} not found in {path}")
+
+
+class CosmicClarity:
+    """SetiAstro's Cosmic Clarity AI4 models (Sharpen, Denoise, Super-Resolution, DarkStar star removal, satellite-trail removal), run by siril-scripts'
+    ``CosmicClarity_Native.py`` - the community script itself, its processing functions called headless by ``cosmic_clarity_worker.py`` in the pyscript virtualenv (see
+    that file for why not its CLI: DarkStar's models are ONNX-only on the mirror and its ``--stars-only`` branch is broken).  The models are the ones its *Download Models*
+    button installs (HuggingFace mirror of SetiAstro's files, ~2.4 GB) in ``<Siril user data>/cosmic_clarity``.  PyTorch is the image's own (IMAGEMM=cuda|cpu), made
+    visible to the virtualenv by a ``.pth`` file; onnxruntime(-gpu) likewise (Dockerfile)."""
+
+    def script(self) -> str | None:
+        for root in (os.path.join(_data_home(), "siril-scripts"), os.path.join(config.get("SIRIL_DATA") or "/opt/siril-data", "siril-scripts")):
+            p = os.path.join(root, CC_SCRIPT)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def venv_python(self) -> str:
+        return os.path.join(_data_home(), "siril", "venv", "bin", "python")
+
+    def models_dir(self) -> str:
+        return os.path.join(_data_home(), "siril", "cosmic_clarity")       # = get_siril_userdatadir() / "cosmic_clarity", where the script looks
+
+    def _venv_site(self) -> str | None:
+        import glob as _glob
+        hits = sorted(_glob.glob(os.path.join(_data_home(), "siril", "venv", "lib", "python3*", "site-packages")))
+        return hits[-1] if hits else None
+
+    # ---- environment
+    def ensure_venv(self, progress: Progress | None = None, checkpoint: Callable[[], None] | None = None) -> None:
+        """Siril creates the pyscript virtualenv (with sirilpy) on its first ``pyscript``: run one when it is not there yet."""
+        if os.path.exists(self.venv_python()):
+            return
+        from .siril import SirilRunner
+        work = tempfile.mkdtemp(prefix="pyscript_venv_", dir=config.home_dir())
+        try:
+            with open(os.path.join(work, "venv_probe.py"), "w") as f:
+                f.write("import sirilpy\nprint('pyscript virtualenv ready')\n")
+            if progress:
+                progress(0, 1, "Creating Siril's Python environment")
+            SirilRunner(work, checkpoint=checkpoint).run("pyscript venv_probe.py\n", "pyscript-venv")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        if not os.path.exists(self.venv_python()):
+            raise ToolUnavailable("cosmic clarity", "Siril did not create its Python environment (pyscript)")
+
+    def link_system_torch(self) -> bool:
+        """Make the image's PyTorch / torchvision / onnxruntime importable in the pyscript virtualenv: a ``.pth`` file there appends the app's site-packages to its
+        ``sys.path`` (after the virtualenv's own packages, which keep precedence).  Without it sirilpy's ``TorchHelper.ensure_torch()`` - called by the script on import -
+        would download a second PyTorch (several GB) into the virtualenv.  False when the image has no PyTorch (IMAGEMM=off): the script's own installer then runs."""
+        site, sp = self._venv_site(), _system_site_packages()
+        if not site or not sp:
+            return False
+        path = os.path.join(site, CC_SYSTEM_SITE_PTH)
+        want = sp + "\n"
+        try:
+            with open(path) as f:
+                if f.read() == want:
+                    return True
+        except OSError:
+            pass
+        with open(path, "w") as f:
+            f.write(want)
+        return True
+
+    # ---- models
+    def _tables(self) -> tuple[dict, dict, str]:
+        sc = self.script()
+        if not sc:
+            raise ToolUnavailable("cosmic clarity", f"siril-scripts' {CC_SCRIPT} is missing")
+        key = (sc, os.path.getmtime(sc))
+        if getattr(self, "_tables_key", None) != key:             # /api/tools asks often; the script is 4000 lines
+            self._tables_val = (_script_literal(sc, "MODEL_FILES"), _script_literal(sc, "MODE_MODELS"), str(_script_literal(sc, "VERSION")))
+            self._tables_key = key
+        return self._tables_val
+
+    def models(self) -> dict[str, str | bool]:
+        """Per mode: "torch" (its PyTorch weights are installed), "onnx" (only its ONNX files, run through onnxruntime) or False."""
+        import importlib.util
+        try:
+            files, modes, _ = self._tables()
+        except (ToolUnavailable, OSError, KeyError, SyntaxError, ValueError):
+            return {m: False for m in CC_MODES}
+        d = self.models_dir()
+        ort = importlib.util.find_spec("onnxruntime") is not None
+        out: dict[str, str | bool] = {}
+        for m in CC_MODES:
+            keys = modes.get(m, [])
+            if keys and all(os.path.exists(os.path.join(d, files[k])) for k in keys):
+                out[m] = "torch"
+            elif keys and ort and all(k + "_onnx" in files and os.path.exists(os.path.join(d, files[k + "_onnx"])) for k in keys):
+                out[m] = "onnx"
+            else:
+                out[m] = False
+        if out.get("satellite") and importlib.util.find_spec("torchvision") is None:
+            out["satellite"] = False                                 # its trail detectors are torchvision ResNet18 / MobileNetV2
+        return out
+
+    def ready(self, mode: str) -> bool:
+        return bool(self.models().get(mode)) and _system_site_packages() is not None and self.script() is not None
+
+    def require(self, mode: str) -> None:
+        if not self.script():
+            raise ToolUnavailable("cosmic clarity", f"siril-scripts' {CC_SCRIPT} is missing")
+        if _system_site_packages() is None:
+            raise ToolUnavailable("cosmic clarity", "this image has no PyTorch (build it with IMAGEMM=cuda or cpu)")
+        if not self.models().get(mode):
+            raise ToolUnavailable(f"cosmic clarity {mode}", "models not installed (download them in the Tools panel)")
+
+    def download_models(self, progress: Progress | None = None, checkpoint: Callable[[], None] | None = None, **_) -> dict:
+        """The script's own *Download Models* (``download_models`` + ``install_models_zip``, run by ``cosmic_clarity_models.py``)."""
+        sc = self.script()
+        if not sc:
+            raise ToolUnavailable("cosmic clarity", f"siril-scripts' {CC_SCRIPT} is missing")
+        self.ensure_venv(progress, checkpoint)
+        self.link_system_torch()
+        tmp = os.path.join(config.home_dir(), ".cache", "cosmic_clarity_install")
+        os.makedirs(tmp, exist_ok=True)
+        argv = [self.venv_python(), os.path.join(_PKG_DIR, "cosmic_clarity_models.py"), "--script", sc, "--models-dir", self.models_dir()]
+
+        def on_line(ln: str):
+            m = re.search(r"Downloading\D*(\d+)%", ln)
+            if progress and m:
+                progress(int(m.group(1)), 100, f"Cosmic Clarity models: {ln.strip()}")
+            elif progress and ln.strip() and not ln.startswith(" "):
+                progress(99 if "Install" in ln or "Extract" in ln else 0, 100, f"Cosmic Clarity models: {ln.strip()[:120]}")
+
+        try:
+            rc, tail = run_streaming(argv, env=tool_env({"TMPDIR": tmp}, kind="cosmic_clarity"), on_line=on_line, checkpoint=checkpoint)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if rc != 0:
+            raise ToolError("cosmic clarity", "model download failed: " + " | ".join(tail[-3:]), rc, "\n".join(tail))
+        return {"path": self.models_dir(), "models": self.models()}
+
+    # ---- run
+    def run(self, mode: str, arr: np.ndarray, cli_args: list[str], *, work: str, device: str | None = "auto", progress: Progress | None = None,
+            checkpoint: Callable[[], None] | None = None) -> tuple[np.ndarray, dict]:
+        """One operation on ``arr`` (C, H, W) in [0, 1]: ``cli_args`` are the script's own command-line options for ``--mode <mode>``; returns ((C, H', W') float32,
+        meta with the command line, the backend / device it ran on and its parameters)."""
+        self.require(mode)
+        self.ensure_venv(progress, checkpoint)
+        self.link_system_torch()
+        os.makedirs(work, exist_ok=True)
+        fin, fout, finfo = (os.path.join(work, f"cc_{mode}_{n}") for n in ("in.npy", "out.npy", "info.json"))
+        x = np.clip(np.nan_to_num(np.asarray(arr, np.float32)), 0.0, 1.0)
+        if x.ndim == 2:
+            x = x[None]
+        np.save(fin, np.ascontiguousarray(np.moveaxis(x if x.shape[0] == 3 else np.repeat(x[:1], 3, 0), 0, -1)))
+        cli = ["--mode", mode, *[str(a) for a in cli_args]]
+        if str(device or "auto").lower() == "cpu":
+            cli.append("--cpu")
+        argv = [self.venv_python(), os.path.join(_PKG_DIR, "cosmic_clarity_worker.py"), "--script", self.script(), "--models-dir", self.models_dir(),
+                "--input", fin, "--output", fout, "--info", finfo, "--", *cli]
+
+        def on_line(ln: str):
+            m = re.match(r"progress: (\d+)/(\d+) (.*)", ln)
+            if progress and m:
+                progress(int(m.group(1)), int(m.group(2)), f"Cosmic Clarity {mode}: {m.group(3)}")
+
+        t0 = time.time()
+        try:
+            rc, tail = run_streaming(argv, env=tool_env(kind="cosmic_clarity"), cwd=work, on_line=on_line, checkpoint=checkpoint)
+            if rc != 0 or not os.path.exists(fout):
+                errs = [ln for ln in tail if "Error" in ln or "ERROR" in ln] or tail[-3:]
+                raise ToolError(f"cosmic clarity {mode}", f"failed (exit {rc}): " + " | ".join(errs[-3:]), rc, "\n".join(tail))
+            out = np.moveaxis(np.load(fout), -1, 0).astype(np.float32)
+            info = {}
+            if os.path.exists(finfo):
+                with open(finfo) as f:
+                    info = json.load(f)
+        finally:
+            for p in (fin, fout, finfo):
+                if os.path.exists(p):
+                    os.remove(p)
+        if x.shape[0] == 1:
+            out = out[:1]
+        meta = {"tool": f"cosmic clarity {mode}", "command": f"{os.path.basename(CC_SCRIPT)} " + " ".join(cli), "script_version": info.get("script_version"),
+                "backend": info.get("backend"), "device": info.get("device"), "onnx_providers": info.get("onnx_providers"), "params": info.get("params"),
+                "seconds": round(time.time() - t0, 1)}
+        if "trails_detected" in info:
+            meta["trails_detected"] = info["trails_detected"]
+        return out, meta
+
+    def status(self) -> dict:
+        import importlib.util
+        sc = self.script()
+        try:
+            _, _, version = self._tables()
+        except (ToolUnavailable, OSError, KeyError, SyntaxError, ValueError):
+            version = None
+        models = self.models()
+        torch_ok = _system_site_packages() is not None
+        ok = bool(sc) and torch_ok and any(models.values())
+        st = {"ok": ok, "version": version, "script": sc, "models_dir": self.models_dir(), "models": models, "torch": torch_ok,
+              "onnxruntime": importlib.util.find_spec("onnxruntime") is not None, "torchvision": importlib.util.find_spec("torchvision") is not None}
+        if not sc:
+            st["reason"] = f"siril-scripts' {CC_SCRIPT} is missing"
+        elif not torch_ok:
+            st["reason"] = "this image has no PyTorch (build it with IMAGEMM=cuda or cpu)"
+        elif not any(models.values()):
+            st["reason"] = "models not downloaded"
+        return st
 
 
 # --------------------------------------------------------------------------- RC-Astro
@@ -1125,10 +1371,11 @@ class GaiaCatalog:
 graxpert = GraXpert()
 starnet = StarNet()
 rcastro = RCAstro()
+cosmic_clarity = CosmicClarity()
 gaia = GaiaCatalog()
 
 
 def tools_status() -> dict:
     """The ``GET /api/tools`` document (DESIGN section 5)."""
     return {"siril": siril_status(), "graxpert": graxpert.status(), "starnet": starnet.status(),
-            "rcastro": rcastro.status(), "gaia": gaia.status()}
+            "rcastro": rcastro.status(), "cosmic_clarity": cosmic_clarity.status(), "gaia": gaia.status()}
