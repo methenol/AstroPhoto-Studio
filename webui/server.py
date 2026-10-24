@@ -75,25 +75,37 @@ STACK_DEFAULTS = {
     "pattern_correction": True,
     "denoise_iters": 2000,
     "ai_deconvolution": True,
-    "deconv_method": "auto",   # auto = BlurXTerminator when licensed, else Siril RL; imagemm = ImageMM (needs torch)
-    "imagemm_r": 1,
-    "imagemm_sigma": 0.0,
-    "imagemm_robust": True,
-    "imagemm_delta": 2.0,
-    "imagemm_kappa": 2.0,
-    "imagemm_epsilon": 1e-6,
-    "imagemm_stop": "c15",
-    "imagemm_max_iters": 2000,
-    "imagemm_psf": "empirical",
-    "imagemm_groups": 0,
-    "imagemm_accelerate": False,
-    "imagemm_n2n": True,
-    "imagemm_point_sources": False,   # MCS / STARRED: stars as point sources at the latent resolution
-    "imagemm_starlet": 0.0,        # STARRED: starlet l1 weight of the extended channel (1-3), with point sources
-    "imagemm_local_psf": False,    # radial PSF correction from each cutout's own bright stars (Magain et al. 1998)
-    "imagemm_psf_steps": 0,        # myopic kernel steps (blind RL, Fish et al. 1995) during the restoration; 0 = off
-    "imagemm_tv": 0.0,             # RL-TV lambda of the latent (Dey et al. 2006; Laasmaa et al. 2011: optimum ~ 50 / SNR); 0 = off
-    "imagemm_background": False,   # False: x >= 0 above the fitted sky (lower bound at the background, LBCA); "sky": x >= -sky
+    "deconv_method": "auto",   # auto = BlurXTerminator when licensed, else Siril RL; imagemm = VeraLux ImageMM (needs torch)
+    # VeraLux ImageMM (sirilpipe/veralux_imagemm.py; the script's GUI defaults).  The 1.x ImageMM keys (imagemm_delta,
+    # imagemm_stop, imagemm_max_iters, imagemm_n2n, ...) stay accepted and are ignored.
+    "imagemm_r": 1,                # super-resolution factor (1..3); restored_resolution sets it too
+    "imagemm_sigma": 0.0,          # SR PSF sigma (latent px); 0 = the script's 1.0
+    "imagemm_iterations": 150,     # cap; the paper's Appendix-C rule stops it (M 31: 92); the script's GUI default is 20
+    "imagemm_huber": 0.05,         # Huber delta (normalised units)
+    "imagemm_kappa": 2.0,          # update clipping [1/kappa, kappa] (Eq. 9)
+    "imagemm_mu": 0.1,             # effective-pixel fraction of the stopping rule
+    "imagemm_epsilon": 1e-5,       # stopping epsilon
+    "imagemm_formal": False,       # formal mode (paper assumptions): zero padding, no PSF TV, v = shot y + read^2
+    "imagemm_shot_noise": 1.0,     # formal mode: shot-noise scale
+    "imagemm_read_noise": 0.0,     # formal mode: read noise (normalised units)
+    "imagemm_saturation": 0.0,     # saturation level of the frames; 0 = measured on the raw frames
+    # the pipeline's fixes to the script (sirilpipe/veralux_imagemm.py docstring), measured on IC 1805 / M 42 crops
+    "imagemm_variance": "model",   # variance at the model prediction ("data": the script's, noisy on faint skies)
+    "imagemm_psf_channels": True,  # one PSF per colour channel (the script: green for all)
+    "imagemm_lower_bound": "local",  # latent >= the local background - 3 sigma (LBCA): no dark moat round stars; "global", False
+    "imagemm_cosmetic": True,      # Siril find_cosme on every sub: warm / cold pixels (ImageMM has no rejection)
+    "imagemm_latent_sigma": 1.0,   # g_sigma of the latent (Eq. 11; the paper's 1 px at r = 1, the script's 0.45)
+    "imagemm_bound_sigma": 1.0,    # lower bound's margin below the local background (latent sigma): 3 left rings, 0 a halo
+    "imagemm_saturated_points": False,  # saturated cores as point sources at iteration 10 (superseded by the photometry)
+    "imagemm_saturated_photometry": True,  # saturated cores' colour from their unsaturated wings (PSF photometry), shape g_sigma
+    "imagemm_psf_asymmetry": True,  # the optics' fixed one-sided wing (m = 1, 2) from the frames' mean, in every kernel
+    "imagemm_psf_radial_wings": True,  # the PSF's extended wing joined from unsaturated + saturated stars (Infante-Sainz 2020)
+    "imagemm_bloom_grow": 4,       # px round each frame's saturated pixels treated as missing (charge spill / non-linearity)
+    "imagemm_point_init": True,    # saturated stars start as points (the censored cores left the starting halo in place)
+    "imagemm_censor_saturated": False,  # saturated pixels as censored data (Whyte et al.) instead of missing (the paper's mask)
+    "imagemm_reference_psf": True, "imagemm_photometry": True, "imagemm_noise_model": "ptc", "imagemm_huber_sigma": 2.0,
+    "imagemm_subsky": False,       # the script's per-frame seqsubsky (removes part of large targets)
+    "imagemm_n2n": True,           # v1 contract field (reported by /api/v1/profiles "effective"); no effect
     "n2n_split": "alternate",
     "n2n_loss": "asinh_mse",
     "star_remover": True,
@@ -118,13 +130,11 @@ def default_scale(deconv_method: str) -> float:
 # stack_params map onto the Siril backend's restoration choices:
 #   deconv_method  auto    = BlurXTerminator when licensed, else Siril makepsf + Richardson-Lucy
 #                  rl      = Siril Richardson-Lucy even when BlurXTerminator is licensed
-#                  imagemm = ImageMM multi-frame restoration of the registered subs (slow; needs IMAGEMM=cuda)
+#                  imagemm = VeraLux ImageMM multi-frame restoration of the subs (slow; needs IMAGEMM=cuda)
 #                  none    = no deconvolution
-# ai_deconvolution is accepted for compatibility and has no effect; imagemm_n2n switches ImageMM's Noise2Noise pass.
+# ai_deconvolution and imagemm_n2n (the 1.x ImageMM's Noise2Noise pass) are accepted for compatibility and have no effect.
 PROFILES = {
     "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
-    # (with its Noise2Noise pass, the stage's default: without it the latent's sky noise, clipped at the x >= 0
-    # bound, is left to the finishing denoiser, which smears it - IC 1805)
     "imagemm": {"label": "ImageMM: multi-frame restoration of every registered sub (slow, GPU)",
                 "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-imagemm": {"label": "ImageMM multi-frame restoration (same as imagemm with this backend)",

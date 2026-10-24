@@ -1,6 +1,6 @@
-"""The ImageMM stage on Siril's registered frames: frame loading / placement / masks, parameter mapping,
-availability without torch, the Session wiring and a small end-to-end restoration on synthetic frames
-(that one needs torch and is skipped without it)."""
+"""The VeraLux ImageMM stage: parameters, availability without torch, Siril sequence files (the stack's transforms
+copied to the new frames), raw-frame saturation, frame placement / store, the Session wiring, and run() end to end on
+synthetic registered frames (the Siril steps faked; needs torch)."""
 from __future__ import annotations
 
 import json
@@ -29,30 +29,118 @@ def test_available_does_not_import_torch_at_module_import():
     assert "import torch" not in head and "import astrophoto" not in head
 
 
-def test_map_params_defaults_and_keys():
+def test_map_params_defaults_are_the_scripts_gui_defaults_plus_the_fixes():
     kw = S.map_params({})
-    assert kw == {"r": 1, "sigma": 1.0, "psf_model": "empirical", "n_groups": 0, "robust": True, "delta": 2.0,
-                  "kappa": 2.0, "epsilon": 1e-6, "stop": "c15", "max_iters": 1000, "accelerate": False,
-                  "background": False, "n2n": True, "tv": 0.0, "point_sources": False, "starlet": 0.0, "psf_steps": 0, "local_psf": False}
-    assert S.map_params({"imagemm_n2n": False, "imagemm_background": "sky"}) == {**kw, "n2n": False, "background": "sky"}
-    kw = S.map_params({"imagemm_r": 2, "imagemm_kappa": 3, "imagemm_delta": 1.5, "imagemm_epsilon": 1e-5,
-                       "imagemm_stop": "flux", "imagemm_max_iters": 200, "imagemm_psf": "moffat",
-                       "imagemm_robust": False})
-    assert kw["r"] == 2 and kw["sigma"] == 1.1                     # the paper's g_sigma at r = 2
-    assert (kw["kappa"], kw["delta"], kw["epsilon"]) == (3.0, 1.5, 1e-5)
-    assert kw["stop"] == "flux" and kw["max_iters"] == 200 and kw["psf_model"] == "moffat" and kw["robust"] is False
-    assert S.map_params({"imagemm_sigma": 1.3, "imagemm_r": 1})["sigma"] == 1.3
-    assert S.map_params({"imagemm_stop": "nonsense"})["stop"] == "c15"
-    assert S.map_params({"imagemm_r": 9})["r"] == 3 and S.map_params({"imagemm_r": 0})["r"] == 1
-    assert S.map_params(None)["r"] == 1
+    assert kw == {"iterations": 150, "kappa": 2.0, "huber_delta": 0.05, "mu": 0.1, "stop_epsilon": 1e-5,
+                  "saturation_level": None, "shot_noise_scale": 1.0, "read_noise": 0.0, "psf_sigma": 1.0,
+                  "formal_mode": False, "r": 1,
+                  # the pipeline's fixes (veralux_imagemm module docstring), on by default
+                  "variance_from": "model", "per_channel_psf": True, "latent_sigma": 1.0, "lower_bound": "local",
+                  "reference_psf": True, "photometry": True, "noise_model": "ptc", "huber_sigma": 2.0, "halo": False,
+                  "saturated_points": False, "saturated_photometry": True, "psf_wings": False, "psf_asymmetry": True, "psf_radial_wings": True,
+                  "bound_sigma": 1.0, "bloom_grow": 4, "point_init": True, "censor_saturated": False}
+    # the 1.x keys are ignored
+    assert S.map_params({"imagemm_delta": 2.0, "imagemm_max_iters": 2000, "imagemm_n2n": True}) == kw
 
 
-def test_resampling_of_stack_meta():
-    rs = S.resampling_of({"mode": "drizzle", "scale": 1.0, "drizzle": {"scale": 1.0, "pixfrac": 1.0, "kernel": "square"}})
-    assert rs == {"mode": "drizzle", "scale": 1.0, "pixfrac": 1.0, "kernel": "square", "framing": "max"}
-    assert S.resampling_of({"mode": "demosaic", "scale": 1.0})["mode"] == "demosaic"
-    # the frames are registered again with the stack's own framing
-    assert S.resampling_of({"mode": "demosaic", "scale": 1.0, "framing": "current"})["framing"] == "current"
+def test_map_params_keys_ranges_and_types():
+    kw = S.map_params({"imagemm_r": 2, "imagemm_iterations": "35", "imagemm_huber": 0.1, "imagemm_kappa": 3,
+                       "imagemm_mu": 0.2, "imagemm_epsilon": 1e-6, "imagemm_sigma": 0, "imagemm_formal": "false",
+                       "imagemm_saturation": 0.06})
+    assert kw["r"] == 2 and kw["iterations"] == 35 and kw["huber_delta"] == 0.1 and kw["kappa"] == 3.0
+    assert kw["mu"] == 0.2 and kw["stop_epsilon"] == 1e-6 and kw["psf_sigma"] == 1.0 and kw["formal_mode"] is False
+    assert kw["saturation_level"] == 0.06
+    kw = S.map_params({"imagemm_r": 9, "imagemm_iterations": 5000, "imagemm_kappa": 0.5, "imagemm_formal": True})
+    assert kw["r"] == 3 and kw["iterations"] == 200 and kw["kappa"] == 1.01 and kw["formal_mode"] is True
+
+
+# --------------------------------------------------------------------------- sequences
+SRC_SEQ = """#Siril sequence file. Contains list of images, selection, registration data and statistics
+#S 'sequence_name' start_index nb_images nb_selected fixed_len reference_image version variable_size fz_flag drizzle
+S 'pp_light_' 1 4 4 5 2 6 0 0 0
+L 1
+I 1 1
+I 2 1
+I 3 1
+I 4 1
+R0 7.7 11.1 0.72 0 0.0005 246 H 1 0 -6 0 1 1.5 0 0 1
+R0 7.5 10.5 0.75 0 0.0005 255 H 1 0 -9 0 1 6.9 0 0 1
+R0 7.4 10.1 0.75 0 0.0005 259 H 1 0 0 0 1 0 0 0 1
+R0 7.4 10.1 0.75 0 0.0005 259 H 1 0 4 0 1 -2 0 0 1
+"""
+
+
+def test_read_seq_and_registration_of(tmp_path):
+    f = tmp_path / "pp_light_.seq"
+    f.write_text(SRC_SEQ)
+    seq = S.read_seq(str(f))
+    assert seq["nums"] == [1, 2, 3, 4] and list(seq["R"]) == [0] and len(seq["R"][0]) == 4
+    reg, ref = S.registration_of(seq)
+    assert ref == 3 and reg[0][2].endswith("H 1 0 -9 0 1 6.9 0 0 1")
+
+
+def test_write_registration_into_a_siril_output_sequence(tmp_path):
+    src = tmp_path / "pp_light_.seq"
+    src.write_text(SRC_SEQ)
+    reg, ref = S.registration_of(S.read_seq(str(src)))
+    dst = tmp_path / "bkg_imm_pp_light_.seq"       # as seqsubsky writes it: frames 2..4 kept their numbers
+    dst.write_text("#Siril sequence file.\nS 'bkg_imm_pp_light_' 2 3 3 5 -1 6 0 0 0\nL -1\nI 2 1\nI 3 1\nI 4 1\n")
+    S.write_registration(str(dst), [2, 3, 4], reg, ref, 3)
+    out = S.read_seq(str(dst))
+    assert out["S"][6] == "1" and "L 3" in out["lines"]                 # frame 3 (the reference) is image 1 here
+    assert out["R"][0] == [reg[0][2], reg[0][3], reg[0][4]]
+    with pytest.raises(RuntimeError):
+        S.write_registration(str(dst), [1, 3, 4], reg, ref, 3)        # not the frames of that sequence
+
+
+def test_write_registration_of_a_new_mono_sequence(tmp_path):
+    src = tmp_path / "pp_light_.seq"
+    src.write_text(SRC_SEQ.replace("L 1", "L 3").replace("R0 ", "R1 "))
+    reg, ref = S.registration_of(S.read_seq(str(src)))
+    S.write_registration(str(tmp_path / "immsat_.seq"), [1, 4], reg, ref, 1, name="immsat", mono_layer=True)
+    out = S.read_seq(str(tmp_path / "immsat_.seq"))
+    assert out["S"][1] == "'immsat_'" and out["S"][2] == "1" and out["S"][3] == "2" and out["S"][6] == "0"
+    assert out["nums"] == [1, 4] and list(out["R"]) == [0] and out["R"][0][1].startswith("R0 ")
+
+
+# --------------------------------------------------------------------------- saturation of the raw frames
+def _raw(tmp_path, name, plateau, ceiling=4095, extra_peak=None):
+    a = np.full((40, 50), 300, np.uint16)
+    a[35, 45] = ceiling                              # a hot pixel: every frame, alone
+    if plateau:
+        a[10:13, 20:23] = ceiling
+        a[10, 23] = ceiling - 10                     # 0.9976 x ceiling: saturated too (>= 0.995)
+        a[30, 30] = int(ceiling * 0.99)              # bright but not saturated
+    if extra_peak:
+        a[5, 5] = extra_peak
+    p = str(tmp_path / name)
+    fits.PrimaryHDU(a).writeto(p, overwrite=True)
+    return p
+
+
+def test_raw_saturation_needs_a_plateau_and_uses_the_sensor_ceiling(tmp_path):
+    paths = {1: _raw(tmp_path, "a.fits", True), 2: _raw(tmp_path, "b.fits", False, extra_peak=4000),
+             3: str(tmp_path / "missing.fits")}
+    ceiling, sat, info = S.raw_saturation(paths)
+    assert ceiling == 4095 and info["unreadable"] == 1 and info["frames_with_plateau"] == 1
+    assert len(sat[1]) == 11 and [10, 23] in sat[1].tolist() and [30, 30] not in sat[1].tolist()   # (+ the hot pixel)
+    assert sat[2].tolist() == [[35, 45]]              # only the hot pixel: 4000 < 0.995 x 4095 is a peak, not saturation
+    assert S.raw_saturation({2: paths[2]})[0] is None  # no plateau anywhere: no saturation
+
+
+def test_confirm_on_calibrated_drops_hot_pixels_and_finds_the_row_order(tmp_path):
+    cal = np.full((40, 50), 0.001, np.float32)
+    cal[10:13, 20:23] = 0.06                                   # the star: still saturated after calibration
+    cal[35, 45] = 0.0012                                       # the hot pixel: removed by the dark / cosmetic correction
+    p = str(tmp_path / "pp_light_00001.fit")
+    fits.PrimaryHDU(cal).writeto(p)
+    rc = np.array([[r, c] for r in range(10, 13) for c in range(20, 23)] + [[35, 45]], np.int32)
+    kept, same, info = S.confirm_on_calibrated({1: rc}, {1: p}, 4095.0)
+    assert same is True and len(kept[1]) == 9 and [35, 45] not in kept[1].tolist() and info["hot_pixels"] == 1
+    flipped = np.c_[39 - rc[:, 0], rc[:, 1]].astype(np.int32)            # a TOP-DOWN raw file
+    kept, same, _ = S.confirm_on_calibrated({1: flipped}, {1: p}, 4095.0)
+    assert same is False and len(kept[1]) == 9
+    assert S.confirm_on_calibrated({1: rc[-1:]}, {1: p}, 4095.0)[1] is None
 
 
 # --------------------------------------------------------------------------- frames
@@ -114,128 +202,6 @@ def test_read_frame_size_mismatch_is_an_error(tmp_path):
         S.read_frame(path, (0, 0, 5, 5), (0, 0, 60, 40))
 
 
-# --------------------------------------------------------------------------- masks
-def _drizzled(h=60, w=70, sat=0.06):
-    rng = np.random.default_rng(1)
-    y = (rng.normal(0.0003, 0.0001, (h, w, 3)) + 0.001).astype(np.float32)
-    y[:6] = 0                                  # outside the footprint
-    y[:, :4] = 0
-    y[30, 30, 0] = 0                           # a lattice hole inside the footprint (red)
-    y[31, 40, 2] = 0
-    y[40:43, 50:53] = np.float32(0.0605)       # a saturated plateau (all channels)
-    return y
-
-
-def test_measurement_masks():
-    y = _drizzled()
-    m = S.measurement_masks(y, 0.0605)
-    assert not m["data"][:6].any() and m["data"][20:, 10:].mean() > 0.99
-    assert m["hole"][30, 30, 0] and m["hole"][31, 40, 2] and not m["hole"][2, 10, 0]   # holes are inside, border zeros are not
-    assert m["region"][30, 30, 0] and not m["valid"][30, 30, 0]                        # a hole stays masked for ImageMM
-    assert not m["interior"][6, 20, 1] and m["interior"][8, 20, 1]                     # the footprint's border pixel is masked
-    # the censored pixels: the plateau grown by the drop footprint (1 px green, 2 px red / blue)
-    assert m["cens"][41, 51].all()
-    assert m["cens"][39, 51, 1] and not m["cens"][38, 51, 1]
-    assert m["cens"][38, 51, 0] and not m["cens"][37, 51, 0]
-    assert not (m["valid"] & m["cens"]).any()
-    assert m["valid"][20, 20].all()
-
-
-def test_measurement_masks_without_saturation():
-    m = S.measurement_masks(_drizzled(), None)
-    assert not m["cens"].any()
-
-
-def test_saturation_follows_the_flat_field():
-    """A flat-fielded frame clips at ceiling / flat: a star saturated where the flat is 15 % above the frame's
-    highest plateau sits below 0.94 of that level, and must still be censored, at its own level."""
-    y = _drizzled(h=80, w=90)
-    y[40:43, 50:53] = np.float32(0.0605)                 # the frame's highest plateau (low flat)
-    y[15:19, 15:19] = np.float32(0.0605 / 1.15)          # a plateau where the flat is high
-    y[60, 70] = np.float32(0.05)                         # a sharp unsaturated peak above the gate
-    m = S.measurement_masks(y, 0.0605)
-    assert m["cens"][16, 16].all() and m["cens"][41, 51].all()
-    assert not m["cens"][60, 70].any()
-    pl = m["ceiling"][1]["plateaus"]
-    assert len(pl) == 2 and sorted(np.round(pl[:, 3], 5)) == sorted(np.round([0.0605, 0.0605 / 1.15], 5))
-    np.testing.assert_allclose(S.ceiling_window(m["ceiling"][1], 80, 90, 15, 19, 15, 19), 0.0605 / 1.15, rtol=1e-6)
-
-
-def test_shift_field_recovers_a_residual_rotation():
-    """An exposure's stars offset by a small residual rotation about the field centre: the degree-1 field
-    reproduces it at the nodes, and an outlier star does not move it."""
-    from astrophoto import exposures as E
-    rng = np.random.default_rng(4)
-    H, W = 800, 1200
-    py, px = rng.uniform(0, H, 40), rng.uniform(0, W, 40)
-    th = 2e-4                                                            # rad
-    dy, dx = th * (px - W / 2) + 0.05, -th * (py - H / 2) - 0.03
-    dy = dy + rng.normal(0, 0.005, 40)
-    dx = dx + rng.normal(0, 0.005, 40)
-    dy[0] += 0.6                                                         # a blended star
-    f = E.shift_field((py, px, dy, dx, np.ones(40)), H, W)
-    assert f["deg"] == 1
-    nodes = (np.array([0.0, H / 2, H - 1.0]), np.array([0.0, W / 2, W - 1.0]))
-    got = E.shift_at_nodes(f, nodes, H, W)
-    yy, xx = np.meshgrid(nodes[0], nodes[1], indexing="ij")
-    np.testing.assert_allclose(got[..., 0], th * (xx - W / 2) + 0.05, atol=0.01)
-    np.testing.assert_allclose(got[..., 1], -th * (yy - H / 2) - 0.03, atol=0.01)
-
-
-def test_discrete_gaussian_composes():
-    """The seeing kernels compose like seeing: T(a) * T(b) = T(sqrt(a^2 + b^2)), variance exactly sigma^2."""
-    from astrophoto import exposures as E
-    import cv2 as _cv2
-    a, b = 0.4, 0.9
-    ga, gb = E._gauss(a, 41), E._gauss(b, 41)
-    comp = _cv2.filter2D(ga.astype(np.float64), -1, gb, borderType=_cv2.BORDER_CONSTANT)
-    np.testing.assert_allclose(comp, E._gauss(np.hypot(a, b), 41), atol=1e-7)
-    yy = np.arange(41) - 20
-    assert (ga.sum(1) * yy ** 2).sum() == pytest.approx(a ** 2, rel=1e-6)
-
-
-def test_encircled_energy_of_a_gaussian():
-    """The aperture correction's encircled energy: 1 - exp(-R^2 / 2 s^2) for a Gaussian - here one sampled at
-    the pixel centres and spread over each pixel, i.e. of variance s^2 + 1/12 per axis."""
-    yy, xx = np.mgrid[:61, :61] - 30
-    for s, R in ((2.0, 3.0), (3.0, 9.0), (2.5, 4.0)):
-        g = np.exp(-0.5 * (yy ** 2 + xx ** 2) / s ** 2)
-        assert S.encircled_energy(g, R) == pytest.approx(1 - np.exp(-R ** 2 / (2 * (s ** 2 + 1 / 12))), abs=5e-3)
-
-
-def test_saturated_plateaus_ignore_bright_smooth_nebula():
-    """Bright nebula is no plateau: a broad hill whose top is flat within the noise ramps down within the
-    connected region above the gate."""
-    rng = np.random.default_rng(2)
-    yy, xx = np.mgrid[:100, :100] - 50
-    hill = 0.04 * np.exp(-0.5 * (yy ** 2 + xx ** 2) / 40.0 ** 2)
-    v = (hill * (1 + 0.004 * rng.normal(size=hill.shape))).astype(np.float32)
-    assert len(S.saturated_plateaus(v, np.ones_like(v, bool), 0.03)) == 0
-
-
-def test_fill_holes_only_for_measuring():
-    y = _drizzled()
-    m = S.measurement_masks(y, 0.0605)
-    f = S.fill_holes(y, m)
-    nb = y[29:32, 29:32, 0].copy()
-    nb[1, 1] = 0
-    assert f[30, 30, 0] == pytest.approx(nb.sum() / 8, rel=1e-5)
-    assert (f[:6] == 0).all()                           # no fill outside the footprint
-    assert y[30, 30, 0] == 0                            # the input is untouched
-
-
-def test_saturation_level_needs_a_plateau():
-    sat = [_drizzled() for _ in range(4)]
-    assert S.saturation_level(sat) == pytest.approx(0.0605, rel=1e-4)
-    rng = np.random.default_rng(0)
-    plain = []
-    for _ in range(4):
-        a = rng.normal(0.001, 0.0001, (60, 70, 3)).astype(np.float32)
-        a[20, 20] = 0.03                                # a bright unsaturated peak, no plateau
-        plain.append(a)
-    assert S.saturation_level(plain) is None
-
-
 def test_stack_is_flipped():
     rng = np.random.default_rng(3)
     base = np.zeros((200, 240, 3), np.float32)
@@ -250,18 +216,14 @@ def test_stack_is_flipped():
     assert f is True and info["correlation_flipped"] > 0.9
 
 
-def test_surface_window_equals_full():
-    coefs = np.array([[0.1, 0.02, -0.03, 0.01, 0.005, -0.002]] * 3)
-    full = S.surface_window(coefs, 50, 60, 0, 50, 0, 60)
-    win = S.surface_window(coefs, 50, 60, 10, 30, 15, 45)
-    np.testing.assert_allclose(win, full[:, 10:30, 15:45], atol=1e-6)
-
-
 def test_norm_peak():
-    assert S._norm_peak(np.full((3, 4, 4), 0.5, np.float32)) == 1.0
-    a = np.full((3, 4, 4), 0.5, np.float32)
-    a[0, 0, 0] = 2.5
+    assert S._norm_peak(np.full((3, 8, 8), 0.5, np.float32)) == 1.0
+    a = np.full((3, 8, 8), 0.5, np.float32)
+    a[0, 2:5, 2:5] = 2.5                                   # a restored star core above the ceiling: the image is scaled
     assert S._norm_peak(a) == pytest.approx(0.4)
+    b = np.full((3, 8, 8), 0.5, np.float32)
+    b[1, 4, 4] = 2.5                                       # a lone hot pixel does not set the scale
+    assert S._norm_peak(b) == 1.0
 
 
 # --------------------------------------------------------------------------- WCS
@@ -270,13 +232,15 @@ def test_rescale_wcs():
     for k, v in {"CRPIX1": 101.0, "CRPIX2": 51.0, "CD1_1": -1e-3, "CD1_2": 2e-4, "CD2_1": 2e-4, "CD2_2": 1e-3,
                  "A_2_0": 1e-6, "B_0_2": 2e-6, "A_ORDER": 2}.items():
         h[k] = v
-    g = S.rescale_wcs(h, 2, (10, 20))
-    assert g["CRPIX1"] == 2 * (101 - 1 - 10) + 1 and g["CRPIX2"] == 2 * (51 - 1 - 20) + 1
+    g = S.rescale_wcs(h, 2, (10, 20), 1)
+    assert g["CRPIX1"] == 2 * (101 - 1 - 10) + 1 + 1 and g["CRPIX2"] == 2 * (51 - 1 - 20) + 1 + 1
     assert g["CD1_1"] == pytest.approx(-5e-4) and g["CD2_2"] == pytest.approx(5e-4)
     assert g["A_2_0"] == pytest.approx(1e-6 * 2 ** (1 - 2)) and g["B_0_2"] == pytest.approx(2e-6 * 2 ** -1)
     assert g["A_ORDER"] == 2
     same = S.rescale_wcs(h, 1)
     assert same["CRPIX1"] == 101.0 and same["CD1_1"] == -1e-3
+    off = S.rescale_wcs(h, 1, (10, 20))
+    assert off["CRPIX1"] == 91.0 and off["CRPIX2"] == 31.0
 
 
 # --------------------------------------------------------------------------- the Session wiring
@@ -376,212 +340,185 @@ def test_stack_swap_is_undone_on_error_and_recovered_after_a_crash(tmp_path):
     assert float(fitsio.read_rgb(s._p("stack.fits"))[0][0, 0, 0]) == 0.25
 
 
-# --------------------------------------------------------------------------- end to end (synthetic frames, needs torch)
-def _star_field(h, w, stars, sigma, shift, rng, gain=300.0, sky=0.02, sat=None):
+# --------------------------------------------------------------------------- run() end to end (Siril faked, needs torch)
+# (the PSF cut-outs are 81 x 81: the stars lie >= 45 px inside the stack's box)
+STARS = [(60.3, 65.7, 0.5), (120.6, 70.2, 0.4), (90.1, 115.4, 0.6), (130.4, 120.9, 0.3), (65.2, 110.5, 0.45), (100.5, 55.5, 0.35)]
+
+
+def _sky(w, h, sigma, rng=None, noise=0.0):
     yy, xx = np.mgrid[:h, :w].astype(np.float64)
-    img = np.full((h, w), sky)
-    for (cy, cx, amp) in stars:
-        img += amp * np.exp(-((yy - cy - shift[0]) ** 2 + (xx - cx - shift[1]) ** 2) / (2 * sigma ** 2))
-    noisy = rng.poisson(img * gain) / gain
-    return noisy
+    img = np.full((h, w), 0.02)
+    for cx, cy, a in STARS:
+        img += a * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
+    if rng is not None:
+        img = img + rng.normal(0, noise, img.shape)
+    return img
 
 
-def test_registered_set_prepare_and_restore_end_to_end(tmp_path):
-    torch = pytest.importorskip("torch")
-    from astrophoto import imagemm
-    rng = np.random.default_rng(7)
-    h, w, n = 260, 300, 8
-    # a jittered grid: isolated stars, as PSF stars must be
-    stars = [(cy + rng.uniform(-5, 5), cx + rng.uniform(-5, 5), rng.uniform(0.5, 1.2))
-             for cy in range(30, h - 20, 40) for cx in range(30, w - 20, 40)]
-    Reg = S.make_set_class()
-    files, rows, places, imgs = {}, [], {}, []
-    for k in range(n):
-        shift = rng.uniform(-0.4, 0.4, 2)
-        img = np.stack([_star_field(h, w, stars, 1.5, shift, rng, gain=400.0) * (1.0 + 0.02 * c) for c in range(3)])
-        img = img * np.float32(0.1)
-        imgs.append(img)
-        path = str(tmp_path / f"r_{k + 1:05d}.fit")
-        fits.PrimaryHDU(img.astype(np.float32)).writeto(path)
-        files[k] = path
-        rows.append({"name": f"f{k}", "fwhm": 3.5, "weight": 1.0})
-        places[k] = (0, 0, w, h)
-    ref = np.moveaxis(np.mean(imgs, 0), 0, -1) / 0.1                  # the "stack": the mean of the frames, 10x their scale
-    es = Reg(files, rows, (0, 0, w, h), ref.astype(np.float32), str(tmp_path / "work"), 1.0, 3.5, places=places)
-    es.prepare()
-    assert len(es.usable()) >= 6 and es.ptc["c1"].min() > 0
-    assert es.sat_frames is None and es.sat > 1e20                      # no saturated star in this field
-    Y, V, Mk = es.windows(es.usable()[:3], 100, 180, 120, 200)
-    assert Y.shape == (3, 3, 80, 80) and (V > 0).all() and Mk.min() >= 0
-    k = es.kernels(es.usable()[:2], "empirical")
-    np.testing.assert_allclose(imagemm.unit_sum(k).sum((-2, -1)), 1.0, rtol=1e-5)
-    lat, info = imagemm.restore(es, r=1, sigma=None, max_iters=40, device="cpu", region=(100, 180, 120, 200))
-    assert lat.shape == (80, 80, 3) and np.isfinite(lat).all()
-    assert info["n_exposures"] == len(es.usable()) and info["tiles"]
-    es.cleanup()
-    assert not os.path.exists(str(tmp_path / "work"))
+def _fake_session(tmp_path, n=6, cw=200, ch=190, crop=(5, 5, 190, 180)):
+    d = tmp_path / "sess"
+    proc = d / "process"
+    (proc / "cache").mkdir(parents=True)
+    clean = _sky(cw, ch, 2.0)
+    x, y, w, h = crop
+    hdr = fits.Header()
+    hdr["CRPIX1"], hdr["CRPIX2"], hdr["CD1_1"], hdr["CD2_2"] = 40.0, 35.0, -1e-3, 1e-3
+    fitsio.write_rgb(str(d / "stack.fits"), np.repeat(clean[None, y:y + h, x:x + w], 3, 0).astype(np.float32), hdr)
+    meta = {"crop": list(crop), "stack_canvas": [cw, ch], "scale": 1.0}
+    json.dump(meta, open(d / "stack_meta.json", "w"))
+    rows = [{"name": f"f{i}.fits", "included": i != 1, "weight": 1.0, "path": str(tmp_path / f"raw{i}.fits")} for i in range(n)]
+    json.dump(rows, open(d / "frames.json", "w"))
+    json.dump({"seq": "pp_light", "n": n, "debayer": False, "hdr": False}, open(proc / "state.json", "w"))
+    lines = ["S 'pp_light_' 1 %d %d 5 0 6 0 0 0" % (n, n), "L 1"] + [f"I {i + 1} 1" for i in range(n)]
+    lines += ["R0 2 3 0.9 0 0.0004 50 H 1 0 0 0 1 0 0 0 1"] * n
+    (proc / "pp_light_.seq").write_text("\n".join(lines) + "\n")
+    return str(d), meta, clean
 
 
-# --------------------------------------------------------------------------- noise model and latent resolution
-def test_ptc_fit_per_pair_read_noise_and_shared_gain():
-    """c0 drifts with the sensor's temperature (IC 1805: -48 % over the night) while the gain is one: with a c0
-    per pair the fit recovers both, where one c0 for the night collapsed the level slope to 0."""
-    pytest.importorskip("scipy")
-    from astrophoto.exposures import ExposureSet
+def _fake_preprocess(cw, ch):
+    def prep(session_dir, meta, inc, rows, say, checkpoint, cosmetic=True, subsky=False, defer_masks=False):
+        proc = os.path.join(session_dir, "process")
+        rng = np.random.default_rng(7)
+        nums = [i + 1 for i in inc]
+        lines = ["S 'r_bkg_imm_pp_light_' 1 %d %d 5 0 6 1 0 0" % (len(nums), len(nums)), "L 3"]
+        lines += [f"I {k} 1 {cw},{ch}" for k in nums] + ["R1 2 3 0.9 0 0.0004 50 H 1 0 0 0 1 0 0 0 1"] * len(nums)
+        open(os.path.join(proc, "r_bkg_imm_pp_light_.seq"), "w").write("\n".join(lines) + "\n")
+        for k in nums:
+            img = _sky(cw, ch, 2.0, rng, 0.003).astype(np.float32)
+            img[:, :3] = 0                                     # outside this frame's footprint
+            fits.PrimaryHDU(np.repeat(img[None], 3, 0)).writeto(os.path.join(proc, f"r_bkg_imm_pp_light_{k:05d}.fit"))
+            with open(os.path.join(proc, "cache", f"r_bkg_imm_pp_light_{k:05d}.lst"), "w") as f:
+                f.write("# star#\tlayer\tB\tA\tbeta\tX\tY\n")
+                for j, (cx, cy, a) in enumerate(STARS):    # Siril's convention: X = col + 0.5, Y = H - row - 0.5
+                    f.write(f"{j + 1}\t1\t0.02\t{a}\t-1\t{cx + 0.5:.3f}\t{ch - cy - 0.5:.3f}\n")
+        return {"seq": "pp_light", "nums": nums, "frames": {k: os.path.join(proc, f"r_bkg_imm_pp_light_{k:05d}.fit") for k in nums},
+                "masks": {}, "stars": {k: os.path.join(proc, "cache", f"r_bkg_imm_pp_light_{k:05d}.lst") for k in nums},
+                "seq_file": os.path.join(proc, "r_bkg_imm_pp_light_.seq"), "mask_seq_file": None,
+                "saturation": {"ceiling": None}}
+    return prep
+
+
+def _fwhm_at(img, cx, cy, r=7):
+    ix, iy = int(round(cx)), int(round(cy))
+    c = np.maximum(img[iy - r:iy + r + 1, ix - r:ix + r + 1] - np.median(img), 0)
+    yy, xx = np.mgrid[:c.shape[0], :c.shape[1]]
+    s = c.sum()
+    my, mx = (c * yy).sum() / s, (c * xx).sum() / s
+    return 2.3548 * np.sqrt(((c * ((yy - my) ** 2 + (xx - mx) ** 2)).sum() / s) / 2), (mx - r + ix, my - r + iy)
+
+
+def test_run_end_to_end_on_synthetic_frames(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    d, meta, clean = _fake_session(tmp_path)
+    monkeypatch.setattr(S, "siril_preprocess", _fake_preprocess(200, 190))
+    out = S.run(d, meta, {"device": "cpu", "imagemm_iterations": 15})
+    img, hdr = fitsio.read_rgb(os.path.join(d, S.OUT_FITS))
+    assert img.shape == (3, 180, 190) and np.isfinite(img).all()
+    assert out["frames_used"] == 5 and out["frames_total"] == 5 and out["r"] == 1 and out["shape"] == [190, 180]
+    prep = out["preparation"]
+    assert prep["frames_flipped"]["flipped"] is False and max(abs(v) for v in prep["alignment_shift_px"]) < 0.3
+    assert prep["stars_median"] == len(STARS) and out["psf"]["stars_median"] == len(STARS)
+    for cx, cy, _ in STARS:                                        # sharper, and where the stack has them
+        w_in, _ = _fwhm_at(clean[5:185, 5:195], cx - 5, cy - 5)
+        w_out, (mx, my) = _fwhm_at(img[1], cx - 5, cy - 5)
+        assert w_out < 0.85 * w_in and abs(mx - (cx - 5)) < 0.3 and abs(my - (cy - 5)) < 0.3
+    assert hdr["CRPIX1"] == 40.0
+    assert not os.path.exists(os.path.join(d, S.WORK))             # store removed
+    assert not os.path.exists(os.path.join(d, "process", "r_bkg_imm_pp_light_00001.fit"))
+    assert json.load(open(os.path.join(d, S.OUT_META)))["method"].startswith("VeraLux ImageMM")
+
+
+def test_run_region_and_kept_store(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    d, meta, _ = _fake_session(tmp_path)
+    calls = []
+    prep = _fake_preprocess(200, 190)
+    monkeypatch.setattr(S, "siril_preprocess", lambda *a, **k: calls.append(1) or prep(*a, **k))
+    # (a region where all six stars lie >= 42 px inside, for the 81 px PSF cut-outs)
+    sp = {"device": "cpu", "imagemm_iterations": 3, "imagemm_region": [5, 5, 180, 170], "imagemm_keep_prepared": True}
+    out = S.run(d, meta, sp)
+    img, hdr = fitsio.read_rgb(os.path.join(d, S.OUT_FITS))
+    assert img.shape == (3, 170, 180) and out["region_offset"] == [5, 5] and hdr["CRPIX1"] == 35.0
+    out2 = S.run(d, meta, sp)                                          # the store is reused: no Siril step
+    assert len(calls) == 1 and out2["preparation"] == out["preparation"]
+    assert os.path.exists(os.path.join(d, S.WORK, "frames.npy"))
+
+
+def test_match_to_stack_on_a_dark_star_field_keeps_each_channels_scale():
+    """M 31's outer field 2026-10-23: a line through the two smoothed images had no lever arm on dark sky and the
+    field's brightest star (clipped in the stack only) set green's slope to 0.4.  The stars' flux ratio sets it now."""
     rng = np.random.default_rng(3)
-    c1 = 3e-5
-    acc = {"X": [], "v": [], "n": [], "pair": []}
-    c0s = np.linspace(9e-8, 5e-8, 6)
-    for p, c0 in enumerate(c0s):
-        Ta, Tb = 0.06 * (1 + 0.02 * rng.normal()), 0.06 * (1 + 0.02 * rng.normal())
-        for lev in np.linspace(0.003, 0.006, 16):                   # a narrow, sky-like range of levels
-            for c in range(3):
-                X = (c, 1 / Ta ** 2 + 1 / Tb ** 2, lev / Ta + lev / Tb)
-                v = c0 * X[1] + c1 * X[2]
-                acc["X"].append(X)
-                acc["v"].append(v * (1 + 0.003 * rng.normal()))
-                acc["n"].append(100000)
-                acc["pair"].append((p, p + 1))
-    out = ExposureSet._ptc_fit(acc, n=len(c0s) + 1)
-    assert out["model"] == "per-pair c0"
-    np.testing.assert_allclose(out["c1"], c1, rtol=0.15)
-    assert out["chi2_red"].max() < 5
-    fr = out["c0_frames"]
-    assert fr.shape == (7, 3) and fr[0, 0] > 1.4 * fr[-1, 0]           # the drift is kept per frame
-    # without the pairs: the old global model, still accepted
-    old = ExposureSet._ptc_fit({k: v for k, v in acc.items() if k != "pair"})
-    assert old["model"] == "global" and "c0_frames" not in old
+    N = 400
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    out = np.full((3, N, N), 0.02) + rng.normal(0, 0.001, (3, N, N))
+    for k in range(40):
+        cx, cy = rng.uniform(20, N - 20, 2)
+        out += 0.05 * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / 2.0)[None]
+    out += 40.0 * np.exp(-((xx - 200) ** 2 + (yy - 200) ** 2) / 8.0)[None]       # the restored bright star
+    gains = np.array([0.8, 1.3, 0.6])
+    ref = np.minimum(out * gains[:, None, None] + 0.01, 1.0)                     # the stack: clipped at 1
+    o, res = S.match_to_stack(out.astype(np.float32), ref.astype(np.float32))
+    for c in range(3):
+        assert abs(res[c][0] / gains[c] - 1.0) < 0.03, res
 
 
-def test_ptc_pairs_ignore_misregistered_nebula_structure():
-    """Consecutive frames whose nebula differs by a 0.3 px residual registration: the plain difference variance
-    of the bright, structured bins exceeds the noise; the high-pass estimate recovers the noise model."""
-    from astrophoto.exposures import ExposureSet, fourier_shift
-    rng = np.random.default_rng(5)
-    H, W = 256, 256
-    yy, xx = np.mgrid[:H, :W]
-    neb = 0.002 + 0.04 * (1 + np.sin(xx / 3.0) * np.cos(yy / 4.0)) * (xx / W)          # structured, brighter to the right
-    c0, c1 = 4e-8, 3e-5
-    es = ExposureSet.__new__(ExposureSet)
-    es.ref = np.repeat(neb[..., None], 3, -1).astype(np.float32)
-    es.smask = np.zeros((H, W), bool)
-    frames = []
-    for k, sh in enumerate((0.0, 0.3)):
-        img = fourier_shift(neb, 0.0, sh)
-        noisy = img + rng.normal(0, 1, img.shape) * np.sqrt(c0 + c1 * np.maximum(img, 0))
-        y3 = np.repeat(noisy[..., None], 3, -1).astype(np.float32)
-        frames.append({"_y": y3, "_valid": np.ones((H, W), bool), "_surf": np.zeros((H, W, 3), np.float32),
-                       "T": np.ones(3)})
-    acc = {"X": [], "v": [], "n": [], "pair": []}
-    es._ptc_pair(frames[0], frames[1], acc, nbins=12, pair=(0, 1))
-    out = ExposureSet._ptc_fit(acc, n=2)
-    np.testing.assert_allclose(out["c1"], c1, rtol=0.2)
+def test_confirm_on_calibrated_keeps_saturated_pixels_under_a_strong_flat(tmp_path):
+    """M 31 2026-10-23: red / blue flats ~3 x green's put saturated blue pixels below half the ceiling after calibration,
+    and the single level dropped them as hot pixels; each CFA lattice has its own saturated level."""
+    cal = np.full((40, 50), 0.001, np.float32)
+    cal[10:16, 20:26] = 0.06                                   # the star: saturated
+    for r in range(10, 16):
+        for c in range(20, 26):
+            if r % 2 == 1 and c % 2 == 1:
+                cal[r, c] = 0.02                                # its blue lattice: saturated, under a flat 3 x green's
+    cal[35, 45] = 0.0012                                       # a hot pixel, corrected
+    p = str(tmp_path / "pp_light_00001.fit")
+    fits.PrimaryHDU(cal).writeto(p)
+    rc = np.array([[r, c] for r in range(10, 16) for c in range(20, 26)] + [[35, 45]], np.int32)
+    kept, same, info = S.confirm_on_calibrated({1: rc}, {1: p}, 4095.0)
+    k = kept[1].tolist()
+    assert len(k) == 36 and [11, 21] in k and [35, 45] not in k
 
 
-def _ring_psf(k=41, r0=2.2, w=1.4, sig=2.6):
-    yy, xx = np.mgrid[:k, :k] - k // 2
-    rr = np.hypot(yy, xx)
-    f = np.exp(-0.5 * ((rr - r0) / w) ** 2) + 0.3 * np.exp(-0.5 * (rr / sig) ** 2)
-    return (f / f.sum()).astype(np.float32)
+def test_saturation_masks_added_after_the_frames_match_masks_read_with_them(tmp_path):
+    """The frames go into the store first (each registered frame deleted as it goes), the saturation masks are added in
+    a second pass: the store's saturated pixels and statistics are those of the one-pass build."""
+    proc = tmp_path / "process"
+    (proc / "cache").mkdir(parents=True)
+    cw, ch = 60, 40
+    nums = [1, 2, 3]
+    rng = np.random.default_rng(3)
 
+    def seq(name, layers):
+        lines = [f"S '{name}_' 1 3 3 5 0 6 1 0 0", f"L {layers}"] + [f"I {k} 1 {cw},{ch}" for k in nums]
+        lines += ["R1 2 3 0.9 0 0.0004 50 H 1 0 0 0 1 0 0 0 1"] * len(nums)
+        (proc / f"{name}_.seq").write_text("\n".join(lines) + "\n")
 
-def test_choose_sigma_keeps_eq11_for_a_ring_cored_psf():
-    """A slightly defocused PSF (its core a ring, IC 1805 on a DWARF 3) has no peaked Eq. 11 kernel at any
-    sigma; the search must not go on to the cap, where D(h * g_sigma) no longer reproduces the PSF."""
-    pytest.importorskip("torch")
-    from astrophoto import imagemm
-    f = _ring_psf()
-    K = np.repeat(np.repeat(f[None, None], 3, 1), 2, 0)
-    se = [np.full(f.shape, 2e-5, np.float32)] * 3                       # a well-measured PSF
-    sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se, max_sigma=2.0)
-    assert sig == 1.0, info                                             # nothing admissible: the requested sigma
-    # a less precisely known PSF: the coarsest sigma at which Eq. 11 still holds (least mid-frequency ringing)
-    se_l = [np.full(f.shape, 2e-3, np.float32)] * 3
-    sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se_l, max_sigma=2.0)
-    ok = [t[0] for t in info["tried"] if max(t[2]) <= 1.0]
-    assert sig == max(ok) and sig > 1.0 and max(info["fit_chi"]) <= 1.0, info
-    # a Gaussian PSF is peaked at the paper's sigma: kept
-    yy, xx = np.mgrid[:41, :41] - 20
-    g = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 3.0 ** 2)
-    K = np.repeat(np.repeat((g / g.sum()).astype(np.float32)[None, None], 3, 1), 2, 0)
-    sig, info = imagemm.choose_sigma(K, 1, 1.0, device="cpu", se=se, max_sigma=2.0)
-    assert sig == 1.0 and min(info["peak"]) >= 0.9
+    seq("r_imm_pp_light", 3)
+    seq("r_immsat", 3)
+    for k in nums:
+        img = (0.1 + rng.normal(0, 0.01, (3, ch, cw))).astype(np.float32)
+        fits.PrimaryHDU(img).writeto(proc / f"r_imm_pp_light_{k:05d}.fit")
+        m = np.zeros((3, ch, cw), np.uint8)
+        m[k % 3, 10 + k:14 + k, 20:24] = 255
+        fits.PrimaryHDU(m).writeto(proc / f"r_immsat_{k:05d}.fit")
+        (proc / "cache" / f"r_imm_pp_light_{k:05d}.lst").write_text("# star#\tlayer\tB\tA\tbeta\tX\tY\n")
 
+    def prep():
+        return {"frames": {k: str(proc / f"r_imm_pp_light_{k:05d}.fit") for k in nums},
+                "masks": {k: str(proc / f"r_immsat_{k:05d}.fit") for k in nums},
+                "stars": {k: str(proc / "cache" / f"r_imm_pp_light_{k:05d}.lst") for k in nums},
+                "seq_file": str(proc / "r_imm_pp_light_.seq"), "mask_seq_file": str(proc / "r_immsat_.seq"), "resampling": "lanczos4"}
 
-def test_eq11_model_matches_the_solver():
-    pytest.importorskip("torch")
-    from astrophoto import imagemm
-    f = _ring_psf(k=31)
-    h, mse = imagemm.refine_psfs(f[None], 1, 1.0, device="cpu")
-    m = imagemm.eq11_model(h, 1, 1.0)
-    np.testing.assert_allclose(((m[0] - f) ** 2).mean(), mse[0], rtol=0.05, atol=1e-14)
-
-
-def test_whyte_segmentation_leaves_unsaturated_stars_to_the_plain_update():
-    """S (Whyte et al. Eq. 23) must hold the latent behind saturated *data*.  A point source whose blurred
-    image peaks at half the ceiling has a latent far above it; thresholding the latent made it "S" and its
-    surroundings were held at the initial guess.  On the blurred model it stays U, so the restoration is the
-    plain one there."""
-    torch = pytest.importorskip("torch")
-    from astrophoto import imagemm
-    d, k, n, L = 48, 15, 3, 1.0
-    yy, xx = np.mgrid[:k, :k] - k // 2
-    ker = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 2.0 ** 2)
-    ker = (ker / ker.sum()).astype(np.float32)
-    K = torch.from_numpy(np.broadcast_to(ker, (n, 1, k, k)).copy())
-    lat = np.zeros((1, 1, d + k - 1, d + k - 1), np.float32)
-    lat[0, 0, (d + k) // 2, (d + k) // 2] = 0.5 * L / ker.max()          # blurred peak 0.5 L, latent ~12 L
-    lat += 1e-3
-    ops = imagemm.Operators(K, 1)
-    y = ops.forward(torch.from_numpy(lat), 0, n).clone()
-    rng = np.random.default_rng(0)
-    y = y + torch.from_numpy(rng.normal(0, 2e-3, y.shape).astype(np.float32))
-    var = torch.full_like(y, 4e-6)
-    mask = torch.ones_like(y)
-    sat = torch.zeros_like(y)
-    sat[:, :, 0, 0] = 1                                                   # one censored pixel far away: the update runs
-    x0 = imagemm.initial_guess(y, mask, k, 1)
-    plain, _ = imagemm.mm_restore(y, var, mask, K, x0, r=1, robust=True, max_iters=150, epsilon=0)
-    wh = {"level": np.full((n, 1), L, np.float32), "saturated": sat, "phi": 0.9, "a": 50.0, "erode": 3, "soft": 3.0}
-    seg, _ = imagemm.mm_restore(y, var, mask, K, x0, r=1, robust=True, max_iters=150, epsilon=0, whyte=dict(wh))
-    old, _ = imagemm.mm_restore(y, var, mask, K, x0, r=1, robust=True, max_iters=150, epsilon=0,
-                                whyte={**wh, "segment": "latent"})
-    c = (d + k) // 2
-    win = (slice(None), slice(None), slice(c - 10, c + 11), slice(c - 10, c + 11))
-    err_seg = float((seg[win] - plain[win]).abs().max())
-    err_old = float((old[win] - plain[win]).abs().max())
-    assert err_seg < 1e-6 < err_old
-
-
-def test_whyte_update_with_super_resolution_and_per_pixel_levels():
-    """Whyte et al.'s update at r = 2 with a saturation level per measurement: a star clipped in the data keeps
-    its flux in the restoration (above the ceiling), where the masked fit alone loses the clipped core."""
-    torch = pytest.importorskip("torch")
-    from astrophoto import imagemm
-    d, r, n = 40, 2, 3
-    kd = 9
-    yy, xx = np.mgrid[:kd, :kd] - kd // 2
-    f = np.exp(-0.5 * (yy ** 2 + xx ** 2) / 1.6 ** 2)
-    f = (f / f.sum()).astype(np.float32)
-    h, _ = imagemm.refine_psfs(f[None], r, 1.1, device="cpu")
-    h = imagemm.unit_sum(h / r ** 2)                                     # (1, 18, 18)
-    K = torch.from_numpy(np.broadcast_to(h[0], (n, 1) + h.shape[-2:]).copy())
-    ks = K.shape[-1]
-    X = r * d + ks - 1
-    lat = np.full((1, 1, X, X), 1e-3, np.float32)
-    lat[0, 0, X // 2, X // 2] = 3.0 / float(h.max())                      # blurred peak ~3 x the ceiling
-    ops = imagemm.Operators(K, r)
-    truth = ops.forward(torch.from_numpy(lat), 0, n).clone()
-    L = 1.0
-    levels = torch.full_like(truth, L) * (1.0 + 0.05 * torch.linspace(-1, 1, d).view(1, 1, 1, d))   # a vignetted ceiling
-    y = torch.minimum(truth, levels)
-    sat = (truth >= levels).float()
-    var = torch.full_like(y, 1e-6)
-    mask = 1.0 - sat
-    x0 = imagemm.initial_guess(y, torch.ones_like(y), ks, r)
-    wh = {"level": levels, "saturated": sat, "phi": 0.9, "a": 50.0, "erode": 3, "soft": 3.0}
-    xw, info = imagemm.mm_restore(y, var, mask, K, x0, r=r, robust=True, max_iters=200, epsilon=0, whyte=wh)
-    assert torch.isfinite(xw).all()
-    fw = float(ops.forward(xw, 0, n).max())
-    assert fw > 1.1 * L                                                  # the clipped core is restored above the ceiling
-
+    box, canvas = (0, 0, cw, ch), (cw, ch)
+    say = lambda *a: None
+    one, st1 = S.build_store(str(tmp_path / "w1"), prep(), nums, ["a", "b", "c"], box, canvas, False, None, say, None)
+    two, st2 = S.build_store(str(tmp_path / "w2"), prep(), nums, ["a", "b", "c"], box, canvas, False, None, say, None,
+                             consume=True, with_masks=False)
+    assert not any(os.path.exists(proc / f"r_imm_pp_light_{k:05d}.fit") for k in nums)          # (consumed)
+    assert all(os.path.exists(proc / f"r_immsat_{k:05d}.fit") for k in nums)                   # (not yet)
+    S.add_masks(two, st2, prep(), nums, box, canvas, False, None, say, None)
+    assert np.array_equal(one.sat, two.sat) and one.sat.any()
+    assert st1["saturated_fraction"] == st2["saturated_fraction"]
+    assert np.allclose(st1["invalid_fraction"], st2["invalid_fraction"])
+    assert not any(os.path.exists(proc / f"r_immsat_{k:05d}.fit") for k in nums)

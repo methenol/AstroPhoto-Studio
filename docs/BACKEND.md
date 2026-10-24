@@ -51,7 +51,7 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
 5. **Restore** (linear) — GraXpert AI background extraction; plate solve (NOMAD, then Gaia DR3, retried); BlurXTerminator correct-only;
    SPCC colour calibration (sensor and filter from the headers; narrowband mode for dual-band filters); BlurXTerminator sharpen with
    the 1-2 h values of research/pro-workflow.md (Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; the lower end on noisy data); NoiseXTerminator `--dn` 0.8 .. 0.5 on the linear
-   data (GraXpert denoise 0.8 .. 0.6, or Siril, as fallbacks).  `deconv_method = imagemm` runs ImageMM on the registered subs instead.
+   data (GraXpert denoise 0.8 .. 0.6, or Siril, as fallbacks).  `deconv_method = imagemm` runs VeraLux ImageMM (`sirilpipe/veralux_imagemm.py`) on the subs instead: the stack's own calibrated, cosmetic-corrected Bayer-drizzle frames with its registration, per-colour saturation masks (pixels within `imagemm_bloom_grow` px of them left out, and within 0.75 x the equivalent radius of a large saturated patch), then the multi-frame restoration with per-frame kernels (plus the optics' static asymmetry and an extended wing to 80 px joined from unsaturated and saturated stars, with its per-channel colour and lobe measured on the saturated stars); a saturated star starts as a point at the light PSF photometry of its unsaturated wings measures, centred on its missing data, and where the frames' data are sparse it becomes the restored image's PSF at its wings' colour, joined to the restoration with the restoration's own structure kept and the PSF's tail fading on; saturated galaxy nuclei get their colour from their wings; the result is put on the stack's photometric scale per channel from the unsaturated stars' flux ratios (sky offset from the median); no BlurXTerminator.
 6. **Stars** — StarXTerminator on the linear data (or StarNet2 `--linear`), no unscreen: `stars = linear - starless`.
 7. **Auto-finish** — `autofinish.py` picks among published values by stated rules (small vs frame-filling target, clipping -> HDR, dual-band vs broadband -> palette / SCNR,
    star density -> reduction, SNR -> NXT strength); every decision is in the report with its rule.
@@ -95,6 +95,6 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 | Diagnostics | stage logs, reference frame, integration coverage map, Siril rejection map |
 | Explore | plate solution from Siril's WCS (own solver as fallback), Gaia DR3 + SIMBAD annotation |
 | Experiments (Optuna) | `sirilpipe/lab/`: finishing chain, linear restoration, registration & integration, star separation, gradient removal; synthetic datasets with truth; *From experiment* in the Process tab |
-| ImageMM | `deconv_method = imagemm` (needs `IMAGEMM=cuda`), `restored_resolution` = r |
+| ImageMM | VeraLux ImageMM v1.0.0 headless: `deconv_method = imagemm` (needs `IMAGEMM=cuda`), `restored_resolution` = r, `imagemm_*` = the script's parameters |
 | CLI | `python -m sirilpipe run|stack|analyse|calibration|devices|tools` |
 | `/api/v1` | unchanged |

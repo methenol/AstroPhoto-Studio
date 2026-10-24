@@ -1,44 +1,40 @@
-"""Optional ImageMM restoration stage on Siril's registered frames (``deconv_method = "imagemm"``).
+"""Optional ImageMM restoration stage (``deconv_method = "imagemm"``): VeraLux ImageMM on the session's subs.
 
-ImageMM (Sukurdeep, Budavari, Connolly & Navarro 2025, arXiv:2501.03002) restores the *individual* exposures
-jointly: ``y(t) = D(h(t) * x) + noise``, a PSF, a variance and a mask per exposure.  This stage feeds it with
-the frames Siril registers for the stack (``seqapplyreg``: homography registration + Bayer drizzle, already
-debayered RGB on the -framing=max canvas) instead of the repo's own raw-sub preparation, and reuses the
-repo's implementation (``astrophoto/imagemm.py``) and its PSF machinery (``astrophoto/exposures.py``)
-unchanged:
+ImageMM (Sukurdeep, Budavari, Connolly & Navarro 2025, AJ 170:233) restores the *individual* exposures jointly:
+``y_t = D(h_t * x) + noise``, one PSF, variance and mask per exposure.  The engine is VeraLux ImageMM v1.0.0 by
+Riccardo Paterniti (``sirilpipe/veralux_imagemm.py``, the script's maths without its Qt window; what changed and why
+is listed there).  This module does what the script's two tabs did by hand, headless, on the frames the stack used:
 
-* frames: ``process/r_<seq>_NNNNN.fit`` of the frames ``frames.json`` marks ``included`` (Siril deletes them
-  after the stack; they are registered again when missing, with the stack's own resampling), cropped to the
-  stack's box ``stack_meta['crop']``, same row order as ``stack.fits``.  A frame is never resampled again.
-* masks: a drizzled frame has no data where no drop landed (exactly 0 in Siril's output; the red and blue
-  planes of a Bayer drizzle at scale 1 mostly) and outside the frame's footprint.  Those pixels are masked
-  per channel.  Pixels whose drops used a saturated raw sample are the "censored" pixels of Whyte, Sivic &
-  Zisserman (2014), exactly as in ``ExposureSet.window`` (``mm_restore(whyte=...)``): the saturation level
-  is measured on the frames, per saturated star and channel (``saturated_plateaus``: a flat-fielded frame clips
-  at ceiling / flat), and each measurement is modelled with its own level (``saturation_levels``).
-* photometric scale T, smooth sky deviation, reference sky: as ``ExposureSet.prepare_one`` (aperture photometry
-  of isolated stars against the reference = ``stack.fits``, then corrected for the light each frame's PSF puts
-  outside the aperture - the growth curve, ``_aperture_correction``), so the latent sky is 0.
-* variances: the photon-transfer curve of consecutive frames (``ExposureSet._ptc_fit``): shot noise per channel
-  (one gain for the night) and read + dark noise per frame pair (it follows the sensor's temperature), measured
-  on the data (no gain or read noise is invented).
-* PSF: measured on the frames' *own* coadd (never on ``stack.fits``: the two resampling paths differ by ~3 % of
-  a star's flux and that alone made dark rings round stars, see ``ExposureSet.prepare``), seeing-mixture
-  kernels G(sigma_t) * Q per frame at the frame's residual registration (``exposures.shift_field``), unit-sum
-  kernels (``imagemm.unit_sum``).
-* one prepare at a time, serial (no process pools), then ``imagemm.restore`` with the paper's settings
-  (Algorithm 3, kappa 2, delta 2, Eq. C15 stop), Whyte et al. for saturated stars.
+1. Pre-processing (the script's tab 1: ``calibrate -debayer``, ``seqsubsky <seq> 1``, ``register``).  The calibrated
+   sequence of the stack (``process/state.json``; already dark / flat / banding corrected, still CFA for the Bayer
+   drizzle) is debayered by ``calibrate <seq> -debayer -prefix=imm_`` (the script's no-master branch), background-
+   subtracted per frame by ``seqsubsky imm_<seq> 1`` and registered by ``seqapplyreg -interp=lanczos4
+   -framing=max`` with the stack's *own* transforms (copied from ``<seq>_.seq``), so the frames land on stack.fits'
+   canvas.  The script registers with interpolation too; the stack's Bayer drizzle would leave 50-75 % of the R / B
+   pixels of an unshifted frame empty, which ``seqsubsky`` then fills (its samples see the zeros: the reference
+   frame of IC 1805 kept its sky while the others were levelled).
+2. Saturation (VeraLux's ``saturation_level``, which it reads from BITPIX - None for Siril's float frames): the
+   sensor ceiling is the highest raw value found as a plateau (>= 4 pixels at the maximum) over the frames' raw
+   files (frames.json ``path``); pixels at >= 0.995 x the ceiling (``SATURATION_FRAC``) that are still >= half the
+   ceiling in Siril's calibrated frame are saturated (the others are hot pixels, ~90 % on DWARF 3), grown by the
+   reach of the debayer and Lanczos-4 kernels (``SAT_GROW`` px) and registered by Siril with the frames' own
+   transforms (``-interp=nearest``).  DWARF 3: a 12-bit sensor (ceiling 4095 in a 16-bit file).
+3. Star lists (the script's per-frame ``findstar`` loop): ``seqfindstar`` on the registered frames, default
+   detection settings (``setfindstar reset``), positions converted to array pixels (``siril_to_array``).
+4. The frames, cropped to the stack's box ``stack_meta['crop']`` in stack.fits' row order, go to a disk store with
+   NaN where a frame has no data and a flag on its saturated pixels; ``ImageMMEngine.run_imagemm`` restores them
+   with the script's defaults (20 iterations, kappa 2, Huber delta 0.05, mu 0.1, epsilon 1e-5, practical mode) and
+   the pipeline's fixes (``veralux_imagemm`` docstring).
 
-Output: ``imagemm.fits`` (float32 (3, H, W), the row order, scale and crop of ``stack.fits``, WCS copied and
-rescaled for r > 1) and ``imagemm_meta.json``.  Nothing here is imported unless the stage runs; torch is
-imported inside ``available()`` / ``run()`` only.
+Output: ``imagemm.fits`` (float32 (3, H, W): the crop, row order and WCS of stack.fits, rescaled for r > 1) and
+``imagemm_meta.json``.  torch is imported inside ``available()`` / ``run()`` only.
 """
 from __future__ import annotations
 
 import glob
 import logging
-import math
 import os
+import re
 import shutil
 import time
 
@@ -52,21 +48,41 @@ log = logging.getLogger("sirilpipe")
 STAGE = "imagemm"
 OUT_FITS = "imagemm.fits"
 OUT_META = "imagemm_meta.json"
-WORK = os.path.join("process", "imagemm")          # prepared frames (deleted afterwards)
+WORK = os.path.join("process", "imagemm")          # the frame store (deleted afterwards)
+PREP_VERSION = 8                                     # bump when the store's content changes (imagemm_keep_prepared)
 
-# stack_params keys (webui/server.py STACK_DEFAULTS) -> imagemm.restore arguments
-PARAM_KEYS = {"imagemm_robust": "robust", "imagemm_delta": "delta", "imagemm_kappa": "kappa",
-              "imagemm_epsilon": "epsilon", "imagemm_stop": "stop", "imagemm_max_iters": "max_iters",
-              "imagemm_psf": "psf_model", "imagemm_groups": "n_groups", "imagemm_accelerate": "accelerate",
-              "imagemm_background": "background", "imagemm_n2n": "n2n", "imagemm_tv": "tv",
-              "imagemm_point_sources": "point_sources", "imagemm_starlet": "starlet", "imagemm_psf_steps": "psf_steps",
-              "imagemm_local_psf": "local_psf"}
-STOPS = ("c15", "flux")
+SATURATION_FRAC = 0.995      # VeraLux build_mask_and_variance(saturation_frac=0.995)
+SAT_PLATEAU = 4              # raw pixels at the frame's maximum that make it a saturation ceiling
+# a registered pixel is touched by a saturated raw pixel within the debayer's reach (RCD, Siril's default: 3 px) plus
+# the Lanczos-4 kernel's (4 px)
+SAT_GROW = 7
+SAT_GROW_DRIZZLE = 2         # a square drizzle drop (pixfrac <= 1) reaches the output pixels within 1 px
+EDGE_ERODE = 6               # px of each registered frame's footprint edge dropped (Lanczos-4 reach + debayer)
+EDGE_ERODE_DRIZZLE = 2       # drizzle: an edge pixel's partial drops are normalised by their weight
+INTERP = "lanczos4"          # Siril's default registration interpolation (the script's `register`)
+
+# stack_params keys (webui/server.py STACK_DEFAULTS) -> VeraLux run_imagemm arguments
+PARAM_KEYS = {"imagemm_iterations": "iterations", "imagemm_huber": "huber_delta", "imagemm_kappa": "kappa",
+              "imagemm_mu": "mu", "imagemm_epsilon": "stop_epsilon", "imagemm_sigma": "psf_sigma",
+              "imagemm_shot_noise": "shot_noise_scale", "imagemm_read_noise": "read_noise",
+              "imagemm_saturation": "saturation_level", "imagemm_formal": "formal_mode",
+              "imagemm_variance": "variance_from", "imagemm_psf_channels": "per_channel_psf",
+              "imagemm_latent_sigma": "latent_sigma", "imagemm_lower_bound": "lower_bound",
+              "imagemm_reference_psf": "reference_psf", "imagemm_photometry": "photometry",
+              "imagemm_noise_model": "noise_model", "imagemm_huber_sigma": "huber_sigma", "imagemm_halo": "halo",
+              "imagemm_saturated_points": "saturated_points", "imagemm_bound_sigma": "bound_sigma",
+              "imagemm_saturated_photometry": "saturated_photometry", "imagemm_psf_wings": "psf_wings",
+              "imagemm_psf_asymmetry": "psf_asymmetry", "imagemm_psf_radial_wings": "psf_radial_wings",
+              "imagemm_bloom_grow": "bloom_grow", "imagemm_point_init": "point_init",
+              "imagemm_censor_saturated": "censor_saturated"}
+LIMITS = {"iterations": (1, 200), "kappa": (1.01, 50.0), "huber_delta": (0.001, 1.0), "mu": (0.0, 1.0),
+          "stop_epsilon": (1e-8, 1e-3), "psf_sigma": (0.5, 3.0), "shot_noise_scale": (0.0, 10.0),
+          "read_noise": (0.0, 1.0)}                  # the script's spin-box ranges
 
 
 def available() -> dict:
-    """``{"ok", "torch", "cuda", "mps", "reason"}`` - whether the stage can run here.  ``ok`` needs torch (and the
-    repo's ImageMM modules); a GPU is optional (the CPU is slow but exact)."""
+    """``{"ok", "torch", "cuda", "mps", "reason"}`` - whether the stage can run here.  ``ok`` needs torch; a GPU is
+    optional (the CPU is slow but exact)."""
     out = {"ok": False, "torch": False, "cuda": False, "mps": False, "reason": ""}
     try:
         import torch                                   # noqa: WPS433 (optional, large)
@@ -80,70 +96,79 @@ def available() -> dict:
         out["mps"] = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
     except Exception:
         pass
-    try:
-        import astrophoto.imagemm  # noqa: F401
-        import astrophoto.exposures  # noqa: F401
-    except Exception as e:
-        out["reason"] = f"the ImageMM modules do not import: {type(e).__name__}: {e}"
-        return out
     out["ok"] = True
     return out
 
 
 # --------------------------------------------------------------------------- parameters
-def map_params(stack_params: dict | None) -> dict:
-    """``imagemm.restore`` keyword arguments from ``stack_params`` (paper defaults where unset).
+def _flag(v) -> bool:
+    return str(v).strip().lower() not in ("false", "0", "off", "no", "none", "") and bool(v)
 
-    imagemm_r is the latent super-resolution factor (output = r x the frames' grid); imagemm_sigma 0 = the
-    paper's g_sigma (1 at r = 1, 1.1 above).  Development options (not in the UI): ``imagemm_max_frames`` (the
-    N best frames by weight) and ``imagemm_region`` ([x, y, w, h] inside the stack's crop box)."""
+
+def map_params(stack_params: dict | None) -> dict:
+    """VeraLux ``run_imagemm`` keyword arguments (+ ``formal_mode``) from ``stack_params``, the script's GUI defaults
+    where unset, clamped to its spin-box ranges.  ``imagemm_r`` is the super-resolution factor (1..3; the script
+    allows 4); ``imagemm_sigma`` 0 = the script's 1.0; ``imagemm_saturation`` 0 = measured on the raw frames.
+    Development options (not in the UI): ``imagemm_max_frames`` (the N best frames by weight), ``imagemm_region``
+    ([x, y, w, h] inside the stack's crop box) and ``imagemm_keep_prepared`` (keep the frame store for the next run)."""
+    from .veralux_imagemm import DEFAULTS
     sp = stack_params or {}
-    # background False: x >= 0 above the fitted sky - the lower bound at the background level of the Lower Bound
-    # Constraint Algorithm (Lanteri et al. 2001; Roche et al. 2003, A&A 409, 1077), which is what removes
-    # Richardson-Lucy's ringing round bright sources on a high background; "sky" lets x go down to minus the
-    # subtracted sky (total intensity >= 0) and the ringing below the background then shows (IC 1805: rings of
-    # -3e-3 round the cluster's stars).  n2n: the two halves of the frames restored apart and combined by
-    # Noise2Noise (imagemm.n2n_pass) - the deconvolved latent's pixel noise is otherwise left to the finishing
-    # denoiser, which smears it (IC 1805)
-    kw: dict = {"r": 1, "sigma": None, "psf_model": "empirical", "n_groups": 0, "robust": True, "delta": 2.0,
-                "kappa": 2.0, "epsilon": 1e-6, "stop": "c15", "max_iters": 1000, "accelerate": False,
-                "background": False, "n2n": True, "tv": 0.0, "point_sources": False, "starlet": 0.0,
-                "psf_steps": 0, "local_psf": False}
+    kw = {k: v for k, v in DEFAULTS.items() if k != "upscale_factor"}
     for key, arg in PARAM_KEYS.items():
-        if sp.get(key) is not None:
+        if sp.get(key) not in (None, ""):
             kw[arg] = sp[key]
+    kw["iterations"] = int(round(float(kw["iterations"])))
+    for k in ("kappa", "huber_delta", "mu", "stop_epsilon", "psf_sigma", "shot_noise_scale", "read_noise"):
+        kw[k] = float(kw[k])
+    if kw["psf_sigma"] <= 0:
+        kw["psf_sigma"] = DEFAULTS["psf_sigma"]
+    for k, (lo, hi) in LIMITS.items():
+        kw[k] = type(kw[k])(min(hi, max(lo, kw[k])))
+    sat = float(kw["saturation_level"] or 0.0)
+    kw["saturation_level"] = sat if sat > 0 else None
+    kw["formal_mode"] = _flag(kw["formal_mode"])
+    kw["latent_sigma"] = min(2.0, max(0.3, float(kw["latent_sigma"] or DEFAULTS["latent_sigma"])))
+    _lb = str(kw["lower_bound"]).strip().lower()
+    kw["lower_bound"] = _lb if _lb in ("local", "global") else ("global" if _flag(kw["lower_bound"]) else False)
+    kw["per_channel_psf"] = _flag(kw["per_channel_psf"])
+    kw["reference_psf"] = _flag(kw["reference_psf"])
+    kw["photometry"] = _flag(kw["photometry"])
+    kw["noise_model"] = "ptc" if str(kw["noise_model"]) == "ptc" else "script"
+    kw["huber_sigma"] = float(kw["huber_sigma"] or 0.0)
+    kw["halo"] = _flag(kw["halo"])
+    kw["saturated_points"] = _flag(kw["saturated_points"])
+    kw["saturated_photometry"] = _flag(kw["saturated_photometry"])
+    kw["psf_wings"] = _flag(kw["psf_wings"])
+    kw["psf_asymmetry"] = _flag(kw["psf_asymmetry"])
+    kw["psf_radial_wings"] = _flag(kw["psf_radial_wings"])
+    kw["bound_sigma"] = max(0.0, float(kw["bound_sigma"]))
+    kw["bloom_grow"] = int(min(8, max(0, round(float(kw["bloom_grow"] or 0)))))
+    kw["point_init"] = _flag(kw["point_init"])
+    kw["censor_saturated"] = _flag(kw["censor_saturated"])
+    kw["variance_from"] = "data" if str(kw["variance_from"]) == "data" else "model"
     kw["r"] = int(min(3, max(1, round(float(sp.get("imagemm_r") or 1)))))
-    # g_sigma of Eq. 11 (the paper: 1 at r = 1, 1.1 at r = 2).  At r = 1 the latent is the sky seen through a
-    # 1 px Gaussian, band-limited, so a star between pixel centres is represented exactly; with the measured
-    # PSFs directly the fit pulls light out of a ring round every star (IC 405)
-    sig = float(sp.get("imagemm_sigma") or 0.0)
-    kw["sigma"] = sig if sig > 0 else (1.1 if kw["r"] > 1 else 1.0)
-    kw["robust"] = bool(kw["robust"])
-    kw["accelerate"] = bool(kw["accelerate"])
-    # (a string from a form or a JSON file: "false" / "0" / "off" is off - bool("false") is True)
-    _b = str(kw["background"]).strip().lower()
-    kw["background"] = "sky" if _b == "sky" else (_b not in ("false", "0", "off", "no", "none", "")) and bool(kw["background"])
-    kw["n2n"] = bool(kw["n2n"])
-    kw["tv"] = max(0.0, float(kw["tv"] or 0.0))
-    # MCS / STARRED point sources with the starlet-regularised extended channel (imagemm.mm_restore ``starlet``)
-    kw["point_sources"] = bool(kw["point_sources"])
-    kw["starlet"] = max(0.0, float(kw["starlet"] or 0.0))
-    # myopic kernel steps (blind Richardson-Lucy on each exposure's kernel, imagemm.mm_restore ``psf_steps``)
-    kw["psf_steps"] = max(0, int(kw["psf_steps"] or 0))
-    kw["local_psf"] = bool(kw["local_psf"])
-    kw["delta"], kw["kappa"], kw["epsilon"] = float(kw["delta"]), float(kw["kappa"]), float(kw["epsilon"])
-    kw["max_iters"] = int(kw["max_iters"])
-    kw["n_groups"] = int(kw["n_groups"] or 0)
-    kw["stop"] = str(kw["stop"]) if str(kw["stop"]) in STOPS else "c15"
-    kw["psf_model"] = "moffat" if str(kw["psf_model"]) == "moffat" else "empirical"
     return kw
 
 
-def _device_arg(stack_params: dict | None) -> str:
-    return str((stack_params or {}).get("device") or "auto")
+def pick_device(preference: str | None = "auto"):
+    """cuda / mps / cpu as asked ("auto" = the GPU when there is one)."""
+    import torch
+    pref = str(preference or "auto").lower()
+    if pref.startswith("cuda") and torch.cuda.is_available():
+        dev = torch.device(pref)
+        return dev if dev.index is None or dev.index < torch.cuda.device_count() else torch.device("cuda:0")
+    if pref == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if pref == "cpu":
+        return torch.device("cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
-# --------------------------------------------------------------------------- registered frames
+# --------------------------------------------------------------------------- sequences
 def included_rows(session_dir: str) -> list[dict]:
     rows = read_json(os.path.join(session_dir, "frames.json"), None)
     if not rows:
@@ -151,18 +176,69 @@ def included_rows(session_dir: str) -> list[dict]:
     return rows
 
 
-def resampling_of(stack_meta: dict) -> dict:
-    """The resampling the stack was made with (``workflow.decide_resampling`` form), from stack_meta."""
-    fr = str(stack_meta.get("framing") or "max")             # (the stack's framing: the same canvas again)
-    if stack_meta.get("mode") == "drizzle":
-        d = stack_meta.get("drizzle") or {}
-        return {"mode": "drizzle", "scale": float(d.get("scale") or stack_meta.get("scale") or 1.0),
-                "pixfrac": float(d.get("pixfrac") or 1.0), "kernel": d.get("kernel") or "square", "framing": fr}
-    return {"mode": "demosaic", "scale": float(stack_meta.get("scale") or 1.0), "interp": "lanczos4", "framing": fr}
+def read_seq(path: str) -> dict:
+    """A Siril ``.seq`` file: {"lines", "S" (fields), "nums" (file number per image), "R" ({layer: [line per image]})}."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    out = {"lines": lines, "S": None, "nums": [], "R": {}}
+    for ln in lines:
+        if ln.startswith("S "):
+            out["S"] = ln.split()
+        elif ln.startswith("I "):
+            out["nums"].append(int(ln.split()[1]))
+        elif re.match(r"R\d* ", ln):
+            out["R"].setdefault(int(ln.split()[0][1:] or 0), []).append(ln)
+    return out
 
 
-def registered_files(process_dir: str, seq: str) -> list[str]:
-    return sorted(glob.glob(os.path.join(process_dir, f"r_{seq}_[0-9]*.fit")))
+def registration_of(seq: dict) -> tuple[dict[int, dict[int, str]], int | None]:
+    """({layer: {file number: R line}}, the reference frame's file number) of a registered sequence."""
+    by = {layer: dict(zip(seq["nums"], rl)) for layer, rl in seq["R"].items() if len(rl) == len(seq["nums"])}
+    if not by:
+        raise RuntimeError("the calibrated sequence has no registration data: stack again")
+    ref = None
+    try:
+        ref = seq["nums"][int(seq["S"][6])]
+    except (TypeError, IndexError, ValueError):
+        pass
+    return by, ref
+
+
+def write_registration(path: str, nums: list[int], reg: dict[int, dict[int, str]], ref: int | None, layers: int,
+                       name: str | None = None, mono_layer: bool = False) -> None:
+    """Give the sequence ``path`` (its frames numbered ``nums``) the stack's transforms: Siril's ``calibrate`` /
+    ``seqsubsky`` keep the file numbers but not the registration, so ``seqapplyreg`` of the new frames needs the R
+    lines of the calibrated sequence, frame by frame.  Writes the file anew when ``name`` is given (a sequence made
+    here: the saturation masks).  ``mono_layer``: the registration on layer 0 (a 1-layer sequence)."""
+    ref_idx = nums.index(ref) if ref in nums else 0
+    if name is None:
+        old = read_seq(path)
+        head = []
+        for ln in old["lines"]:
+            if re.match(r"R\d* ", ln):
+                continue
+            if ln.startswith("S "):
+                p = ln.split()
+                p[6] = str(ref_idx)
+                ln = " ".join(p)
+            elif ln.startswith("L "):
+                ln = f"L {layers}"
+            head.append(ln)
+        if old["nums"] != nums:
+            raise RuntimeError(f"{os.path.basename(path)}: frames {old['nums'][:3]}... are not the included frames {nums[:3]}...")
+    else:
+        head = ["#Siril sequence file. Contains list of images, selection, registration data and statistics",
+                "#S 'sequence_name' start_index nb_images nb_selected fixed_len reference_image version variable_size fz_flag drizzle",
+                f"S '{name}_' {nums[0]} {len(nums)} {len(nums)} 5 {ref_idx} 6 0 0 0", f"L {layers}"] + [f"I {n} 1" for n in nums]
+    body = []
+    for layer, lines in sorted(reg.items()):
+        tag = "R0" if mono_layer else f"R{layer}"
+        for n in nums:
+            body.append(re.sub(r"^R\d*", tag, lines[n]))
+        if mono_layer:
+            break
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(head + body) + "\n")
 
 
 def sequence_placements(seq_file: str, canvas: tuple[int, int]) -> dict[int, tuple[int, int, int, int]]:
@@ -201,50 +277,6 @@ def sequence_placements(seq_file: str, canvas: tuple[int, int]) -> dict[int, tup
     return out
 
 
-def ensure_registered(session_dir: str, stack_meta: dict, progress=None, checkpoint=None) -> tuple[dict, dict]:
-    """The registered frames of the included subs: ({row index: file}, info).
-
-    Siril removes ``r_*`` after the stack (up to 100 MB each), so they are made again here with the same
-    ``seqapplyreg`` the stack used (``workflow.apply_script``; all included frames, so that the -framing=max
-    canvas is the stack's) and removed by ``run`` when the stage ends."""
-    from . import workflow
-    from .siril import SirilRunner
-    process = os.path.join(session_dir, "process")
-    state = read_json(os.path.join(process, "state.json"), {}) or {}
-    seq, n = state.get("seq"), int(state.get("n") or 0)
-    if not seq or not os.path.exists(os.path.join(process, f"{seq}_.seq")):
-        raise RuntimeError("the registration (process/state.json, the calibrated sequence) is missing: stack again")
-    if state.get("hdr"):
-        raise RuntimeError("ImageMM does not support HDR (several exposure groups) stacks")
-    rows = included_rows(session_dir)
-    inc = [i for i, r in enumerate(rows) if r.get("included")]
-    excluded = [i for i in range(len(rows)) if i not in set(inc)]
-    rs = resampling_of(stack_meta)
-    info = {"resampling": rs, "regenerated": False, "seq": seq}
-    files = registered_files(process, seq)
-    if len(files) != len(inc):
-        workflow.clean_registered(process)
-        runner = SirilRunner(process, progress=progress, checkpoint=checkpoint)
-        runner.run(workflow.apply_script(process, seq, n, excluded, rs), "apply_registration_imagemm",
-                   expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc),
-                   label="ImageMM: registering the frames")
-        files = registered_files(process, seq)
-        info["regenerated"] = True
-    if len(files) != len(inc):
-        raise RuntimeError(f"expected {len(inc)} registered frames, found {len(files)} in {process}")
-    # Siril names the r_ frames like the sequence (file number = sequence index + 1) and skips the unselected ones
-    by_row = {}
-    for f in files:
-        num = int(os.path.basename(f).rsplit("_", 1)[1].split(".")[0])
-        by_row[num - 1] = f
-    if set(by_row) != set(inc):
-        by_row = dict(zip(inc, files))          # (a different numbering: they are in sequence order)
-    cw, ch = stack_meta.get("stack_canvas") or [0, 0]
-    places = sequence_placements(os.path.join(process, f"r_{seq}_.seq"), (int(cw), int(ch)))
-    info["placements"] = {i: places[int(os.path.basename(f).rsplit("_", 1)[1].split(".")[0])] for i, f in by_row.items()}
-    return by_row, info
-
-
 # --------------------------------------------------------------------------- frames
 def read_frame(path: str, box: tuple[int, int, int, int], place: tuple[int, int, int, int] | None = None) -> np.ndarray:
     """The box (x, y, w, h) of the stack's canvas, as seen by a registered frame, float32 (h, w, 3): the frame
@@ -261,10 +293,12 @@ def read_frame(path: str, box: tuple[int, int, int, int], place: tuple[int, int,
     with fits.open(path, memmap=True) as hdul:
         d = hdul[0].data
         if d.ndim == 2:
-            d = np.repeat(d[None], 3, 0)
+            d = d[None]
         if d.shape[1] != fh or d.shape[2] != fw:
             raise RuntimeError(f"{os.path.basename(path)}: {d.shape[2]} x {d.shape[1]}, the sequence says {fw} x {fh}")
         a = np.array(d[:, y0 - oy:y1 - oy, x0 - ox:x1 - ox], dtype=np.float32)
+        if a.shape[0] == 1:
+            a = np.repeat(a, 3, 0)
     out[y0 - y:y1 - y, x0 - x:x1 - x] = np.moveaxis(a, 0, -1)
     return out
 
@@ -295,663 +329,427 @@ def stack_is_flipped(ref: np.ndarray, frame: np.ndarray) -> tuple[bool, dict]:
     return flipped > straight + 0.05, {"correlation": round(straight, 3), "correlation_flipped": round(flipped, 3)}
 
 
-def saturation_tops(frames: list[np.ndarray], plateau: int = 6, tol: float = 0.03) -> tuple[list[float], int]:
-    """(the ceilings found, frame-channels examined): per frame and channel the maximum, where at least
-    ``plateau`` pixels lie within ``tol`` of it (a saturated plateau; a sharp unsaturated peak never has)."""
-    tops = []
-    n = 0
-    for y in frames:
-        for c in range(3):
-            v = y[..., c]
-            m = float(v.max())
-            n += 1
-            if m > 0 and int((v >= (1 - tol) * m).sum()) >= plateau:
-                tops.append(m)
-    return tops, n
+def alignment_shift(ref: np.ndarray, frame: np.ndarray) -> list[float]:
+    """(dx, dy) of a frame against stack.fits (phase correlation of the smoothed g channels, 4x down-sampled
+    and scaled back): the frames must sit on the stack's pixels."""
+    have = frame[..., 1] != 0
+    a = np.where(have, frame[..., 1], np.median(frame[..., 1][have]) if have.any() else 0).astype(np.float32)
+    b = np.ascontiguousarray(ref[..., 1], np.float32)
+    a = cv2.GaussianBlur(a, (0, 0), 2.0)
+    b = cv2.GaussianBlur(b, (0, 0), 2.0)
+    (dx, dy), _ = cv2.phaseCorrelate(b.astype(np.float64), a.astype(np.float64))
+    return [round(float(dx), 3), round(float(dy), 3)]
 
 
-def saturation_level(frames: list[np.ndarray], plateau: int = 6, tol: float = 0.03) -> float | None:
-    """Saturation level of the registered frames, in their units, measured on them: a saturated star is a
-    plateau of (nearly) equal values at the sensor's ceiling.  Per frame and channel the maximum is the
-    ceiling when at least ``plateau`` pixels lie within ``tol`` of it (``saturation_tops``); the level is the
-    median ceiling over the frames and channels that show a plateau, and None when fewer than a third of them
-    do (no saturated star: nothing to censor).  A quick estimate only: on flat-fielded frames the ceiling is the
-    raw one divided by the flat and varies over the field, and a frame's maximum need not be a plateau at all -
-    ``RegisteredSet.prepare`` detects saturation with ``saturated_plateaus``."""
-    tops, n = saturation_tops(frames, plateau, tol)
-    if not n or len(tops) < max(3, n // 3):
-        return None
-    return float(np.median(tops))
+# --------------------------------------------------------------------------- saturation (raw frames)
+def raw_saturation(paths: dict[int, str], progress=None, checkpoint=None) -> tuple[float | None, dict[int, np.ndarray], dict]:
+    """(sensor ceiling, {file number: (row, col) of the saturated raw pixels}, info) from the frames' raw FITS files.
 
-
-def saturated_plateaus(v: np.ndarray, d: np.ndarray, gate: float, plateau: int = 6, tol: float = 0.03) -> np.ndarray:
-    """The saturated cores of one channel of a frame, each with its own ceiling: (P, 4) rows (cy, cx, radius,
-    ceiling).
-
-    A calibrated frame is (raw - dark) / flat: a raw sample at the converter's ceiling becomes ceiling / flat,
-    so the saturation level follows the flat field - its vignetting (DWARF 3: tens of per cent from the centre
-    to the corners) and, on a debayered sequence whose flat was not CFA-equalised, the colour of the flat
-    source per channel.  One level for the frame (the largest plateau of the frame, in a corner of low flat,
-    against a central star's) left the central stars' plateaus below the censoring threshold: their clipped
-    cores went into the fit as valid measurements.  So every plateau is measured where it is: pixels within
-    ``tol`` of their 5 x 5 local maximum, at least ``gate`` (half the lowest ceiling seen), 8-connected,
-    at least ``plateau`` of them, flat (all within 2 ``tol`` of the brightest: a ramp of smooth bright nebula
-    is not a plateau) and the top of a peak - the ring 2-3 px outside it at most 1 - 2 ``tol`` of its level (a
-    clipped core is surrounded by the star's falling profile; a patch of noise on bright, smooth nebula by the
-    same level).  Its ceiling is the median of its values."""
-    from scipy import ndimage as ndi
-    vv = np.where(d & np.isfinite(v), v, 0).astype(np.float32)
-    loc = cv2.dilate(vv, np.ones((5, 5), np.uint8))
-    top = (vv >= gate) & (vv >= (1 - tol) * loc) & (vv > 0)
-    if int(top.sum()) < plateau:
-        return np.zeros((0, 4), np.float64)
-    lab, _ = ndi.label(top, structure=np.ones((3, 3), int))
-    H, W = vv.shape
-    disk = lambda q: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * q + 1, 2 * q + 1))
-    out = []
-    for i, sl in enumerate(ndi.find_objects(lab), 1):
-        if sl is None:
+    The ceiling is the highest frame maximum that is a plateau (>= ``SAT_PLATEAU`` pixels at it: a saturated star
+    has many, an unsaturated peak one); a pixel is saturated at >= ``SATURATION_FRAC`` x the ceiling.  No plateau in
+    any frame: no saturation (None)."""
+    from astropy.io import fits
+    cand: dict[int, tuple[np.ndarray, np.ndarray]] = {}      # pixels >= 0.98 x the frame's maximum: (row, col), value
+    maxima: list[tuple[float, int]] = []
+    unreadable = 0
+    n = len(paths)
+    for k, (num, p) in enumerate(sorted(paths.items())):
+        if checkpoint:
+            checkpoint()
+        try:
+            with fits.open(p, memmap=False) as hdul:
+                hdu = hdul[0] if hdul[0].data is not None else next(h for h in hdul if h.data is not None)
+                a = np.asarray(hdu.data, dtype=np.float32)
+        except Exception:                                            # noqa: BLE001 (a raw camera format: no mask)
+            unreadable += 1
             continue
-        m = lab[sl] == i
-        if int(m.sum()) < plateau:
+        if a.ndim != 2:
+            unreadable += 1
             continue
-        vals = vv[sl][m]
-        if float(vals.min()) < (1 - 2 * tol) * float(vals.max()):
+        mx = float(a.max())
+        maxima.append((mx, int((a >= mx).sum())))
+        rc = np.argwhere(a >= 0.98 * mx).astype(np.int32)
+        cand[num] = (rc, a[rc[:, 0], rc[:, 1]])
+        if progress and (k % 10 == 0 or k == n - 1):
+            progress(k + 1, n, f"ImageMM: saturation of the raw frames {k + 1}/{n}")
+    plateaus = [m for m, c in maxima if c >= SAT_PLATEAU]
+    info = {"raw_frames": len(maxima), "unreadable": unreadable}
+    if not plateaus:
+        return None, {}, {**info, "ceiling": None}
+    ceiling = max(plateaus)
+    # (a frame whose maximum is below 0.995 x the ceiling has no pixel there; one at the ceiling has them all in cand)
+    out = {num: rc[v >= SATURATION_FRAC * ceiling] for num, (rc, v) in cand.items()}
+    counts = [len(v) for v in out.values()]
+    return ceiling, out, {**info, "ceiling": ceiling, "frames_with_plateau": len(plateaus),
+                          "saturated_pixels_median": float(np.median(counts)) if counts else 0.0}
+
+
+def confirm_on_calibrated(sat: dict[int, np.ndarray], calibrated: dict[int, str], ceiling: float) -> tuple[dict[int, np.ndarray], bool | None, dict]:
+    """The raw-saturated pixels that are saturated star light: still >= half the saturated level of their CFA lattice in
+    Siril's calibrated frame.
+
+    A raw pixel at the ceiling is also a hot pixel, which the dark subtraction / cosmetic correction removed from the
+    calibrated frame (IC 1805: ~600 of the ~700 pixels at 4095 per frame, some in pairs or only in part of the night).
+    A saturated star pixel stays at (ceiling - dark) / flat, and the flat differs by colour: one level for all (half the
+    ceiling) dropped most saturated BLUE pixels as hot (M 31 2026-10-23: red and blue flats ~3 x green's; blue cores
+    then entered the fit as valid data, flat-topped, their light 36-65 % of the stack's).  The level of each 2 x 2
+    lattice is the 90th percentile of its candidates' calibrated values over all frames (the saturated star pixels; the
+    corrected hot pixels fall far below).  The same test tells whether Siril read the raw file's rows reversed (a
+    TOP-DOWN file): returns (pixels, raw rows = the calibrated rows: True / False / None when no star pixel is found
+    either way, info)."""
+    from astropy.io import fits
+    vals = {True: {}, False: {}}
+    for num, rc in sat.items():
+        p = calibrated.get(num)
+        if p is None or not len(rc):
             continue
-        ceil_ = float(np.median(vals))
-        # the ring round it, in a box 4 px larger
-        ya, yb = max(sl[0].start - 4, 0), min(sl[0].stop + 4, H)
-        xa, xb = max(sl[1].start - 4, 0), min(sl[1].stop + 4, W)
-        mm = (lab[ya:yb, xa:xb] == i).astype(np.uint8)
-        ring = (cv2.dilate(mm, disk(3)) > 0) & ~(cv2.dilate(mm, disk(1)) > 0) & d[ya:yb, xa:xb]
-        if int(ring.sum()) < 4 or float(np.median(vv[ya:yb, xa:xb][ring])) > (1 - 2 * tol) * ceil_:
-            continue
-        ys, xs = np.nonzero(m)
-        cy, cx = float(ys.mean() + sl[0].start), float(xs.mean() + sl[1].start)
-        rad = float(np.sqrt(((ys + sl[0].start - cy) ** 2 + (xs + sl[1].start - cx) ** 2).max()))
-        out.append((cy, cx, rad, ceil_))
-    return np.asarray(out, np.float64).reshape(-1, 4)
+        with fits.open(p, memmap=True) as hdul:
+            d = hdul[0].data
+            H = d.shape[-2]
+            for straight in (True, False):
+                rows = rc[:, 0] if straight else H - 1 - rc[:, 0]
+                v = np.asarray(d[..., rows, rc[:, 1]], dtype=np.float32)
+                vals[straight][num] = (v.max(0) if v.ndim == 2 else v, rows % 2, rc[:, 1] % 2)
+    kept = {True: {}, False: {}}
+    levels = {}
+    for straight in (True, False):
+        lv = {}
+        for i in (0, 1):
+            for j in (0, 1):
+                pool = [v[(ry == i) & (cx == j)] for v, ry, cx in vals[straight].values()]
+                pool = np.concatenate(pool) if pool else np.zeros(0, np.float32)
+                lv[(i, j)] = float(np.percentile(pool, 90)) if pool.size else np.inf
+        # (floors: a tenth of the ceiling in Siril's [0, 1] units - a flat up to 10 x green's - and 0.15 of the brightest
+        # lattice's level: a lattice whose candidates are all hot pixels must not set its own level)
+        top = max([v for v in lv.values() if np.isfinite(v)], default=np.inf)
+        cn = ceiling / 65535.0 if ceiling > 2.0 else ceiling
+        lv = {k: max(v, 0.1 * cn, 0.15 * top) for k, v in lv.items()}
+        levels[straight] = lv
+        for num, rc in sat.items():
+            if num not in vals[straight]:
+                kept[straight][num] = rc[:0]
+                continue
+            v, ry, cx = vals[straight][num]
+            thr = np.array([lv[(int(a_), int(b_))] for a_, b_ in zip(ry, cx)], np.float32) * 0.5
+            kept[straight][num] = rc[v >= thr]
+    n_s = sum(len(v) for v in kept[True].values())
+    n_f = sum(len(v) for v in kept[False].values())
+    n_all = sum(len(v) for v in sat.values())
+    info = {"raw_saturated": n_all, "star_pixels": max(n_s, n_f), "hot_pixels": n_all - max(n_s, n_f),
+            "kept_straight": n_s, "kept_flipped": n_f}
+    if n_s == n_f == 0:
+        return {}, None, info
+    same = n_s >= n_f
+    info["lattice_levels"] = {f"{k[0]}{k[1]}": round(v, 5) for k, v in levels[same].items()}
+    return kept[same], same, info
 
 
-def ceiling_model(plats: np.ndarray, H: int, W: int, default: float) -> dict:
-    """The saturation ceiling over a frame's channel from its plateaus (``saturated_plateaus``): the flat field
-    is smooth, so a low-order polynomial of the plateaus' ceilings in the normalised [-1, 1] coordinates of the
-    (H, W) field (degree 2 from 12 plateaus, 1 from 4, their median below; 3-sigma clipped), ``default`` where
-    the frame has none; each plateau keeps its own measured value round it (``ceiling_window``)."""
-    P = len(plats)
-    if P == 0:
-        return {"deg": 0, "coef": np.array([float(default)]), "plateaus": np.zeros((0, 4))}
-    cy, cx, cz = plats[:, 0], plats[:, 1], plats[:, 3]
-    deg = 2 if P >= 12 else (1 if P >= 4 else 0)
-    if deg == 0:
-        return {"deg": 0, "coef": np.array([float(np.median(cz))]), "plateaus": plats}
-    from astrophoto.exposures import _poly_terms
-    X = np.stack(_poly_terms((cx + 0.5) / W * 2 - 1, (cy + 0.5) / H * 2 - 1, deg), 1)
-    keep = np.ones(P, bool)
-    for _ in range(4):
-        beta, *_ = np.linalg.lstsq(X[keep], cz[keep], rcond=None)
-        res = cz - X @ beta
-        s = 1.4826 * float(np.median(np.abs(res[keep]))) + 1e-12
-        new = np.abs(res) <= 3 * s
-        if new.sum() < X.shape[1] + 1 or (new == keep).all():
-            break
-        keep = new
-    # (no extrapolation beyond the ceilings measured: the polynomial is bounded by them)
-    return {"deg": deg, "coef": beta, "plateaus": plats, "range": [float(cz[keep].min()), float(cz[keep].max())]}
-
-
-def ceiling_window(model: dict, H: int, W: int, y0: int, y1: int, x0: int, x1: int, reach: float = 4.0) -> np.ndarray:
-    """The ceiling (``ceiling_model``) on the window [y0, y1) x [x0, x1) of the (H, W) field, (y1-y0, x1-x0):
-    the smooth model, and within ``reach`` px of a plateau's edge that plateau's own ceiling (the nearest)."""
-    h, w = y1 - y0, x1 - x0
-    if model["deg"] == 0:
-        out = np.full((h, w), float(model["coef"][0]), np.float64)
+def cfa_layout(calibrated: str, drizzled: str) -> tuple[dict[tuple[int, int], int] | None, dict]:
+    """{(row % 2, col % 2): channel} of a CFA frame, measured: the mean of each 2 x 2 sub-lattice of the calibrated CFA
+    frame against the means of the drizzled frame's channels (the two green lattices are the diagonal pair that agree
+    best; red and blue the remaining two, matched to the drizzled R and B means).  None when it cannot tell."""
+    from astropy.io import fits
+    cal = np.asarray(fits.getdata(calibrated), dtype=np.float64)
+    drz = np.asarray(fits.getdata(drizzled), dtype=np.float64)
+    if cal.ndim != 2 or drz.ndim != 3 or drz.shape[0] != 3:
+        return None, {"reason": "not a CFA / RGB pair"}
+    lat = {(i, j): float(np.nanmean(cal[i::2, j::2])) for i in (0, 1) for j in (0, 1)}
+    ch = [float(np.mean(drz[c][drz[c] != 0])) for c in range(3)]
+    pairs = [((0, 0), (1, 1)), ((0, 1), (1, 0))]
+    rel = [abs(lat[a] - lat[b]) / max(abs(lat[a]) + abs(lat[b]), 1e-12) for a, b in pairs]
+    g = pairs[int(np.argmin(rel))]
+    o = [p for p in lat if p not in g]
+    # R / B: the assignment with the smaller relative mismatch to the drizzled means (relative to green, so that scale
+    # differences of the two images cancel)
+    gl, gd = 0.5 * (lat[g[0]] + lat[g[1]]), ch[1]
+    cost0 = abs(lat[o[0]] / gl - ch[0] / gd) + abs(lat[o[1]] / gl - ch[2] / gd)
+    cost1 = abs(lat[o[0]] / gl - ch[2] / gd) + abs(lat[o[1]] / gl - ch[0] / gd)
+    out = {g[0]: 1, g[1]: 1}
+    if cost0 <= cost1:
+        out[o[0]], out[o[1]] = 0, 2
     else:
-        from astrophoto.exposures import _poly_terms
-        xx, yy = np.meshgrid((np.arange(x0, x1) + 0.5) / W * 2 - 1, (np.arange(y0, y1) + 0.5) / H * 2 - 1)
-        out = np.tensordot(np.asarray(model["coef"], np.float64), np.stack(_poly_terms(xx, yy, model["deg"]), 0), 1)
-        out = np.clip(out, *model["range"])
-    pl = np.asarray(model["plateaus"], np.float64).reshape(-1, 4)
-    if len(pl):
-        R = pl[:, 2] + float(reach)
-        near = (pl[:, 0] + R >= y0) & (pl[:, 0] - R < y1) & (pl[:, 1] + R >= x0) & (pl[:, 1] - R < x1)
-        if near.any():
-            best = np.full((h, w), np.inf)
-            for cy, cx, rad, cz in pl[near]:
-                Rq = rad + float(reach)
-                ya, yb = max(int(np.floor(cy - Rq)), y0), min(int(np.ceil(cy + Rq)) + 1, y1)
-                xa, xb = max(int(np.floor(cx - Rq)), x0), min(int(np.ceil(cx + Rq)) + 1, x1)
-                if yb <= ya or xb <= xa:
-                    continue
-                yy, xx = np.mgrid[ya:yb, xa:xb]
-                dist = np.hypot(yy - cy, xx - cx) - rad
-                bq = best[ya - y0:yb - y0, xa - x0:xb - x0]
-                sel = (dist <= reach) & (dist < bq)
-                out[ya - y0:yb - y0, xa - x0:xb - x0][sel] = cz
-                bq[sel] = dist[sel]
-    return out
+        out[o[0]], out[o[1]] = 2, 0
+    info = {"layout": {f"{k[0]}{k[1]}": "RGB"[v] for k, v in out.items()}, "green_agreement": round(float(min(rel)), 4),
+            "rb_margin": round(float(abs(cost0 - cost1)), 4)}
+    return out, info
 
 
-def measurement_masks(y: np.ndarray, sat: float | None, thr: float = 0.94, gate: float | None = None) -> dict:
-    """The masks of a drizzled frame y (h, w, 3), per channel unless noted:
-
-    ``data``     pixels where a drop landed (Siril writes exactly 0 where none did) and finite;
-    ``hole``     missing pixels inside the footprint (at least 5 of the 8 neighbours have data): the gaps of
-                 the drop lattice, ~3 % of the red and blue planes of a Bayer drizzle at scale 1;
-    ``region``   data or hole;  ``interior`` the region eroded by 1 px (its border pixels are the ones
-                 with a partial drop weight at the edge of the footprint);
-    ``cens``     pixels whose drops used a saturated raw sample (value >= thr x the local saturation level,
-                 grown by the drop footprint: 1 px for green, 2 px for the 2x2 drops of red and blue) that
-                 hold data - Whyte et al.'s saturated pixels, recorded values kept;
-    ``valid``    the ImageMM mask m: data, interior and not censored;
-    ``ceiling``  per channel the frame's saturation ceiling (``ceiling_model``: the plateaus found with
-                 ``gate``, default half of ``sat``; ``sat`` where there are none), or None without ``sat``."""
-    h, w, _ = y.shape
-    data = np.isfinite(y) & (y != 0)
-    k8 = np.ones((3, 3), np.float32)
-    k8[1, 1] = 0
-    hole = np.zeros_like(data)
-    region = np.zeros_like(data)
-    interior = np.zeros_like(data)
-    cens = np.zeros_like(data)
-    ceiling = [None] * 3
-    for c in range(3):
-        d = data[..., c]
-        nb = cv2.filter2D(d.astype(np.float32), -1, k8, borderType=cv2.BORDER_CONSTANT)
-        hole[..., c] = ~d & (nb >= 5)
-        region[..., c] = d | hole[..., c]
-        interior[..., c] = cv2.erode(region[..., c].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-    if sat is not None:
-        plats = [saturated_plateaus(np.where(data[..., c], y[..., c], 0), data[..., c],
-                                    0.5 * float(sat) if gate is None else float(gate)) for c in range(3)]
-        # a channel without a plateau of its own (its saturated cores smaller than ``plateau`` pixels) takes the
-        # frame's other plateaus' level, else the typical one: censoring an unsaturated pixel costs little (it is
-        # still fitted, through the saturating response), keeping a clipped one as valid biases the fit
-        found = np.concatenate([p_[:, 3] for p_ in plats])
-        dflt = float(np.median(found)) if len(found) else float(sat)
-        for c in range(3):
-            d = data[..., c]
-            v = np.where(d, y[..., c], 0)
-            ceiling[c] = ceiling_model(plats[c], h, w, dflt)
-            s = (v >= thr * ceiling_window(ceiling[c], h, w, 0, h, 0, w)).astype(np.uint8)
-            if s.any():
-                g = 1 if c == 1 else 2
-                s = cv2.dilate(s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
-                cens[..., c] = (s > 0) & d
-    valid = data & interior & ~cens
-    return {"data": data, "hole": hole, "region": region, "interior": interior, "cens": cens, "valid": valid,
-            "ceiling": ceiling}
-
-
-def fill_holes(y: np.ndarray, masks: dict) -> np.ndarray:
-    """Copy of y with the lattice holes replaced by the mean of their neighbours that hold data.  Used for
-    measuring (aperture photometry, the sky surface, PSF-star cut-outs), where a single missing pixel among
-    ~150 of a star's core would bias a flux; the restoration's mask keeps them masked (``valid``)."""
-    out = y.copy()
-    k8 = np.ones((3, 3), np.float32)
-    k8[1, 1] = 0
-    for c in range(3):
-        hl = masks["hole"][..., c]
-        if hl.any():
-            d = masks["data"][..., c].astype(np.float32)
-            num = cv2.filter2D(np.where(d > 0, y[..., c], 0).astype(np.float32), -1, k8, borderType=cv2.BORDER_CONSTANT)
-            den = cv2.filter2D(d, -1, k8, borderType=cv2.BORDER_CONSTANT)
-            out[..., c] = np.where(hl, num / np.maximum(den, 1), y[..., c])
-    return out
-
-
-def encircled_energy(K: np.ndarray, R: float, sub: int = 8) -> float:
-    """Fraction of the light of the centred kernel K (n x n, n odd) within radius R of its centre pixel's
-    centre: each pixel weighted by the part of it inside the circle (``sub`` x ``sub`` samples per pixel, as an
-    aperture sums partial pixels).  Relative to K's sum."""
-    K = np.asarray(K, np.float64)
-    n = K.shape[-1]
-    c = n // 2
-    o = (np.arange(sub) + 0.5) / sub - 0.5
-    d = np.arange(n) - c
-    yy = (d[:, None] + o[None, :])[:, None, :, None]                # (n, 1, sub, 1)
-    xx = (d[:, None] + o[None, :])[None, :, None, :]                # (1, n, 1, sub)
-    frac = (yy ** 2 + xx ** 2 <= float(R) ** 2).mean((-2, -1))      # (n, n)
-    tot = float(K.sum())
-    return float((K * frac).sum() / tot) if tot > 0 else 1.0
-
-
-def surface_window(coefs: np.ndarray, H: int, W: int, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
-    """The smooth sky surface of a frame (``exposures.fit_smooth_surface`` coefficients (3, terms), normalised
-    [-1, 1] coordinates of the (H, W) field) on the window, (3, y1-y0, x1-x0), evaluated exactly."""
-    from astrophoto.exposures import _poly_terms
-    x = (np.arange(x0, x1) + 0.5) / W * 2 - 1
-    y = (np.arange(y0, y1) + 0.5) / H * 2 - 1
-    xx, yy = np.meshgrid(x, y)
-    terms = np.stack(_poly_terms(xx, yy, 2), 0)
-    return np.tensordot(np.asarray(coefs, np.float64), terms, axes=([1], [0])).astype(np.float32)
-
-
-
-
-
-def make_set_class():
-    """``RegisteredSet``, an ``exposures.ExposureSet`` whose exposures are Siril's registered frames.  A function
-    so that importing this module imports neither astrophoto nor torch."""
-    from astrophoto import exposures as E
-
-    class RegisteredSet(E.ExposureSet):
-        """Prepared registered frames in the form ``imagemm.restore`` consumes (the ExposureSet interface:
-        ``usable``, ``node_kernels``/``kernels``, ``windows`` with censored pixels, ``sat``, ``params[k]['T']``,
-        ``psf_ref``).  Everything about PSFs, photometric scales, photon-transfer variances and the seeing
-        mixture is ExposureSet's own code; only the frame source (no raw subs, no demosaic, no own
-        registration: the frames are Siril's registered, drizzled RGB) and the window extraction differ."""
-
-        PREP_VERSION = E.ExposureSet.PREP_VERSION
-
-        def __init__(self, files: dict, rows: list, box: tuple[int, int, int, int], ref: np.ndarray,
-                     work: str, scale: float, fwhm_guess: float, places: dict | None = None, progress=None,
-                     checkpoint=None, sat_box: tuple[int, int, int, int] | None = None, flip: bool = False):
-            import types
-            self.keys = sorted(files)
-            self.files = [files[k] for k in self.keys]
-            self.places = [(places or {}).get(k) for k in self.keys]
-            self.box = tuple(int(v) for v in box)
-            self.flip = bool(flip)             # the frames are read upside down (see stack_is_flipped)
-            self.sat_box = tuple(int(v) for v in (sat_box or box))       # where the saturation is looked for
-            self.work = work
-            self.progress = progress
-            self.checkpoint = checkpoint
-            self.H0, self.W0 = ref.shape[:2]
-            self.ref = ref.astype(np.float32)
-            self.pattern = None
-            self.defects = np.zeros((self.H0, self.W0), bool)
-            self.info0 = types.SimpleNamespace(width=self.W0, height=self.H0, bayer=None)
-            fw = np.array([float(rows[k].get("fwhm") or np.nan) for k in self.keys], float) * float(scale)
-            med = float(np.nanmedian(fw)) if np.isfinite(fw).any() else float(fwhm_guess)
-            self.fwhm_rel = np.where(np.isfinite(fw), fw / med, 1.0)
-            self.fwhm_guess = med if np.isfinite(med) and med > 0 else float(fwhm_guess)
-            self.items = [(types.SimpleNamespace(name=os.path.basename(f), path=f), {"fwhm": float(self.fwhm_guess * q)})
-                          for f, q in zip(self.files, self.fwhm_rel)]
-            self.sat = 1e30
-            self.sat_frames = None             # saturation in the frames' units (None: no saturated stars)
-            self.sat_gate = None               # floor of the plateau search (saturated_plateaus)
-            self.aperture_info = None          # the scales' aperture corrections (_aperture_correction)
-            self.coadd = None
-            self.coverage = None
-            self._acc = None
-            self.workers = 4
-            self.params = []
-            self.ptc = None
-            self.nodes = E.psf_nodes(self.H0, self.W0)
-            self.fwhm_max = self.fwhm_med = self.fwhm_ref = self.fwhm_guess
-
-        # -------------------------------------------------------- bookkeeping
-        def say(self, i, n, msg):
-            if self.progress:
-                self.progress(i, n, msg)
-            elif self.checkpoint:
-                self.checkpoint()
-
-        def _frame_paths(self, k):
-            return (os.path.join(self.work, f"y_{k:05d}.npy"), os.path.join(self.work, f"f_{k:05d}.npy"))
-
-        def _read(self, k: int, box=None) -> np.ndarray:
-            y = read_frame(self.files[k], box or self.box, self.places[k])
-            return np.ascontiguousarray(y[::-1]) if self.flip else y
-
-        # -------------------------------------------------------- the pass
-        def prepare(self, progress=None, cancel=None):
-            """One pass over the frames (serial; one prepare at a time).  Per frame: masks, photometric scale
-            T against the reference (aperture photometry of isolated stars), the sky surface, the PSF-star
-            cut-outs and field PSF; the prepared frame goes to ``work`` for ``windows``.  Then the photon
-            transfer curve, the PSF of the frames' own coadd, and the seeing-mixture kernels."""
-            from astrophoto.exposures import poly_background
-            n = len(self.files)
-            os.makedirs(self.work, exist_ok=True)
-            # Whether the frames saturate, and at what typical level: saturated plateaus (saturated_plateaus: flat,
-            # peak-topped) in a sample of frames - the sharpest ones, which saturate first (a star can clip only in
-            # the good-seeing frames), and frames spread over the night.  The search floor in each sampled frame is
-            # 0.3 of its maximum (a frame's maximum is at most its highest ceiling, the flat's lowest point); the
-            # frames' own search then starts at half the lowest ceiling found.
-            sample = sorted(set(np.argsort(self.fwhm_rel, kind="stable")[:min(n, 12)].tolist())
-                            | set(np.linspace(0, n - 1, min(n, 12)).round().astype(int).tolist()))
-            conf = []
-            for k in sample:
-                fr = self._read(k, self.sat_box)
+def write_saturation_masks(process: str, sat: dict[int, np.ndarray], shape: tuple[int, int], flip: bool, grow: int = SAT_GROW,
+                           layout: dict | None = None) -> None:
+    """``immsat_NNNNN.fit``: 255 where a raw pixel within ``grow`` px is saturated (uint8, the CFA geometry); with a CFA
+    ``layout`` three planes, plane c from the saturated raw pixels of colour c only."""
+    from astropy.io import fits
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
+    H, W = shape
+    for num, rc in sat.items():
+        planes = 3 if layout else 1
+        m = np.zeros((planes, H, W), np.uint8)
+        if len(rc):
+            rows = (H - 1 - rc[:, 0]) if flip else rc[:, 0]
+            cols = rc[:, 1]
+            if layout:
+                colour = np.array([layout[(int(r_) % 2, int(c_) % 2)] for r_, c_ in zip(rows, cols)])
                 for c in range(3):
-                    v = fr[..., c]
-                    dd = np.isfinite(v) & (v != 0)
-                    mx = float(v[dd].max()) if dd.any() else 0.0
-                    if mx > 0:
-                        conf.extend(saturated_plateaus(v, dd, 0.3 * mx)[:, 3].tolist())
-                del fr
-            self.sat_frames = float(np.median(conf)) if len(conf) >= 2 else None
-            self.sat_gate = 0.5 * float(min(conf)) if self.sat_frames is not None else None
-            self.say(0, n, "ImageMM: reference sky model and star catalogue")
-            self.sky_ref, self.sky_info = poly_background(self.ref, 2)
-            ref_bs = (self.ref - self.sky_ref).astype(np.float32)
-            # saturation of the reference (a stack of the saturated plateaus): from the censored pixels of the sharpest
-            # frame (the one that clips most; the first frame may clip nothing)
-            sat_ref = 1e30
-            if self.sat_frames is not None:
-                k_sh = int(np.argmin(np.where(np.isfinite(self.fwhm_rel), self.fwhm_rel, np.inf)))
-                m0 = measurement_masks(self._read(k_sh), self.sat_frames, gate=self.sat_gate)
-                c0 = m0["cens"].all(-1)
-                if c0.sum() >= 4:
-                    sat_ref = float(np.median(self.ref[c0]))
-                else:
-                    sat_ref = float(np.percentile(self.ref, 99.99))
-                del m0
-            self.sat_ref = sat_ref
-            self.fwhm_ref = self.fwhm_guess
-            self.cat = E.star_catalog(ref_bs, sat_ref, self.fwhm_ref)
-            fw = self.fwhm_ref * self.fwhm_rel
-            # the faint neighbours the 3-sigma list misses, found on the stack's residual (DAOPHOT / Magain et al.
-            # 2007): every PSF built below masks them
-            if getattr(self, "deepen_catalog", False):
-                # (off: on IC 1805 the extra masks left 27 of 48 PSF stars and over-subtracted their wings)
-                self.say(0, n, "ImageMM: neighbours of the PSF stars")
-                self.cat = E.deepen_catalog(ref_bs, self.cat, sat_ref, self.fwhm_ref, self.nodes,
-                                            int(math.ceil(3.5 * float(np.nanmax(fw)))))
-            self.fwhm_med = self.fwhm_ref
-            self.fwhm_max = float(np.nanmax(fw))
-            self.smask = E.star_mask(self.ref.shape[:2], self.cat, self.fwhm_ref)
-            self.items = [(i, {"fwhm": float(q)}) for (i, _), q in zip(self.items, fw)]
-            self.params = [None] * n
-            S = np.zeros((self.H0, self.W0, 3), np.float32)
-            Wt = np.zeros((self.H0, self.W0, 3), np.float32)
-            # optical-state groups (optional): consecutive frames (time order).  The telescope's focus drifts as it cools
-            # (IC 1805, DWARF 3, 43 -> 39 C: the core's centre / 2-3 px ring 1.03 -> 0.90, rms radius 3.6 ->
-            # 4.0 px over the night); the seeing mixture G(sigma_t) * Q can widen Q but not deepen its ring, so
-            # each group gets its own Q from its own coadd
-            # (off unless asked: on IC 1805 eight groups left the rings round the cluster's stars as they were and
-            # made each group's PSF wing ~3x noisier)
-            G = max(1, int(getattr(self, "n_psf_groups", 0) or 1))
-            self.psf_group = np.minimum((np.arange(n) * G) // max(n, 1), G - 1)
-            Sg = np.zeros((G, self.H0, self.W0, 3), np.float32)
-            Wg = np.zeros((G, self.H0, self.W0, 3), np.float32)
-            acc = {"X": [], "v": [], "n": [], "pair": []}
-            cens_any = np.zeros((self.H0, self.W0, 3), bool)
-            prev = None
-            for k in range(n):
-                if self.checkpoint:
-                    self.checkpoint()
-                self.say(k, n, f"ImageMM: preparing frames {k}/{n}")
-                p, cur = self.prepare_frame(k)
-                self.params[k] = p
-                if cur is None:
-                    prev = None
-                    continue
-                if prev is not None:
-                    self._ptc_pair(prev, cur, acc, pair=(prev["_k"], k))
-                cur["_k"] = k
-                prev = cur
-                v = cur["_valid"]
-                cens_any |= cur["_cens"]
-                S += cur["_yb"] * v
-                Wt += v
-                Sg[self.psf_group[k]] += cur["_yb"] * v
-                Wg[self.psf_group[k]] += v
-            self.say(n, n, f"ImageMM: preparing frames {n}/{n}")
-            seen = Wt > 0
-            self.coadd = np.where(seen, S / np.maximum(Wt, 1), self.ref).astype(np.float32)
-            self.coverage = Wt.mean(-1).astype(np.float32)
-            del S, prev
-            self.ptc = self._ptc_fit(acc, n)
-            usable = [k for k in range(n) if self.params[k] and np.all(np.isfinite(self.params[k]["T"]))]
-            if len(usable) < 3:
-                raise RuntimeError(f"ImageMM: only {len(usable)} of {n} frames have a photometric scale in every "
-                                   "channel (too few isolated stars against the stack)")
-            if self.sat_frames is not None:
-                self.sat = self.latent_saturation(usable)
-            self.say(0, 1, "ImageMM: PSF of the frames' coadd")
-            cbs = self.coadd - self.sky_ref
-            # the PSF only where no frame was censored: a pixel saturated in some frames (the best-seeing ones, for a
-            # star at 0.3-0.5 of the ceiling in the stack) is the mean of the others there - a flattened core
-            psf_ok = seen & ~(cv2.dilate(cens_any.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
-            del cens_any
-            # DAOPHOT's crowded-field PSF: measured again with every non-PSF star subtracted (twice)
-            self.psf_ref = [E.psf_field_neighbours_subtracted(cbs[..., c], psf_ok[..., c], self.cat,
-                                                              int(math.ceil(3.5 * self.fwhm_max)), self.fwhm_ref, self.nodes,
-                                                              sat=float(self.sat_ref)) for c in range(3)]
-            # the outer wing from the brightest stars, saturated ones included (extended PSF, Infante-Sainz et al. 2020)
-            half_ref = int(math.ceil(3.5 * self.fwhm_max))
-            self.psf_ref = [E.extend_psf_wings(r, cbs[..., c], psf_ok[..., c], self.cat, half_ref, self.fwhm_ref,
-                                               sat=float(self.sat_ref))
-                            for c, r in enumerate(self.psf_ref)]
-            for r in self.psf_ref:
-                if r is not None:
-                    r["source"] = "frames"
-            if G <= 1:
-                self._fit_exposure_kernels(1, progress=self.say, cancel=self.checkpoint)
-                self._aperture_correction(n)
-                return self
-            # the seeing mixture per group: Q from the group's coadd, each frame's G(sigma_t) against it
-            glob_ref, all_params = self.psf_ref, self.params
-            self.psf_ref_groups = []
-            for g in range(G):
-                seen_g = Wg[g] > 0
-                cg = np.where(seen_g, Sg[g] / np.maximum(Wg[g], 1), self.ref) - self.sky_ref
-                refs = [E.empirical_psf_field(cg[..., c], seen_g[..., c], self.cat, int(math.ceil(3.5 * self.fwhm_max)),
-                                              self.fwhm_ref, self.nodes) for c in range(3)]
-                refs = [r_g if r_g is not None else r_all for r_g, r_all in zip(refs, glob_ref)]
-                self.psf_ref = refs
-                self.params = [p if (p is not None and self.psf_group[k] == g) else None for k, p in enumerate(all_params)]
-                self.say(g, G, f"ImageMM: PSF group {g + 1}/{G}")
-                self._fit_exposure_kernels(1, progress=self.say, cancel=self.checkpoint)
-                self.psf_ref_groups.append(refs)
-            self.params, self.psf_ref = all_params, glob_ref
-            del Sg, Wg
-            self._aperture_correction(n)
-            return self
-
-        def _aperture_correction(self, n: int, tol: float = 1e-3):
-            """The photometric scales T corrected for the light outside the aperture (the growth-curve method,
-            Stetson 1990, PASP 102, 932): aperture_ratio compares a frame's 3-FWHM aperture flux with the
-            stack's, and a frame of poor seeing has less of its light inside - T came out low by the difference
-            of the encircled energies (a Moffat beta 2.5 of 1.2 x the FWHM: 1.4 %), and the frames' stars no
-            longer matched one latent.  With the frames' PSFs known, T_true = T_aperture EE_ref(R) / EE_t(R), EE
-            the fraction of a unit-sum kernel within the aperture radius R (the frame's model kernel; for the
-            stack, the frames' coadd PSF).  The frames are then prepared again with the corrected scales - the
-            sky surface is fitted to y / T - ref and the window arrays, the coadd and the photon-transfer
-            pairs all depend on T - unless every correction is below ``tol``.  The PSFs are kept (a scale of
-            the data does not change a normalised PSF)."""
-            usable = self.usable()
-            # every frame with a scale is prepared again (the coadd and the photon-transfer pairs are made of all of
-            # them); a frame without a PSF in some channel keeps its aperture scale there
-            corr = {k: np.ones(3) for k in range(n) if self.params[k] is not None and np.all(np.isfinite(self.params[k]["T"]))}
-            for k in usable:
-                p = self.params[k]
-                R = self.aperture_radius(k)
-                c_k = corr[k]
-                for c in range(3):
-                    kt = p["psf"][c] if p.get("psf") else None
-                    kr = self.psf_ref[c]["psf"] if self.psf_ref[c] is not None else None
-                    if kt is not None and kr is not None:
-                        c_k[c] = encircled_energy(kr, R) / max(encircled_energy(kt, R), 1e-12)
-            if usable:
-                vals = np.asarray([corr[k] for k in usable])
-                self.aperture_info = {"median": np.median(vals, 0).round(5).tolist(), "min": vals.min(0).round(5).tolist(),
-                                      "max": vals.max(0).round(5).tolist(), "applied": False}
-            if not corr or max(float(np.abs(v - 1).max()) for v in corr.values()) < tol:
-                return
-            S = np.zeros((self.H0, self.W0, 3), np.float32)
-            Wt = np.zeros((self.H0, self.W0, 3), np.float32)
-            acc = {"X": [], "v": [], "n": [], "pair": []}
-            prev = None
-            for k in range(n):
-                if self.checkpoint:
-                    self.checkpoint()
-                self.say(k, n, f"ImageMM: aperture-corrected scales, frames {k}/{n}")
-                if k not in corr:
-                    prev = None
-                    continue
-                p, cur = self.prepare_frame(k, T_fixed=np.asarray(self.params[k]["T"], np.float64) * corr[k])
-                p["T_aperture"] = np.asarray(self.params[k]["T"], np.float64)
-                p["aperture_correction"] = corr[k]
-                self.params[k] = p
-                if prev is not None:
-                    self._ptc_pair(prev, cur, acc, pair=(prev["_k"], k))
-                cur["_k"] = k
-                prev = cur
-                S += cur["_yb"] * cur["_valid"]
-                Wt += cur["_valid"]
-            seen = Wt > 0
-            self.coadd = np.where(seen, S / np.maximum(Wt, 1), self.ref).astype(np.float32)
-            self.coverage = Wt.mean(-1).astype(np.float32)
-            self.ptc = self._ptc_fit(acc, n)
-            if self.sat_frames is not None:
-                self.sat = self.latent_saturation(usable)
-            if self.aperture_info is not None:
-                self.aperture_info["applied"] = True
-
-        def sky_floor(self, idx: list[int], y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
-            """(3,) the sky each frame had on the window before it was taken off, in the latent's units -
-            sky_ref + surf (a window holds y / T - surf - sky_ref) - the least over the frames ``idx``
-            (the sky glow changes through the night; the static sky must stay >= 0 in every frame)."""
-            ref = np.moveaxis(self.sky_ref[y0:y1, x0:x1], -1, 0)
-            lev = [np.median(ref + surface_window(self.params[k]["surf"], self.H0, self.W0, y0, y1, x0, x1), axis=(1, 2))
-                   for k in idx]
-            return np.min(lev, 0)
-
-        def latent_saturation(self, usable: list[int]) -> float:
-            """The saturation in the units ``imagemm.restore_cutout`` divides by T (``level = sat / T``): the
-            frames' ceiling with each frame's own sky taken off, sat_frames - T (sky_ref + surf).  A window
-            holds y / T - surf - sky_ref, and the frame's sky in its own units is T (sky_ref + surf) - not
-            T sky_ref: the stack carries a pedestal the frames do not (IC 1805, DWARF 3: stack sky 0.050,
-            frames 0.0003 = T x 0.005), which ``surf`` absorbs.  Median over the frames and the field."""
-            vals = []
-            for k in usable:
-                p = self.params[k]
-                T = float(np.median(p["T"]))
-                surf = surface_window(p["surf"], self.H0, self.W0, 0, self.H0, 0, self.W0)[:, ::16, ::16]
-                vals.append(self.sat_frames - T * float(np.median(np.moveaxis(self.sky_ref[::16, ::16], -1, 0) + surf)))
-            return float(np.median(vals))
-
-        def aperture_radius(self, k: int) -> float:
-            """The photometric aperture of frame k (``prepare_frame``'s aperture_ratio): 3 FWHM."""
-            return 3.0 * max(float(self.items[k][1]["fwhm"]), self.fwhm_ref)
-
-        def prepare_frame(self, k: int, T_fixed: np.ndarray | None = None):
-            """Frame k prepared (masks, photometric scale, sky surface, PSF-star cut-outs and field PSF, the window
-            arrays on disk).  ``T_fixed``: the scale is given (``_aperture_correction``'s second pass): only the
-            surface, the window arrays and the coadd / photon-transfer inputs are made again, the PSFs are kept."""
-            from astrophoto.exposures import fit_smooth_surface
-            E_ = E
-            fwhm = float(self.items[k][1]["fwhm"])
-            y = self._read(k)
-            ms = measurement_masks(y, self.sat_frames, gate=getattr(self, "sat_gate", None))
-            yf = fill_holes(y, ms)
-            hard = (ms["region"] & ms["interior"]).all(-1)
-            if ms["cens"].any():
-                grown = cv2.dilate(ms["cens"].any(-1).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-                hard &= ~grown
-            if T_fixed is None:
-                T, T_err = E_.aperture_ratio(yf, self.ref, hard, self.cat, radius=self.aperture_radius(k))
+                    sel = colour == c
+                    m[c, rows[sel], cols[sel]] = 255
+                    m[c] = cv2.dilate(m[c], se)
             else:
-                T = np.asarray(T_fixed, np.float64)
-                T_err = np.asarray(self.params[k]["T_err"], np.float64) * T / np.asarray(self.params[k]["T"], np.float64)
-            base = {"refine": None, "residual": None, "T": T, "T_err": T_err, "fwhm": fwhm,
-                    "valid_frac": float(ms["valid"].mean()), "ceiling": ms["ceiling"]}
-            log.debug("frame %d: T %s +- %s, valid %.3f, holes %s, censored %.5f", k, T, T_err, ms["valid"].mean(),
-                      ms["hole"].mean(axis=(0, 1)), ms["cens"].mean())
-            if not np.all(np.isfinite(T)):
-                return {**base, "surf": None, "psf": [None] * 3, "psf_field": [None] * 3, "psf_stars": [0, 0, 0]}, None
-            e = yf / T[None, None, :] - self.ref
-            coefs = fit_smooth_surface(e, hard & ~self.smask, deg=2)
-            surf = np.moveaxis(surface_window(coefs, self.H0, self.W0, 0, self.H0, 0, self.W0), 0, -1)
-            ybs = (yf / T[None, None, :] - surf - self.sky_ref).astype(np.float32)
-            cur = {"_y": np.where(ms["data"], y, 0).astype(np.float32), "_valid": ms["valid"], "_cens": ms["cens"], "_surf": surf, "T": T,
-                   "_yb": (y / T[None, None, :] - surf).astype(np.float32)}
-            if T_fixed is not None:
-                ypath, _ = self._frame_paths(k)
-                np.save(ypath, np.ascontiguousarray(np.moveaxis(ybs, -1, 0)))
-                return {**self.params[k], "T": T, "T_err": T_err, "surf": coefs}, cur
-            half = int(math.ceil(3.5 * max(fwhm, self.fwhm_ref)))
-            fe = max(fwhm, self.fwhm_ref)
-            fe_ = math.ceil(fe * 10 - 1e-9) / 10
-            cuts = [E_._psf_cutouts(ybs[..., c], hard, self.cat, half, fe_, 1000) for c in range(3)]
-            fields = [E_.empirical_psf_field(ybs[..., c], hard, self.cat, half, fe, self.nodes, cutouts=cu)
-                      for c, cu in enumerate(cuts)]
-            flags = (ms["valid"].astype(np.uint8) | (ms["cens"].astype(np.uint8) << 1))
-            ypath, fpath = self._frame_paths(k)
-            np.save(ypath, np.ascontiguousarray(np.moveaxis(ybs, -1, 0)))
-            np.save(fpath, np.ascontiguousarray(np.moveaxis(flags, -1, 0)))
-            p = {**base, "surf": coefs, "psf": [f["psf"] if f else None for f in fields], "psf_field": fields,
-                 "psf_stars": [f["n_stars"] if f else 0 for f in fields],
-                 "cuts": [E_._compact_cutouts(cu, 60) for cu in cuts]}
-            return p, cur
+                m[0, rows, cols] = 255
+                m[0] = cv2.dilate(m[0], se)
+        fits.writeto(os.path.join(process, f"immsat_{num:05d}.fit"), m if layout else m[0], overwrite=True)
 
-        # -------------------------------------------------------- data for a window
-        def window(self, k, y0, y1, x0, x1, censored=False):
-            res = self.windows([k], y0, y1, x0, x1, censored)
-            z = [np.moveaxis(r[0], 0, -1) for r in res]
-            return tuple(z)
 
-        def windows(self, idx, y0, y1, x0, x1, censored=False):
-            """Stacked y, v, m (and c) of the chosen frames on a window: (n, 3, h, w) float32 each."""
-            from concurrent.futures import ThreadPoolExecutor
-            n, h, w = len(idx), y1 - y0, x1 - x0
-            Y = np.empty((n, 3, h, w), np.float32)
-            V = np.empty_like(Y)
-            Mk = np.empty_like(Y)
-            Cn = np.empty_like(Y) if censored else None
-            # the expected level of a frame from the frames' own coadd (y / T - surf, the stack where no frame covers):
-            # the stack is weighted by FWHM and resampled differently, its stars sharper than the frames' - their
-            # cores' shot noise then came out too high and the wings' too low
-            lvl_img = self.coadd if getattr(self, "coadd", None) is not None else self.ref
-            refw = np.moveaxis(lvl_img[y0:y1, x0:x1], -1, 0)
-            c1 = self.ptc["c1"][:, None, None]
+# --------------------------------------------------------------------------- preparation
+def _remove(pattern: str) -> None:
+    for p in glob.glob(pattern):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
-            def one(a):
-                k = idx[a]
-                p = self.params[k]
-                ypath, fpath = self._frame_paths(k)
-                Y[a] = np.load(ypath, mmap_mode="r")[:, y0:y1, x0:x1]
-                fl = np.load(fpath, mmap_mode="r")[:, y0:y1, x0:x1]
-                Mk[a] = (fl & 1) > 0
-                if censored:
-                    Cn[a] = (fl & 2) > 0
-                T = np.asarray(p["T"], np.float32)[:, None, None]
-                surf = surface_window(p["surf"], self.H0, self.W0, y0, y1, x0, x1)
-                level = np.maximum(T * (refw + surf), 0)               # the expected level in the frame's units
-                V[a] = (self.ptc_c0(k)[:, None, None] + c1 * level) / T ** 2
-            with ThreadPoolExecutor(max_workers=self.workers) as ex:
-                list(ex.map(one, range(n)))
-            return (Y, V, Mk, Cn) if censored else (Y, V, Mk)
 
-        def saturation_levels(self, idx, y0, y1, x0, x1):
-            """(n, 3, h, w) float32: each frame's saturation on the window in the units ``windows`` returns -
-            its ceiling there (``ceiling_window``: the plateaus' own levels, the flat field's smooth model
-            between them) / T - surf - sky_ref, exactly as the window's data were formed.  Whyte et al.'s
-            saturation response R needs the level of the measurement it models; one level per frame was off
-            by the flat field's variation (and, as a field median, by the sky's)."""
-            n, h, w = len(idx), y1 - y0, x1 - x0
-            L = np.empty((n, 3, h, w), np.float32)
-            sky = np.moveaxis(self.sky_ref[y0:y1, x0:x1], -1, 0)
-            for a, k in enumerate(idx):
-                p = self.params[k]
-                T = np.asarray(p["T"], np.float64)
-                surf = surface_window(p["surf"], self.H0, self.W0, y0, y1, x0, x1)
-                ceil_ = p.get("ceiling") or [None] * 3
-                for c in range(3):
-                    cm = (ceiling_window(ceil_[c], self.H0, self.W0, y0, y1, x0, x1) if ceil_[c] is not None
-                          else np.full((h, w), float(self.sat_frames if self.sat_frames is not None else 1e30)))
-                    L[a, c] = cm / T[c] - surf[c] - sky[c]
-            return L
+def clean_intermediates(process: str, seq: str) -> None:
+    """Remove every file the preparation writes into ``process/`` (up to 100 MB per frame)."""
+    for pat in (f"imm_*{seq}_*", f"imc_{seq}_*", f"bkg_im*{seq}_*", f"r_bkg_im*{seq}_*", f"r_im*{seq}_*", "immsat_*",
+                "r_immsat_*", os.path.join("cache", f"r_bkg_im*{seq}_*.lst"), os.path.join("cache", f"r_im*{seq}_*.lst")):
+        _remove(os.path.join(process, pat))
+    shutil.rmtree(os.path.join(process, "drizztmp"), ignore_errors=True)
 
-        def cleanup(self):
-            shutil.rmtree(self.work, ignore_errors=True)
 
-    return RegisteredSet
+def siril_preprocess(session_dir: str, meta: dict, inc: list[int], rows: list[dict], say, checkpoint, cosmetic: bool = True,
+                     subsky: bool = False, defer_masks: bool = False) -> dict:
+    """Steps 1-3 of the module docstring.  Returns {"seq", "frames" (file number -> registered frame), "masks" (file
+    number -> registered saturation mask, may be empty), "stars" (file number -> findstar list), "saturation"}."""
+    from .siril import SirilRunner, quote, ranges
+    process = os.path.join(session_dir, "process")
+    state = read_json(os.path.join(process, "state.json"), {}) or {}
+    seq, n = state.get("seq"), int(state.get("n") or 0)
+    if not seq or not os.path.exists(os.path.join(process, f"{seq}_.seq")):
+        raise RuntimeError("the registration (process/state.json, the calibrated sequence) is missing: stack again")
+    if state.get("hdr"):
+        raise RuntimeError("ImageMM does not support HDR (several exposure groups) stacks")
+    src = read_seq(os.path.join(process, f"{seq}_.seq"))
+    reg, ref = registration_of(src)
+    nums = [src["nums"][i] for i in inc]                             # file numbers of the included frames
+    excluded = [i for i in range(len(src["nums"])) if i not in set(inc)]
+    scale = float(meta.get("scale") or 1.0)
+    clean_intermediates(process, seq)
+    runner = SirilRunner(process, progress=say, checkpoint=checkpoint)
+
+    # 1. debayer + per-frame background (VeraLux tab 1, no-master branch: `calibrate light -debayer`, `seqsubsky 1`)
+    lines = [f"cd {quote(process)}", f"select {seq} 1 {n}"]
+    lines += [f"unselect {seq} {a + 1} {b + 1}" for a, b in ranges(excluded)]
+    # cosmetic correction of each sub (Siril find_cosme, 3 / 3 sigma): the stack rejects warm / cold pixels by sigma
+    # clipping across frames, ImageMM has only its Huber weights - on an alt-az mount's rotating field a warm pixel the
+    # dark map misses traces a dotted arc through the restoration (IC 1805)
+    base = seq
+    if cosmetic:
+        lines.append(f"seqfind_cosme{'' if state.get('debayer') else '_cfa'} {seq} 3 3 -prefix=imc_")
+        base = f"imc_{seq}"
+    # the frames the stack integrated: a Bayer-drizzle stack's CFA frames are drizzled again with its own transforms
+    # and drizzle parameters (no demosaicing: colours never mix; the pixels no drop reached are missing data).  The
+    # script's `calibrate -debayer` + interpolation (RCD) mixed the colours of every star - M 31 2026-10-22: ImageMM
+    # R/G = 0.32 + 1.28 x the stack's, the colour calibration's fit then off by an intercept of 0.95
+    drizzle = meta.get("mode") == "drizzle" and not state.get("debayer") and not subsky
+    if state.get("debayer") or drizzle:
+        sub = base                                                   # (RGB already, or CFA for the drizzle)
+    else:
+        lines.append(f"calibrate {base} -debayer -prefix=imm_")
+        sub = f"imm_{base}"
+    # the script's per-frame absolute background (seqsubsky 1) is an option, off by default: on a large target the
+    # fitted background takes part of the target's light, differently per frame (M 31 2026-10-21: the outer disk lost).
+    # The engine normalises each frame against the frames' mean instead (veralux_imagemm change 23).
+    if subsky:
+        bkg = f"bkg_{sub}" if sub != seq else f"bkg_imm_{seq}"
+        lines.append(f"seqsubsky {sub} 1 -prefix={bkg[:-len(sub)]}")
+    elif sub == seq:
+        bkg = f"imm_{seq}"                                           # (our own name over the stack's frames: links)
+        for k in nums:
+            dst = os.path.join(process, f"{bkg}_{k:05d}.fit")
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(f"{seq}_{k:05d}.fit", dst)
+    else:
+        bkg = sub
+    if cosmetic or subsky or not (state.get("debayer") or drizzle):  # (any Siril processing to run)
+        runner.run("\n".join(lines) + "\n", "imagemm_debayer_subsky", expect=[f"{bkg}_.seq"] if bkg != f"imm_{seq}" or subsky else [],
+                   count_glob=f"{bkg}_[0-9]*.fit", total=len(nums), label="ImageMM: cosmetic correction, debayer" + (" + background (seqsubsky)" if subsky else ""))
+    if subsky:
+        _remove(os.path.join(process, f"imm_*{seq}_*"))
+        _remove(os.path.join(process, f"imc_{seq}_*"))
+    elif bkg != f"imc_{seq}":
+        _remove(os.path.join(process, f"imc_{seq}_*"))
+    from astropy.io import fits
+    first = fits.getheader(os.path.join(process, f"{bkg}_{nums[0]:05d}.fit"))
+    layers = int(first.get("NAXIS3") or 1) if int(first.get("NAXIS") or 2) == 3 else 1
+    if os.path.exists(os.path.join(process, f"{bkg}_.seq")):
+        write_registration(os.path.join(process, f"{bkg}_.seq"), nums, reg, ref, layers)
+    else:
+        write_registration(os.path.join(process, f"{bkg}_.seq"), nums, reg, ref, layers, name=bkg)
+
+    # 2. registration with the stack's transforms + star lists (VeraLux: `register`, `findstar` per frame)
+    rs = f"-framing=max -scale={scale:g}"
+    if drizzle:
+        dz = meta.get("drizzle") or {}
+        reg_args = f"-drizzle -pixfrac={float(dz.get('pixfrac') or 1.0):g} -kernel={dz.get('kernel') or 'square'}"
+    else:
+        reg_args = f"-interp={INTERP}"
+    lines = [f"cd {quote(process)}", f"seqapplyreg {bkg} {rs} {reg_args}", "setfindstar reset", f"seqfindstar r_{bkg}"]
+    runner.run("\n".join(lines) + "\n", "imagemm_register", expect=[f"r_{bkg}_.seq"],
+               count_glob=f"r_{bkg}_[0-9]*.fit", total=len(nums), label="ImageMM: registering the frames")
+    _remove(os.path.join(process, f"{bkg}_*"))
+    _remove(os.path.join(process, f"imm_*{seq}_*"))
+    _remove(os.path.join(process, f"imc_{seq}_*"))
+
+    # 3. saturation masks from the raw frames, one per colour: a drizzled pixel's channel c is censored only when a raw
+    # pixel of colour c that drops into it was saturated.  One mask for all colours (any colour saturated nearby)
+    # censored the unsaturated R / B measurements round a saturated G core - 50-84 % of the masked values were under
+    # half the ceiling (M 31) - and the restoration grew a coloured crown on one side of every saturated star.
+    say(0, 1, "ImageMM: saturation of the raw frames")
+    raw_paths = {src["nums"][i]: rows[i].get("path") for i in inc if rows[i].get("path")}
+    ceiling, sat, sat_info = raw_saturation(raw_paths, say, checkpoint)
+    masks = False
+    if ceiling is not None:
+        sat, same, o_info = confirm_on_calibrated(sat, {k: os.path.join(process, f"{seq}_{k:05d}.fit") for k in sat}, ceiling)
+        sat_info.update(o_info)
+        if same is None:
+            sat_info["skipped"] = "no raw-saturated pixel is still saturated in the calibrated frames"
+        else:
+            sat_info["raw_rows_reversed"] = not same
+            sat_info["saturated_pixels_median"] = float(np.median([len(v) for v in sat.values()]))
+            hdr = fits.getheader(os.path.join(process, f"{seq}_{nums[0]:05d}.fit"))
+            shape = (int(hdr["NAXIS2"]), int(hdr["NAXIS1"]))
+            layout = None
+            if int(hdr.get("NAXIS") or 2) == 2:              # a CFA frame: which colour each 2 x 2 position is
+                probe = nums[len(nums) // 2]
+                layout, l_info = cfa_layout(os.path.join(process, f"{seq}_{probe:05d}.fit"),
+                                            os.path.join(process, f"r_{bkg}_{probe:05d}.fit"))
+                sat_info["cfa_layout"] = l_info
+            write_saturation_masks(process, sat, shape, flip=not same, grow=SAT_GROW_DRIZZLE if drizzle else SAT_GROW, layout=layout)
+            write_registration(os.path.join(process, "immsat_.seq"), sorted(sat), reg, ref, 3 if layout else 1, name="immsat", mono_layer=True)
+            n_sat = len(sat)
+
+            def register_masks():
+                # (16-bit output: the masks are 0 / 1 and as 32-bit floats they needed 29 GB for M 31's 299 frames; every
+                # script starts with set32bits again - siril.HEADER)
+                runner.run(f"cd {quote(process)}\nset16bits\nseqapplyreg immsat {rs} -interp=nearest\n", "imagemm_register_masks",
+                           expect=["r_immsat_.seq"], count_glob="r_immsat_[0-9]*.fit", total=n_sat, label="ImageMM: registering the saturation masks")
+                _remove(os.path.join(process, "immsat_*"))
+            if not defer_masks:
+                register_masks()
+            masks = True
+    deferred = {"register_masks": register_masks} if (masks and defer_masks) else {}
+    return {**deferred, "seq": seq, "nums": nums, "frames": {k: os.path.join(process, f"r_{bkg}_{k:05d}.fit") for k in nums},
+            "masks": {k: os.path.join(process, f"r_immsat_{k:05d}.fit") for k in nums} if masks else {},
+            "stars": {k: os.path.join(process, "cache", f"r_{bkg}_{k:05d}.lst") for k in nums},
+            "seq_file": os.path.join(process, f"r_{bkg}_.seq"), "resampling": "drizzle" if drizzle else INTERP,
+            "mask_seq_file": os.path.join(process, "r_immsat_.seq") if masks else None, "saturation": sat_info}
+
+
+def build_store(work: str, prep: dict, keys: list[int], names: list[str], box: tuple[int, int, int, int],
+                canvas: tuple[int, int], flip: bool, region: tuple[int, int, int, int] | None, say, checkpoint,
+                consume: bool = False, with_masks: bool = True):
+    """Step 4: the frames ``keys`` (file numbers) cropped to ``box`` (and ``region`` inside it), in stack.fits' row
+    order, into a ``FrameStore`` with NaN where there is no data or a saturated pixel; their stars in its pixels.
+    ``consume``: each registered frame and mask is deleted once it is in the store (the store and the registered
+    frames together need ~2 x the frames' size on disk - M 31's 299 frames: 26 + 36 GB; the registration then failed
+    for space, and the run fell back to BlurXTerminator)."""
+    from .veralux_imagemm import FrameStore, parse_findstar, siril_to_array
+    places = sequence_placements(prep["seq_file"], canvas)
+    mplaces = sequence_placements(prep["mask_seq_file"], canvas) if (with_masks and prep.get("mask_seq_file")) else {}
+    bx, by, bw, bh = box
+    rx, ry, rw, rh = region if region else (0, 0, bw, bh)
+    os.makedirs(work, exist_ok=True)
+    store = FrameStore(os.path.join(work, "frames.npy"), (len(keys), 3, rh, rw))
+    stats = {"stars": [], "invalid_fraction": [], "saturated_fraction": []}
+    for k, num in enumerate(keys):
+        if checkpoint:
+            checkpoint()
+        a = read_frame(prep["frames"][num], box, places[num])
+        bad = (a == 0) | ~np.isfinite(a)                         # outside the frame's footprint (exactly 0)
+        # the footprint's edge: within the Lanczos-4 kernel's reach of the outside a registered pixel is interpolated
+        # against zeros (attenuated, not missing) and the debayer's edge rows are extrapolated - they were fitted as
+        # data and printed bands along the image borders (M 31, 2026-10-22).  Footprint shrunk by EDGE_ERODE px.
+        foot = (~bad.all(-1)).astype(np.uint8)
+        e_ = EDGE_ERODE_DRIZZLE if prep.get("resampling") == "drizzle" else EDGE_ERODE
+        foot = cv2.erode(foot, np.ones((2 * e_ + 1, 2 * e_ + 1), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=1)
+        bad |= (foot == 0)[..., None]
+        sat = np.zeros(a.shape, bool)                            # (h, w, 3): per channel (a mono mask: all three)
+        if with_masks and num in prep.get("masks", {}):
+            sat = read_frame(prep["masks"][num], box, mplaces[num]) > 0.5
+        if flip:
+            a, bad, sat = a[::-1], bad[::-1], sat[::-1]
+        a = np.where(bad, np.float32(np.nan), a)[ry:ry + rh, rx:rx + rw]
+        store.data[k] = np.moveaxis(a, -1, 0)
+        sw_ = sat[ry:ry + rh, rx:rx + rw]
+        store.sat[k] = (sw_[..., 0] * 1 + sw_[..., 1] * 2 + sw_[..., 2] * 4).astype(np.uint8)
+        stats["invalid_fraction"].append(float((bad.any(-1) | sat.any(-1))[ry:ry + rh, rx:rx + rw].mean()))
+        stats["saturated_fraction"].append(float(sw_.any(-1).mean()))
+        ox, oy, fw, fh = places[num]
+        stars = []
+        for X, Y in parse_findstar(prep["stars"][num]):
+            col, row = siril_to_array(X, Y, fh)
+            cx, cy = ox + col - bx, oy + row - by                    # canvas -> the box
+            if flip:
+                cy = bh - 1 - cy
+            cx, cy = cx - rx, cy - ry
+            if 0 <= cx < rw and 0 <= cy < rh:
+                stars.append((float(cx), float(cy)))
+        store.stars[k] = stars
+        store.names[k] = names[k]
+        stats["stars"].append(len(stars))
+        if consume:
+            for p_ in (prep["frames"].get(num), (prep.get("masks") or {}).get(num) if with_masks else None):
+                if p_:
+                    try:
+                        os.remove(p_)
+                    except OSError:
+                        pass
+        if k % 10 == 0 or k == len(keys) - 1:
+            say(k + 1, len(keys), f"ImageMM: frame store {k + 1}/{len(keys)}")
+    store.flush()
+    return store, stats
+
+
+def add_masks(store, stats: dict, prep: dict, keys: list[int], box: tuple[int, int, int, int], canvas: tuple[int, int],
+              flip: bool, region: tuple[int, int, int, int] | None, say, checkpoint, consume: bool = True) -> None:
+    """The registered saturation masks into a store ``build_store`` made without them (``with_masks=False``): the
+    frames are stored and deleted first, then the masks are registered into the space they freed (M 31's 299 frames:
+    36 GB of registered frames and 29 GB of registered masks did not fit beside each other)."""
+    mplaces = sequence_placements(prep["mask_seq_file"], canvas)
+    bx, by, bw, bh = box
+    rx, ry, rw, rh = region if region else (0, 0, bw, bh)
+    for k, num in enumerate(keys):
+        if checkpoint:
+            checkpoint()
+        if num not in prep.get("masks", {}):
+            continue
+        sat = read_frame(prep["masks"][num], box, mplaces[num]) > 0.5
+        if flip:
+            sat = sat[::-1]
+        sw_ = sat[ry:ry + rh, rx:rx + rw]
+        store.sat[k] = (sw_[..., 0] * 1 + sw_[..., 1] * 2 + sw_[..., 2] * 4).astype(np.uint8)
+        stats["saturated_fraction"][k] = float(sw_.any(-1).mean())
+        stats["invalid_fraction"][k] = float((~np.isfinite(store.data[k]).all(0) | sw_.any(-1)).mean())
+        if consume:
+            try:
+                os.remove(prep["masks"][num])
+            except OSError:
+                pass
+        if k % 20 == 0 or k == len(keys) - 1:
+            say(k + 1, len(keys), f"ImageMM: saturation masks {k + 1}/{len(keys)}")
+    store.flush()
 
 
 # --------------------------------------------------------------------------- output
-def rescale_wcs(header, r: int, offset: tuple[int, int] = (0, 0)):
-    """The header of an image whose pixel (x, y) = r * (old pixel - offset): latent sample j sits at the old
-    pixel coordinate j / r (``imagemm.restore``), so CRPIX' = r (CRPIX - 1 - offset) + 1, the CD matrix (or
-    CDELT) / r and the SIP terms (A_p_q ... of u, v relative to CRPIX) x r^(1 - p - q)."""
-    import re
+def rescale_wcs(header, r: int, offset: tuple[int, int] = (0, 0), t: int = 0):
+    """The header of an image whose pixel u = r * (old pixel - offset) + t (0-based; ``veralux_imagemm.sr_origin``):
+    CRPIX' = r (CRPIX - 1 - offset) + t + 1, the CD matrix (or CDELT) / r and the SIP terms (A_p_q ... of u, v
+    relative to CRPIX) x r^(1 - p - q)."""
     h = header.copy()
     if "CRPIX1" in h and "CRPIX2" in h:
-        h["CRPIX1"] = r * (float(h["CRPIX1"]) - 1 - offset[0]) + 1
-        h["CRPIX2"] = r * (float(h["CRPIX2"]) - 1 - offset[1]) + 1
+        h["CRPIX1"] = r * (float(h["CRPIX1"]) - 1 - offset[0]) + t + 1
+        h["CRPIX2"] = r * (float(h["CRPIX2"]) - 1 - offset[1]) + t + 1
     for k in ("CD1_1", "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2"):
         if k in h and r != 1:
             h[k] = float(h[k]) / r
@@ -963,161 +761,281 @@ def rescale_wcs(header, r: int, offset: tuple[int, int] = (0, 0)):
     return h
 
 
-def _plateau_summary(es, usable: list[int]) -> dict | None:
-    """Saturated plateaus of the frames (``saturated_plateaus``): the median count per frame and channel and the
-    5th / 50th / 95th percentiles of their ceilings over ``es.sat_frames``, or None without saturation."""
-    if not es.sat_frames:
-        return None
-    counts, ceils = [], []
-    for k in usable:
-        for m in (es.params[k].get("ceiling") or []):
-            if m is None:
-                continue
-            pl = np.asarray(m["plateaus"]).reshape(-1, 4)
-            counts.append(len(pl))
-            ceils.extend((pl[:, 3] / float(es.sat_frames)).tolist())
-    if not counts:
-        return None
-    q = np.percentile(ceils, [5, 50, 95]).round(4).tolist() if ceils else None
-    return {"per_frame_channel": float(np.median(counts)), "ceiling_relative_p5_p50_p95": q}
+def match_to_stack(out: np.ndarray, ref: np.ndarray, r: int = 1, sigma: float = 8.0, ap: float = 8.0,
+                   min_stars: int = 10) -> tuple[np.ndarray, list]:
+    """``out`` (C, r H, r W) on the photometric scale of ``ref`` (C, H, W, stack.fits' window), per channel ref = a out + b.
+
+    a: the median over the unsaturated stars of their flux ratio ref / out (aperture ``ap`` px, local sky from the
+    annulus 1.25-1.75 ap) - photometric calibration on stars; the restoration conserves flux, so a star's light is the
+    same in both.  b: the median of ref - a out over the image smoothed over ``sigma`` px.  The former fit of a line
+    through the two smoothed images had no lever arm where the field is mostly dark sky: its slope came from a few stars
+    and the field's brightest (clipped in the stack, not in the restoration) - green at 0.4 x on M 31's outer field
+    (2026-10-23).  With fewer than ``min_stars`` stars that line (fitted after a 3-sigma clip) is kept."""
+    from scipy.ndimage import maximum_filter
+    res = []
+    o = np.empty_like(out)
+    C = out.shape[0]
+    xs_ = [cv2.resize(out[c], (ref.shape[2], ref.shape[1]), interpolation=cv2.INTER_AREA) if r > 1 else out[c]
+           for c in range(C)]
+    g = ref[1 if C > 1 else 0].astype(np.float32)
+    sm = cv2.GaussianBlur(g, (0, 0), 1.0)
+    med = float(np.nanmedian(sm))
+    sd = 1.4826 * float(np.nanmedian(np.abs(sm - med)))
+    top = float(np.nanmax(ref)) if np.isfinite(ref).any() else 1.0
+    R = int(np.ceil(1.75 * ap))
+    yy, xx = np.mgrid[-R:R + 1, -R:R + 1]
+    rr = np.hypot(yy, xx)
+    apm, anm = rr <= ap, (rr >= 1.25 * ap) & (rr <= 1.75 * ap)
+    H, W = g.shape
+    pk = (sm == maximum_filter(sm, 9)) & (sm > med + 30.0 * sd) & (np.nanmax(ref, 0) < 0.5 * top)
+    ys, xs = np.nonzero(pk)
+    sel = (ys > R) & (ys < H - R - 1) & (xs > R) & (xs < W - R - 1)
+    ys, xs = ys[sel], xs[sel]
+    for c in range(C):
+        x = xs_[c].astype(np.float32)
+        rc = ref[c].astype(np.float32)
+        rat = []
+        for y0, x0 in zip(ys, xs):
+            wr, wo = rc[y0 - R:y0 + R + 1, x0 - R:x0 + R + 1], x[y0 - R:y0 + R + 1, x0 - R:x0 + R + 1]
+            fr = float((wr[apm] - np.nanmedian(wr[anm])).sum())
+            fo = float((wo[apm] - np.nanmedian(wo[anm])).sum())
+            if fr > 0 and fo > 0 and np.isfinite(fr) and np.isfinite(fo):
+                rat.append(fr / fo)
+        lx = cv2.GaussianBlur(x, (0, 0), sigma)[::3, ::3].ravel()
+        lr = cv2.GaussianBlur(rc, (0, 0), sigma)[::3, ::3].ravel()
+        ok = np.isfinite(lx) & np.isfinite(lr)
+        if len(rat) >= min_stars:
+            a = float(np.median(rat))
+            b = float(np.median(lr[ok] - a * lx[ok]))
+        else:
+            a, b = np.polyfit(lx[ok], lr[ok], 1)
+            d = lr - (a * lx + b)
+            keep = ok & (np.abs(d) <= 3 * 1.4826 * np.median(np.abs(d[ok])))
+            a, b = np.polyfit(lx[keep], lr[keep], 1)
+        o[c] = (out[c] * a + b).astype(np.float32)
+        res.append([round(float(a), 6), round(float(b), 7)])
+    return o, res
+
+
+def clip_preserving_colour(out: np.ndarray) -> tuple[np.ndarray, int]:
+    """``out`` (C, H, W) with every pixel whose brightest channel exceeds 1 scaled so that it is 1 (all channels by the
+    same factor: the hue of a restored star core is kept); (result, pixels scaled)."""
+    mx = out.max(0)
+    over = mx > 1.0
+    f = np.where(over, 1.0 / np.maximum(mx, 1e-12), 1.0).astype(np.float32)
+    return np.ascontiguousarray(np.clip(out * f[None], 0.0, 1.0).astype(np.float32)), int(over.sum())
 
 
 def _norm_peak(out: np.ndarray) -> float:
     """Scale that keeps the restored image in the [0, 1] the pipeline's linear files use: a restored star core can
-    exceed the stack's ceiling (that is the point of Whyte et al.'s update)."""
-    mx = float(out.max())
+    exceed the frames' ceiling.  The maximum of the image smoothed over 3 x 3 (a lone hot pixel does not set the scale;
+    the few pixels above 1 after it are a star's single brightest pixels)."""
+    sm = np.stack([cv2.blur(np.ascontiguousarray(c, np.float32), (3, 3)) for c in out])
+    mx = float(np.nanmax(sm))
     if mx <= 1.0:
         return 1.0
-    if mx > 16.0:
-        mx = float(np.percentile(out[:, ::2, ::2], 99.9999))
-    return 1.0 / max(mx, 1.0)
+    return 1.0 / mx
+
+
+def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> dict:
+    return {"version": PREP_VERSION, "cosmetic": cosmetic, "subsky": subsky, "frames": [int(k) for k in keys], "crop": list(crop),
+            "region": list(region) if region else None, "scale": scale, "flip": bool(flip)}
 
 
 def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None) -> dict:
-    """Restore the included registered frames of a stacked session with ImageMM -> ``imagemm.fits`` and
+    """Restore the included frames of a stacked session with VeraLux ImageMM -> ``imagemm.fits`` and
     ``imagemm_meta.json`` (returned).  Raises on failure; the caller falls back to the normal path."""
     av = available()
     if not av["ok"]:
         raise RuntimeError(av["reason"])
     import torch
-    from astrophoto import imagemm
-    from astrophoto.denoise import pick_device
-    from . import workflow
+    from . import veralux_imagemm as V
     t0 = time.time()
     sp = dict(stack_params or {})
     kw = map_params(sp)
     r = kw.pop("r")
+    formal = kw.pop("formal_mode")
     say = progress or (lambda i, n, m: None)
-    say(0, 1, "ImageMM: loading the stack and the registered frames")
-    stack_path = os.path.join(session_dir, "stack.fits")
-    stack, header = fitsio.read_rgb(stack_path)
+    say(0, 1, "ImageMM: loading the stack")
+    stack, header = fitsio.read_rgb(os.path.join(session_dir, "stack.fits"))
     meta = dict(stack_meta or read_json(os.path.join(session_dir, "stack_meta.json"), {}) or {})
     crop = [int(v) for v in meta.get("crop") or [0, 0, stack.shape[2], stack.shape[1]]]
     if (crop[2], crop[3]) != (stack.shape[2], stack.shape[1]):
         raise RuntimeError(f"stack.fits is {stack.shape[2]} x {stack.shape[1]} but stack_meta.crop is {crop}")
+    canvas = tuple(int(v) for v in (meta.get("stack_canvas") or [crop[0] + crop[2], crop[1] + crop[3]]))
     region = sp.get("imagemm_region")
-    off, reg_win = (0, 0), None
-    if region:                                  # development: restore a window of the stack (all of it is prepared)
+    off = (0, 0)
+    if region:                                  # development: restore a window of the stack
         rx, ry, rw, rh = (int(v) for v in region)
         rx, ry = max(0, rx), max(0, ry)
         rw, rh = min(rw, crop[2] - rx), min(rh, crop[3] - ry)
-        off, reg_win = (rx, ry), (ry, ry + rh, rx, rx + rw)
-    scale = float(meta.get("scale") or 1.0)
-    files, reg = ensure_registered(session_dir, meta, say, checkpoint)
-    reg_info = {k: v for k, v in reg.items() if k != "placements"}
+        region, off = (rx, ry, rw, rh), (rx, ry)
     rows = included_rows(session_dir)
-    keys = sorted(files)
-    maxf = int(sp.get("imagemm_max_frames") or 0)
-    if maxf and len(keys) > maxf:
-        keys = sorted(sorted(keys, key=lambda i: -(rows[i].get("weight") or 0.0))[:maxf])
-    # orientation of stack.fits against the canvas: tested on the frame that covers most of the crop
-    best = max(keys, key=lambda k: min(crop[0] + crop[2], reg["placements"][k][0] + reg["placements"][k][2])
-               - max(crop[0], reg["placements"][k][0]))
-    probe = read_frame(files[best], tuple(crop), reg["placements"][best])
-    flip, flip_info = stack_is_flipped(np.moveaxis(stack, 0, -1), probe)
-    del probe
-    Reg = make_set_class()
-    work = os.path.join(session_dir, WORK)
-    shutil.rmtree(work, ignore_errors=True)
+    inc = [i for i, row in enumerate(rows) if row.get("included")]
+    if not inc:
+        raise RuntimeError("no included frames")
+    process = os.path.join(session_dir, "process")
+    # (development: imagemm_work names another folder, so a production run never deletes a kept store)
+    work = os.path.join(session_dir, "process", str(sp["imagemm_work"])) if sp.get("imagemm_work") else os.path.join(session_dir, WORK)
+    keep = _flag(sp.get("imagemm_keep_prepared", False))
+    state = read_json(os.path.join(process, "state.json"), {}) or {}
+    seq = state.get("seq") or "pp_light"
     try:
-        es = Reg({k: files[k] for k in keys}, rows, tuple(crop), np.moveaxis(stack, 0, -1),
-                 work, scale, float(meta.get("fwhm_px") or 4.0), places=reg["placements"], progress=say,
-                 checkpoint=checkpoint, flip=flip)
-        t1 = time.time()
-        es.prepare()
-        t_prep = time.time() - t1
-        dev = pick_device(_device_arg(sp))
-        psf_mix = [(None if p is None else p.get("sigma_median")) for p in es.psf_ref]
+        src_nums = read_seq(os.path.join(process, f"{seq}_.seq"))["nums"]
+    except OSError:
+        raise RuntimeError("the calibrated sequence is missing: stack again") from None
+    maxf = int(sp.get("imagemm_max_frames") or 0)
+    sel = inc
+    if maxf and len(sel) > maxf:
+        sel = sorted(sorted(sel, key=lambda i: -(rows[i].get("weight") or 0.0))[:maxf])
+    keys = [src_nums[i] for i in sel]
+    names = [rows[i].get("name") or str(src_nums[i]) for i in sel]
+    sig_path = os.path.join(work, "store.json")
+    store = prep_info = None
+    old = read_json(sig_path, None) if keep else None
+    try:
+        if old and os.path.exists(os.path.join(work, "frames.npy")):
+            sig = _signature(keys, crop, region, float(meta.get("scale") or 1.0), old.get("signature", {}).get("flip"),
+                             _flag(sp.get("imagemm_cosmetic", True)), _flag(sp.get("imagemm_subsky", False)))
+            if old.get("signature") == sig:
+                store = V.FrameStore(os.path.join(work, "frames.npy"))
+                store.stars = [[tuple(s) for s in st] for st in old["stars"]]
+                store.names = list(old["names"])
+                prep_info = old["info"]
+                say(1, 1, "ImageMM: frame store reused")
+        if store is None:
+            shutil.rmtree(work, ignore_errors=True)
+            t1 = time.time()
+            prep = siril_preprocess(session_dir, meta, inc, rows, say, checkpoint, defer_masks=True, cosmetic=_flag(sp.get("imagemm_cosmetic", True)),
+                                    subsky=_flag(sp.get("imagemm_subsky", False)))
+            best = keys[len(keys) // 2]
+            places = sequence_placements(prep["seq_file"], canvas)
+            ext = (max(p[0] + p[2] for p in places.values()), max(p[1] + p[3] for p in places.values()))
+            # (Siril rounds the -framing=max bounding box of interpolated and drizzled frames differently by up to 1 px
+            # - IC 1805: 4062 vs 4063 - while each frame is placed by its own translation; the alignment decides)
+            if abs(ext[0] - canvas[0]) > 1 or abs(ext[1] - canvas[1]) > 1:
+                raise RuntimeError(f"the registered frames span {ext[0]} x {ext[1]}, stack.fits' canvas is {canvas[0]} x {canvas[1]}")
+            probe = read_frame(prep["frames"][best], tuple(crop), places[best])
+            flip, flip_info = stack_is_flipped(np.moveaxis(stack, 0, -1), probe)
+            shift = alignment_shift(np.moveaxis(stack, 0, -1), probe[::-1] if flip else probe)
+            if max(abs(v) for v in shift) > 0.5:
+                raise RuntimeError(f"the registered frames are {shift} px off stack.fits")
+            del probe
+            # (the frames into the store first, each registered frame deleted as it goes; then the saturation masks are
+            # registered into the space that freed and added - side by side they needed ~65 GB for M 31's 299 frames)
+            store, st = build_store(work, prep, keys, names, tuple(crop), canvas, flip, region, say, checkpoint, consume=True,
+                                    with_masks=not prep.get("register_masks"))
+            if prep.get("register_masks"):
+                prep["register_masks"]()
+                add_masks(store, st, prep, keys, tuple(crop), canvas, flip, region, say, checkpoint)
+            prep_info = {"saturation": prep["saturation"], "frames_flipped": {**flip_info, "flipped": bool(flip)},
+                         "alignment_shift_px": shift, "stars_median": float(np.median(st["stars"])),
+                         "invalid_fraction_median": float(np.median(st["invalid_fraction"])),
+                         "saturated_fraction_median": float(np.median(st["saturated_fraction"])),
+                         "seconds": round(time.time() - t1, 1)}
+            clean_intermediates(process, prep["seq"])
+            if keep:
+                write_json(sig_path, clean_json({"signature": _signature(keys, crop, region, float(meta.get("scale") or 1.0), flip,
+                                                                         _flag(sp.get("imagemm_cosmetic", True)),
+                                                                         _flag(sp.get("imagemm_subsky", False))),
+                                                 "stars": store.stars, "names": store.names, "info": prep_info}))
+
+        dev = pick_device(sp.get("device"))
+        engine = V.ImageMMEngine(str(dev), formal_mode=formal)
         t2 = time.time()
-        lat, info = imagemm.restore(es, r=r, device=dev, progress=say, cancel=checkpoint, region=reg_win,
-                                    kernel_cache=os.path.join(work, "kernels.pkl"), **kw)
+
+        def cb(i, n, m):
+            say(i, n, f"ImageMM: {m}")
+        out = engine.run_imagemm(store, upscale_factor=r, callback=cb, cancel=checkpoint,
+                                 log=lambda m: log.info("ImageMM: %s", m), **kw)
         t_rest = time.time() - t2
-        cov = info.pop("coverage")
-        info.pop("residual", None)
-        sky = np.moveaxis(es.sky_ref, -1, 0)
-        if reg_win:
-            sky = sky[:, reg_win[0]:reg_win[1], reg_win[2]:reg_win[3]]
-        out = np.moveaxis(lat, -1, 0).astype(np.float32)
-        if r == 1:
-            out = out + sky.astype(np.float32)
-        else:
-            # latent sample j sits at reference coordinate j / r (imagemm.restore), not at cv2.resize's pixel-centre
-            # grid ((j + 1/2) / r - 1/2): the smooth sky sampled exactly there
-            M_ = np.float32([[1.0 / r, 0, 0], [0, 1.0 / r, 0]])
-            out = out + np.stack([cv2.warpAffine(np.ascontiguousarray(sky[c], np.float32), M_, (out.shape[2], out.shape[1]),
-                                                 flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                                                 borderMode=cv2.BORDER_REPLICATE)
-                                  for c in range(3)]).astype(np.float32)
+        info = engine.last_run_info
+        if out.shape[0] == 1:
+            out = np.repeat(out, 3, 0)
         if not np.isfinite(out).all():
             raise RuntimeError("ImageMM produced non-finite pixels")
-        k_norm = _norm_peak(out)
-        out = np.ascontiguousarray(out * np.float32(k_norm))
-        usable = es.usable()
-        tiles = info.get("tiles") or []
-        iters = [t["iterations"] for t in tiles]
-        hdr = rescale_wcs(header, r, off)
-        hdr["HISTORY"] = "ImageMM restoration (arXiv:2501.03002) of the registered frames"
+        # the stack's photometric scale, offset and channel balance (post's AI tools and colour calibration work on
+        # absolute levels; seqsubsky levelled each channel's sky and the frames sit ~14 x below the stack's scale)
+        rx_, ry_ = off
+        ref_win = stack[:, ry_:ry_ + out.shape[1] // r, rx_:rx_ + out.shape[2] // r]
+        out, phot = match_to_stack(out, ref_win, r)
+        # cores of stars saturated in the data are restored above the stack's ceiling (censored data, point sources): on
+        # the stack's scale they exceed 1 (M 31: 22 x).  Scaling the whole image to fit made every other star 22 x
+        # fainter after the stretch (they vanished); clipping each channel at 1 coloured the cores.  The pixels above 1
+        # are scaled down as a whole, their colour ratio kept.
+        k_norm = 1.0
+        out, clipped = clip_preserving_colour(out)
+        hdr = rescale_wcs(header, r, off, V.sr_origin(r))
+        hdr["HISTORY"] = f"VeraLux ImageMM {V.VERSION} (Sukurdeep et al. 2025, AJ 170:233) of the registered frames"
+        if r > 1:
+            hdr["HISTORY"] = f"VeraLux ImageMM SR x{r:g}"
         fitsio.write_rgb(os.path.join(session_dir, OUT_FITS), out, hdr)
+        kern = [k for k in (info.pop("kernels", None) or []) if k is not None]
         meta_out = {
-            "ok": True, "method": info.get("method"), "paper": "Sukurdeep, Budavari, Connolly & Navarro 2025, arXiv:2501.03002",
-            "frames_used": len(usable), "frames_total": len(keys), "frames": [rows[keys[k]]["name"] for k in usable],
-            "frames_skipped": [rows[keys[k]]["name"] for k in range(len(keys)) if k not in set(usable)],
-            "r": r, "scale": scale * r, "crop": crop, "region_offset": list(off), "shape": [out.shape[2], out.shape[1]],
-            "psf": {"measured_on": "the registered frames' own coadd (not stack.fits)", "model": kw["psf_model"],
-                    "fwhm_px": round(float(es.fwhm_ref), 3), "fwhm_latent_px": round(float(info.get("fwhm") or 0), 3),
-                    "size": info.get("psf_size"), "stars": [r_.get("n_stars") if r_ else None for r_ in es.psf_ref],
-                    "seeing_sigma_median": psf_mix, "unit_sum": True, "eq11": info.get("eq11")},
-            "noise": {"model": "photon transfer curve of consecutive frames, var = c0 + c1 * level per channel"
-                               + (", c0 per frame pair" if es.ptc.get("model") == "per-pair c0" else ""),
-                      "c0": [float(v) for v in es.ptc["c0"]], "c1": [float(v) for v in es.ptc["c1"]],
-                      "c0_frames_range": ([[float(v) for v in es.ptc["c0_frames"].min(0)],
-                                           [float(v) for v in es.ptc["c0_frames"].max(0)]]
-                                          if es.ptc.get("c0_frames") is not None else None),
-                      "chi2_red": [float(v) for v in es.ptc["chi2_red"]]},
-            "saturation": {"level_frames": es.sat_frames, "level_latent": float(es.sat) if es.sat_frames else None,
-                           "whyte": bool(es.sat_frames), "saturated_pixels": info.get("saturated_pixels"),
-                           # per saturated star (the ceiling follows the flat field): plateaus found per frame and
-                           # channel, and the spread of their ceilings relative to level_frames
-                           "plateaus": _plateau_summary(es, usable)},
-            "params": {**{k: v for k, v in kw.items()}, "r": r},
-            "photometry": {"scale": "aperture photometry of isolated stars against stack.fits, 3 FWHM, corrected for "
-                                    "the encircled energy of each frame's PSF (growth curve)",
-                           "aperture_correction": es.aperture_info},
-            "iterations": {"min": min(iters) if iters else None, "median": float(np.median(iters)) if iters else None,
-                           "max": max(iters) if iters else None, "cutouts": len(tiles),
-                           "converged": int(sum(bool(t["converged"]) for t in tiles))},
-            "stopping": ("Eq. C15: |mean(m~ xi_k) - 1| < epsilon" if kw["stop"] == "c15" else kw["stop"])
-                        + f", epsilon {kw['epsilon']:g}, at most {kw['max_iters']} iterations",
-            "sky": {"model": "degree-2 polynomial of the stack, subtracted before and added back after the restoration",
-                    "info": {k: v for k, v in (es.sky_info or {}).items() if isinstance(v, (str, int, float, bool))}},
-            "peak_scale": k_norm, "resampling": reg_info["resampling"], "frames_flipped": flip_info | {"flipped": bool(flip)}, "registered_again": reg_info["regenerated"],
-            "device": str(dev), "torch": torch.__version__, "regridded": False,
-            "seconds": round(time.time() - t0, 1), "seconds_prepare": round(t_prep, 1), "seconds_restore": round(t_rest, 1),
+            "ok": True, "method": f"VeraLux ImageMM {V.VERSION} ({'formal' if formal else 'practical'} mode)",
+            "source": V.SOURCE, "paper": "Sukurdeep, Budavari, Connolly & Navarro 2025, AJ 170:233",
+            "frames_used": len(info.get("frames_used") or range(len(store))), "frames_total": len(inc),
+            "frames": [store.names[i] for i in (info.get("frames_used") or range(len(store)))],
+            "frames_skipped": [{"frame": store.names[i], "why": why} for i, why in (info.get("frames_dropped") or {}).items()],
+            "r": r, "scale": float(meta.get("scale") or 1.0) * r, "crop": crop, "region_offset": list(off),
+            "shape": [out.shape[2], out.shape[1]],
+            "psf": {"measured_on": "each registered frame's own stars (findstar, median of 33 x 33 cut-outs, green)",
+                    "stars_median": float(np.median(info.get("psf_stars") or [0])),
+                    "stars_min": int(min(info.get("psf_stars") or [0])),
+                    "kernel_size": int(kern[0].shape[-1]) if kern else None,
+                    "kernel_fwhm_px_median": [round(float(np.median([_fwhm(k[c]) for k in kern])) / r, 3)
+                                              for c in range(kern[0].shape[0])] if kern else None,
+                    # the restored stars' width (information: their equivalent Gaussian sigma)
+                    "restored_sigma_px": restored_sigma(out, [(x_ * r, y_ * r) for x_, y_ in (store.stars[0] if len(store) else [])])},
+            "params": {**kw, "r": r, "formal_mode": formal},
+            "iterations": {"done": info.get("iters_done"), "max": info.get("iters_max"), "converged": info.get("converged"),
+                           "mean_diff": info.get("mean_diff"), "mean_diff_history": info.get("mean_diff_history")},
+            "stopping": f"Appendix C: mean |u_k / u_k-1 - 1| over the effective pixels (mu {kw['mu']:g}) < {kw['stop_epsilon']:g}",
+            "norm_factor": info.get("norm_factor"), "var_floor_median": info.get("var_floor_median"),
+            "effective_fraction": info.get("effective_fraction"), "preparation": prep_info,
+            "peak_scale": k_norm, "photometric_match": phot, "clipped_above_1": clipped, "device": str(dev), "torch": torch.__version__,
+            "seconds": round(time.time() - t0, 1), "seconds_restore": round(t_rest, 1),
+            "seconds_per_frame_iteration": round(t_rest / max(1, info.get("iters_done") or 1) / max(1, len(store)), 4),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         write_json(os.path.join(session_dir, OUT_META), clean_json(meta_out))
         return clean_json(meta_out)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
-        if not sp.get("imagemm_keep_registered"):                    # (development: keep them for the next run)
-            workflow.clean_registered(os.path.join(session_dir, "process"))
+        if not keep:
+            shutil.rmtree(work, ignore_errors=True)
+        clean_intermediates(process, seq)
+
+
+def restored_sigma(img: np.ndarray, stars: list[tuple[float, float]], half: int = 8) -> float | None:
+    """The equivalent Gaussian sigma (px) of the restored stars: the median second moment of the isolated,
+    unsaturated stars of ``stars`` in the green channel of ``img`` (C, H, W), local sky removed."""
+    g = img[1] if img.shape[0] > 1 else img[0]
+    H, W = g.shape
+    top = float(np.percentile(g, 99.99))
+    yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+    out = []
+    for x, y in stars:
+        ix, iy = int(round(x)), int(round(y))
+        if not (3 * half < ix < W - 3 * half and 3 * half < iy < H - 3 * half):
+            continue
+        big = g[iy - 3 * half:iy + 3 * half + 1, ix - 3 * half:ix + 3 * half + 1]
+        c = g[iy - half:iy + half + 1, ix - half:ix + half + 1] - np.median(big)
+        if c.max() >= 0.5 * top or c.max() <= 0:
+            continue
+        w = np.maximum(c, 0)
+        s_ = w.sum()
+        my, mx = (w * yy).sum() / s_, (w * xx).sum() / s_
+        out.append(np.sqrt(((w * ((yy - my) ** 2 + (xx - mx) ** 2)).sum() / s_) / 2))
+    return round(float(np.median(out)), 3) if len(out) >= 5 else None
+
+
+def _fwhm(k: np.ndarray) -> float:
+    """FWHM (px) of a kernel from its second moments (Gaussian equivalent)."""
+    k = np.maximum(np.asarray(k, np.float64), 0)
+    s = k.sum()
+    if s <= 0:
+        return 0.0
+    yy, xx = np.mgrid[:k.shape[0], :k.shape[1]]
+    cy, cx = (k * yy).sum() / s, (k * xx).sum() / s
+    var = ((k * ((yy - cy) ** 2 + (xx - cx) ** 2)).sum() / s) / 2
+    return float(2.3548 * np.sqrt(max(var, 0.0)))

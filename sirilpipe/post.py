@@ -794,7 +794,10 @@ def _linear_source(session: str) -> str:
 
 
 def _imagemm_sigma(session: str) -> float | None:
-    """The latent resolution (Gaussian sigma, px) of the ImageMM restoration the linear image comes from, or None."""
+    """The latent resolution (Gaussian sigma, px) of a 1.x ImageMM restoration the linear image comes from, or None.
+    VeraLux ImageMM's stars are partially deconvolved PSFs, not Gaussians of a latent sigma: restricting its star layer to
+    such footprints (``_compact_star_layer``) gave the bright stars a cyan glow and a dark ring (IC 1805, 2026-10-21),
+    so it has no Eq. 11 sigma and the step stays off for it."""
     rm = _read_json_quiet(_p(session, "restore_meta.json"))
     if not rm or rm.get("deconvolution_by") != "imagemm":
         return None
@@ -803,6 +806,69 @@ def _imagemm_sigma(session: str) -> float | None:
     except (TypeError, ValueError, AttributeError):
         return None
     return sig if sig > 0 else None
+
+
+def _restored_by_imagemm(session: str) -> bool:
+    rm = _read_json_quiet(_p(session, "restore_meta.json"))
+    return bool(rm) and rm.get("deconvolution_by") == "imagemm"
+
+
+def _fill_starless_under_stars(lin: np.ndarray, starless: np.ndarray, stars: np.ndarray, nsig: float = 20.0,
+                               r_max: int = 24, sky_in: int = 25, sky_out: int = 35):
+    """The star remover's starless layer raised back to the sky where it was dug out round a star; the star layer gives
+    that light up (starless + stars stays the linear image, nothing is added).
+
+    StarXTerminator is trained on stars with halos: round the compact stars of an ImageMM restoration it still removes a
+    halo-sized disc (M 31 2026-10-22: out to 10-12 px round the bright stars, while the restored star itself ends at
+    4 px and the linear image is at the sky there within 1 sigma) - after the finish's denoise and stretch a dark disc
+    round every bright star.  For each star of the star layer peaking above ``nsig`` x the starless noise (brightest
+    first): the sky is the median of the starless layer in the ``sky_in``-``sky_out`` px annulus; the deficit radius is
+    where the starless layer's ring medians are back within one standard error of that sky (at most ``r_max``); inside
+    it every ring is offset up to the sky (an offset: the texture stays), never above the linear image."""
+    noise = finish.lower_half_sigma(finish.sample(finish.luminance(starless)))
+    lum = np.ascontiguousarray(stars.max(0), np.float32)
+    pk = (lum == cv2.dilate(lum, np.ones((9, 9), np.uint8))) & (lum > nsig * max(noise, 1e-12))
+    ys, xs = np.nonzero(pk)
+    order = np.argsort(-lum[ys, xs])
+    C, H, W = starless.shape
+    R = sky_out
+    yy, xx = np.mgrid[-R:R + 1, -R:R + 1]
+    rb = np.rint(np.hypot(yy, xx)).astype(int)
+    ann = (rb >= sky_in) & (rb <= sky_out)
+    out = starless.copy()
+    filled, radii, raised = 0, [], 0.0
+    for j in order:
+        y, x = int(ys[j]), int(xs[j])
+        if not (R <= y < H - R and R <= x < W - R):
+            continue
+        hit = False
+        for c in range(C):
+            win = out[c, y - R:y + R + 1, x - R:x + R + 1]
+            lw = lin[c, y - R:y + R + 1, x - R:x + R + 1]
+            sky = float(np.median(win[ann]))
+            sd = 1.4826 * float(np.median(np.abs(win[ann] - sky)))
+            prof = np.array([float(np.median(win[rb == k])) for k in range(r_max + 3)])
+            se = np.array([1.2533 * sd / np.sqrt(max(1, int((rb == k).sum()))) for k in range(r_max + 3)])
+            back = [k for k in range(1, r_max + 1) if (prof[k:k + 3] >= sky - se[k:k + 3]).all()]
+            rd = back[0] if back else r_max
+            if rd <= 1:
+                continue
+            new = win.copy()
+            for k in range(rd):
+                d = sky - prof[k]
+                if d > 0:
+                    m = rb == k
+                    new[m] = np.minimum(win[m] + d, lw[m])
+            raised += float((new - win).sum())
+            out[c, y - R:y + R + 1, x - R:x + R + 1] = new
+            hit = True
+            if c == (1 if C > 1 else 0):
+                radii.append(rd)
+        filled += int(hit)
+    stars_out = np.maximum(lin - out, 0.0).astype(np.float32)
+    return out.astype(np.float32), stars_out, {"stars": int(len(order)), "filled": filled,
+                                               "radius_px_median": float(np.median(radii)) if radii else None,
+                                               "raised_flux_fraction": round(raised / max(float(stars.sum()), 1e-12), 4)}
 
 
 def _read_json_quiet(path: str):
@@ -958,6 +1024,9 @@ def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params:
         if sig_mm:
             starless, stars, cinfo = _compact_star_layer(lin, stars, sig_mm)
             meta["imagemm_star_footprint"] = cinfo
+        elif _restored_by_imagemm(session_dir):
+            starless, stars, finfo = _fill_starless_under_stars(lin, starless, stars)
+            meta["imagemm_starless_fill"] = finfo
         fitsio.write_rgb(starless_path, starless, header)
         fitsio.write_rgb(_p(session_dir, "stars.fits"), stars, header)
         sky_noise = finish.lower_half_sigma(finish.sample(finish.luminance(starless)))
