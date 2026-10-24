@@ -2,6 +2,7 @@
 written, overrides reaching the unselect commands, cancel, plate-solve failure being non-fatal."""
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -266,13 +267,42 @@ def test_post_stages_are_delegated_lazily(session, monkeypatch):
 
 
 def test_local_copy_copies_and_cleans(session, monkeypatch, tmp_path):
+    """The folder is cleared at the start (a dead job's copy), the subs are copied when calibration stages them, the
+    staging symlinks point at the copy during the job and back at the library afterwards, and the copy is deleted."""
     monkeypatch.setenv("ASTROPHOTO_LOCAL_COPY", "1")
-    monkeypatch.setenv("ASTROPHOTO_LOCAL_DIR", str(tmp_path / "local"))
+    root = tmp_path / "local"
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_DIR", str(root))
+    (root / "stale").mkdir(parents=True)
+    (root / "stale" / "old.fit").write_bytes(b"x")
     msgs = []
     with session.local_copy(lambda i, n, m: msgs.append(m)) as s:
-        assert s._local and all(os.path.exists(p) for p in s._local.values())
-        assert msgs[-1].startswith("Copying the subs to the local disk (12/12")
-    assert session._local == {} and not any(os.path.isdir(p) for p in (tmp_path / "local").glob("*") if any(p.iterdir()))
+        assert not (root / "stale").exists() and s._local == {}
+        s.run_analysis(1.0)
+        assert len(s._local) == 12 and all(os.path.exists(p) and p.startswith(str(root)) for p in s._local.values())
+        assert msgs[-1 - [m.startswith("Copying") for m in reversed(msgs)].index(True)].startswith(
+            "Copying the subs to the local disk (12/12")
+        links = sorted(glob.glob(os.path.join(s.process, "src", "*.fit")))
+        assert links and all(os.readlink(p).startswith(str(root)) for p in links)
+        assert s._local_paths([f.path for f in s.fs.frames[:2]]) == {f.path: s._local[f.path] for f in s.fs.frames[:2]}
+    assert session._local == {} and not root.exists()
+    lib = {f.path for f in session.fs.frames}
+    assert all(os.readlink(p) in lib for p in links)
+    msgs.clear()
+    with session.local_copy(lambda i, n, m: msgs.append(m)):
+        session.run_stack({})                       # the registration is reused: no sub is read, nothing copied
+    assert not any(m.startswith("Copying") for m in msgs)
+
+
+def test_local_copy_off_and_unsafe_dir(session, monkeypatch, tmp_path):
+    monkeypatch.delenv("ASTROPHOTO_LOCAL_COPY", raising=False)
+    with session.local_copy() as s:
+        assert s._local_root is None
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_COPY", "true")
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_DIR", session.workdir)
+    with pytest.raises(RuntimeError):
+        with session.local_copy():
+            pass
+    assert os.path.isdir(session.dir)
 
 
 def test_banding_stage_runs_only_when_measured(session, monkeypatch):

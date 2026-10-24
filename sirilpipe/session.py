@@ -75,6 +75,8 @@ class Session:
         self.cancel_flag = threading.Event()
         self.pause_flag = threading.Event()
         self._local: dict[str, str] = {}         # original path -> local copy while local_copy() is active
+        self._local_root: str | None = None      # the local copy's folder while local_copy() is active
+        self._local_progress = None
         self.timings: dict[str, float] = read_json(os.path.join(self.process, "timings.json"), {}) or {}
         self._rows: list[dict] | None = None
         self._units: list[workflow.Unit] = []
@@ -384,6 +386,7 @@ class Session:
                 shutil.rmtree(u.dir, ignore_errors=True)
         t0 = time.time()
         done = 0
+        self._localise([f for u in units for f in u.frames])
         for u in units:
             workflow.stage_inputs(u, [self._path(f) for f in u.frames])
             pre = seq
@@ -941,7 +944,8 @@ class Session:
                 log.warning("ImageMM is not available (%s)", av["reason"])
             return False, {"state": "unavailable", "reason": av["reason"]}
         try:
-            return True, {"state": "ran", **imagemm_stage.run(self.dir, self.meta, sp, self._cb(progress), self.checkpoint)}
+            return True, {"state": "ran", **imagemm_stage.run(self.dir, self.meta, sp, self._cb(progress), self.checkpoint,
+                                                              local=self._local_paths)}
         except Cancelled:
             raise
         except Exception as e:
@@ -1042,10 +1046,11 @@ class Session:
         """analysis -> stack -> plate solve -> restore -> (star removal) -> (auto-finish) -> export."""
         sp, pr, eo = dict(stack_params or {}), dict(params or {}), dict(export_opts or {})
         t0 = time.time()
-        self.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), progress, sp)
-        self.run_stack(sp, progress)
-        self.plate_solve(progress)
-        self.run_denoise(sp, progress, pr)
+        with self.local_copy(progress):              # the stages that read the subs
+            self.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), progress, sp)
+            self.run_stack(sp, progress)
+            self.plate_solve(progress)
+            self.run_denoise(sp, progress, pr)
         if sp.get("star_remover", True):
             self.train_star_remover(pr, sp, progress)
         fin = None
@@ -1061,37 +1066,73 @@ class Session:
     # ------------------------------------------------------------------ local copy
     @contextlib.contextmanager
     def local_copy(self, progress=None):
-        """With ASTROPHOTO_LOCAL_COPY on: copy the subs to a local disk first (slow NAS), read them from there
-        and delete the copy afterwards.  Caches keep the library paths."""
-        if not local_copy_enabled():
+        """Read the subs from a local copy for the duration of a job (``ASTROPHOTO_LOCAL_COPY``), for a library
+        on a NAS.  The folder (``ASTROPHOTO_LOCAL_DIR``, default ``<workdir>/.local_copy``) is cleared first (a
+        job that died leaves its copy behind), the subs are copied into it the first time a stage reads them
+        (``_localise``: calibration staging, ImageMM's raw saturation pass; a registration that is reused reads
+        no sub and copies nothing), and when the job ends, however it ends, the staging symlinks are pointed
+        back at the library and the copy is deleted.  Frame lists and caches keep the library paths."""
+        if not local_copy_enabled() or self._local_root:      # off, or already active (run_all inside a job)
             yield self
             return
-        if self.fs is None:
-            self.scan(progress)
         root = local_copy_dir(self.workdir)
-        files = [f for f in self.fs.frames]
-        total = sum(os.path.getsize(f.path) for f in files if os.path.exists(f.path))
-        done = 0
+        if root in (os.sep, self.workdir) or self.workdir.startswith(root.rstrip(os.sep) + os.sep) or \
+                any(f == root or f.startswith(root.rstrip(os.sep) + os.sep) for f in self.folders):
+            raise RuntimeError(f"ASTROPHOTO_LOCAL_DIR {root} holds the output or the images: it is deleted after every job")
+        shutil.rmtree(root, ignore_errors=True)
         os.makedirs(root, exist_ok=True)
+        self._local, self._local_root, self._local_progress = {}, root, progress
         try:
-            for i, f in enumerate(files, 1):
-                d = os.path.join(root, hashlib.sha1(os.path.dirname(f.path).encode()).hexdigest()[:12])
-                os.makedirs(d, exist_ok=True)
-                dst = os.path.join(d, os.path.basename(f.path))
-                if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(f.path):
-                    shutil.copyfile(f.path, dst + ".part")
-                    os.replace(dst + ".part", dst)
-                self._local[f.path] = dst
-                done += os.path.getsize(dst)
-                if progress:
-                    progress(i, len(files), f"Copying the subs to the local disk ({i}/{len(files)}, "
-                             f"{done / 1e9:.1f} of {total / 1e9:.1f} GB)")
-                self.checkpoint()
             yield self
         finally:
-            self._local = {}
-            for d in {os.path.dirname(p) for p in glob.glob(os.path.join(root, "*", "*"))}:
-                shutil.rmtree(d, ignore_errors=True)
+            back = {v: k for k, v in self._local.items()}
+            self._local, self._local_root, self._local_progress = {}, None, None
+            if back:
+                self._unlocalise_links(back)
+            shutil.rmtree(root, ignore_errors=True)
+
+    def _localise(self, frames: list[Frame]) -> None:
+        """Copy ``frames`` into the active local copy (no-op when none is active or they are there already)."""
+        root, progress = self._local_root, self._local_progress
+        todo = [f for f in frames if f.path not in self._local] if root else []
+        if not todo:
+            return
+        t0 = time.time()
+        total = sum(os.path.getsize(f.path) for f in todo)
+        done = 0
+        for i, f in enumerate(todo, 1):
+            d = os.path.join(root, hashlib.sha1(os.path.dirname(f.path).encode()).hexdigest()[:12])
+            os.makedirs(d, exist_ok=True)
+            dst = os.path.join(d, os.path.basename(f.path))
+            shutil.copyfile(f.path, dst + ".part")
+            os.replace(dst + ".part", dst)
+            self._local[f.path] = dst
+            done += os.path.getsize(dst)
+            if progress:
+                progress(i, len(todo), f"Copying the subs to the local disk ({i}/{len(todo)}, "
+                         f"{done / 2**30:.1f} of {total / 2**30:.1f} GB)")
+            self.checkpoint()
+        self._time("local_copy", time.time() - t0)
+
+    def _local_paths(self, paths: list[str]) -> dict[str, str]:
+        """{library path: file to read} for these subs: their local copies while one is active (copied now)."""
+        if self.fs is None:
+            self.scan()
+        want = set(paths)
+        self._localise([f for f in self.fs.frames + [f for g in self.fs.exposure_groups for f in g.frames] if f.path in want])
+        return {p: self._local.get(p, p) for p in paths}
+
+    def _unlocalise_links(self, back: dict[str, str]) -> None:
+        """Point the staging symlinks (``<unit>/src/light_NNNNN.fit``) that lead into the local copy back at the
+        library: without masters the registered sequence is Siril's ``link`` of them and outlives the copy."""
+        for link in glob.glob(os.path.join(self.process, "src", "*")) + glob.glob(os.path.join(self.process, "u*", "src", "*")):
+            try:
+                tgt = os.readlink(link)
+            except OSError:
+                continue
+            if tgt in back:
+                os.remove(link)
+                os.symlink(back[tgt], link)
 
     # ------------------------------------------------------------------ status
     def status(self) -> dict:

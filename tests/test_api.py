@@ -6,6 +6,7 @@ without Siril, GraXpert, StarNet or RC-Astro.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -138,6 +139,7 @@ class FakeSession:
         self.pause_requested = False
         self.calls: list = []
         self.prefs = {"enabled": True}
+        self.local_copies = 0                   # jobs run inside local_copy() (ASTROPHOTO_LOCAL_COPY)
         FakeSession.instances.append(self)
 
     def status(self):
@@ -148,6 +150,11 @@ class FakeSession:
     def checkpoint(self):
         if self.cancel_requested:
             raise Cancelled()
+
+    @contextlib.contextmanager
+    def local_copy(self, progress=None):
+        self.local_copies += 1
+        yield self
 
     def _steps(self, progress, name, n=3, delay=0.05):
         for i in range(n):
@@ -388,6 +395,7 @@ def test_submit_all_job_runs_and_outputs(env):
     # the server path of "all": analyse, stack, solve, restore, star removal, autofinish, export (tuned params exported)
     s = FakeSession.instances[0]
     assert [c if isinstance(c, str) else c[0] for c in s.calls] == ["analyse", "stack", "solve", "restore", "stars", "autofinish", "export"]
+    assert s.local_copies == 1                  # the job reads the subs through Session.local_copy
     stack_call = s.calls[1][1]
     assert stack_call["deconv_method"] == "auto" and stack_call["scale"] == 2.0 and stack_call["sigma_low"] == 4.0
     export_call = s.calls[-1]

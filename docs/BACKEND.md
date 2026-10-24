@@ -20,7 +20,7 @@ docker compose up -d --build         # NVIDIA profile (default); --profile cpu f
 | `OUTPUT_DIR` | caches, exports, **and `.home/`: tool licences, models, Siril config** (keep it across rebuilds) |
 | `STARNET_ACCEPT_LICENSE=yes` | download the StarNet2 CLI from starnetastro.com at build time (you accept its licence) |
 | `IMAGEMM=cuda\|cpu\|off` | add PyTorch for the optional ImageMM multi-frame restoration and for Cosmic Clarity (+ torchvision, onnxruntime; cuda adds ~4 GB) |
-| `LOCAL_COPY=true` | copy a dataset's subs to the output volume before a job (NAS shares) |
+| `LOCAL_COPY=true` | jobs read the subs from a copy on the output volume (NAS shares): copied when a stage first reads them, cleared at the start of every job and deleted at its end |
 
 The container's hostname is fixed (`astrophoto-studio`) because the RC-Astro licence is bound to the
 machine identity. Activation is done once in the web UI (*Tools* card: paste the 8-letter code from

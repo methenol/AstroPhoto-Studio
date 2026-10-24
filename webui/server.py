@@ -820,7 +820,10 @@ def _run_job(job_id: str):
             if kind == "tools":
                 job["result"] = _run_tools_job(params, progress)
             else:
-                job["result"] = _run_session_job(kind, s, progress, params, stack_params, export_opts)
+                # ASTROPHOTO_LOCAL_COPY: the copy folder is cleared, and the subs are read from a local copy
+                # (made when a stage first reads them, deleted when the job ends)
+                with s.local_copy(progress):
+                    job["result"] = _run_session_job(kind, s, progress, params, stack_params, export_opts)
             job["state"] = "done"
             job["progress"] = 1.0
             job["message"] = "Finished"

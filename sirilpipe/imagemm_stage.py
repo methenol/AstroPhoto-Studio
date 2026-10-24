@@ -517,9 +517,10 @@ def clean_intermediates(process: str, seq: str) -> None:
 
 
 def siril_preprocess(session_dir: str, meta: dict, inc: list[int], rows: list[dict], say, checkpoint, cosmetic: bool = True,
-                     subsky: bool = False, defer_masks: bool = False) -> dict:
+                     subsky: bool = False, defer_masks: bool = False, local=None) -> dict:
     """Steps 1-3 of the module docstring.  Returns {"seq", "frames" (file number -> registered frame), "masks" (file
-    number -> registered saturation mask, may be empty), "stars" (file number -> findstar list), "saturation"}."""
+    number -> registered saturation mask, may be empty), "stars" (file number -> findstar list), "saturation"}.
+    ``local``: library paths -> {library path: file to read} (Session.local_copy), for the raw frames."""
     from .siril import SirilRunner, quote, ranges
     process = os.path.join(session_dir, "process")
     state = read_json(os.path.join(process, "state.json"), {}) or {}
@@ -607,6 +608,9 @@ def siril_preprocess(session_dir: str, meta: dict, inc: list[int], rows: list[di
     # half the ceiling (M 31) - and the restoration grew a coloured crown on one side of every saturated star.
     say(0, 1, "ImageMM: saturation of the raw frames")
     raw_paths = {src["nums"][i]: rows[i].get("path") for i in inc if rows[i].get("path")}
+    if local is not None:
+        to_read = local(list(raw_paths.values()))
+        raw_paths = {k: to_read.get(p, p) for k, p in raw_paths.items()}
     ceiling, sat, sat_info = raw_saturation(raw_paths, say, checkpoint)
     masks = False
     if ceiling is not None:
@@ -842,9 +846,10 @@ def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> 
             "region": list(region) if region else None, "scale": scale, "flip": bool(flip)}
 
 
-def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None) -> dict:
+def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None, local=None) -> dict:
     """Restore the included frames of a stacked session with VeraLux ImageMM -> ``imagemm.fits`` and
-    ``imagemm_meta.json`` (returned).  Raises on failure: the restore job then fails with the reason (no BlurXTerminator in its place)."""
+    ``imagemm_meta.json`` (returned).  Raises on failure: the restore job then fails with the reason (no BlurXTerminator in its place).
+    ``local``: see ``siril_preprocess``."""
     av = available()
     if not av["ok"]:
         raise RuntimeError(av["reason"])
@@ -906,7 +911,7 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
         if store is None:
             shutil.rmtree(work, ignore_errors=True)
             t1 = time.time()
-            prep = siril_preprocess(session_dir, meta, inc, rows, say, checkpoint, defer_masks=True, cosmetic=_flag(sp.get("imagemm_cosmetic", True)),
+            prep = siril_preprocess(session_dir, meta, inc, rows, say, checkpoint, defer_masks=True, local=local, cosmetic=_flag(sp.get("imagemm_cosmetic", True)),
                                     subsky=_flag(sp.get("imagemm_subsky", False)))
             best = keys[len(keys) // 2]
             places = sequence_placements(prep["seq_file"], canvas)

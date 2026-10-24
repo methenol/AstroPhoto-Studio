@@ -378,7 +378,7 @@ def _fake_session(tmp_path, n=6, cw=200, ch=190, crop=(5, 5, 190, 180)):
 
 
 def _fake_preprocess(cw, ch):
-    def prep(session_dir, meta, inc, rows, say, checkpoint, cosmetic=True, subsky=False, defer_masks=False):
+    def prep(session_dir, meta, inc, rows, say, checkpoint, cosmetic=True, subsky=False, defer_masks=False, local=None):
         proc = os.path.join(session_dir, "process")
         rng = np.random.default_rng(7)
         nums = [i + 1 for i in inc]

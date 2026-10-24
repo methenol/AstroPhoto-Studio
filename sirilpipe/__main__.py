@@ -74,19 +74,20 @@ def main(argv: list[str] | None = None) -> int:
     s = Session(args.folders, args.workdir, limit=args.limit)
     sp, pr, prog = _kv(args.stack_param), _kv(args.param), _progress()
     t0 = time.time()
-    if args.cmd == "calibration":
-        s.run_calibration(prog)
-        print(json.dumps(s.calibration_info(), indent=1))
-    elif args.cmd == "analyse":
-        print(s.run_analysis(float(sp.get("sensitivity", 1.0)), prog))
-    elif args.cmd == "stack":
-        s.run_analysis(float(sp.get("sensitivity", 1.0)), prog, sp)
-        meta = s.run_stack(sp, prog)
-        if not args.no_solve:
-            s.plate_solve(prog)
-        print(json.dumps(clean_json(s.meta), indent=1))
-    elif args.cmd == "run":
-        print(json.dumps(clean_json(s.run_all(sp, pr, {}, prog)), indent=1))
+    with s.local_copy(prog):                       # ASTROPHOTO_LOCAL_COPY
+        if args.cmd == "calibration":
+            s.run_calibration(prog)
+            print(json.dumps(s.calibration_info(), indent=1))
+        elif args.cmd == "analyse":
+            print(s.run_analysis(float(sp.get("sensitivity", 1.0)), prog))
+        elif args.cmd == "stack":
+            s.run_analysis(float(sp.get("sensitivity", 1.0)), prog, sp)
+            meta = s.run_stack(sp, prog)
+            if not args.no_solve:
+                s.plate_solve(prog)
+            print(json.dumps(clean_json(s.meta), indent=1))
+        elif args.cmd == "run":
+            print(json.dumps(clean_json(s.run_all(sp, pr, {}, prog)), indent=1))
     print(f"done in {time.time() - t0:.0f} s; session folder {s.dir}", file=sys.stderr)
     return 0
 
