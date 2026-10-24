@@ -900,8 +900,8 @@ class Session:
         ``deconv_method`` "imagemm" (explicit choice; "auto" = BlurXTerminator when licensed, else Siril RL):
         the registered frames are restored jointly by ``imagemm_stage`` first (``imagemm.fits``, same grid as
         stack.fits) and ``post.restore`` then works on that instead of stack.fits - without its own
-        deconvolution, ImageMM being one.  Without torch, or if ImageMM fails, the normal chain runs and
-        restore_meta.json says so (``imagemm``: "unavailable" / "failed")."""
+        deconvolution, ImageMM being one.  Without torch, or if ImageMM fails, the job fails with the reason
+        (restore_meta.json: ``imagemm`` "unavailable" / "failed") - no BlurXTerminator in ImageMM's place."""
         from sirilpipe import post
         with self.lock:
             sp = dict(stack_params or {})
@@ -916,6 +916,12 @@ class Session:
             used, info = False, None
             if sp.get("deconv_method") == "imagemm":
                 used, info = self._imagemm_stage(sp, progress)
+                if not used:
+                    # (ImageMM was chosen: a run that cannot do it fails with the reason - falling back to
+                    # BlurXTerminator handed back a BXT image under ImageMM's name, 2026-10-24: Siril out of disk)
+                    self._record_imagemm({}, False, info)
+                    raise RuntimeError(f"ImageMM {info['state']}: {info.get('reason') or 'unknown reason'} - "
+                                       "not restored (no BlurXTerminator fallback)")
             if used:
                 out = self._restore_from(post, "imagemm.fits", info, sp, params, progress)
             else:
@@ -932,14 +938,14 @@ class Session:
         if not av["ok"]:
             if not _IMAGEMM_WARNED:
                 _IMAGEMM_WARNED = True
-                log.warning("ImageMM is not available (%s): restoring with BlurXTerminator / Siril RL instead", av["reason"])
+                log.warning("ImageMM is not available (%s)", av["reason"])
             return False, {"state": "unavailable", "reason": av["reason"]}
         try:
             return True, {"state": "ran", **imagemm_stage.run(self.dir, self.meta, sp, self._cb(progress), self.checkpoint)}
         except Cancelled:
             raise
         except Exception as e:
-            log.warning("ImageMM failed (%s): restoring with BlurXTerminator / Siril RL instead", str(e).splitlines()[0])
+            log.warning("ImageMM failed (%s)", str(e).splitlines()[0])
             return False, {"state": "failed", "reason": str(e).splitlines()[0][:400]}
 
     def _restore_from(self, post, name: str, info: dict, sp: dict, params, progress) -> dict:

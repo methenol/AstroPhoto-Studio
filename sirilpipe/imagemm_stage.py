@@ -844,7 +844,7 @@ def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> 
 
 def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None) -> dict:
     """Restore the included frames of a stacked session with VeraLux ImageMM -> ``imagemm.fits`` and
-    ``imagemm_meta.json`` (returned).  Raises on failure; the caller falls back to the normal path."""
+    ``imagemm_meta.json`` (returned).  Raises on failure: the restore job then fails with the reason (no BlurXTerminator in its place)."""
     av = available()
     if not av["ok"]:
         raise RuntimeError(av["reason"])

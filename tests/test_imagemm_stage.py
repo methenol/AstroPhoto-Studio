@@ -266,7 +266,7 @@ def _fake_post(seen):
     return types.SimpleNamespace(restore=restore)
 
 
-def test_run_denoise_falls_back_when_torch_is_missing(tmp_path, monkeypatch, caplog):
+def test_run_denoise_fails_when_torch_is_missing(tmp_path, monkeypatch, caplog):
     from sirilpipe import post, session
     s = _session(tmp_path)
     seen = []
@@ -274,12 +274,12 @@ def test_run_denoise_falls_back_when_torch_is_missing(tmp_path, monkeypatch, cap
     monkeypatch.setattr(S, "available", lambda: {"ok": False, "torch": False, "cuda": False, "mps": False,
                                                  "reason": "torch is not installed"})
     monkeypatch.setattr(session, "_IMAGEMM_WARNED", False)
-    out = s.run_denoise({"deconv_method": "imagemm"})
-    out2 = s.run_denoise({"deconv_method": "imagemm"})
-    assert len(seen) == 2 and seen[0]["sp"]["deconv_method"] == "imagemm" and seen[0]["stack_value"] == 0.25
-    assert out["imagemm"] == "unavailable" and "torch" in out["imagemm_reason"]
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="ImageMM unavailable: torch is not installed"):
+            s.run_denoise({"deconv_method": "imagemm"})
+    assert seen == []                                        # (no BlurXTerminator / RL restore in its place)
     rm = json.load(open(s._p("restore_meta.json")))
-    assert rm["imagemm"] == "unavailable" and out2["imagemm"] == "unavailable"
+    assert rm["imagemm"] == "unavailable" and "torch" in rm["imagemm_reason"]
     assert sum("ImageMM is not available" in r.message for r in caplog.records) == 1      # logged once
 
 
@@ -313,7 +313,7 @@ def test_run_denoise_with_imagemm_reads_imagemm_fits_and_restores_the_stack(tmp_
     assert out["imagemm"] == "ran" and out["deconvolution_by"] == "imagemm" and "frames" not in out["imagemm_info"]
 
 
-def test_run_denoise_imagemm_failure_falls_back(tmp_path, monkeypatch):
+def test_run_denoise_imagemm_failure_fails_the_job_without_bxt(tmp_path, monkeypatch):
     from sirilpipe import post
     s = _session(tmp_path)
     seen = []
@@ -323,9 +323,11 @@ def test_run_denoise_imagemm_failure_falls_back(tmp_path, monkeypatch):
     def fail(*a, **k):
         raise RuntimeError("not enough GPU memory\nmore")
     monkeypatch.setattr(S, "run", fail)
-    out = s.run_denoise({"deconv_method": "imagemm"})
-    assert seen[0]["stack_value"] == 0.25 and seen[0]["sp"]["deconv_method"] == "imagemm"
-    assert out["imagemm"] == "failed" and out["imagemm_reason"] == "not enough GPU memory"
+    with pytest.raises(RuntimeError, match="ImageMM failed: not enough GPU memory"):
+        s.run_denoise({"deconv_method": "imagemm"})
+    assert seen == []                                        # (no BlurXTerminator / RL restore in its place)
+    rm = json.load(open(s._p("restore_meta.json")))
+    assert rm["imagemm"] == "failed" and rm["imagemm_reason"] == "not enough GPU memory"
 
 
 def test_stack_swap_is_undone_on_error_and_recovered_after_a_crash(tmp_path):
