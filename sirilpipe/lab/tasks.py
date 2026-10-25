@@ -328,7 +328,8 @@ class RestoreTask(Task):
                    "denoise strength (NoiseXTerminator / GraXpert), colour calibration.  Scored on the result: star FWHM, background noise, Krotkov sharpness, aperture "
                    "photometry against the stack (bright / faint bias) and, on synthetic data, the truth.  Each trial runs the whole linear stage (1-2 min).")
     params = _processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance"], {"deconvolution", "denoise", "bg_smoothing"})
-    params.append({"name": "deconv_method", "label": "Deconvolution tool", "type": "categorical", "choices": ["auto", "bxt", "rl", "graxpert_obj", "graxpert_stellar", "graxpert_both", "none"], "default": "auto", "tune": False, "pipeline": "deconv_method"})
+    params.append({"name": "deconv_method", "label": "Deconvolution tool (objects)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"], "default": "auto", "tune": False, "pipeline": "deconv_method"})
+    params.append({"name": "deconv_stars_method", "label": "Deconvolution tool (stars)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"], "default": "auto", "tune": False, "pipeline": "deconv_stars_method"})
     params.append({"name": "denoise_method", "label": "Noise reduction tool", "type": "categorical", "choices": ["auto", "nxt", "graxpert", "siril", "none"], "default": "auto", "tune": False, "pipeline": "denoise_method"})
     metrics = {
         "fwhm": {"label": "Star FWHM (px)", "direction": "minimize"},
@@ -353,8 +354,9 @@ class RestoreTask(Task):
         ctx["n"] += 1
         wd = os.path.join(ctx["study_dir"], "work", f"restore_{ctx['n']}")
         _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
-        prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k not in ("deconv_method", "denoise_method")}}
-        sp = {**(s.meta.get("params") or {}), "deconv_method": p.get("deconv_method", "auto"), "denoise_method": p.get("denoise_method", "auto"), "device": str(ctx["device"])}
+        prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k not in ("deconv_method", "deconv_stars_method", "denoise_method")}}
+        sp = {**(s.meta.get("params") or {}), "deconv_method": p.get("deconv_method", "auto"), "deconv_stars_method": p.get("deconv_stars_method", ""),
+              "denoise_method": p.get("denoise_method", "auto"), "device": str(ctx["device"])}
         t = time.time()
         try:
             def checkpoint():

@@ -905,10 +905,11 @@ class Session:
     def run_denoise(self, stack_params: dict | None = None, progress=None, params: dict | None = None) -> dict:
         """"Restore": linear post-processing -> linear.fits (gradient, colour calibration, deconvolution, denoise).
 
-        ``deconv_method`` "imagemm" (explicit choice; "auto" = BlurXTerminator when licensed, else Siril RL):
-        the registered frames are restored jointly by ``imagemm_stage`` first (``imagemm.fits``, same grid as
-        stack.fits) and ``post.restore`` then works on that instead of stack.fits - without its own
-        deconvolution, ImageMM being one.  Without torch, or if ImageMM fails, the job fails with the reason
+        ImageMM chosen for the objects and / or the stars (``deconv_method`` / ``deconv_stars_method`` "imagemm"; "auto" =
+        BlurXTerminator when licensed, else Siril RL): the registered frames are restored jointly by ``imagemm_stage``
+        first (``imagemm.fits``, same grid as stack.fits) and ``post.restore`` then works on that instead of stack.fits -
+        without its own deconvolution of ImageMM's region(s), ImageMM being one; with ImageMM for one region only, the
+        other comes from stack.fits through the star mask and is deconvolved by its own tool (post.Restorer).  Without torch, or if ImageMM fails, the job fails with the reason
         (restore_meta.json: ``imagemm`` "unavailable" / "failed") - no BlurXTerminator in ImageMM's place."""
         from sirilpipe import post
         with self.lock:
@@ -922,7 +923,7 @@ class Session:
                 pass
             self._recover_stack_swap()
             used, info = False, None
-            if sp.get("deconv_method") == "imagemm":
+            if "imagemm" in post.deconv_choice(sp):
                 used, info = self._imagemm_stage(sp, progress)
                 if not used:
                     # (ImageMM was chosen: a run that cannot do it fails with the reason - falling back to
@@ -935,7 +936,7 @@ class Session:
             else:
                 out = post.restore(self.dir, self.meta, sp, params or {}, self._cb(progress), self.checkpoint)
             if info is not None:
-                out = self._record_imagemm(out, used, info)
+                out = self._record_imagemm(out, used, info, post.deconv_choice(sp))
             return out
 
     def _imagemm_stage(self, sp: dict, progress) -> tuple[bool, dict]:
@@ -962,15 +963,15 @@ class Session:
 
         post.py honours ``stack_meta['restore_source']`` (or a ``restore_input`` argument) when it knows it;
         otherwise stack.fits is swapped for ``name`` while it runs and put back whatever happens.  The
-        deconvolution is off for it: ImageMM is the deconvolution."""
+        deconvolution of ImageMM's region(s) is off for it: ImageMM is the deconvolution there."""
         import inspect
         meta = dict(self.meta)
         r = int(info.get("r") or 1)
         if r != 1:
             meta.update(scale=float(meta.get("scale") or 1.0) * r, shape=[int(v) for v in info["shape"]],
                         pixel_scale=(meta["pixel_scale"] / r) if meta.get("pixel_scale") else None)
-        meta["restore_source"] = name
-        sp2 = {**sp, "deconv_method": "none"}
+        meta.update(restore_source=name, imagemm_r=r, imagemm_offset=[int(v) for v in (info.get("region_offset") or (0, 0))])
+        sp2 = dict(sp)
         cb = self._cb(progress)
         kw: dict = {}
         takes = "restore_input" in inspect.signature(post.restore).parameters
@@ -1001,7 +1002,7 @@ class Session:
         if os.path.exists(keep):
             os.replace(keep, self._p("stack.fits"))
 
-    def _record_imagemm(self, out: dict, used: bool, info: dict) -> dict:
+    def _record_imagemm(self, out: dict, used: bool, info: dict, regions: tuple[str, str] = ("imagemm", "imagemm")) -> dict:
         """What ImageMM did, in restore_meta.json (and the returned meta): ``imagemm`` = ran | unavailable | failed."""
         path = self._p("restore_meta.json")
         rm = read_json(path, None)
@@ -1010,7 +1011,8 @@ class Session:
         rec = {"imagemm": info["state"]}
         if used:
             rec["imagemm_info"] = {k: v for k, v in info.items() if k not in ("state", "frames", "frames_skipped")}
-            rec["deconvolution_by"] = "imagemm"
+            # the star layer's ImageMM handling (post.remove_stars) is for ImageMM's stars only
+            rec["deconvolution_by"] = "imagemm" if regions[1] == "imagemm" else "imagemm_objects"
         else:
             rec["imagemm_reason"] = info.get("reason")
         rm.update(rec)

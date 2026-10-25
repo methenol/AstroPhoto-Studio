@@ -35,7 +35,12 @@ from .util import Cancelled
 PLATESOLVE_PAUSE = float(os.environ.get("PLATESOLVE_PAUSE", 20))   # seconds between catalogue retries
 SPCC_ATTEMPTS = 2                                                      # SPCC once more after a failed / crashed catalogue download (Siril resumes from its spcc-cache)
 SPCC_RETRY_PAUSE = float(os.environ.get("SPCC_RETRY_PAUSE", 5))
-GRAXPERT_DECONV = {"graxpert_obj": ("obj",), "graxpert_stellar": ("stellar",), "graxpert_both": ("obj", "stellar")}   # deconv_method -> GraXpert models, in order
+# Deconvolution is chosen per region: ``deconv_method`` = the objects (nonstellar structure), ``deconv_stars_method`` = the stars; each one of
+DECONV_TOOLS = ("auto", "bxt", "graxpert", "rl", "imagemm", "none")
+# the single choice before the split, still accepted: GraXpert's models named in deconv_method -> (objects, stars)
+LEGACY_DECONV = {"graxpert_obj": ("graxpert", "none"), "graxpert_stellar": ("none", "graxpert"), "graxpert_both": ("graxpert", "graxpert")}
+GRAXPERT_DECONV = {"both": ("obj", "stellar"), "objects": ("obj",), "stars": ("stellar",)}   # region -> GraXpert models, in order (objects then stars)
+STAR_MASK_K = 1.0        # a star's footprint ends where its fitted Moffat profile falls to STAR_MASK_K x the sky noise
 CC_SUPERRES_SCALES = (2, 3, 4)   # the scales the Cosmic Clarity super-resolution models exist for
 RL_TIMEOUT = float(os.environ.get("RL_TIMEOUT", 1800))      # Siril's Richardson-Lucy: ~40 s / iteration on a loaded 8 MP frame
 
@@ -161,7 +166,7 @@ PARAM_SPEC: list[dict] = [
     _R("Grade", "grade_contrast", "Object contrast (S-curve)", -1, 1, 0.05),
     _B("Linear", "crop", "Auto-crop the stacking edges (stack job)"),
     _R("Linear", "crop_threshold", "Crop: minimum frame coverage (stack job)", 0.1, 1.0, 0.05),
-    _R("Linear", "restored_resolution", "ImageMM super-resolution factor r (deconv_method imagemm)", 1, 3, 1),
+    _R("Linear", "restored_resolution", "ImageMM super-resolution factor r (deconvolution imagemm)", 1, 3, 1),
 ]
 
 # Same presets as before ("Balanced" = DEFAULTS); only keys that are still honoured matter.
@@ -403,6 +408,85 @@ def _spcc_database_present() -> bool:
     return os.path.isdir(os.path.join(home, ".local", "share", "siril-spcc-database"))
 
 
+def deconv_choice(stack_params: dict | None) -> tuple[str, str]:
+    """(objects, stars): the deconvolution tool of each region, each one of DECONV_TOOLS.  ``deconv_method`` is the objects' tool and
+    ``deconv_stars_method`` the stars'; without the latter (or "") the stars follow ``deconv_method``, the single choice before the split.
+    The former GraXpert values of deconv_method (graxpert_obj / graxpert_stellar / graxpert_both) name both regions."""
+    sp = stack_params or {}
+    obj = str(sp.get("deconv_method") or "auto")
+    stars = str(sp.get("deconv_stars_method") or "")
+    if obj in LEGACY_DECONV:
+        obj, follow = LEGACY_DECONV[obj]
+    else:
+        follow = obj
+    if stars in LEGACY_DECONV:
+        stars = LEGACY_DECONV[stars][1]
+    return obj, stars or follow
+
+
+def star_footprint_mask(work: str, steps: _Steps, arr: np.ndarray, header) -> tuple[np.ndarray, dict]:
+    """(H, W) float32 mask in [0, 1] of the stars' footprints on the linear image ``arr`` (Siril's row order), for confining a whole-image
+    deconvolution (Siril RL, ImageMM) to the objects or to the stars.
+
+    Siril ``findstar`` with Moffat profiles (``setfindstar -moffat``; the default detection otherwise) fits every star; a star covers the
+    pixels where its fitted profile A (1 + (r / alpha)^2)^-beta is above STAR_MASK_K x the sky noise (per pixel, of the green plane,
+    the plane findstar measures): r = alpha sqrt((A / k sigma)^(1 / beta) - 1), alpha = FWHM / (2 sqrt(2^(1 / beta) - 1)), at
+    least the FWHM.  The discs are softened by the median star's own Gaussian sigma (FWHM / 2.355), like a star mask's smoothing."""
+    from .veralux_imagemm import siril_to_array
+    H, W = arr.shape[-2:]
+    lst = os.path.join(work, "starmask.lst")
+    if os.path.exists(lst):
+        os.remove(lst)
+    fin = os.path.join(work, "starmask_in.fit")
+    _write_like(fin, arr, header)
+    try:
+        _siril_run(work, steps, "load starmask_in\nsetfindstar reset\nsetfindstar -moffat\nfindstar -out=starmask.lst\nsetfindstar reset\n",
+                   "Star mask", expect=["starmask.lst"])
+    finally:
+        if os.path.exists(fin):
+            os.remove(fin)
+    cols, rows = None, []
+    with open(lst, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.split()
+            if line.startswith("#"):
+                head = line.lstrip("#").replace("[px]", "").replace('["]', "").split()
+                if "X" in head and "beta" in head:
+                    cols = {k: head.index(k) for k in ("A", "beta", "X", "Y", "FWHMx", "FWHMy")}
+                continue
+            if cols and len(parts) > max(cols.values()):
+                try:
+                    rows.append({k: float(parts[i]) for k, i in cols.items()})
+                except ValueError:
+                    continue
+    # the sky's per-pixel noise: MAD of the 5 px high-pass of the green plane (the plane findstar measures), over the high-pass's own factor for white noise,
+    # sqrt(1 - 2 g(0) + sum g^2) = sqrt(1 - 3 / (4 pi s^2)); finish.lower_half_sigma reads 0.6 sigma on pure Gaussian noise (a relative estimate)
+    g = arr[1 if arr.shape[0] > 1 else 0].astype(np.float32)
+    sigma = finish.mad_sigma((g - cv2.GaussianBlur(g, (0, 0), 5.0))[::2, ::2]) / float(np.sqrt(1.0 - 3.0 / (4.0 * np.pi * 25.0)))
+    mask = np.zeros((H, W), np.uint8)
+    fwhms, radii = [], []
+    for st in rows:
+        fwhm = max(st["FWHMx"], st["FWHMy"])
+        beta = max(st["beta"], 1.0 + 1e-3)
+        if not (np.isfinite(fwhm) and fwhm > 0 and np.isfinite(st["A"])):
+            continue
+        alpha = fwhm / (2.0 * np.sqrt(2.0 ** (1.0 / beta) - 1.0))
+        ratio = st["A"] / max(STAR_MASK_K * sigma, 1e-12)
+        r = alpha * np.sqrt(ratio ** (1.0 / beta) - 1.0) if ratio > 1 else 0.0
+        r = max(r, fwhm)
+        c, y = siril_to_array(st["X"], st["Y"], H)
+        cv2.circle(mask, (int(round(c * 16)), int(round(y * 16))), int(round(r * 16)), 1, -1, lineType=cv2.LINE_8, shift=4)
+        fwhms.append(fwhm)
+        radii.append(r)
+    m = mask.astype(np.float32)
+    if fwhms:
+        m = np.clip(cv2.GaussianBlur(m, (0, 0), float(np.median(fwhms)) / 2.3548), 0.0, 1.0)
+    info = {"stars": len(fwhms), "sky_sigma": round(float(sigma), 7), "k": STAR_MASK_K, "coverage": round(float(m.mean()), 4),
+            "fwhm_median": round(float(np.median(fwhms)), 2) if fwhms else None,
+            "radius_median": round(float(np.median(radii)), 2) if radii else None, "radius_max": round(float(max(radii)), 1) if radii else None}
+    return m, info
+
+
 class Restorer:
     """The linear post-processing chain on ``stack.fits`` -> ``linear.fits`` (DESIGN section 4 "Restore")."""
 
@@ -416,15 +500,60 @@ class Restorer:
         if not os.path.exists(_p(session, self.source)):
             self.source = "stack.fits"
         self.arr, self.header = fitsio.read_rgb(_p(session, self.source))
-        if not export_mod.bottom_up(self.header):                    # one row order for everything downstream (Siril's)
+        flip = not export_mod.bottom_up(self.header)
+        if flip:                                                     # one row order for everything downstream (Siril's)
             self.arr = np.ascontiguousarray(self.arr[:, ::-1])
             self.header["ROWORDER"] = "BOTTOM-UP"
+        self.deconv = deconv_choice(self.sp)                         # (objects, stars)
+        self._mask: np.ndarray | None = None
+        self._psf_image: np.ndarray | None = None                     # the image whose blur the deconvolution undoes, when not self.arr
+        if self.source == "imagemm.fits" and self.deconv.count("imagemm") == 1:
+            self._imagemm_region(flip)
         self.arr, self.scale = normalise_scale(_sanitize(self.arr))
         self.gpu = _device_gpu(self.sp)
         self.dual = _dual_band(meta, self.header)
         self.psf_corrected = False
         self.info: dict = {"spcc": None}
         self._snr: float | None = None
+
+    def _imagemm_region(self, flip: bool) -> None:
+        """ImageMM restores one region only: the other region is taken from stack.fits (the same window, Lanczos-resampled to ImageMM's r x grid;
+        ImageMM's output is on the stack's per-pixel photometric scale, imagemm_stage.match_to_stack), joined through the stars' footprint mask
+        measured on the stack.  The other region's tool then deconvolves it in ``deconvolve``."""
+        s = self.steps
+        t0 = time.time()
+        region = "objects" if self.deconv[0] == "imagemm" else "stars"
+        stack, _ = fitsio.read_rgb(_p(self.session, "stack.fits"))
+        r = int(self.meta.get("imagemm_r") or 1)
+        ox, oy = (int(v) for v in (self.meta.get("imagemm_offset") or (0, 0)))
+        C, H, W = self.arr.shape
+        win = stack[:, oy:oy + H // r, ox:ox + W // r]
+        if r > 1:
+            win = np.stack([cv2.resize(win[c], (W, H), interpolation=cv2.INTER_LANCZOS4) for c in range(C)])
+        if win.shape != self.arr.shape:
+            raise RuntimeError(f"ImageMM ({region} only): stack.fits window {win.shape} does not match imagemm.fits {self.arr.shape}")
+        if flip:
+            win = np.ascontiguousarray(win[:, ::-1])
+        # joined on their own values and sanitised once as a whole (by the caller): _sanitize rescales an image whose maximum is
+        # in (1, 4] by that maximum, so sanitising each part on its own put them on different scales - an HDR stack peaks
+        # above 1 (Sh2-131: 2.13; ImageMM's output <= 1) and every star came from a 2.13 x darker stack, a black disc in the sky
+        win = np.nan_to_num(win.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        img = np.nan_to_num(self.arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        m, info = star_footprint_mask(self.work, s, np.clip(win / max(float(win.max()), 1.0), 0.0, 1.0), self.header)
+        self._mask = m
+        self._psf_image = win                                        # the other region's tool deconvolves the stack's blur
+        w = m if region == "stars" else 1.0 - m                      # where ImageMM's pixels are kept
+        self.arr = (win + w[None] * (img - win)).astype(np.float32)
+        s.add("deconvolution", "imagemm", seconds=time.time() - t0, region=region,
+              note=f"ImageMM's {region}; the {'objects' if region == 'stars' else 'stars'} from stack.fits through the star mask", star_mask=info)
+
+    def star_mask(self) -> np.ndarray:
+        """The stars' footprint mask (``star_footprint_mask``), measured once, on the image before the deconvolution."""
+        if self._mask is None:
+            t0 = time.time()
+            self._mask, info = star_footprint_mask(self.work, self.steps, self.arr, self.header)
+            self.steps.add("deconvolution", "siril findstar (star mask)", seconds=time.time() - t0, **info)
+        return self._mask
 
     # ---- plumbing
     def _file(self, arr: np.ndarray, name: str) -> str:
@@ -614,13 +743,16 @@ class Restorer:
         s, p = self.steps, self.p
         s.begin("PSF correction")
         if self.source == "imagemm.fits":
-            s.add("psf-correction", "none", "skipped", note="deconvolution by ImageMM")
+            # (also with ImageMM for one region: correcting the whole image would reshape ImageMM's restored region)
+            s.add("psf-correction", "none", "skipped",
+                  note="deconvolution by ImageMM" if self.deconv.count("imagemm") == 2 else "ImageMM restored the {} of the image".format(
+                      "objects" if self.deconv[0] == "imagemm" else "stars"))
             return
-        if float(p["deconvolution"]) <= 0 or (self.sp.get("deconv_method") or "auto") == "none":
+        if float(p["deconvolution"]) <= 0 or self.deconv == ("none", "none"):
             s.add("psf-correction", "none", "skipped", note="deconvolution off")
             return
-        if (self.sp.get("deconv_method") or "auto") not in ("auto", "bxt"):
-            s.add("psf-correction", "none", "skipped", note=f"deconv_method={self.sp.get('deconv_method')}: no BlurXTerminator")
+        if not {"auto", "bxt"} & set(self.deconv):
+            s.add("psf-correction", "none", "skipped", note="deconvolution (objects / stars) = {} / {}: no BlurXTerminator".format(*self.deconv))
             return
         t0 = time.time()
         try:
@@ -711,74 +843,109 @@ class Restorer:
         return info
 
     def deconvolve(self) -> None:
-        """``deconv_method``: auto = BlurXTerminator when licensed, else Siril Richardson-Lucy; bxt / rl = that tool only; graxpert_obj / graxpert_stellar /
-        graxpert_both = GraXpert's AI deconvolution models (objects, stars, objects then stars); imagemm (session.py); none.  A tool chosen explicitly that cannot
-        run is recorded and the image is left as it is - nothing else runs in its place (the user chooses what runs)."""
+        """Deconvolution per region: ``deconv_method`` the objects, ``deconv_stars_method`` the stars (``deconv_choice``).  Each: auto =
+        BlurXTerminator when licensed, else Siril Richardson-Lucy; bxt / graxpert / rl = that tool only; imagemm (session.py, before this);
+        none.  One tool for both regions runs once on the whole image.  Two tools run objects first, then stars (GraXpert's own order):
+        BlurXTerminator and GraXpert deconvolve one region by their own controls (BXT Sharpen Nonstellar / Sharpen Stars, the other at 0;
+        GraXpert's objects / stars model); Siril RL, which has none, is blended in through the stars' footprint mask (``star_mask``).  A
+        tool chosen explicitly that cannot run is recorded and its region left as it is - nothing else runs in its place (the user
+        chooses what runs)."""
         s, p = self.steps, self.p
         s.begin("Deconvolution")
-        if self.source == "imagemm.fits":
-            s.add("deconvolution", "imagemm", "skipped", note="deconvolution by ImageMM")
-            return
         d = float(np.clip(p["deconvolution"], 0, 1))
-        method = (self.sp.get("deconv_method") or "auto")
-        if d <= 0 or method == "none":
-            s.add("deconvolution", "none", "skipped", note="deconvolution=0" if d <= 0 else "deconv_method=none")
+        obj, stars = self.deconv
+        if d <= 0 or (obj, stars) == ("none", "none"):
+            s.add("deconvolution", "none", "skipped", note="deconvolution=0" if d <= 0 else "deconvolution (objects / stars) = none")
             return
-        if method in GRAXPERT_DECONV:
-            self._graxpert_deconvolve(d, method)
+        if self.source == "imagemm.fits":
+            done = [rg for rg, t in (("objects", obj), ("stars", stars)) if t == "imagemm"]
+            if len(done) == 2:
+                s.add("deconvolution", "imagemm", "skipped", note="deconvolution by ImageMM")
+                return
+        if obj == stars:
+            self._deconvolve_region(obj, "both", d)
             return
-        t0 = time.time()
-        try:                                                         # BlurXTerminator sharpening (auto PSF)
-            if method == "rl":                                       # the n2n-rl profile: Siril's own deconvolution
-                raise ToolUnavailable("rc-astro bxt", "deconv_method=rl: Siril Richardson-Lucy requested")
-            tools.rcastro.require("bxt")
-            # BXT sharpen with the 1-2 h smart-scope values (research/pro-workflow.md A5/B3: Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; Brecher's 0.5/0.9 are
-            # for 15-19 h stacks, AstroPipe's 0.25/0.60/0 for smart-scope data); the lower end on the noisiest data (finish.bxt_ss / bxt_sn).
-            snr = self.snr()
-            ss, sn = round(finish.bxt_ss(snr), 3), round(finish.bxt_sn(snr), 3)     # research/pro-workflow.md A5: 1-2 h stacks ss 0.25-0.35, sn 0.5-0.6
-            extra: dict = {}
-            fwhm = float(self.meta.get("fwhm_px") or 0)
-            if p.get("bxt_manual_psf") and 1.0 < fwhm:                 # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
-                extra = {"ansp": False, "nsd": min(8.0, fwhm)}
-            self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=0.0, **extra)
-            s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, ss=round(ss, 3), sn=round(sn, 3), snr=round(snr, 2),
-                  flags=meta.get("flags"), **extra)
+        for region, tool in (("objects", obj), ("stars", stars)):
+            if tool == "none":
+                s.add("deconvolution", "none", "skipped", region=region, note=f"deconvolution ({region}) = none")
+            elif tool == "imagemm" and self.source == "imagemm.fits":
+                continue                                             # recorded by _imagemm_region
+            else:
+                self._deconvolve_region(tool, region, d)
+
+    def _deconvolve_region(self, tool: str, region: str, d: float) -> None:
+        """``tool`` on ``region`` ("both", "objects" or "stars") at strength ``d``."""
+        s = self.steps
+        if tool == "imagemm":
+            s.add("deconvolution", "imagemm", "unavailable", region=region,
+                  note="ImageMM runs in the session's restore on the registered subs (Session.run_denoise), not on a stack")
             return
-        except Cancelled:
-            raise
-        except (ToolUnavailable, ToolError) as e:
-            s.add("deconvolution", "rc-astro bxt", "unavailable", time.time() - t0, note=str(e))
-        if method == "bxt":
+        if tool == "graxpert":
+            self._graxpert_deconvolve(d, region)
             return
+        if tool in ("auto", "bxt"):
+            t0 = time.time()
+            try:                                                     # BlurXTerminator sharpening (auto PSF)
+                tools.rcastro.require("bxt")
+                # BXT sharpen with the 1-2 h smart-scope values (research/pro-workflow.md A5/B3: Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; Brecher's 0.5/0.9 are
+                # for 15-19 h stacks, AstroPipe's 0.25/0.60/0 for smart-scope data); the lower end on the noisiest data (finish.bxt_ss / bxt_sn).  One region only:
+                # the other's sharpening at 0 (RC-Astro: Sharpen Stars / Sharpen Nonstellar act on the stars / the nonstellar structure).
+                snr = self.snr()
+                ss, sn = round(finish.bxt_ss(snr), 3), round(finish.bxt_sn(snr), 3)     # research/pro-workflow.md A5: 1-2 h stacks ss 0.25-0.35, sn 0.5-0.6
+                if region == "objects":
+                    ss = 0.0
+                elif region == "stars":
+                    sn = 0.0
+                extra: dict = {}
+                fwhm = float(self.meta.get("fwhm_px") or 0)
+                if self.p.get("bxt_manual_psf") and 1.0 < fwhm:        # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
+                    extra = {"ansp": False, "nsd": min(8.0, fwhm)}
+                self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=0.0, **extra)
+                s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, region=region, ss=round(ss, 3), sn=round(sn, 3), snr=round(snr, 2),
+                      flags=meta.get("flags"), **extra)
+                return
+            except Cancelled:
+                raise
+            except (ToolUnavailable, ToolError) as e:
+                s.add("deconvolution", "rc-astro bxt", "unavailable", time.time() - t0, region=region, note=str(e))
+            if tool == "bxt":
+                return
         t0 = time.time()
         # DESIGN: rl -iters=10..30 -alpha=3000 -tv.  fftw_timelimit=0 = FFTW "estimate" planning: with Siril's default
         # (measure, 60 s per plan) the first run on every new image size spent 10+ minutes planning FFTs (measured:
         # 1200 px crop 101 s -> 6 s once the wisdom existed; with the limit at 0 a 1800 px crop takes 13 s from scratch).
         iters = int(round(10 + 20 * d))
         try:
+            w = 1.0
+            if region != "both":                                     # Siril's rl has no star / nonstellar control: blended in through the star mask
+                m = self.star_mask()
+                w = (m if region == "stars" else 1.0 - m)[None]
             out, _ = _siril_image(self.work, s, "rl", self.arr, self.header,
                                   f"set core.fftw_timelimit=0\nmakepsf stars\nrl -iters={iters} -alpha=3000 -tv\n"
                                   "set core.fftw_timelimit=60", "Deconvolution",
                                   timeout=RL_TIMEOUT)
             res = _sanitize(out)
-            self.arr = (self.arr + np.float32(d) * (res - self.arr)).astype(np.float32)     # strength = linear blend
-            s.add("deconvolution", "siril rl", seconds=time.time() - t0, iterations=iters, alpha=3000, tv=True,
-                  blend=round(d, 2))
+            self.arr = (self.arr + np.float32(d) * w * (res - self.arr)).astype(np.float32)     # strength = linear blend
+            s.add("deconvolution", "siril rl", seconds=time.time() - t0, region=region, iterations=iters, alpha=3000, tv=True,
+                  blend=round(d, 2), **({"through": "star mask" if region == "stars" else "inverted star mask"} if region != "both" else {}))
         except SIRIL_FAILS as e:
-            s.add("deconvolution", "siril rl", "failed", time.time() - t0, note=str(e).splitlines()[0])
+            s.add("deconvolution", "siril rl", "failed", time.time() - t0, region=region, note=str(e).splitlines()[0])
 
     def image_fwhm(self) -> float | None:
         """The image's star FWHM in px, measured on the linear image itself (lab.metrics.star_fwhm: twice the half-light radius of isolated, unsaturated stars) -
         GraXpert's "Image FWHM (in pixels)".  The registration's per-sub FWHM in stack_meta is not used: it is measured on the subs by Siril's PSF fit and need not
-        match the stack (Sh2-131 two nights: 8.9 px recorded, 4.5 px on the stack)."""
+        match the stack (Sh2-131 two nights: 8.9 px recorded, 4.5 px on the stack).  With ImageMM for one region the image is ImageMM's restoration joined
+        with the stack, and the other region - the one GraXpert deconvolves - is the stack's: its FWHM is measured on the stack (``_psf_image``); on the
+        joined image the isolated faint stars measured are ImageMM's restored ones (Sh2-131: 2.3 px for the stack's ~7 px stars)."""
         from .lab import metrics as MX
+        src = self.arr if self._psf_image is None else self._psf_image
         try:
-            v = float(MX.star_fwhm(np.ascontiguousarray(np.moveaxis(self.arr, 0, -1)), float(self.arr.max())))
+            v = float(MX.star_fwhm(np.ascontiguousarray(np.moveaxis(src, 0, -1)), float(src.max())))
         except Exception:                                             # noqa: BLE001
             return None
         return v if np.isfinite(v) and v > 0 else None
 
-    def _graxpert_deconvolve(self, d: float, method: str) -> None:
+    def _graxpert_deconvolve(self, d: float, region: str) -> None:
         """GraXpert AI deconvolution (``graxpert -cmd deconv-obj`` / ``deconv-stellar``, its models since 3.1) on the linear image: ``-strength`` = the Deconvolution
         slider (GraXpert: 0 none .. 1 maximum), ``-psfsize`` = the image FWHM in px (GraXpert / Siril's GraXpert interface: "Image FWHM (in pixels)").  GraXpert works on
         each tile through a log transform and its inverse, so it takes linear data as it is."""
@@ -790,21 +957,22 @@ class Restorer:
         if fwhm is None:
             fwhm = self.image_fwhm()
         if fwhm is None:
-            s.add("deconvolution", "graxpert", "failed", note="the image FWHM could not be measured (too few isolated stars): set GraXpert PSF size in the options")
+            s.add("deconvolution", "graxpert", "failed", region=region,
+                  note="the image FWHM could not be measured (too few isolated stars): set GraXpert PSF size in the options")
             return
-        for kind in GRAXPERT_DECONV[method]:
+        for kind in GRAXPERT_DECONV[region]:
             t0 = time.time()
             try:
                 src, dst = self._file(self.arr, f"gxdc_{kind}_in.fits"), self._out(f"gxdc_{kind}_out.fits")
                 meta = tools.graxpert.deconvolve(src, dst, kind=kind, strength=d, psfsize=fwhm, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
                 self.arr = _sanitize(fitsio.read_rgb(dst)[0])
-                s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})", seconds=time.time() - t0, strength=round(d, 3),
+                s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})", seconds=time.time() - t0, region=region, strength=round(d, 3),
                       psfsize=round(fwhm, 2), model=meta.get("model"), providers=meta.get("providers"))
             except Cancelled:
                 raise
             except (ToolUnavailable, ToolError) as e:
                 s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})",
-                      "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, note=str(e))
+                      "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, region=region, note=str(e))
                 return
 
     def denoise(self) -> None:
@@ -871,7 +1039,7 @@ class Restorer:
         ran = [r["tool"] for r in s.records if r["status"] == "done" and r["tool"] != "none"]
         return {"created": datetime.now().isoformat(timespec="seconds"), "steps": s.records, "tools": ran,
                 "scale": self.scale, "wcs": _has_wcs(self.header), "dual_band": self.dual, "spcc": self.info["spcc"], "snr": self.info.get("snr"),
-                "deconv_method": str(self.sp.get("deconv_method") or "auto"), "denoise_method": str(self.sp.get("denoise_method") or "auto"),
+                "deconv_method": self.deconv[0], "deconv_stars_method": self.deconv[1], "denoise_method": str(self.sp.get("denoise_method") or "auto"),
                 "stats": {"median": round(float(np.median(finish.sample(lum))), 6),
                           "noise_sigma": round(finish.lower_half_sigma(finish.sample(lum)), 6),
                           "max": round(float(self.arr.max()), 4)},
@@ -886,7 +1054,7 @@ def restore(session_dir: str, stack_meta: dict, stack_params: dict, params: dict
 
     Each step tries its best tool and falls back (GraXpert -> Siril RBF; SPCC -> background neutralisation +
     rmgreen; auto: BXT -> Siril Richardson-Lucy; NXT -> GraXpert -> Siril denoise) and records what ran; a deconvolution / denoise tool chosen explicitly
-    (``deconv_method`` bxt / rl / graxpert_*, ``denoise_method`` nxt / graxpert / siril) runs alone.  Cosmic Clarity (SetiAstro, through siril-scripts'
+    (``deconv_method`` / ``deconv_stars_method`` bxt / rl / graxpert for the objects / the stars, ``denoise_method`` nxt / graxpert / siril) runs alone.  Cosmic Clarity (SetiAstro, through siril-scripts'
     CosmicClarity_Native.py) is the optional path: here ``satellite_removal`` (on the stack) and, in remove_stars, DarkStar; its Sharpen / Denoise (``cc_sharpen``,
     ``cc_denoise``) and Super-Resolution (``superres_method``) run on the stretched image (pro.Finisher / export), where they keep the flux - on this pipeline's
     linear data they did not (6.2 x / 2.2 x / 0.75 x the flux, Sh2-131 2026-10-24).  RC-Astro's

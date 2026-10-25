@@ -420,3 +420,33 @@ def test_local_bound_is_not_held_up_over_a_dust_lane_under_the_sources():
     src = np.zeros((n, n), bool); src[40:150, 40:150] = True
     b = V.ImageMMEngine._local_background(x, torch.ones_like(x, dtype=torch.bool), src)[0, 0].numpy()
     assert np.all(b[60:130, 98:103] <= img[60:130, 98:103] + 1e-3)
+
+
+# ----------------------------------------------------------------------------- several exposure times (HDR sets)
+
+def test_transmission_is_per_second_of_exposure():
+    """A 60 s frame of a 60 s + 120 s set holds half the light of a 120 s frame: not a cloud frame.  A 120 s frame at
+    0.3 x the others' light still is one."""
+    s = np.array([1.0, 1.02, 0.98, 1.0, 1.01, 0.47, 0.46, 0.48, 0.3])   # the 60 s frames under slightly thinner sky (0.94 x)
+    exp = [120, 120, 120, 120, 120, 60, 60, 60, 120]
+    assert set(V.transmission_drops(s, exp)) == {8}
+    assert set(V.transmission_drops(s)) == {5, 6, 7, 8}              # without the exposure times every 60 s frame went
+
+
+def test_photon_transfer_with_mixed_frame_scales():
+    """Frames on the common scale y / s_t with shot variance slope x level / s_t: the fit recovers the slope whatever
+    the mix of scales (unweighted, the 60 s frames' doubled variance biased it)."""
+    rng = np.random.default_rng(5)
+    n_px, slope = 20000, 2e-5
+    level = rng.uniform(0.0, 0.2, n_px)
+    ref = rng.random((100, 200)).astype(np.float32)                 # (the smooth-pixel selection needs a gradient to rank)
+    pick = np.arange(n_px)
+    sky = np.zeros((20, 1))
+
+    def fit(scale, weighted=True):
+        cube = (level[None] + rng.standard_normal((20, n_px)) * np.sqrt(slope * level[None] / scale[:, None]))[:, None].astype(np.float32)
+        return V.ImageMMEngine._photon_transfer(cube, sky, ref, pick, scale if weighted else None)["slope"][0]
+    one = fit(np.ones(20))                                         # (the 20-frame median-of-MAD estimate itself reads ~0.89 x)
+    mixed = np.array([1.0] * 10 + [0.5] * 10)
+    assert fit(mixed) == pytest.approx(one, rel=0.08)                # (two noise draws: ~5 % apart)
+    assert fit(mixed, weighted=False) > 1.25 * one                 # pooled unweighted: ~1.4 x

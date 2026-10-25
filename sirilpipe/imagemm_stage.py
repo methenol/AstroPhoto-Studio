@@ -527,8 +527,8 @@ def siril_preprocess(session_dir: str, meta: dict, inc: list[int], rows: list[di
     seq, n = state.get("seq"), int(state.get("n") or 0)
     if not seq or not os.path.exists(os.path.join(process, f"{seq}_.seq")):
         raise RuntimeError("the registration (process/state.json, the calibrated sequence) is missing: stack again")
-    if state.get("hdr"):
-        raise RuntimeError("ImageMM does not support HDR (several exposure groups) stacks")
+    # (an HDR stack - several exposure groups - is restored too: every group is registered in the one sequence, on one
+    # grid; the engine judges each frame's transmission per second of exposure and weights its noise by its own scale)
     src = read_seq(os.path.join(process, f"{seq}_.seq"))
     reg, ref = registration_of(src)
     nums = [src["nums"][i] for i in inc]                             # file numbers of the included frames
@@ -945,6 +945,8 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
                                                                          _flag(sp.get("imagemm_subsky", False))),
                                                  "stars": store.stars, "names": store.names, "info": prep_info}))
 
+        # each frame's exposure time (an HDR set mixes them; the engine's transmission and noise follow it)
+        store.exptimes = [float(rows[i].get("exptime") or 1.0) for i in sel]
         dev = pick_device(sp.get("device"))
         engine = V.ImageMMEngine(str(dev), formal_mode=formal)
         t2 = time.time()

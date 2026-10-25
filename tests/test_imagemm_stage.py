@@ -306,11 +306,29 @@ def test_run_denoise_with_imagemm_reads_imagemm_fits_and_restores_the_stack(tmp_
     out = s.run_denoise({"deconv_method": "imagemm"})
     c = seen[0]
     assert c["stack_value"] == 0.75                          # post.restore read imagemm.fits in stack.fits' place
-    assert c["sp"]["deconv_method"] == "none"                # ImageMM is the deconvolution
+    assert post.deconv_choice(c["sp"]) == ("imagemm", "imagemm")    # post.Restorer: ImageMM is the deconvolution of both regions
     assert c["meta"]["restore_source"] == "imagemm.fits"
     a, _ = fitsio.read_rgb(s._p("stack.fits"))
     assert float(a[0, 0, 0]) == 0.25 and not os.path.exists(s._p("process", "stack_original.fits"))   # put back
     assert out["imagemm"] == "ran" and out["deconvolution_by"] == "imagemm" and "frames" not in out["imagemm_info"]
+
+
+def test_run_denoise_imagemm_for_the_objects_only(tmp_path, monkeypatch):
+    from sirilpipe import post
+    s = _session(tmp_path)
+    seen = []
+    monkeypatch.setattr(post, "restore", _fake_post(seen).restore)
+    monkeypatch.setattr(S, "available", lambda: {"ok": True, "torch": True, "cuda": False, "mps": False, "reason": ""})
+    monkeypatch.setattr(S, "run", lambda *a, **k: {"ok": True, "r": 1, "shape": [4, 4], "region_offset": [0, 0], "seconds": 1.0})
+    out = s.run_denoise({"deconv_method": "imagemm", "deconv_stars_method": "rl"})
+    c = seen[0]
+    assert post.deconv_choice(c["sp"]) == ("imagemm", "rl")
+    assert c["meta"]["restore_source"] == "imagemm.fits" and c["meta"]["imagemm_r"] == 1 and c["meta"]["imagemm_offset"] == [0, 0]
+    assert out["deconvolution_by"] == "imagemm_objects"      # the stars are not ImageMM's: no ImageMM star-layer handling
+    # ImageMM for the stars only runs the stage too
+    seen.clear()
+    s.run_denoise({"deconv_method": "bxt", "deconv_stars_method": "imagemm"})
+    assert seen and seen[0]["meta"]["restore_source"] == "imagemm.fits"
 
 
 def test_run_denoise_imagemm_failure_fails_the_job_without_bxt(tmp_path, monkeypatch):

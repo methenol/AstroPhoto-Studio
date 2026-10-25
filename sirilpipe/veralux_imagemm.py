@@ -245,6 +245,22 @@ def siril_to_array(x: float, y: float, height: int) -> tuple[float, float]:
 #  FRAME STORE (PIPELINE, change 1)
 # ------------------------------------------------------------------------------
 
+def transmission_drops(scale_t: np.ndarray, exptimes=None) -> dict[int, str]:
+    """{frame index: why} of the frames not used (change 21): no photometry, or a transmission - the frame's star flux
+    ratio s_t per second of exposure - under MIN_TRANSMISSION x the median frame's."""
+    s_ = np.asarray(scale_t, np.float64)
+    exp_t = np.array([float(e) if e and float(e) > 0 else 1.0 for e in (exptimes if exptimes is not None else [1.0] * len(s_))], np.float64)
+    trans = s_ / exp_t
+    med = float(np.nanmedian(trans))
+    out: dict[int, str] = {}
+    for i in range(len(s_)):
+        if not np.isfinite(s_[i]):
+            out[i] = "photometry: fewer than 5 stars measured"
+        elif trans[i] < MIN_TRANSMISSION * med:
+            out[i] = f"transmission {trans[i] / med:.2f} of the median"
+    return out
+
+
 class FrameStore:
     """The prepared frames: one float32 ``.npy`` memmap (N, C, H, W) on disk, NaN where a frame has no data, a uint8
     memmap (N, H, W) flagging its saturated pixels (their values are kept: the initial image uses them, as the
@@ -261,6 +277,9 @@ class FrameStore:
             self.sat = np.lib.format.open_memmap(sat_path, mode="w+", dtype=np.uint8, shape=(int(shape[0]),) + tuple(int(v) for v in shape[2:]))
         self.stars: list[list[tuple[float, float]]] = [[] for _ in range(self.data.shape[0])]
         self.names: list[str] = [""] * self.data.shape[0]
+        # each frame's exposure time (s; the stage sets them from the frames' headers): an HDR set's 60 s frame holds half a
+        # 120 s frame's light without any loss of transmission
+        self.exptimes: list[float] = [1.0] * self.data.shape[0]
 
     def __len__(self) -> int:
         return int(self.data.shape[0])
@@ -819,12 +838,18 @@ class ImageMMEngine:
         return k
 
     @staticmethod
-    def _photon_transfer(cube: np.ndarray, sky_t: np.ndarray, ref_img: np.ndarray, pick: np.ndarray) -> dict | None:
+    def _photon_transfer(cube: np.ndarray, sky_t: np.ndarray, ref_img: np.ndarray, pick: np.ndarray, scale_t: np.ndarray | None = None) -> dict | None:
         """var = a + slope x (level - sky) per channel from the frames themselves: at a fixed sample of pixels, the
         temporal median (level) and robust scatter (variance) over the frames, each frame's sky removed, on smooth
         pixels (the mean image's gradient in the lower half: no star edges, whose seeing changes are not shot noise);
-        a robust line through 15 level bins.  IC 1805 (2026-10-21): slope 1.7-1.9e-5 in [0, 1] units = ~0.85 e-/DN."""
+        a robust line through 15 level bins.  IC 1805 (2026-10-21): slope 1.7-1.9e-5 in [0, 1] units = ~0.85 e-/DN.
+
+        ``scale_t``: each frame's scale s_t onto the common one (cube = y / s_t).  A frame's shot variance there is
+        slope x level / s_t (the run's variance model divides by s_t the same way), so each frame's deviation from the
+        median is weighted by sqrt(s_t) and every frame measures the same slope: pooled unweighted, an HDR set's
+        60 s + 120 s frames (s_t 0.5 / 1) mixed two variances into one slope."""
         N, C, n = cube.shape
+        w_t = np.sqrt(np.clip(np.asarray(scale_t, np.float64), 1e-6, None)).astype(np.float32)[:, None] if scale_t is not None else np.ones((N, 1), np.float32)
         H, W = ref_img.shape
         g = cv2.GaussianBlur(np.nan_to_num(ref_img), (0, 0), 1.0)
         grad = np.hypot(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1)).ravel()[pick]
@@ -833,7 +858,7 @@ class ImageMMEngine:
         for c in range(C):
             x = cube[:, c] - sky_t[:, c][:, None].astype(np.float32)
             med = np.nanmedian(x, 0)
-            var = (1.4826 * np.nanmedian(np.abs(x - med[None]), 0)) ** 2
+            var = (1.4826 * np.nanmedian(np.abs((x - med[None]) * w_t), 0)) ** 2
             ok = smooth & np.isfinite(med) & np.isfinite(var) & (np.sum(np.isfinite(x), 0) >= max(5, N // 2))
             if ok.sum() < 500:
                 return None
@@ -2535,12 +2560,9 @@ class ImageMMEngine:
                 planes[idx, c] = self._plane_fit(dn[c] - s_ * Mn[c], tile)
             say(idx + 1, n_imgs, f"photometry {idx + 1}/{n_imgs}")
         if photometry and len(catalog) >= 5:
-            med_s = float(np.nanmedian(scale_t))
-            for i in range(n_imgs):
-                if not np.isfinite(scale_t[i]):
-                    dropped[i] = "photometry: fewer than 5 stars measured"
-                elif scale_t[i] < MIN_TRANSMISSION * med_s:
-                    dropped[i] = f"transmission {scale_t[i] / med_s:.2f} of the median"
+            # transmission = the frame's light per second of exposure against the median frame's: with several exposure times
+            # (HDR) the star flux ratio s_t alone made every 60 s frame of a 60 s + 120 s set a "transmission 0.50" cloud frame
+            dropped.update(transmission_drops(scale_t, getattr(store, "exptimes", None)))
             scale_t = np.where(np.isfinite(scale_t) & (scale_t > 0), scale_t, 1.0)
             active = [i for i in range(n_imgs) if i not in dropped]
         # the sky level of the common scale: the mean image's 5th percentile per channel (signal above it is shot noise)
@@ -2557,7 +2579,7 @@ class ImageMMEngine:
             xs_, ys_ = (px_ - width / 2) / width, (py_ - height / 2) / height
             pl = planes[active][:, :, 0:1] + planes[active][:, :, 1:2] * xs_[None, None] + planes[active][:, :, 2:3] * ys_[None, None]
             sub = (cube[active] - pl) / scale_t[active][:, None, None]
-            ptc = self._photon_transfer(sub.astype(np.float32), np.zeros((len(active), channels)), ref_img, pick)
+            ptc = self._photon_transfer(sub.astype(np.float32), np.zeros((len(active), channels)), ref_img, pick, scale_t[active])
         else:
             ptc = None
         del cube

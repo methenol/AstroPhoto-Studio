@@ -76,8 +76,9 @@ STACK_DEFAULTS = {
     "pattern_correction": True,
     "denoise_iters": 2000,
     "ai_deconvolution": True,
-    "deconv_method": "auto",   # auto = BlurXTerminator when licensed, else Siril RL; bxt | rl | graxpert_obj | graxpert_stellar | graxpert_both (that tool only);
+    "deconv_method": "auto",   # deconvolution of the objects: auto = BlurXTerminator when licensed, else Siril RL; bxt | graxpert | rl (that tool only);
                                # imagemm = VeraLux ImageMM (needs torch); none.  Cosmic Clarity Sharpen is the finishing setting cc_sharpen (stretched image)
+    "deconv_stars_method": "auto",  # deconvolution of the stars, the same choices (post.deconv_choice; a request naming only deconv_method: the stars follow it)
     "denoise_method": "auto",  # linear noise reduction: auto = NXT when licensed, else GraXpert / Siril; nxt | graxpert | siril (that tool only); none.  CC Denoise: cc_denoise
     "satellite_removal": False,  # Cosmic Clarity satellite-trail removal on the stack before the restoration
     "graxpert_psfsize": 0.0,   # GraXpert deconvolution -psfsize (Image FWHM, px); 0 = the star FWHM measured on the linear image
@@ -137,7 +138,9 @@ def default_scale(deconv_method: str) -> float:
 #                  rl      = Siril Richardson-Lucy even when BlurXTerminator is licensed
 #                  imagemm = VeraLux ImageMM multi-frame restoration of the subs (slow; needs IMAGEMM=cuda)
 #                  none    = no deconvolution
-#                  bxt / graxpert_obj / graxpert_stellar / graxpert_both = that tool only (not used by the 1.x profiles)
+#                  bxt / graxpert = that tool only (not used by the 1.x profiles); the former graxpert_obj / graxpert_stellar /
+#                  graxpert_both stay accepted.  deconv_method is the objects' tool; the profiles leave deconv_stars_method out, so the
+#                  stars follow it (_run_session_job)
 # ai_deconvolution and imagemm_n2n (the 1.x ImageMM's Noise2Noise pass) are accepted for compatibility and have no effect.
 PROFILES = {
     "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
@@ -705,6 +708,8 @@ def _norm_autofinish(res) -> dict:
 def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params: dict, export_opts: dict):
     """Map a job kind onto the Session methods (api-contract.md section 2)."""
     sp = {**STACK_DEFAULTS, **stack_params}
+    if "deconv_method" in stack_params and "deconv_stars_method" not in stack_params:
+        sp["deconv_stars_method"] = ""           # one deconvolution named (an API client, a 1.x profile): the stars follow it (post.deconv_choice)
     # the auto-crop is decided at stack time, so the two processing settings that control it travel
     # with the stack parameters (Session.run_stack only receives those)
     for k in ("crop", "crop_threshold"):

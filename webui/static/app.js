@@ -347,10 +347,13 @@ function applyExperiment(id) {
   const e = EXPERIMENTS.find(x => x.id === id);
   if (!e) { $("#sp-experiment-info").textContent = ""; return; }
   const set = [];
+  // the single GraXpert deconvolution choice before the objects / stars split (studies run before it)
+  const legacy = { graxpert_obj: ["graxpert", "none"], graxpert_stellar: ["none", "graxpert"], graxpert_both: ["graxpert", "graxpert"] };
   for (const [k, v] of Object.entries(e.settings)) {
     const el = $("#sp-" + k); if (!el) continue;
-    if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
-    if (k === "deconv_method") el.dispatchEvent(new Event("change", { bubbles: true }));
+    if (k === "deconv_method" && legacy[v]) [el.value, $("#sp-deconv_stars_method").value] = legacy[v];
+    else if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
+    if (k === "deconv_method" || k === "deconv_stars_method") el.dispatchEvent(new Event("change", { bubbles: true }));
     set.push(`${k} = ${v}`);
   }
   const proc = Object.entries(e.processing || {});
@@ -368,12 +371,12 @@ document.addEventListener("change", e => { if (e.target.id === "sp-experiment") 
 // Noise2Noise ones) are still accepted by the API and ignored, so they are not sent.
 function stackParams() {
   const g = id => $("#sp-" + id);
-  const on = g("deconv_method").value !== "none";
+  const on = g("deconv_method").value !== "none" || g("deconv_stars_method").value !== "none";
   return {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
     local_norm: g("local_norm").checked, pattern_correction: g("pattern_correction").checked,
-    deconv_method: g("deconv_method").value, ai_deconvolution: on,
+    deconv_method: g("deconv_method").value, deconv_stars_method: g("deconv_stars_method").value, ai_deconvolution: on,
     denoise_method: g("denoise_method").value, superres_method: g("superres_method").value, satellite_removal: g("satellite_removal").checked,
     graxpert_psfsize: parseFloat(g("graxpert_psfsize").value) || 0,
     star_remover: g("star_remover").checked,

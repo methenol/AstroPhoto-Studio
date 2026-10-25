@@ -907,7 +907,9 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
             xi = u / u_prev
             M_c = max(float(m_crit.sum()), 1.0)
             if stop == "c15":
-                crit = abs(float((m_crit * xi).sum()) / M_c - 1.0)                       # Eq. C15
+                # Eq. C15 as the mean of xi - 1, summed in float64: the mean of xi summed in float32 and then less 1 lost the
+                # signal to rounding (sum of ~1e3 ratios near 1: resolution ~1e-7) and stopped at 0 (test: 492 iterations at epsilon 1e-9)
+                crit = abs(float((m_crit * (xi - 1)).double().sum()) / M_c)
             else:
                 crit = float((m_crit * (xi - 1).abs()).sum()) / M_c
         else:

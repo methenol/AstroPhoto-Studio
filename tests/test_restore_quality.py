@@ -150,7 +150,7 @@ def test_deconv_method_rl_uses_siril_richardson_lucy_not_bxt(tmp_path, fake_rc, 
     assert not any(c[0] == "bxt" for c in fake_rc.calls)
     assert any(body.startswith("set core.fftw_timelimit=0") and "rl -iters=" in body for body in bodies)
     tools_used = [x["tool"] for x in r.steps.records if x["step"] == "deconvolution"]
-    assert tools_used == ["rc-astro bxt", "siril rl"] and r.steps.records[-1]["status"] == "done"
+    assert tools_used == ["siril rl"] and r.steps.records[-1]["status"] == "done"
 
 
 def test_survey_gradient_keeps_the_sky_pedestal_and_clips_nothing(tmp_path, monkeypatch):

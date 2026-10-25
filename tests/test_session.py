@@ -249,7 +249,9 @@ def test_post_stages_are_delegated_lazily(session, monkeypatch):
     import sys
     import types
     calls = []
+    from sirilpipe import post as real_post
     fake = types.ModuleType("sirilpipe.post")
+    fake.deconv_choice = real_post.deconv_choice          # Session.run_denoise asks it whether ImageMM runs
     fake.restore = lambda *a: calls.append("restore") or {"ok": True}
     fake.remove_stars = lambda *a: calls.append("stars") or {"tool": "x"}
     fake.autofinish = lambda *a: calls.append("auto") or {"params": {"stretch": 0.2}, "report": {}}

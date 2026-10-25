@@ -401,6 +401,7 @@ def test_submit_all_job_runs_and_outputs(env):
     assert s.local_copies == 1                  # the job reads the subs through Session.local_copy
     stack_call = s.calls[1][1]
     assert stack_call["deconv_method"] == "auto" and stack_call["scale"] == 2.0 and stack_call["sigma_low"] == 4.0
+    assert stack_call["deconv_stars_method"] == ""            # the profile names one deconvolution: the stars follow it
     export_call = s.calls[-1]
     assert export_call[1]["saturation"] == 1.7 and export_call[2:] == (92, 1.0, True)
     f = env.client.get(done["outputs"][0]["url"])

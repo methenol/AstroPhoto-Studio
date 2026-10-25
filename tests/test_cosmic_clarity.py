@@ -61,7 +61,7 @@ class FakeCC:
 
 class FakeRC:
     def __init__(self, licensed=("bxt", "nxt")):
-        self.licensed, self.calls = licensed, []
+        self.licensed, self.calls, self.params = licensed, [], []
 
     def require(self, key):
         if key not in self.licensed:
@@ -69,6 +69,7 @@ class FakeRC:
 
     def run(self, product, src, dst, **params):
         self.calls.append(product)
+        self.params.append(params)
         arr, hdr = fitsio.read_rgb(src)
         fitsio.write_rgb(dst, arr, hdr)
         return {"tool": f"rc-astro {product}", "flags": []}
@@ -138,7 +139,128 @@ def test_graxpert_deconvolution_needs_the_image_fwhm(tmp_path, monkeypatch, fake
     monkeypatch.setattr(post.Restorer, "image_fwhm", lambda self: None)
     r = _restorer(tmp_path, {"deconv_method": "graxpert_obj"})
     r.deconvolve()
-    assert fake_gx.calls == [] and r.steps.records[-1]["status"] == "failed"
+    assert fake_gx.calls == [] and [x["status"] for x in r.steps.records if x["tool"] == "graxpert"] == ["failed"]
+
+
+# ----------------------------------------------------------------------------- deconvolution per region (objects / stars)
+
+@pytest.mark.parametrize("sp,want", [
+    ({}, ("auto", "auto")),
+    ({"deconv_method": "rl"}, ("rl", "rl")),                                   # one choice named: the stars follow it
+    ({"deconv_method": "rl", "deconv_stars_method": ""}, ("rl", "rl")),
+    ({"deconv_method": "imagemm", "deconv_stars_method": "bxt"}, ("imagemm", "bxt")),
+    ({"deconv_method": "graxpert_obj"}, ("graxpert", "none")),                 # the former single GraXpert choices
+    ({"deconv_method": "graxpert_stellar"}, ("none", "graxpert")),
+    ({"deconv_method": "graxpert_both"}, ("graxpert", "graxpert")),
+    ({"deconv_method": "graxpert_obj", "deconv_stars_method": "bxt"}, ("graxpert", "bxt")),
+])
+def test_deconv_choice(sp, want):
+    assert post.deconv_choice(sp) == want
+
+
+@pytest.mark.parametrize("obj,stars,kinds", [("graxpert", "graxpert", ["obj", "stellar"]), ("graxpert", "none", ["obj"]), ("none", "graxpert", ["stellar"])])
+def test_graxpert_per_region(tmp_path, monkeypatch, fakes, fake_gx, obj, stars, kinds):
+    monkeypatch.setattr(post.Restorer, "image_fwhm", lambda self: 4.5)
+    _restorer(tmp_path, {"deconv_method": obj, "deconv_stars_method": stars}).deconvolve()
+    assert [c[1] for c in fake_gx.calls] == kinds
+
+
+def test_bxt_objects_graxpert_stars(tmp_path, monkeypatch, fakes, fake_gx):
+    _, rc = fakes
+    monkeypatch.setattr(post.Restorer, "image_fwhm", lambda self: 4.5)
+    r = _restorer(tmp_path, {"deconv_method": "bxt", "deconv_stars_method": "graxpert"})
+    r.psf_correction()
+    r.deconvolve()
+    assert rc.calls == ["bxt", "bxt"] and rc.params[0].get("correct_only")      # correct-only, then the objects' sharpening
+    assert rc.params[1]["ss"] == 0.0 and rc.params[1]["sn"] > 0                  # Sharpen Stars off: the stars are GraXpert's
+    assert [c[1] for c in fake_gx.calls] == ["stellar"]
+    assert [x.get("params", {}).get("region") for x in r.steps.records if x["step"] == "deconvolution"] == ["objects", "stars"]
+
+
+def test_bxt_same_tool_runs_once_on_both(tmp_path, fakes):
+    _, rc = fakes
+    _restorer(tmp_path, {"deconv_method": "bxt", "deconv_stars_method": "bxt"}).deconvolve()
+    assert rc.calls == ["bxt"] and rc.params[0]["ss"] > 0 and rc.params[0]["sn"] > 0
+
+
+def test_rl_objects_through_the_star_mask_then_bxt_stars(tmp_path, monkeypatch, fakes):
+    _, rc = fakes
+    mask = np.zeros((96, 128), np.float32)
+    mask[30:50, 50:70] = 1.0
+    monkeypatch.setattr(post, "star_footprint_mask", lambda work, steps, arr, header: (mask, {"stars": 1}))
+    monkeypatch.setattr(post, "_siril_image", lambda work, steps, name, arr, header, *a, **k: (arr * 0.5, header))
+    r = _restorer(tmp_path, {"deconv_method": "rl", "deconv_stars_method": "bxt"}, {"deconvolution": 0.5})
+    before = r.arr.copy()
+    r.deconvolve()
+    diff = r.arr - before
+    want = -0.25 * before                                            # 0.5 x (the fake RL's arr / 2 - arr)
+    assert np.allclose(diff[:, mask == 0], want[:, mask == 0], atol=1e-6) and np.allclose(diff[:, mask == 1], 0.0, atol=1e-6)   # RL only off the stars, at the slider's blend
+    assert rc.calls == ["bxt"] and rc.params[0]["sn"] == 0.0 and rc.params[0]["ss"] > 0
+
+
+def test_auto_stars_unlicensed_falls_back_to_masked_rl(tmp_path, monkeypatch, fakes):
+    _, rc = fakes
+    rc.licensed = ()
+    mask = np.zeros((96, 128), np.float32)
+    mask[30:50, 50:70] = 1.0
+    monkeypatch.setattr(post, "star_footprint_mask", lambda work, steps, arr, header: (mask, {"stars": 1}))
+    monkeypatch.setattr(post, "_siril_image", lambda work, steps, name, arr, header, *a, **k: (arr * 0.5, header))
+    r = _restorer(tmp_path, {"deconv_method": "none", "deconv_stars_method": "auto"}, {"deconvolution": 1.0})
+    before = r.arr.copy()
+    r.deconvolve()
+    diff = r.arr - before
+    assert np.allclose(diff[:, mask == 1], -0.5 * before[:, mask == 1], atol=1e-6) and np.allclose(diff[:, mask == 0], 0.0, atol=1e-6)
+
+
+def test_imagemm_without_the_session_is_recorded_not_replaced(tmp_path, fakes):
+    _, rc = fakes
+    r = _restorer(tmp_path, {"deconv_method": "imagemm", "deconv_stars_method": "none"})
+    r.deconvolve()
+    assert rc.calls == [] and [(x["tool"], x["status"]) for x in r.steps.records if x["tool"] == "imagemm"] == [("imagemm", "unavailable")]
+
+
+def test_imagemm_objects_takes_the_stars_from_the_stack(tmp_path, monkeypatch, fakes):
+    _, rc = fakes
+    d = tmp_path / "s"
+    d.mkdir()
+    hdr = {"ROWORDER": "BOTTOM-UP", "FILTER": "Duo-Band"}
+    stack = np.full((3, 48, 64), 0.2, np.float32)
+    fitsio.write_rgb(str(d / "stack.fits"), stack, hdr)
+    fitsio.write_rgb(str(d / "imagemm.fits"), np.full((3, 96, 128), 0.6, np.float32), hdr)
+    mask = np.zeros((96, 128), np.float32)
+    mask[10:20, 10:20] = 1.0
+    seen = []
+    monkeypatch.setattr(post, "star_footprint_mask", lambda work, steps, arr, header: (seen.append(arr.shape), (mask, {"stars": 1}))[1])
+    r = post.Restorer(str(d), {"filter": "Duo-Band", "restore_source": "imagemm.fits", "imagemm_r": 2, "imagemm_offset": [0, 0]},
+                      {"deconv_method": "imagemm", "deconv_stars_method": "bxt"}, dict(post.DEFAULTS), None, None)
+    assert seen == [(3, 96, 128)]                                    # the mask measured on the stack, resampled to ImageMM's grid
+    k = r.scale
+    assert np.allclose(r.arr[:, mask == 1], 0.2 * k, atol=1e-4) and np.allclose(r.arr[:, mask == 0], 0.6 * k, atol=1e-4)
+    r.psf_correction()
+    r.deconvolve()
+    assert rc.calls == ["bxt"] and rc.params[0]["sn"] == 0.0           # no correct-only over ImageMM's objects; BXT sharpens the stars only
+
+
+def test_imagemm_region_keeps_one_scale_with_an_hdr_stack_above_1(tmp_path, monkeypatch, fakes):
+    """An HDR stack peaks above 1 (the blend; Sh2-131 2.13) and ImageMM's output at 1: the two parts must be joined on their
+    own values and scaled together - each sanitised on its own put the stack's stars 2.13 x darker than ImageMM's sky."""
+    d = tmp_path / "s"
+    d.mkdir()
+    hdr = {"ROWORDER": "BOTTOM-UP", "FILTER": "Duo-Band"}
+    stack = np.full((3, 64, 64), 0.02, np.float32)
+    stack[:, 30, 30] = 2.0                                           # an HDR-blended core
+    imm = np.full((3, 64, 64), 0.02, np.float32)
+    imm[:, 30, 30] = 1.0
+    fitsio.write_rgb(str(d / "stack.fits"), stack, hdr)
+    fitsio.write_rgb(str(d / "imagemm.fits"), imm, hdr)
+    mask = np.zeros((64, 64), np.float32)
+    mask[20:40, 20:40] = 1.0
+    monkeypatch.setattr(post, "star_footprint_mask", lambda work, steps, arr, header: (mask, {"stars": 1}))
+    r = post.Restorer(str(d), {"filter": "Duo-Band", "restore_source": "imagemm.fits", "imagemm_r": 1, "imagemm_offset": [0, 0]},
+                      {"deconv_method": "imagemm", "deconv_stars_method": "graxpert"}, dict(post.DEFAULTS), None, None)
+    sky_in, sky_out = float(np.median(r.arr[1][mask == 1])), float(np.median(r.arr[1][mask == 0]))
+    assert sky_in == pytest.approx(sky_out, rel=1e-5)                 # the stack's sky round the star = ImageMM's sky
+    assert float(r.arr[1, 30, 30]) / sky_out == pytest.approx(100.0, rel=1e-4)   # the core keeps its ratio to the sky
 
 
 def test_explicit_bxt_does_not_fall_back(tmp_path, monkeypatch, fakes):
@@ -353,3 +475,20 @@ def test_models_inventory_torch_onnx_missing(tmp_path, monkeypatch):
     st = cc.status()
     assert st["version"] == "1.2.0" and st["models"]["darkstar"] == "onnx"
 
+
+
+def test_imagemm_region_measures_the_psf_on_the_stack(tmp_path, monkeypatch, fakes):
+    """With ImageMM for the objects, GraXpert deconvolves the stack's stars: its -psfsize is the stack's FWHM, not the joined image's
+    (whose isolated faint stars are ImageMM's restored ones)."""
+    d = tmp_path / "s"
+    d.mkdir()
+    hdr = {"ROWORDER": "BOTTOM-UP", "FILTER": "Duo-Band"}
+    fitsio.write_rgb(str(d / "stack.fits"), np.full((3, 64, 64), 0.2, np.float32), hdr)
+    fitsio.write_rgb(str(d / "imagemm.fits"), np.full((3, 64, 64), 0.6, np.float32), hdr)
+    monkeypatch.setattr(post, "star_footprint_mask", lambda work, steps, arr, header: (np.zeros((64, 64), np.float32), {"stars": 0}))
+    from sirilpipe.lab import metrics as MX
+    seen = []
+    monkeypatch.setattr(MX, "star_fwhm", lambda img, sat: (seen.append(float(np.median(img))), 4.3)[1])
+    r = post.Restorer(str(d), {"filter": "Duo-Band", "restore_source": "imagemm.fits", "imagemm_r": 1, "imagemm_offset": [0, 0]},
+                      {"deconv_method": "imagemm", "deconv_stars_method": "graxpert"}, dict(post.DEFAULTS), None, None)
+    assert r.image_fwhm() == 4.3 and seen == [pytest.approx(0.2)]   # measured on the stack's values

@@ -28,15 +28,17 @@ const Tools = (() => {
     const deconvAuto = live("bxt") ? "BlurXTerminator (licensed)" : "Richardson-Lucy (Siril)";
     const denoiseAuto = live("nxt") ? "NoiseXTerminator (licensed)" : ok(gx) && gx.models?.denoise !== false ? "GraXpert denoising" : "Siril denoising";
     const starsAuto = live("sxt") ? "StarXTerminator (licensed)" : ok(sn) ? "StarNet2" : "none installed: the stars stay in the image";
-    const dm = sel("deconv_method"), nm = sel("denoise_method"), sm = S.params?.star_removal;
+    const dm = sel("deconv_method"), ds = sel("deconv_stars_method"), nm = sel("denoise_method"), sm = S.params?.star_removal;
     const gxOk = k => ok(gx) && (!gx.models || gx.models[k] !== false);
     const deconvNames = { bxt: "BlurXTerminator" + (live("bxt") ? "" : " (not licensed: nothing runs)"), rl: "Richardson-Lucy (Siril)", imagemm: "ImageMM", none: "off",
-      graxpert_obj: "GraXpert deconvolution (objects)", graxpert_stellar: "GraXpert deconvolution (stars)", graxpert_both: "GraXpert deconvolution (objects + stars)" };
+      graxpert: "GraXpert deconvolution" + (gxOk("deconv_obj") || gxOk("deconv_stellar") ? "" : " (models not installed)") };
+    const dn = v => deconvNames[v] || deconvAuto;
+    const deconv = dm === ds ? dn(dm) : `${dn(dm)} (objects), ${dn(ds)} (stars)`;
     const denoiseNames = { nxt: "NoiseXTerminator" + (live("nxt") ? "" : " (not licensed: nothing runs)"), graxpert: "GraXpert denoising", siril: "Siril denoising", none: "off" };
     const ccSharpen = S.params?.cc_sharpen && S.params.cc_sharpen !== "off", ccDenoise = !!S.params?.cc_denoise;
     return {
       background: bge ? "GraXpert background extraction" : "Siril background extraction (RBF)",
-      deconv: (deconvNames[dm] || deconvAuto) + (ccSharpen ? (ccOk("sharpen") ? "; Cosmic Clarity Sharpen on the stretched image" : "; Cosmic Clarity Sharpen (models not installed)") : ""),
+      deconv: deconv + (ccSharpen ? (ccOk("sharpen") ? "; Cosmic Clarity Sharpen on the stretched image" : "; Cosmic Clarity Sharpen (models not installed)") : ""),
       denoise: (denoiseNames[nm] || denoiseAuto) + (ccDenoise ? (ccOk("denoise") ? "; Cosmic Clarity Denoise on the stretched image" : "; Cosmic Clarity Denoise (models not installed)") : ""),
       stars: sm === "darkstar" ? (ccOk("darkstar") ? "Cosmic Clarity DarkStar" : "Cosmic Clarity DarkStar (models not installed), then " + starsAuto) : starsAuto,
     };
@@ -222,7 +224,7 @@ const Tools = (() => {
     // the plan names the tool each step will use: follow the choices that change it
     document.addEventListener("change", e => {
       const t = e.target;
-      if (["sp-deconv_method", "sp-denoise_method"].includes(t.id) || ["star_removal", "cc_sharpen", "cc_denoise"].includes(t.dataset?.key)) renderPlan();
+      if (["sp-deconv_method", "sp-deconv_stars_method", "sp-denoise_method"].includes(t.id) || ["star_removal", "cc_sharpen", "cc_denoise"].includes(t.dataset?.key)) renderPlan();
     });
     load();
   }

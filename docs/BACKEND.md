@@ -54,13 +54,19 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    the 1-2 h values of research/pro-workflow.md (Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; the lower end on noisy data); NoiseXTerminator `--dn` 0.8 .. 0.5 on the linear
    data (GraXpert denoise 0.8 .. 0.6, or Siril, as fallbacks).  `deconv_method = imagemm` runs VeraLux ImageMM (`sirilpipe/veralux_imagemm.py`) on the subs instead: the stack's own calibrated, cosmetic-corrected Bayer-drizzle frames with its registration, per-colour saturation masks (pixels within `imagemm_bloom_grow` px of them left out, and within 0.75 x the equivalent radius of a large saturated patch), then the multi-frame restoration with per-frame kernels (plus the optics' static asymmetry and an extended wing to 80 px joined from unsaturated and saturated stars, with its per-channel colour and lobe measured on the saturated stars); a saturated star starts as a point at the light PSF photometry of its unsaturated wings measures, centred on its missing data, and where the frames' data are sparse it becomes the restored image's PSF at its wings' colour, joined to the restoration with the restoration's own structure kept and the PSF's tail fading on; saturated galaxy nuclei get their colour from their wings; the result is put on the stack's photometric scale per channel from the unsaturated stars' flux ratios (sky offset from the median); no BlurXTerminator.
 6. **Stars** — StarXTerminator on the linear data (or StarNet2 `--linear`; Cosmic Clarity DarkStar with `star_removal = darkstar`), no unscreen: `stars = linear - starless`.
-   **Linear tools are the user's choice** (*Integration & options*): `deconv_method` auto (BlurXTerminator when licensed, else
-   Siril RL) / bxt / rl / **graxpert_obj / graxpert_stellar / graxpert_both** (GraXpert's AI deconvolution models, `-strength`
+   **Linear tools are the user's choice** (*Integration & options*): deconvolution per region, `deconv_method` for the objects
+   and `deconv_stars_method` for the stars (a request naming only `deconv_method` deconvolves the stars with it too; the former
+   `graxpert_obj / graxpert_stellar / graxpert_both` values stay accepted).  Each is auto (BlurXTerminator when licensed, else
+   Siril RL) / bxt / rl / imagemm / none / **graxpert** (GraXpert's AI deconvolution models, `-strength`
    = the Deconvolution slider, `-psfsize` = `graxpert_psfsize`, or when 0 the star FWHM measured on the linear image, GraXpert's
    "Image FWHM (in pixels)"; BlurXTerminator's correct-only pass runs only with auto / bxt; measured on Sh2-131 at strength 0.5,
    PSF 4.48 px: the objects model keeps the flux and leaves the star FWHM almost unchanged, the stars model takes the FWHM from
-   4.5 to 2.0 px and keeps 19-27 % of the stars' flux, independent of the data's scale) /
-   imagemm / none; `denoise_method` auto (NXT, else GraXpert, else Siril) / nxt / graxpert / siril / none. A tool chosen
+   4.5 to 2.0 px and keeps 19-27 % of the stars' flux, independent of the data's scale).  One tool for both regions runs once on
+   the whole image; two tools run objects first, then stars: BXT with the other region's sharpening at 0, GraXpert with its
+   objects or stars model, Siril RL blended in through a star mask (each star Siril's `findstar` fits with a Moffat profile,
+   out to where the profile falls to the sky noise, softened by the median star's sigma).  ImageMM for one region only: the
+   other region is taken from stack.fits (Lanczos to ImageMM's grid) through that mask, measured on the stack, then
+   deconvolved by its own tool. `denoise_method` auto (NXT, else GraXpert, else Siril) / nxt / graxpert / siril / none. A tool chosen
    explicitly that cannot run is recorded and nothing else runs in its place; the same holds for DarkStar, Cosmic Clarity's steps,
    the Hubble palette script and a super-resolution scale Cosmic Clarity has no model for (2x / 3x / 4x only).
 
