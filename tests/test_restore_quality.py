@@ -151,3 +151,48 @@ def test_deconv_method_rl_uses_siril_richardson_lucy_not_bxt(tmp_path, fake_rc, 
     assert any(body.startswith("set core.fftw_timelimit=0") and "rl -iters=" in body for body in bodies)
     tools_used = [x["tool"] for x in r.steps.records if x["step"] == "deconvolution"]
     assert tools_used == ["rc-astro bxt", "siril rl"] and r.steps.records[-1]["status"] == "done"
+
+
+def test_survey_gradient_keeps_the_sky_pedestal_and_clips_nothing(tmp_path, monkeypatch):
+    """skyref's model carries the whole sky pedestal: subtracting all of it put the sky on 0 and _sanitize zeroed the lower half of its noise
+    (M 42 2026-10-24: 44 % of the values, pixel noise 1.72e-4 -> 1.01e-4), which NXT turned into blocks.  The shape goes, the pedestal stays."""
+    from sirilpipe import skyref
+    r = _restorer(tmp_path, _stack(0.004))
+    r.header["CTYPE1"], r.header["CTYPE2"] = "RA---TAN", "DEC--TAN"
+    h, w = r.arr.shape[1:]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    ped = float(np.median(finish.luminance(r.arr)))                  # the sky at the Restorer's scale (normalise_scale)
+    g = 0.1 * ped * (xx / w)
+    grad = ped + g                                                    # pedestal + a linear gradient, the same in the 3 channels
+    monkeypatch.setattr(post, "_has_wcs", lambda hdr: True)
+    monkeypatch.setattr(post.Restorer, "_survey_gradient", lambda self: (np.repeat(grad[..., None], 3, -1),
+                        {"method": "reference", "degree": 3, "coverage": 1.0, "gradient_range": 1.0, "survey_coefficients": {}, "credit": "",
+                         "_emission": np.zeros((h // skyref.FACTOR, w // skyref.FACTOR), np.float32), "_emission_block": skyref.FACTOR}))
+    noise_in = finish.lower_half_sigma(finish.sample(finish.luminance(r.arr)))
+    r.arr = (r.arr + g[None]).astype(np.float32)
+    r.background()
+    rec = [x for x in r.steps.records if x["step"] == "gradient"][-1]
+    assert rec["status"] == "done" and rec["params"]["clipped_fraction"] == 0.0
+    assert int((r.arr == 0).sum()) == 0
+    sky = finish.luminance(r.arr)
+    assert abs(float(np.median(sky)) / ped - 1) < 0.05               # the pedestal kept
+    assert abs(finish.lower_half_sigma(finish.sample(sky)) / noise_in - 1) < 0.1     # the noise untouched
+    assert abs(float(np.median(sky[:, : w // 8])) - float(np.median(sky[:, -w // 8:]))) < 0.1 * float(g.max())      # the gradient gone
+
+
+def test_reduced_wcs_keeps_the_pixel_scale_of_a_pc_cdelt_header():
+    """A PC + CDELT plate solution (Siril 1.4): get_pc() alone asked hips2fits for ~6 degrees per reduced pixel."""
+    from astropy.wcs import WCS
+    from sirilpipe import skyref
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crval = [83.82, -5.38]
+    w.wcs.crpix = [1850.5, 904.5]
+    w.wcs.cdelt = [-0.000766, 0.000766]
+    w.wcs.pc = [[0.8744, 0.4851], [-0.4850, 0.8745]]
+    red = skyref.reduced_wcs(w, 8)
+    assert np.allclose(red.pixel_scale_matrix, w.pixel_scale_matrix * 8, rtol=1e-9)
+    # the same sky position at the same (reduced) place
+    ra, dec = w.wcs_pix2world([[400.0, 300.0]], 0)[0]
+    x, y = red.wcs_world2pix([[ra, dec]], 0)[0]
+    assert abs(x - (400.0 + 0.5) / 8 + 0.5) < 1e-6 and abs(y - (300.0 + 0.5) / 8 + 0.5) < 1e-6

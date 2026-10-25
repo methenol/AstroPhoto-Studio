@@ -124,6 +124,27 @@ class SirilStretcher:
         self.calls.append({"tag": tag, "blocks": blocks, "seconds": round(res.seconds, 1), "script": res.script_path})
         return out_planes
 
+    def _run_trials(self, planes: list[np.ndarray], blocks: list[list[str]], tag: str) -> list[list[np.ndarray] | None]:
+        """``_run`` for the trial values of a fit, one output per block, None for a trial Siril cannot complete.  A trial past the method's
+        usable range can leave an image Siril has no statistics for (autoghs D 2.66 x 3 passes clipped M 42's trial copy flat: "stats failed",
+        and the one script of 9 trials - and with it the preview - failed); the batch is then run one trial per script and the failing values
+        are left out of the fit.  When every trial fails the error stands."""
+        try:
+            return self._run(planes, blocks, tag)
+        except SirilError as e:
+            if len(blocks) == 1:
+                raise
+            first = e
+        outs: list[list[np.ndarray] | None] = []
+        for i, b in enumerate(blocks):
+            try:
+                outs.append(self._run(planes, [b], f"{tag}_t{i}")[0])
+            except SirilError:
+                outs.append(None)
+        if all(o is None for o in outs):
+            raise first
+        return outs
+
     def _run_worker(self, plane: np.ndarray, kwargs_list: list[dict], tag: str) -> list[np.ndarray]:
         """Call VeraLux HyperMetric Stretch's ``process_veralux_v6`` (siril-scripts) on a mono plane, once per kwargs dict, in the pyscript virtualenv (no Siril process)."""
         import subprocess
@@ -220,13 +241,19 @@ class SirilStretcher:
                 if method == "hms":
                     outs = [[o] for o in self._run_worker(mono[0], [self.hms_kwargs(v) for v in vals], f"fit{rnd}")]
                 else:
-                    outs = self._run(mono, [self.command(method, v, ctx_t) for v in vals], f"fit{rnd}_p{passes}", must_log=None)
+                    outs = self._run_trials(mono, [self.command(method, v, ctx_t) for v in vals], f"fit{rnd}_p{passes}")
                 for v, o in zip(vals, outs):
-                    sky, neb = self._levels(o[0], in_lum, ctx_t)
+                    sky, neb = self._levels(o[0], in_lum, ctx_t) if o is not None else (float("nan"), float("nan"))
                     trials.append((v, sky, neb))
                 ys = np.array([(t[1] if by_sky else t[2] - t[1]) for t in trials[-TRIAL_POINTS:]])
-                xs = np.array(vals)
+                fin = np.isfinite(ys)                                 # a trial Siril could not complete has no level
+                failed_above = np.array(vals)[~fin & (np.array(vals) > max(np.array(vals)[fin]))] if fin.any() else np.array([])
+                xs, ys = np.array(vals)[fin], ys[fin]
                 order = np.argsort(ys)
+                if ys.max() < target and failed_above.size:
+                    # the values past the strongest usable one failed by overshooting (an image clipped flat): the target lies between them
+                    lo, hi = float(xs.max()), float(failed_above.min())
+                    continue
                 if ys.max() < target or ys.min() > target:
                     reachable = reachable and not (rnd == 0 and ys.max() < target)    # the strongest value of the tool stays short: one more pass (autoghs)
                     best = float(xs[int(np.argmin(np.abs(ys - target)))])

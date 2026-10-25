@@ -36,6 +36,7 @@ CREDIT = ("NSNS DR0.2 (Northern Sky Narrowband Survey, simg.de; CC BY-NC-SA 4.0,
           "via CDS hips2fits")
 HIPS2FITS = "https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
 FACTOR = 8               # reference pixels: FACTOR x FACTOR stack pixels (~20" for a DWARF / Seestar)
+FETCH_VERSION = 2        # part of the skyref.npz cache key: 2 = the reduced WCS with the pixel scale (caches of 1 hold a radially smeared sky)
 
 
 def reduced_wcs(wcs, factor: int):
@@ -44,7 +45,9 @@ def reduced_wcs(wcs, factor: int):
     w.sip = None
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     w.wcs.crpix = [(wcs.wcs.crpix[0] - 0.5) / factor + 0.5, (wcs.wcs.crpix[1] - 0.5) / factor + 0.5]
-    w.wcs.pc = wcs.wcs.get_pc() * factor
+    # degrees per pixel = PC x CDELT (or CD): get_pc() alone is the scale only for a CD-matrix header; with PC + CDELT
+    # (Siril 1.4 plate solutions) it asked hips2fits for ~6 degrees per reduced pixel and the "survey" was the whole sky smeared radially
+    w.wcs.pc = wcs.pixel_scale_matrix * factor
     w.wcs.cdelt = [1.0, 1.0]
     return w
 

@@ -26,6 +26,9 @@ def test_star_stretch_is_the_midtones_transfer_function():
 
 @pytest.mark.docker
 def test_star_stretch_mtf_in_siril_matches_the_formula(tmp_path):
+    from sirilpipe import stretch
+    if not stretch.siril_available():
+        pytest.skip("no siril-cli")
     x = RNG.uniform(0, 0.3, (3, 200, 300)).astype(np.float32)
     fitsio.write_rgb(str(tmp_path / "a.fit"), x, {})
     m = pro.star_stretch_m(5.0)

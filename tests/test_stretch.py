@@ -53,3 +53,21 @@ def test_every_alternative_tool_runs_headless_and_lands_the_sky(tmp_path, method
     assert rec["method"] == method and rec["commands"]
     assert 0.0 <= out[0].min() and out[0].max() <= 1.0
     assert float(np.median(out[0])) == pytest.approx(0.10, abs=0.02)
+
+
+def test_a_failing_trial_is_left_out_of_the_fit_not_the_whole_run(tmp_path, monkeypatch):
+    """One trial value Siril cannot complete (autoghs at high D x 3 passes: the trial copy clipped flat, "stats failed") failed the script of all
+    9 trials and the preview with it.  The batch is retried one trial per script; the failing values get no level."""
+    from sirilpipe.siril import SirilError
+    st = stretch.SirilStretcher(str(tmp_path), allow=False)
+    plane = np.full((8, 8), 0.1, np.float32)
+
+    def fake_run(planes, blocks, tag, must_log=None):
+        if len(blocks) > 1 or "BAD" in blocks[0][0]:
+            raise SirilError("stretch failed: stats failed")
+        return [[planes[0] * float(blocks[0][0].split()[1])]]
+    monkeypatch.setattr(st, "_run", fake_run)
+    outs = st._run_trials([plane], [["x 1"], ["x 2"], ["BAD 3"]], "fit0_p1")
+    assert outs[2] is None and float(outs[1][0].mean()) == pytest.approx(0.2)
+    with pytest.raises(SirilError):                                   # every trial failing still fails
+        st._run_trials([plane], [["BAD 1"], ["BAD 2"]], "fit0_p1")

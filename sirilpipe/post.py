@@ -492,14 +492,22 @@ class Restorer:
                 if not _has_wcs(self.header):
                     raise ValueError("the stack has no plate solution")
                 bg, info = self._survey_gradient()
-                self.arr = _sanitize(self.arr - np.moveaxis(bg, -1, 0))
-                zero = skyref_mod.sky_zero_mask(info, self.arr.shape[1:])
+                bgm = np.moveaxis(bg, -1, 0).astype(np.float32)
+                # the model's shape is removed and its mean - the sky pedestal - stays (GraXpert "subtract" and Siril subsky keep it too).  Subtracting
+                # the whole model put the sky on 0 and _sanitize clipped its lower half (M 42 2026-10-24: 44 % of the values zeroed, the pixel noise
+                # 1.72e-4 -> 1.01e-4); NXT then shifted every area by how much of it was clipped (blocks) and the stretch blew the nebula out
+                flat = self.arr - bgm + bgm.mean(axis=(1, 2), keepdims=True)
+                zero = skyref_mod.sky_zero_mask(info, flat.shape[1:])
+                level = None
                 if zero is not None and zero.sum() > 100:
-                    off = [float(np.median(self.arr[c][zero])) for c in range(3)]
-                    lvl = float(np.median(finish.luminance(self.arr)))
-                    self.arr = _sanitize(self.arr - np.array(off, np.float32)[:, None, None] + lvl)   # the sky's zero point where the survey sees the least emission
+                    off = np.array([float(np.median(flat[c][zero])) for c in range(3)], np.float32)
+                    level = float(off.mean())
+                    flat = flat - off[:, None, None] + np.float32(level)    # the sky's zero point where the survey sees the least emission, one level for the 3 channels
+                clipped = float((flat < 0).mean())
+                self.arr = _sanitize(flat)
                 s.add("gradient", "sky survey reference (skyref)", seconds=time.time() - t0, method=info["method"], degree=info["degree"], coverage=info["coverage"],
-                      gradient_range=round(info["gradient_range"], 2), survey_coefficients=info["survey_coefficients"], credit=info["credit"])
+                      gradient_range=round(info["gradient_range"], 2), survey_coefficients=info["survey_coefficients"], credit=info["credit"],
+                      sky_level=None if level is None else round(level, 6), clipped_fraction=round(clipped, 6))
                 return
             except Cancelled:
                 raise
@@ -540,7 +548,7 @@ class Restorer:
         # plate-solved image (IC 1805, 2026-10-16)
         wcs = WCS(self.header, naxis=2)
         shape = self.arr.shape[1:]
-        key = json.dumps([wcs.to_header_string()[:4000], list(shape), skyref_mod.SURVEYS, skyref_mod.FACTOR])
+        key = json.dumps([wcs.to_header_string()[:4000], list(shape), skyref_mod.SURVEYS, skyref_mod.FACTOR, skyref_mod.FETCH_VERSION])
         path = _p(self.session, "skyref.npz")
         refs = None
         if os.path.exists(path):
