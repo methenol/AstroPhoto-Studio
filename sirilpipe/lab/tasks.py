@@ -2,31 +2,44 @@
 
 A task declares its parameters (search space with the pipeline default of each and what it maps to:
 ``pipeline`` = an integration & compute option (stack_params / STACK_DEFAULTS), ``processing`` = a processing
-setting (post.DEFAULTS), ``code`` = a constant of the code), its metrics (direction of improvement, whether
-they need a ground truth) and two functions: ``prepare`` loads what a study shares between trials, once;
+setting (post.DEFAULTS / EXTRA_DEFAULTS), ``code`` = a constant of the code), its metrics (direction of improvement,
+whether they need a ground truth) and two functions: ``prepare`` loads what a study shares between trials, once;
 ``run`` executes one trial and returns its metrics and a preview image (h, w, 3).
 
-Real datasets are the pipeline's own sessions (read only: trials work in the study's own folder on copies of
-the cached products).  Synthetic datasets (``synthetic.py``) are Seestar-format subs of an analytic sky with
-an exact truth, stacked once by Siril; truth metrics compare the result with the truth registered onto the
-stack's grid (astroalign on the stars, so the crop, flip and rotation of the stack do not matter).
+Search spaces.  A parameter may be conditional: ``when`` = {other: [values]} (all must hold) or a list of such dicts
+(any may hold); an inactive parameter is not sampled and keeps its fixed value, so a trial is never spent on a setting
+that has no effect (the RBF smoothing of a polynomial model, the Cosmic Clarity amounts with Sharpen off).
+``hypertune`` marks the parameters the hyper-tuned pipeline (sirilpipe.hypertune) searches: True, or a condition on
+the dataset ("dual": dual-band data only, "refs": only when reference looks of the target exist - the palette and the
+colour grade are matters of style, judged only against references); ``ht_choices`` narrows a categorical there.
 
-Tasks:
-  finish      the finishing chain (pro.py): stretch tool and its settings, highlights, noise reduction, palette,
-              saturation, stars - scored by the finishing gates and the distance to the reference looks
-  restore     the linear restoration (post.restore): gradient model, deconvolution and denoise strengths -
-              scored by star FWHM, background noise, sharpness, photometry against the stack, truth
-  stack       registration & integration (Session.run_stack): rejection sigmas, drizzle, frame selection -
-              scored by background noise, star FWHM / roundness, frames kept, truth
-  stars       star separation (post.remove_stars): tool and its settings - residual star flux / stars left in
-              the starless image, change away from the stars, truth
-  background  gradient removal (the restore stage's background step): model, degree, smoothing - gradient
-              left in the sky, emission removed, truth
+Scores and constraints.  ``score`` is the task's figure of merit (the hyper-tune objective and the lab's default),
+``limits(ctx)`` its constraints ({metric: ("max" | "min", bound)}), whose violations every trial records (Optuna's
+constrained TPE / NSGA-II, Ozaki et al. 2022): the best trial is the best feasible one, and a trial within
+``min_gain`` of the baseline on the score does not replace it.  The measurements are paired (lab.objectives): the
+same stars and sky apertures, chosen once on a reference image, in every trial.
+
+Real datasets are the pipeline's own sessions (read only: trials work in the study's own folder on copies of
+the cached products; the hyper-tune's stack study re-stacks the session itself, which it stacks next anyway).
+Synthetic datasets (``synthetic.py``) are Seestar-format subs of an analytic sky with an exact truth, stacked once
+by Siril; truth metrics compare the result with the truth registered onto the stack's grid (astroalign on the
+stars, so the crop, flip and rotation of the stack do not matter).
+
+Tasks (pipeline order):
+  stack       registration & integration (Session.run_stack): rejection, weighting, frame selection, resampling, drizzle drop / kernel
+  satellite   Cosmic Clarity satellite-trail removal on the stack: trails left vs change elsewhere
+  background  gradient removal (the restore stage's background step): model, degree, smoothing
+  restore     the linear restoration (post.restore): deconvolution / denoise tools and strengths (BXT, GraXpert, RL; NXT, GraXpert, Siril)
+  stars       star separation (post.remove_stars): StarXTerminator, StarNet2, Cosmic Clarity DarkStar
+  finish      the finishing chain (pro.py): stretch, highlights, noise reduction (NXT / Cosmic Clarity), Cosmic Clarity Sharpen, palette, colour, stars
+  superres    super-resolution of the finished image: Cosmic Clarity Super-Resolution against Lanczos
 """
 from __future__ import annotations
 
 import json
+import math
 import os
+import pickle
 import shutil
 import time
 
@@ -34,18 +47,21 @@ import cv2
 import numpy as np
 
 from . import metrics as MX
+from . import objectives as OB
 from . import synthetic as SY
 
 
 # ----------------------------------------------------------------------------- datasets
 class Dataset:
     """A real session (``{"kind": "real", "folder": <subs>}``, several nights of one target joined with
-    ``os.pathsep``) or a generated synthetic one (``{"kind": "synthetic", "dir": <output/lab/synthetic/name>}``)."""
+    ``os.pathsep``) or a generated synthetic one (``{"kind": "synthetic", "dir": <output/lab/synthetic/name>}``).
+    ``session``: a Session object to use instead of opening one (the hyper-tune passes the job's own)."""
 
-    def __init__(self, spec: dict, workdir: str):
+    def __init__(self, spec: dict, workdir: str, session=None):
         from ..util import split_folders
         self.spec = spec
         self.kind = spec["kind"]
+        self.given = session
         if self.kind == "synthetic":
             self.dir = spec["dir"]
             self.folder = os.path.join(self.dir, "subs")
@@ -67,6 +83,8 @@ class Dataset:
         return self.kind == "synthetic"
 
     def session(self, workdir: str | None = None):
+        if self.given is not None and workdir is None:
+            return self.given
         from ..session import Session
         return Session(self.folder, workdir or self.workdir)
 
@@ -74,7 +92,8 @@ class Dataset:
         """The dataset's session, analysed and stacked with the pipeline defaults if needed (synthetic datasets
         only: a real session must have been stacked in the pipeline)."""
         s = self.session()
-        s.cancel_flag = cancel
+        if self.given is None:
+            s.cancel_flag = cancel
         if s.status()["stacked"]:
             return s
         if not self.synthetic:
@@ -130,24 +149,65 @@ def _read(path: str) -> np.ndarray:
     return fitsio.read_rgb(path)[0]
 
 
+def _checkpoint(cancel):
+    def f():
+        if cancel.is_set():
+            raise RuntimeError("cancelled")
+    return f
+
+
+def _centre_crop(img: np.ndarray, c: int = 1024) -> np.ndarray:
+    H, W = img.shape[:2]
+    y0, x0 = max(0, H // 2 - c // 2), max(0, W // 2 - c // 2)
+    return np.ascontiguousarray(img[y0:y0 + c, x0:x0 + c])
+
+
+def _store(study_dir: str, name: str, obj=None):
+    """Pickle ``obj`` into the study folder (``obj`` None: load it back, None when absent): what a continued study must measure against."""
+    path = os.path.join(study_dir, name)
+    if obj is None:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        return None
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=4)
+    os.replace(tmp, path)
+    return obj
+
+
 # ----------------------------------------------------------------------------- truth on the stack's grid
+def _truth_render(ds: Dataset, sc: float, extended: bool, stars: bool) -> np.ndarray:
+    """The true sky on the reference sub's grid at scale ``sc`` through the subs' mean PSF, rendered once per dataset (minutes on the CPU):
+    only its registration onto a result differs between trials."""
+    key = (round(float(sc), 6), bool(extended), bool(stars))
+    cache = ds.__dict__.setdefault("_truth_renders", {})
+    if key not in cache:
+        truth, _ = SY.load_truth(ds.dir)
+        spec = truth["spec"]
+        n = len(truth["frames"])
+        psf = SY.effective_psf(ds.dir, list(range(n)), None, sc)
+        H0, W0 = int(spec["height"] * sc), int(spec["width"] * sc)
+        cache[key] = SY.truth_image(ds.dir, 0, (H0, W0), sc, psf, extended=extended, stars=stars)
+    return cache[key]
+
+
 def truth_on_stack(ds: Dataset, s, stack: np.ndarray, extended: bool = True, stars: bool = True) -> tuple[np.ndarray, np.ndarray, dict]:
     """The true sky rendered on the reference sub's grid through the subs' mean PSF, registered onto the
     stack's grid (crop, flip, rotation, drizzle scale) by astroalign on the star positions.  Returns
     (truth (H, W, 3) in the truth's units, valid mask, info)."""
     import astroalign as aa
-    truth, _ = SY.load_truth(ds.dir)
-    spec = truth["spec"]
-    n = len(truth["frames"])
     sc = float(s.meta.get("scale", 1.0))
-    psf = SY.effective_psf(ds.dir, list(range(n)), None, sc)
-    H0, W0 = int(spec["height"] * sc), int(spec["width"] * sc)
-    full = SY.truth_image(ds.dir, 0, (H0, W0), sc, psf, extended=extended, stars=stars)
-    full_stars = SY.truth_image(ds.dir, 0, (H0, W0), sc, psf, extended=False, stars=True)
-    src = np.ascontiguousarray(full_stars.mean(-1), np.float32)
-    dst = np.ascontiguousarray(_hwc(stack).mean(-1), np.float32)
-    tf, (s_pts, d_pts) = aa.find_transform(src, dst, max_control_points=120, detection_sigma=5, min_area=5)
-    H, W = dst.shape
+    full = _truth_render(ds, sc, extended, stars)
+    full_stars = _truth_render(ds, sc, False, True)
+    # control points: the brightest genuine stars of each (a synthetic stack keeps hot-pixel blocks, which swamped astroalign's own detection);
+    # the noiseless render gets a pedestal and a whisper of noise so that the detector has a background to measure
+    peak = float(full_stars.max()) or 1.0
+    noisy = full_stars + np.float32(1e-3 * peak) + np.random.default_rng(0).normal(0, 1e-4 * peak, full_stars.shape).astype(np.float32)
+    dst_img = _hwc(stack)
+    tf, (s_pts, d_pts) = aa.find_transform(OB.star_points(noisy), OB.star_points(dst_img), max_control_points=120)
+    H, W = dst_img.shape[:2]
     M = tf.params[:2]
     out = np.stack([cv2.warpAffine(full[..., c].astype(np.float32), M, (W, H), flags=cv2.INTER_LINEAR, borderValue=np.nan) for c in range(3)], -1)
     valid = np.isfinite(out).all(-1)
@@ -165,14 +225,32 @@ class Task:
     metrics: dict[str, dict] = {}
     options: list[dict] = []
     default_objective = ""
+    score = ""                      # the figure of merit: the hyper-tune objective
+    min_gain = 0.0                  # an improvement of the score below this does not replace the baseline (the measurement's resolution)
+    min_gain_rel = 0.0              # ... nor one below this fraction of the baseline's score (scores that are distances, not logarithms)
+    objective_note = ""             # how the score and the constraints are defined (shown in the Experiments tab)
     display_ready = False
 
     def describe(self) -> dict:
         return {"name": self.name, "label": self.label, "description": self.description, "params": self.params,
-                "metrics": self.metrics, "options": self.options, "default_objective": self.default_objective}
+                "metrics": self.metrics, "options": self.options, "default_objective": self.default_objective or self.score,
+                "score": self.score, "min_gain": self.min_gain, "min_gain_rel": self.min_gain_rel, "objective_note": self.objective_note,
+                "constraints": {k: list(v) for k, v in self.static_limits().items()}}
 
     def defaults(self) -> dict:
         return {p["name"]: p["default"] for p in self.params}
+
+    def static_limits(self) -> dict:
+        return {}
+
+    def canonical(self, active: dict, ctx: dict) -> dict:
+        """The settings that decide what a trial runs (``active``: the sampled ones): settings that run the same thing map to one key, so the study
+        evaluates them once (lab.run's duplicate detection)."""
+        return active
+
+    def limits(self, ctx: dict) -> dict:
+        """The constraints of a trial ({metric: ("max" | "min", bound)}); may depend on the study's reference (``ctx``)."""
+        return self.static_limits()
 
     def prepare(self, ds: Dataset, opts: dict, device, log, cancel, study_dir: str) -> dict:
         raise NotImplementedError
@@ -188,6 +266,13 @@ TRUTH_METRICS = {
     "truth_psnr": {"label": "Truth: PSNR (dB)", "direction": "maximize", "truth": True},
     "truth_star_dmag_mad": {"label": "Truth: star photometry scatter (mag)", "direction": "minimize", "truth": True},
     "truth_star_dmag_abs": {"label": "Truth: |star photometry bias| (mag)", "direction": "minimize", "truth": True},
+}
+
+DEPTH_METRICS = {
+    "depth": {"label": "Depth: (ln S/N point + ln S/N extended) / 2 of the reference stars, empty-aperture noise", "direction": "maximize"},
+    "snr_point": {"label": "Median S/N of the reference stars, 0.68 FWHM aperture", "direction": "maximize"},
+    "snr_total": {"label": "Median S/N of the reference stars, 2.5 FWHM aperture", "direction": "maximize"},
+    "fwhm": {"label": "Star FWHM (px of the reference grid)", "direction": "minimize"},
 }
 
 
@@ -212,11 +297,13 @@ def _truth_scores(ds: Dataset, s, result: np.ndarray, sigma_eval: float, stars_i
         return {"truth_error": f"{type(e).__name__}: {e}"}
 
 
-def _processing_params(keys: list[str], tune: set[str]) -> list[dict]:
-    """Task parameters taken from the UI's PARAM_SPEC so that ranges and labels follow the pipeline."""
+def _processing_params(keys: list[str], tune: set[str], hypertune: dict | None = None, when: dict | None = None) -> list[dict]:
+    """Task parameters taken from the UI's PARAM_SPEC so that ranges and labels follow the pipeline.  ``hypertune``: {key: True | condition},
+    ``when``: {key: condition} (see the module docstring)."""
     from ..post import DEFAULTS, EXTRA_DEFAULTS, PARAM_SPEC
     out = []
     spec = {s["key"]: s for s in PARAM_SPEC}
+    hypertune, when = hypertune or {}, when or {}
     for k in keys:
         sp = spec.get(k)
         d = DEFAULTS.get(k, EXTRA_DEFAULTS.get(k))
@@ -229,307 +316,265 @@ def _processing_params(keys: list[str], tune: set[str]) -> list[dict]:
             p.update(type="bool")
         else:
             p.update(type="categorical", choices=list(sp["options"]))
+        if k in hypertune:
+            p["hypertune"] = hypertune[k]
+        if k in when:
+            p["when"] = when[k]
         out.append(p)
     return out
 
 
-# ----------------------------------------------------------------------------- finishing
-class FinishTask(Task):
-    name = "finish"
-    label = "Stretch & finish (finishing chain)"
-    display_ready = True
-    description = ("The finishing chain (pro.py) on the dataset's cached starless and star layers (or the linear / stacked image): the stretch tool and its "
-                   "settings, highlights, the noise reduction of the stretched image, palette / OIII boost, local contrast, saturation and the star layer.  Scored by "
-                   "the finishing gates (sky level, clipping, sky chroma, sky noise, star count / shape / colour), the nebula contrast and the distance to the "
-                   "reference looks of the target.  Trial images are the finished renders (one chain, same data).  Option 'external': run NoiseXTerminator / GraXpert "
-                   "on the stretched image in every trial (slower, the export's result).")
-    params = _processing_params(["stretch_method", "stretch", "contrast", "hdr", "color_preservation", "luminance_denoise", "chroma_denoise", "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "palette", "hubble_formula", "oiii_boost",
-                                 "synthetic_luminance", "saturation", "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "scnr",
-                                 "black_point", "brightness"],
-                                {"stretch", "contrast", "hdr", "saturation", "local_contrast", "star_reduction"})
-    params.append({"name": "ghs_d2", "label": "GHS pass 2 D (ghs2)", "type": "float", "low": 0.3, "high": 6.0, "default": 2.5, "tune": True, "processing": "ghs_d2"})
-    params.append({"name": "star_stretch", "label": "Star stretch amount (Seti Astro)", "type": "float", "low": 2.0, "high": 8.0, "default": 5.0, "tune": False, "processing": "star_stretch"})
-    metrics = {
-        "gate_distance": {"label": "Gates: distance outside the limits (0 = all pass)", "direction": "minimize"},
-        "gates_failed": {"label": "Gates failed (count)", "direction": "minimize"},
-        "nebula_contrast": {"label": "Nebula contrast (p90 - sky, lightness)", "direction": "maximize"},
-        "look_distance": {"label": "Distance to the reference looks", "direction": "minimize"},
-        "sky_median": {"label": "Sky level", "direction": "minimize"},
-        "sky_noise": {"label": "Sky pixel noise", "direction": "minimize"},
-        "sky_chroma": {"label": "Sky chroma (max |a|, |b|)", "direction": "minimize"},
-        "clipped": {"label": "Clipped fraction", "direction": "minimize"},
-        "stars_coloured": {"label": "Star colour saturation", "direction": "maximize"},
-        "seconds": {"label": "Run time (s)", "direction": "minimize"},
-    }
-    options = [{"name": "external", "label": "AI noise reduction per trial (1 = yes)", "type": "int", "default": 0},
-               {"name": "max_side", "label": "Render size (px, 0 = full)", "type": "int", "default": 0}]
-    default_objective = "gate_distance"
-
-    def prepare(self, ds, opts, device, log, cancel, study_dir):
-        from .. import looks, post
-        s = ds.ensure_stacked(log, cancel)
-        p0 = dict(post.DEFAULTS)
-        max_side = int(opts.get("max_side", 0) or 0) or None
-        layers = post._Layers(s.dir, p0, max_side)
-        dual = post._dual_band(s.meta, layers.header)
-        ref_looks, ref_agg, desc, _ = looks.reference_looks(s.meta.get("object"), dual)
-        log(f"Layers: {os.path.basename(layers.src)}{' + stars' if layers.stars is not None else ''}; {desc}")
-        work = os.path.join(study_dir, "work", "finish")
-        os.makedirs(work, exist_ok=True)
-        return {"ds": ds, "session": s, "layers": layers, "dual": dual, "looks": ref_looks, "work": work, "device": device, "opts": opts, "header": layers.header}
-
-    def run(self, ctx, p, log, cancel):
-        from .. import finish, gates, looks, post, pro
-        layers = ctx["layers"]
-        prm = {**post.DEFAULTS, **p}
-        if cancel.is_set():
-            raise RuntimeError("cancelled")
-        t = time.time()
-        fin = pro.Finisher(ctx["work"], ctx["header"], prm, ctx["dual"], external=bool(int(ctx["opts"].get("external", 0))), device=str(ctx["device"]),
-                           checkpoint=(lambda: (_ for _ in ()).throw(RuntimeError("cancelled")) if cancel.is_set() else None), keep_pictures=False)
-        img, info = fin.run(layers.base, layers.stars)
-        dt = time.time() - t
-        sm = layers.starnet.get("stars") or {}
-        level = float(pro.mtf_balance(pro.star_stretch_m(float(prm.get("star_stretch", pro.STAR_STRETCH))), 5.0 * float(sm["sky_noise"]))) if sm.get("sky_noise") else None
-        g = gates.compute(img, starless=info.get("starless") if layers.stars is not None and prm["star_reduction"] < 1.0 else None, linear_star_count=sm.get("count"), star_level=level)
-        dist = 0.0
-        for k, v in g.items():
-            if not isinstance(v, dict) or v.get("pass") or v.get("value") is None:
-                continue
-            lim, val = v.get("limit"), v.get("value")
-            if isinstance(val, dict):                             # stars_count -> its deviation; sky_chroma -> max(|a|, |b|)
-                val = val.get("deviation") if "deviation" in val else (max(x for x in val.values() if isinstance(x, (int, float))) if any(isinstance(x, (int, float)) for x in val.values()) else None)
-            if val is None:
-                continue
-            if isinstance(lim, (list, tuple)):
-                lo, hi = lim
-                dist += (lo - val) / lo if val < lo else (val - hi) / hi
-            elif isinstance(lim, (int, float)) and val is not None and lim:
-                dist += abs(val - lim) / lim
-        lum = finish.luminance(img)
-        hs = pro._hist_stats(lum)
-        mask, _ = pro.nebula_mask(lum, hs["mode"])
-        neb = float(np.percentile(lum[mask], 90) - g["sky_median"]["value"]) if mask.any() else 0.0
-        out = {"gate_distance": float(dist), "gates_failed": len(g.get("failed", [])), "nebula_contrast": neb, "sky_median": g["sky_median"]["value"],
-               "sky_noise": g.get("sky_pixel_noise", {}).get("value"), "sky_chroma": max(g["sky_chroma"]["value"].values()) if isinstance(g.get("sky_chroma", {}).get("value"), dict) else None,
-               "clipped": g["clipped"]["value"], "stars_coloured": g.get("stars_coloured", {}).get("value"), "seconds": dt, "failed": g.get("failed")}
-        if ctx["looks"]:
-            st = looks.look_stats(_hwc(img))
-            out["look_distance"] = looks.score(st, ctx["looks"], looks.object_weight(st))[0]
-        from .. import export as export_mod
-        return out, export_mod.display_image(img, export_mod.bottom_up(ctx["header"]))        # (H, W, 3) north-up like the exports
+GATE_NAMES = ("sky_median", "clipped", "white", "sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise", "stars_count",
+              "stars_round", "stars_coloured")
 
 
-# ----------------------------------------------------------------------------- linear restoration
-class RestoreTask(Task):
-    name = "restore"
-    label = "Linear restoration (restore stage)"
-    description = ("The linear stage (post.restore) on a copy of the stack: gradient model and smoothing, deconvolution strength (BlurXTerminator / Siril RL), "
-                   "denoise strength (NoiseXTerminator / GraXpert), colour calibration.  Scored on the result: star FWHM, background noise, Krotkov sharpness, aperture "
-                   "photometry against the stack (bright / faint bias) and, on synthetic data, the truth.  Each trial runs the whole linear stage (1-2 min).")
-    params = _processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance"], {"deconvolution", "denoise", "bg_smoothing"})
-    params.append({"name": "deconv_method", "label": "Deconvolution tool (objects)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"], "default": "auto", "tune": False, "pipeline": "deconv_method"})
-    params.append({"name": "deconv_stars_method", "label": "Deconvolution tool (stars)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"], "default": "auto", "tune": False, "pipeline": "deconv_stars_method"})
-    params.append({"name": "denoise_method", "label": "Noise reduction tool", "type": "categorical", "choices": ["auto", "nxt", "graxpert", "siril", "none"], "default": "auto", "tune": False, "pipeline": "denoise_method"})
-    metrics = {
-        "fwhm": {"label": "Star FWHM (px)", "direction": "minimize"},
-        "bg_noise": {"label": "Background noise", "direction": "minimize"},
-        "sharpness": {"label": "Sharpness S_F (Krotkov)", "direction": "maximize"},
-        "dm_bright_abs": {"label": "|photometry bias| bright stars (mag)", "direction": "minimize"},
-        "dm_faint_abs": {"label": "|photometry bias| faint stars (mag)", "direction": "minimize"},
-        "seconds": {"label": "Run time (s)", "direction": "minimize"},
-        **TRUTH_METRICS,
-    }
-    options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
-    default_objective = "bg_noise"
+def _gate_violations(g: dict) -> dict:
+    """Per gate, how far outside its limit the picture is (relative units; 0 = passes)."""
+    out = {}
+    for k in GATE_NAMES:
+        v = g.get(k)
+        out[k] = _gate_distance({k: v}) if isinstance(v, dict) else 0.0
+    return out
 
-    def prepare(self, ds, opts, device, log, cancel, study_dir):
-        s = ds.ensure_stacked(log, cancel)
-        stack = _read(s._p("stack.fits"))
-        return {"ds": ds, "session": s, "stack": stack, "study_dir": study_dir, "n": 0, "device": device, "opts": opts}
 
-    def run(self, ctx, p, log, cancel):
-        from .. import post
-        s, ds = ctx["session"], ctx["ds"]
-        ctx["n"] += 1
-        wd = os.path.join(ctx["study_dir"], "work", f"restore_{ctx['n']}")
-        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
-        prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k not in ("deconv_method", "deconv_stars_method", "denoise_method")}}
-        sp = {**(s.meta.get("params") or {}), "deconv_method": p.get("deconv_method", "auto"), "deconv_stars_method": p.get("deconv_stars_method", ""),
-              "denoise_method": p.get("denoise_method", "auto"), "device": str(ctx["device"])}
-        t = time.time()
-        try:
-            def checkpoint():
-                if cancel.is_set():
-                    raise RuntimeError("cancelled")
-            post.restore(wd, s.meta, sp, prm, None, checkpoint)
-            dt = time.time() - t
-            lin = _read(os.path.join(wd, "linear.fits"))
-            est = _hwc(lin)
-            sat = 0.98
-            out = {"fwhm": MX.star_fwhm(est, sat), "bg_noise": MX.background_noise(est), "sharpness": float(np.mean([MX.sharpness(est[..., c]) for c in range(3)])), "seconds": dt}
-            try:
-                coadd = _hwc(ctx["stack"])
-                mc, dm = MX.photometry(coadd.mean(-1), est.mean(-1) * (np.median(coadd) / max(np.median(est), 1e-9)), thresh=5 * MX.sky_sigma(coadd.mean(-1)))
-                if len(mc) >= 4:
-                    bright = mc <= np.percentile(mc, 50)
-                    out["dm_bright_abs"], out["dm_faint_abs"] = abs(float(np.median(dm[bright]))), abs(float(np.median(dm[~bright])))
-            except Exception:                                 # noqa: BLE001
-                pass
-            if ds.synthetic:
-                out.update(_truth_scores(ds, s, lin, float(ctx["opts"].get("sigma_eval", 1.0))))
-            return out, est
-        finally:
-            shutil.rmtree(wd, ignore_errors=True)
+def _gate_distance(g: dict) -> float:
+    """How far outside their limits the failed gates are (relative units; 0 = every gate passes)."""
+    dist = 0.0
+    for k, v in g.items():
+        if not isinstance(v, dict) or v.get("pass") or v.get("value") is None:
+            continue
+        lim, val = v.get("limit"), v.get("value")
+        if isinstance(val, dict):                             # stars_count -> its deviation; sky_chroma -> max(|a|, |b|)
+            val = val.get("deviation") if "deviation" in val else (max(x for x in val.values() if isinstance(x, (int, float))) if any(isinstance(x, (int, float)) for x in val.values()) else None)
+        if val is None:
+            dist += 1.0
+            continue
+        if isinstance(lim, (list, tuple)):
+            lo, hi = lim
+            dist += (lo - val) / lo if val < lo else (val - hi) / hi
+        elif isinstance(lim, (int, float)) and lim:
+            dist += abs(val - lim) / lim
+    return float(dist)
 
 
 # ----------------------------------------------------------------------------- registration & integration
 class StackTask(Task):
     name = "stack"
     label = "Registration & integration"
-    description = ("Re-stacks the dataset with each trial's settings in the study's own session folder (Siril; the registration is reused when its settings are unchanged): "
-                   "rejection sigmas, frame selection sensitivity, resampling and drizzle scale, banding correction.  Real data: background noise and star FWHM / roundness on "
-                   "the stack; synthetic data also against the truth seen through the subs' mean PSF.")
+    description = ("Re-stacks the dataset with each trial's settings (Siril; the registration is reused when its settings are unchanged): rejection algorithm and "
+                   "sigmas, frame weighting, frame selection sensitivity, resampling (Bayer drizzle / demosaic), drizzle drop size and kernel, banding correction.  "
+                   "Scored by the depth of the stack on the reference stars of the first trial (mapped onto each stack by astroalign, so another crop or drizzle "
+                   "scale compares directly); synthetic data also against the truth seen through the subs' mean PSF.")
+    objective_note = ("Score: depth = (ln S/N of point sources + ln S/N of extended sources) / 2, the reference stars' aperture fluxes over the empty-aperture noise "
+                      "(Labbe et al. 2003): more frames, better rejection and sharper registration all raise it, and it is unit-free, so stacks normalised or "
+                      "resampled differently compare.  Constraints against the baseline: star ellipticity at most 0.02 worse (registration / frame selection), "
+                      "single-pixel outliers (hot pixels, cosmic rays a lax rejection lets through) at most 1.5 x (or +2 per Mpx), trail pixels at most 1.25 x "
+                      "(or +20 per million: on M 31 the search's best trials raised the high rejection sigma to ~7, which lets trails through on a night that has "
+                      "them), and the auto-crop keeping "
+                      "at least 90 % of the baseline's field (a synthetic stack without banding correction came out cropped to a third of it).")
     params = [
-        {"name": "sigma_low", "label": "Rejection σ low", "type": "float", "low": 1.5, "high": 8.0, "default": 4.0, "tune": True, "pipeline": "sigma_low"},
-        {"name": "sigma_high", "label": "Rejection σ high", "type": "float", "low": 1.5, "high": 8.0, "default": 3.0, "tune": True, "pipeline": "sigma_high"},
-        {"name": "sensitivity", "label": "Frame rejection sensitivity", "type": "float", "low": 0.5, "high": 2.0, "default": 1.0, "tune": False, "pipeline": "sensitivity"},
-        {"name": "mode", "label": "Resampling", "type": "categorical", "choices": ["auto", "drizzle", "demosaic"], "default": "auto", "tune": False, "pipeline": "mode"},
+        {"name": "rejection", "label": "Rejection algorithm (auto: winsorized, MAD for drizzle > 1x)", "type": "categorical",
+         "choices": ["auto", "winsorized", "sigma", "mad", "linear", "median", "none"], "ht_choices": ["auto", "winsorized", "sigma", "mad", "linear"],
+         "default": "auto", "tune": False, "hypertune": True, "pipeline": "rejection"},
+        {"name": "sigma_low", "label": "Rejection σ low", "type": "float", "low": 1.5, "high": 8.0, "default": 4.0, "tune": True, "hypertune": True, "pipeline": "sigma_low",
+         "when": {"rejection": ["auto", "winsorized", "sigma", "mad", "linear"]}},
+        {"name": "sigma_high", "label": "Rejection σ high", "type": "float", "low": 1.5, "high": 8.0, "default": 3.0, "tune": True, "hypertune": True, "pipeline": "sigma_high",
+         "when": {"rejection": ["auto", "winsorized", "sigma", "mad", "linear"]}},
+        {"name": "stack_weighting", "label": "Frame weighting (stack -weight)", "type": "categorical", "choices": ["wfwhm", "nbstars", "noise", "nbstack", "none"],
+         "default": "wfwhm", "tune": False, "hypertune": True, "pipeline": "stack_weighting"},
+        {"name": "sensitivity", "label": "Frame rejection sensitivity", "type": "float", "low": 0.5, "high": 2.0, "default": 1.0, "tune": False, "hypertune": True, "pipeline": "sensitivity"},
+        {"name": "mode", "label": "Resampling", "type": "categorical", "choices": ["auto", "drizzle", "demosaic"], "ht_choices": ["auto", "demosaic"],
+         "default": "auto", "tune": False, "hypertune": True, "pipeline": "mode"},
+        {"name": "drizzle_pixfrac", "label": "Drizzle drop size (pixfrac; 0 = 1 / scale)", "type": "float", "low": 0.5, "high": 1.0, "default": 1.0, "tune": False,
+         "hypertune": True, "pipeline": "drizzle_pixfrac", "when": {"mode": ["auto", "drizzle"]}},
+        {"name": "drizzle_kernel", "label": "Drizzle kernel", "type": "categorical", "choices": ["square", "point", "turbo", "gaussian", "lanczos2", "lanczos3"],
+         "ht_choices": ["square", "turbo", "gaussian"], "default": "square", "tune": False, "hypertune": True, "pipeline": "drizzle_kernel", "when": {"mode": ["auto", "drizzle"]}},
         {"name": "scale", "label": "Drizzle scale", "type": "categorical", "choices": [1.0, 1.5, 2.0], "default": 1.0, "tune": False, "pipeline": "scale"},
-        {"name": "pattern_correction", "label": "Row banding correction (seqfixbanding)", "type": "bool", "default": True, "tune": False, "pipeline": "pattern_correction"},
+        {"name": "pattern_correction", "label": "Row banding correction (seqfixbanding)", "type": "bool", "default": True, "tune": False, "hypertune": True, "pipeline": "pattern_correction"},
         {"name": "crop_threshold", "label": "Crop: minimum frame coverage", "type": "float", "low": 0.1, "high": 1.0, "default": 0.3, "tune": False, "pipeline": "crop_threshold"},
     ]
     metrics = {
-        "bg_noise": {"label": "Background noise", "direction": "minimize"},
-        "fwhm": {"label": "Star FWHM (px)", "direction": "minimize"},
-        "roundness": {"label": "Star ellipticity", "direction": "minimize"},
+        **DEPTH_METRICS,
+        "ellipticity": {"label": "Star ellipticity (median 1 - b / a)", "direction": "minimize"},
+        "outliers": {"label": "Single-pixel outliers per Mpx (hot pixels / cosmic rays left)", "direction": "minimize"},
+        "dm_mad": {"label": "Photometric scatter against the baseline stack (mag)", "direction": "minimize"},
+        "bg_noise": {"label": "Background noise (centre crop)", "direction": "minimize"},
+        "roundness": {"label": "Star ellipticity (centre crop, gates)", "direction": "minimize"},
         "n_frames": {"label": "Frames stacked", "direction": "maximize"},
+        "field_fraction": {"label": "Field kept by the auto-crop (fraction of the baseline's)", "direction": "maximize"},
+        "trails": {"label": "Satellite / aircraft trail pixels per million left in the stack", "direction": "minimize"},
         "seconds": {"label": "Run time (s)", "direction": "minimize"},
         **TRUTH_METRICS,
     }
-    options = [{"name": "crop", "label": "Scored crop (px per side)", "type": "int", "default": 1024},
-               {"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
-    default_objective = "bg_noise"
+    options = [{"name": "crop", "label": "Preview / crop metrics (px per side)", "type": "int", "default": 1024},
+               {"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0},
+               {"name": "in_place", "label": "Stack the session itself (hyper-tune; 0 = the study's own folder)", "type": "int", "default": 0, "internal": True}]
+    score = default_objective = "depth"
+    min_gain = 0.005              # Siril stacking is deterministic (four identical stacks: the same depth to 1e-15); 0.5 % in S/N
+
+    def limits(self, ctx):
+        b = ctx.get("base") or {}
+        out = {"n_frames": ("min", 3), "field_fraction": ("min", 0.9)}
+        if b.get("ellipticity") is not None:
+            out["ellipticity"] = ("max", b["ellipticity"] + 0.02)
+        if b.get("outliers") is not None:
+            out["outliers"] = ("max", max(1.5 * b["outliers"], b["outliers"] + 2.0))
+        if b.get("trails") is not None:                      # a lax rejection (high sigma near 7 kept depth rising on M 31) lets trails through
+            out["trails"] = ("max", max(1.25 * b["trails"], b["trails"] + 20.0))
+        return out
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
         from ..session import Session
-        base = ds.ensure_stacked(log, cancel) if ds.synthetic else ds.session()
-        wd = os.path.join(study_dir, "work", "stack")
-        s = Session(ds.folder, wd)
-        s.cancel_flag = cancel
-        for n in ("calibration.json", "calib_prefs.json", "overrides.json"):
-            if os.path.exists(base._p(n)):
-                os.makedirs(s.dir, exist_ok=True)
-                shutil.copy(base._p(n), s._p(n))
-        log("Calibrating and registering once (the trials reuse the registration unless its settings change)")
-        s.run_analysis(1.0, _prog(log, 20), stack_params={})
-        return {"ds": ds, "session": s, "opts": opts, "device": device}
+        if int(opts.get("in_place", 0) or 0) and ds.given is not None:
+            s = ds.given
+            log("Stacking the session itself (hyper-tune): the registration of its analysis is reused")
+        else:
+            base = ds.ensure_stacked(log, cancel) if ds.synthetic else ds.session()
+            wd = os.path.join(study_dir, "work", "stack")
+            s = Session(ds.folder, wd)
+            s.cancel_flag = cancel
+            for n in ("calibration.json", "calib_prefs.json", "overrides.json"):
+                if os.path.exists(base._p(n)):
+                    os.makedirs(s.dir, exist_ok=True)
+                    shutil.copy(base._p(n), s._p(n))
+            log("Calibrating and registering once (the trials reuse the registration unless its settings change)")
+            s.run_analysis(1.0, _prog(log, 20), stack_params={})
+        saved = _store(study_dir, "reference.pkl") or {}
+        return {"ds": ds, "session": s, "opts": opts, "device": device, "study_dir": study_dir, "yard": saved.get("yard"), "base": saved.get("base")}
 
     def run(self, ctx, p, log, cancel):
         from .. import gates
         s, ds = ctx["session"], ctx["ds"]
-        sp = {k: p[k] for k in ("sigma_low", "sigma_high", "sensitivity", "mode", "scale", "pattern_correction", "crop_threshold")}
+        sp = {**(ctx["opts"].get("stack_params") or {}),
+              **{k: p[k] for k in ("rejection", "sigma_low", "sigma_high", "stack_weighting", "sensitivity", "mode", "drizzle_pixfrac", "drizzle_kernel",
+                                   "scale", "pattern_correction", "crop_threshold") if k in p}}
         t = time.time()
         meta = s.run_stack(sp, _prog(log, 20))
         dt = time.time() - t
-        st = _read(s._p("stack.fits"))
+        from .. import post
+        st, _ = post.normalise_scale(_read(s._p("stack.fits")))
         est = _hwc(st)
-        c = int(ctx["opts"].get("crop", 1024))
-        H, W = est.shape[:2]
-        y0, x0 = max(0, H // 2 - c // 2), max(0, W // 2 - c // 2)
-        x = np.ascontiguousarray(est[y0:y0 + c, x0:x0 + c])
+        if ctx["yard"] is None:                                 # the first trial (the baseline) is the reference of the paired measurements
+            ctx["yard"] = OB.Yardstick(est, keep_image=False)
+            log(f"Reference: {len(ctx['yard'].sx)} stars, FWHM {ctx['yard'].fwhm:.2f} px, {len(ctx['yard'].ax)} sky apertures")
+        y = ctx["yard"]
+        scale = float(meta.get("scale") or 1.0) / float((ctx.get("base") or {}).get("scale") or float(meta.get("scale") or 1.0))
+        field = est.shape[0] * est.shape[1] / (y.shape[0] * y.shape[1] * scale * scale)
+        try:
+            m = y.measure(est)
+        except Exception as e:                                   # noqa: BLE001  the reference stars cannot be mapped onto it (a stack cropped to part of the field)
+            m = dict(OB.Yardstick(est, keep_image=False).ref)
+            m["alignment"] = f"unpaired (its own stars): {type(e).__name__}: {e}"
+            log(f"Reference stars not mapped onto this stack ({e}); depth measured on its own stars")
+        m.update(OB.Yardstick.shape_and_outliers(est, y.fwhm))
+        x = _centre_crop(est, int(ctx["opts"].get("crop", 1024)))
         lum = x.mean(-1)
         noise = float(1.4826 * np.median(np.abs(lum - np.median(lum))))
         ms = gates.measure_stars(np.moveaxis(x, -1, 0), noise * 5.0) if noise > 0 else {"ellipticity": None}
-        out = {"bg_noise": MX.background_noise(x), "fwhm": MX.star_fwhm(x, 0.98), "roundness": ms.get("ellipticity"), "n_frames": meta["n_frames"], "seconds": dt}
+        out = {k: m.get(k) for k in ("depth", "snr_point", "snr_total", "fwhm", "ellipticity", "outliers", "dm_mad", "n_stars", "alignment")}
+        out.update(bg_noise=MX.background_noise(x), roundness=ms.get("ellipticity"), n_frames=meta["n_frames"], seconds=dt, field_fraction=float(field),
+                   trails=trail_pixels(est),
+                   scale=float(meta.get("scale") or 1.0),
+                   resampling=meta.get("resampling_reason"), rejection=(meta.get("rejection") or {}).get("type"))
+        if ctx["base"] is None:
+            ctx["base"] = dict(out)
+            _store(ctx["study_dir"], "reference.pkl", {"yard": y, "base": ctx["base"]})
         if ds.synthetic:
             out.update(_truth_scores(ds, s, st, float(ctx["opts"].get("sigma_eval", 1.0))))
         return out, x
 
 
-# ----------------------------------------------------------------------------- star separation
-class StarsTask(Task):
-    name = "stars"
-    label = "Star separation"
-    description = ("Star removal (post.remove_stars: StarXTerminator, else StarNet2; Cosmic Clarity DarkStar) on the dataset's linear image, scored against the stars the detector finds in it: "
-                   "their flux left in the starless image (local-background apertures), the fraction still detected, and the change away from every star (damage to "
-                   "nebula and sky, × the image's noise).  Synthetic data: the starless image against the true sky without stars.")
-    params = [
-        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"], "default": "auto", "tune": True, "processing": "star_removal"},
-        {"name": "starnet_stride", "label": "StarNet2 stride", "type": "categorical", "choices": [64, 128, 256], "default": 256, "tune": False, "processing": "starnet_stride"},
-    ]
-    metrics = {
-        "residual_flux": {"label": "Star flux left in the starless image (fraction)", "direction": "minimize"},
-        "residual_stars": {"label": "Stars still detected in the starless image (fraction)", "direction": "minimize"},
-        "offstar_change": {"label": "Change away from the stars (× noise)", "direction": "minimize"},
-        "seconds": {"label": "Run time (s)", "direction": "minimize"},
-        **{k: v for k, v in TRUTH_METRICS.items() if k in ("truth_nrmse", "truth_faint_nrmse", "truth_ssim", "truth_psnr")},
-    }
-    options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
-    default_objective = "residual_flux"
+# ----------------------------------------------------------------------------- satellite trails (Cosmic Clarity)
+def trail_pixels(img: np.ndarray, mask: np.ndarray | None = None) -> float:
+    """Pixels on straight trails, per million: the luminance high-passed at 16 px (galaxies, nebulae, gradients out), the star-like detections masked -
+    round ones only: a trail is detected as a source too, an elongated one, and stays - smoothed at 1.5 px and thresholded at 3 sigma of the smoothed
+    noise; the straight segments longer than a tenth of the frame found by the probabilistic Hough transform (Matas et al. 2000; OpenCV).
+    ``mask``: further pixels to leave out."""
+    import sep as _sep
+    L = OB.lum(img)
+    valid = OB.valid_region(L)
+    # high-pass: sep's sigma-clipped background on a 16 px mesh follows galaxies and nebulae but not a few-pixel-wide trail crossing a mesh
+    bk = _sep.Background(L, mask=~valid, bw=16, bh=16, fw=3, fh=3)
+    sub = np.ascontiguousarray(L - bk.back(), np.float32)
+    rms = max(bk.globalrms, 1e-12)
+    star = np.zeros(L.shape, np.uint8)
+    try:
+        objs = _sep.extract(sub, 5.0, err=rms, mask=~valid, minarea=5)
+        for x_, y_, a_, b_ in zip(objs["x"], objs["y"], objs["a"], objs["b"]):
+            if b_ >= 0.3 * a_ and a_ < 0.02 * max(L.shape):                  # round and compact: a star (a trail is long and thin)
+                cv2.circle(star, (int(round(x_)), int(round(y_))), int(round(3 * a_ + 3)), 1, -1)
+    except Exception:                                                    # noqa: BLE001
+        pass
+    z = sub / rms
+    z[(star > 0) | ~valid] = 0.0
+    if mask is not None:
+        z[mask] = 0.0
+    sm = cv2.GaussianBlur(z.astype(np.float32), (0, 0), 1.5)
+    s0 = OB.nmad(sm[valid & (star == 0)][::17]) or 1.0
+    binary = ((sm / s0) > 3.0).astype(np.uint8)
+    h, w = binary.shape
+    f = 2 if max(h, w) > 2000 else 1
+    if f > 1:
+        binary = cv2.resize(binary, (w // f, h // f), interpolation=cv2.INTER_NEAREST)
+    lines = cv2.HoughLinesP(binary * 255, 1, np.pi / 360, threshold=max(60, int(0.05 * min(h, w) / f)),
+                            minLineLength=int(0.1 * min(h, w) / f), maxLineGap=8)
+    if lines is None:
+        return 0.0
+    canvas = np.zeros(binary.shape, np.uint8)
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):        # (N, 1, 4) in OpenCV 4, (N, 4) in 5
+        cv2.line(canvas, (int(x1), int(y1)), (int(x2), int(y2)), 1, 3)
+    return float((canvas & binary).sum() * f * f / max(valid.sum(), 1) * 1e6)
+
+
+class SatelliteTask(Task):
+    name = "satellite"
+    label = "Satellite trails (Cosmic Clarity)"
+    description = ("Cosmic Clarity satellite-trail removal (siril-scripts CosmicClarity_Native.py, the script's defaults) on the dataset's stack, as the restore stage "
+                   "runs it, against the stack as it is.  Scored by the straight trails left (Hough transform on the source-masked sky) and the change it makes "
+                   "away from them (it must leave everything else alone).")
+    objective_note = ("Score: trail pixels per million left in the stack (probabilistic Hough on the 3-sigma sky).  Constraint: the change at scales above the "
+                      "PSF, away from the stars and the trails, at most 0.5 x the noise there.  With no trail in the stack, removal changes nothing and the "
+                      "baseline (off) stays.")
+    params = [{"name": "satellite_removal", "label": "Cosmic Clarity satellite-trail removal", "type": "bool", "default": False, "tune": True, "hypertune": True,
+               "pipeline": "satellite_removal"}]
+    metrics = {"trails": {"label": "Trail pixels per million", "direction": "minimize"},
+               "trails_detected": {"label": "Cosmic Clarity detected trails (1 = yes)", "direction": "minimize"},
+               "large_change": {"label": "Change above the PSF scale away from stars and trails (× noise)", "direction": "minimize"},
+               "seconds": {"label": "Run time (s)", "direction": "minimize"}}
+    score = default_objective = "trails"
+    min_gain = 1.0
+
+    def static_limits(self):
+        return {"large_change": ("max", 0.5)}
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
-        from scipy.spatial import cKDTree  # noqa: F401
+        from .. import post
         s = ds.ensure_stacked(log, cancel)
-        src = s._p("linear.fits") if os.path.exists(s._p("linear.fits")) else s._p("stack.fits")
-        lin = _read(src)
-        L = np.ascontiguousarray(_hwc(lin).mean(-1), np.float32)
-        import sep as _sep
-        bk = _sep.Background(L, bw=64, bh=64)
-        sub = L - bk.back()
-        objs = _sep.extract(sub, 5.0, err=bk.globalrms, minarea=5)
-        if len(objs) < 20:
-            raise RuntimeError(f"only {len(objs)} stars found: too few to score a star removal")
-        fw = float(np.median(2.0 * np.sqrt(objs["a"] * objs["b"]))) or 3.0
-        r_ap = max(1.5 * fw, 2.0)
-        f0, _, _ = _sep.sum_circle(L, objs["x"], objs["y"], r_ap, bkgann=(2.5 * r_ap, 4 * r_ap), subpix=5)
-        keep = f0 > 0
-        mask = np.zeros(L.shape, np.uint8)
-        for x_, y_ in zip(objs["x"], objs["y"]):
-            cv2.circle(mask, (int(round(x_)), int(round(y_))), int(round(2 * r_ap)), 1, -1)
-        off = mask == 0
-        off[:8], off[-8:], off[:, :8], off[:, -8:] = False, False, False, False
-        log(f"{int(keep.sum())} reference stars (FWHM {fw:.2f} px), {int(off.mean() * 100)} % of the image away from every star")
-        return {"ds": ds, "session": s, "lin": lin, "L0": L, "src": os.path.basename(src), "ref_x": objs["x"][keep], "ref_y": objs["y"][keep], "ref_f": f0[keep], "r_ap": r_ap,
-                "fw": fw, "off": off, "noise": float(bk.globalrms), "study_dir": study_dir, "n": 0, "opts": opts, "device": device}
+        st, _ = post.normalise_scale(_read(s._p("stack.fits")))
+        img = _hwc(st)
+        y = OB.Yardstick(img)
+        t0 = trail_pixels(img)
+        log(f"Stack: {t0:.0f} trail pixels per million")
+        return {"ds": ds, "session": s, "stack": st, "img": img, "yard": y, "trails0": t0, "device": device, "study_dir": study_dir, "n": 0}
 
     def run(self, ctx, p, log, cancel):
-        import sep as _sep
-        from scipy.spatial import cKDTree
-        from .. import post
-        s, ds = ctx["session"], ctx["ds"]
+        from .. import tools
+        y = ctx["yard"]
+        if not p.get("satellite_removal"):
+            return {"trails": ctx["trails0"], "trails_detected": 0, "large_change": 0.0, "seconds": 0.0}, _centre_crop(ctx["img"])
         ctx["n"] += 1
-        wd = os.path.join(ctx["study_dir"], "work", f"stars_{ctx['n']}")
-        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "linear.fits", "restore_meta.json"))
-        prm = {**post.DEFAULTS, **p}
-        sp = {**(s.meta.get("params") or {}), "device": str(ctx["device"])}
+        work = os.path.join(ctx["study_dir"], "work", f"sat_{ctx['n']}")
         t = time.time()
         try:
-            def checkpoint():
-                if cancel.is_set():
-                    raise RuntimeError("cancelled")
-            meta = post.remove_stars(wd, s.meta, prm, sp, None, checkpoint)
-            dt = time.time() - t
-            if not os.path.exists(os.path.join(wd, "starless.fits")):
-                raise RuntimeError(f"no starless image: {meta.get('tool')} {meta.get('reason') or ''}")
-            starless = _read(os.path.join(wd, "starless.fits"))
-            L1 = np.ascontiguousarray(_hwc(starless).mean(-1), np.float32)
-            r = ctx["r_ap"]
-            f1, _, _ = _sep.sum_circle(L1, ctx["ref_x"], ctx["ref_y"], r, bkgann=(2.5 * r, 4 * r), subpix=5)
-            out = {"residual_flux": float(np.clip(f1, 0, None).sum() / ctx["ref_f"].sum()), "seconds": dt, "tool": meta.get("tool")}
-            bk = _sep.Background(L1, bw=64, bh=64)
-            objs = _sep.extract(L1 - bk.back(), 5.0, err=max(bk.globalrms, ctx["noise"]), minarea=5)
-            if len(objs):
-                d, _ = cKDTree(np.stack([objs["x"], objs["y"]], 1)).query(np.stack([ctx["ref_x"], ctx["ref_y"]], 1))
-                out["residual_stars"] = float(np.mean(d < max(1.5 * ctx["fw"], 2.0)))
-            else:
-                out["residual_stars"] = 0.0
-            out["offstar_change"] = float(np.mean(np.abs(L1 - ctx["L0"])[ctx["off"]]) / max(ctx["noise"], 1e-9))
-            if ds.synthetic:
-                out.update(_truth_scores(ds, s, starless, float(ctx["opts"].get("sigma_eval", 1.0)), stars_in_result=False))
-            return out, _hwc(starless)
+            out, meta = tools.cosmic_clarity.run("satellite", ctx["stack"], ["--sat-mode", "full", "--sensitivity", "0.1"], work=work, device=str(ctx["device"]),
+                                                 checkpoint=_checkpoint(cancel))
         finally:
-            shutil.rmtree(wd, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
+        img = _hwc(out)
+        tr = trail_pixels(img)
+        # the change away from the trails: the trails found on the original are masked too
+        m = y.measure(img, same_grid=True, normalise_gain=False)
+        return {"trails": tr, "trails_detected": int(bool(meta.get("trails_detected"))), "large_change": m.get("large_change"), "seconds": time.time() - t}, _centre_crop(img)
 
 
 # ----------------------------------------------------------------------------- gradient removal
@@ -579,33 +624,114 @@ def _tile_medians(img: np.ndarray, yard: dict) -> np.ndarray:
     return np.asarray(out)
 
 
+def model_structure(before: np.ndarray, after: np.ndarray, valid: np.ndarray) -> float:
+    """How much of the image's structure at 1 - 10 % of the frame the gradient model took away: the std of the removed component's band-pass
+    (difference of Gaussians at 1 % and 10 % of the long side) over that of the image's own.  A gradient (sky glow, vignetting, amp glow) is smooth
+    at those scales - the scale separation every background extraction rests on (DBE / ABE, GraXpert) - and nebulae, dust and galaxy halos are not."""
+    L0, L1 = OB.lum(before), OB.lum(after)
+    h, w = L0.shape
+    f = max(1, int(round(max(h, w) / 800)))
+    sz = (w // f, h // f)
+    a, b = cv2.resize(L0, sz, interpolation=cv2.INTER_AREA), cv2.resize(L1, sz, interpolation=cv2.INTER_AREA)
+    v = cv2.resize(valid.astype(np.uint8), sz, interpolation=cv2.INTER_NEAREST) > 0
+    s1, s2 = 0.01 * max(sz), 0.10 * max(sz)
+    yy, xx = np.mgrid[0:sz[1], 0:sz[0]].astype(np.float32)
+    xx, yy = xx / sz[0] - 0.5, yy / sz[1] - 0.5
+    A = np.stack([np.ones_like(xx), xx, yy, xx * xx, xx * yy, yy * yy], -1)
+
+    def band(x):
+        # a quadratic surface (the least any gradient model holds) off first: the blur's mirrored borders would turn a ramp into band-pass structure
+        coef, *_ = np.linalg.lstsq(A[v], x[v], rcond=None)
+        r = (x - A @ coef).astype(np.float32)
+        return cv2.GaussianBlur(r, (0, 0), s1) - cv2.GaussianBlur(r, (0, 0), s2)
+    d = a - b
+    return float(np.std(band(d)[v]) / max(np.std(band(a)[v]), 1e-12))
+
+
 class BackgroundTask(Task):
     name = "background"
     label = "Gradient removal"
     description = ("The restore stage's gradient model on the stack: the NSNS sky survey reference (when plate-solved and covered), GraXpert's AI background extraction with its "
-                   "smoothing, or Siril subsky (polynomial degree / RBF smoothing), subtraction or division.  Real data: the gradient left in the sky (range of a robust "
-                   "quadratic over the star-free sky tiles, × the pixel noise) and the extended emission removed (the fraction of the emission tiles' signal the model took "
-                   "away).  Sky and emission tiles are set once against a robust plane through the faintest tiles.  Synthetic data: against the truth (constant offset fitted).")
-    params = _processing_params(["bg_method", "bg_correction", "bg_degree", "bg_smoothing"], {"bg_method", "bg_smoothing", "bg_degree"})
+                   "smoothing, or Siril subsky (polynomial degree / RBF smoothing), subtraction or division.  Real data: the emission the model changed (the signal of "
+                   "the emission tiles above the sky), the gradient left in the sky (range of a robust quadratic over the star-free sky tiles, × the pixel noise) and "
+                   "the structure the model took away at 1-10 % of the frame (a gradient has none there).  "
+                   "Sky and emission tiles are set once against a robust plane through the faintest tiles.  Synthetic data: against the truth (constant offset fitted).")
+    objective_note = ("Score: emission_change = |signal_removed|, the fraction of the emission tiles' signal above the sky that the model changed - "
+                      "the gradient model that leaves the emission most intact.  Constraints: the gradient left in the sky tiles at most 3 × the pixel noise "
+                      "(sky_flatness: the model must remove the gradient) and the model's own structure at 1-10 % of the frame at most 15 % of the "
+                      "image's there.  Validated against the truth of a synthetic sky (12 models: Spearman rho +0.99 between emission_change and the "
+                      "error against the truth, -0.19 for sky_flatness): the 'sky' tiles of a nebula field hold faint nebula, so the flattest sky is "
+                      "the one whose model ate it - on Sh2-131 GraXpert left the flattest sky (0.14 × noise against 0.77 for the sky-survey "
+                      "reference) by taking 43 % of the nebula's signal.  Sky flatness ranks no model; it only rejects one that leaves the gradient.")
+    params = _processing_params(["bg_method", "bg_correction", "bg_degree", "bg_smoothing"], {"bg_method", "bg_smoothing", "bg_degree"},
+                                hypertune={"bg_method": True, "bg_correction": True, "bg_degree": True, "bg_smoothing": True},
+                                when={"bg_degree": {"bg_method": ["poly"]}, "bg_smoothing": {"bg_method": ["auto", "graxpert", "rbf"]},
+                                      "bg_correction": {"bg_method": ["auto", "graxpert", "poly", "rbf"]}})
+    # reference = auto without its fallback: the same model wherever auto uses the survey
+    next(q for q in params if q["name"] == "bg_method")["ht_choices"] = ["auto", "graxpert", "poly", "rbf"]
     metrics = {
+        "emission_change": {"label": "Emission changed by the model (|fraction of the emission tiles' signal|)", "direction": "minimize"},
         "sky_flatness": {"label": "Gradient left in the sky (× pixel noise)", "direction": "minimize"},
-        "signal_removed": {"label": "Extended emission removed (fraction)", "direction": "minimize"},
+        "model_structure": {"label": "Structure the model removed at 1-10 % of the frame (fraction)", "direction": "minimize"},
+        "signal_removed": {"label": "Extended emission removed (fraction, emission tiles)", "direction": "minimize"},
         "seconds": {"label": "Run time (s)", "direction": "minimize"},
         **{k: v for k, v in TRUTH_METRICS.items() if k in ("truth_nrmse", "truth_faint_nrmse", "truth_ssim", "truth_psnr")},
     }
     options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 4.0}]
-    default_objective = "sky_flatness"
+    score = default_objective = "emission_change"
+    min_gain = 0.02
+
+    def static_limits(self):
+        return {"model_structure": ("max", 0.15), "sky_flatness": ("max", 3.0)}
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
+        from .. import post
         s = ds.ensure_stacked(log, cancel)
         stack = _read(s._p("stack.fits"))
+        # the stack as the restore stage loads it (post.Restorer: row order, _sanitize - an HDR stack peaking at 2.13 is divided by it - and
+        # normalise_scale); comparing the file's own values with the restored ones scored that rescale as removed signal
+        wd = os.path.join(study_dir, "work", "bg_ref")
+        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json"))
+        try:
+            stack = post.Restorer(wd, s.meta, {}, dict(post.DEFAULTS), None, None).arr.copy()
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
         img = _hwc(stack)
         yard = _sky_yardstick(img)
         log(f"{len(yard['tiles'])} scoring tiles: {int(yard['sky'].sum())} sky, {int(yard['emission'].sum())} emission")
-        return {"ds": ds, "session": s, "stack": stack, "img": img, "yard": yard, "study_dir": study_dir, "n": 0, "opts": opts, "device": device}
+        # does the sky-survey reference apply to this field (plate-solved, covered)?  Then "auto" is the survey model, which ignores the smoothing and the
+        # correction - those trials are one setting (canonical); on M 31 37 of 60 trials had been auto with differing, unused smoothing values
+        skyref_ok = False
+        wd = os.path.join(study_dir, "work", "bg_probe")
+        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
+        try:
+            from .. import post
+            r = post.Restorer(wd, s.meta, {"device": str(device)}, {**post.DEFAULTS, "bg_method": "reference"}, None, _checkpoint(cancel))
+            r.background()
+            skyref_ok = (([x for x in r.steps.records if x["step"] == "gradient"] or [{}])[-1]).get("status") == "done"
+        except Exception as e:                     # noqa: BLE001
+            log(f"Sky-survey reference probe: {e}")
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
+        log("The sky-survey reference covers this field: auto = the survey model" if skyref_ok else "No sky-survey reference for this field: auto = GraXpert")
+        try:                                       # the photometric scale: the stars' local-background photometry, which no gradient model changes
+            stars = OB.Yardstick(img, keep_image=False)
+        except Exception as e:                     # noqa: BLE001
+            stars = None
+            log(f"No star photometry for the photometric scale ({e}): results are compared as they are")
+        return {"ds": ds, "session": s, "stack": stack, "img": img, "yard": yard, "study_dir": study_dir, "n": 0, "opts": opts, "device": device,
+                "valid": OB.valid_region(OB.lum(img)), "stars": stars, "skyref": skyref_ok}
+
+    def canonical(self, active, ctx):
+        m = str(active.get("bg_method", "auto"))
+        if m == "reference" or (m == "auto" and ctx.get("skyref")):
+            return {"bg_method": "sky-survey reference" if ctx.get("skyref") else "reference (unavailable)"}
+        if m == "auto":
+            return {**{k: v for k, v in active.items()}, "bg_method": "graxpert"}       # auto without the survey = GraXpert
+        return active
 
     def run(self, ctx, p, log, cancel):
-        from .. import fitsio, post
+        from .. import post
         s, ds, yard = ctx["session"], ctx["ds"], ctx["yard"]
         ctx["n"] += 1
         wd = os.path.join(ctx["study_dir"], "work", f"bg_{ctx['n']}")
@@ -613,26 +739,38 @@ class BackgroundTask(Task):
         prm = {**post.DEFAULTS, **p}
         t = time.time()
         try:
-            r = post.Restorer(wd, s.meta, {"device": str(ctx["device"])}, prm, None, (lambda: (_ for _ in ()).throw(RuntimeError("cancelled")) if cancel.is_set() else None))
-            r.arr, r.header = fitsio.read_rgb(os.path.join(wd, "stack.fits"))
-            r.arr, _ = post.normalise_scale(r.arr)
+            r = post.Restorer(wd, s.meta, {"device": str(ctx["device"])}, prm, None, _checkpoint(cancel))     # loads the stack as the restore does
+            before = _hwc(r.arr)
             r.background()
             dt = time.time() - t
             res = _hwc(r.arr)
-            step = next((x for x in r.steps.records if x["step"] == "gradient"), {})
-            T1 = _tile_medians(res, yard)
+            step = ([x for x in r.steps.records if x["step"] == "gradient"] or [{}])[-1]        # auto: the survey may be skipped, its fallback ran
+            # a global rescale is no change of the emission: post._sanitize divides the result by its peak when the gradient model's pedestal lifts
+            # a saturated core above 1 (M 31: x 0.89, which had scored every model as removing 11 % of the galaxy); the stars' fluxes give the scale
+            gain = 1.0
+            if ctx.get("stars") is not None:
+                dm = ctx["stars"].measure(res, same_grid=True, normalise_gain=False).get("dm_median")
+                if dm is not None and np.isfinite(dm):
+                    gain = float(10 ** (-0.4 * dm))
+            res_n = res / np.float32(gain)
+            if step.get("status") not in (None, "done"):
+                raise RuntimeError(f"{step.get('tool')} {step.get('status')}: {step.get('note') or ''}")
+            T1 = _tile_medians(res_n, yard)
             sky = yard["sky"]
             # the gradient left: range of a robust quadratic over the sky tiles, in units of the pixel noise
             cx, cy = yard["cx"][sky], yard["cy"][sky]
             A = np.stack([np.ones(sky.sum()), cx, cy, cx * cx, cx * cy, cy * cy], 1)
             coef, *_ = np.linalg.lstsq(A, T1[sky], rcond=None)
             fitv = A @ coef
-            out = {"sky_flatness": float(np.ptp(fitv) / max(yard["noise"], 1e-12)), "seconds": dt, "method_used": step.get("tool"), "note": step.get("note")}
+            out = {"sky_flatness": float(np.ptp(fitv) / max(yard["noise"], 1e-12)), "seconds": dt, "method_used": step.get("tool"), "note": step.get("note"),
+                   "model_structure": model_structure(before, res_n, ctx["valid"]), "gain": gain}
             em = yard["emission"]
+            out["signal_removed"] = 0.0                              # no emission tiles: nothing a model could take away
             if em.any() and sky.any():
-                before = yard["med0"][em] - np.median(yard["med0"][sky])
+                before_t = yard["med0"][em] - np.median(yard["med0"][sky])
                 after = T1[em] - np.median(T1[sky])
-                out["signal_removed"] = float(np.clip(1.0 - after.sum() / max(before.sum(), 1e-12), -1.0, 1.0))
+                out["signal_removed"] = float(np.clip(1.0 - after.sum() / max(before_t.sum(), 1e-12), -1.0, 1.0))
+            out["emission_change"] = abs(out["signal_removed"])
             if ds.synthetic:
                 out.update(_truth_scores(ds, s, r.arr, float(ctx["opts"].get("sigma_eval", 4.0)), stars_in_result=True, fit_plane=False))
             return out, res
@@ -640,4 +778,489 @@ class BackgroundTask(Task):
             shutil.rmtree(wd, ignore_errors=True)
 
 
-TASKS = {t.name: t for t in (FinishTask(), RestoreTask(), StackTask(), StarsTask(), BackgroundTask())}
+# ----------------------------------------------------------------------------- linear restoration
+_BXT = ["auto", "bxt"]
+_STRENGTH_TOOLS = ["auto", "rl", "graxpert"]          # the Deconvolution slider acts on RL (blend) and GraXpert (-strength); auto falls back to RL without BXT
+
+
+class RestoreTask(Task):
+    name = "restore"
+    label = "Linear restoration (restore stage)"
+    description = ("The linear stage (post.restore) on a copy of the stack: the deconvolution tool of the objects and of the stars (BlurXTerminator, GraXpert, Siril RL) "
+                   "with their strengths, the noise reduction tool (NoiseXTerminator, GraXpert, Siril) with its strength, colour calibration and gradient settings.  "
+                   "Every trial is measured against a reference restore run once with the same gradient and colour settings and no deconvolution or noise "
+                   "reduction: the same stars and sky apertures.  Each trial runs the whole linear stage (about a minute).")
+    objective_note = ("Score: depth of the restored image (point- and extended-source S/N on the reference stars, empty-aperture noise): sharpening and noise "
+                      "reduction both raise it.  Constraints closing its exploits: star flux conserved (|median Δmag| bright ≤ 0.05, faint ≤ 0.10 in the "
+                      "2.5 FWHM aperture: GraXpert's stars model shrank stars by removing their light); the image above the PSF scale, away from the stars, "
+                      "unchanged within 1.25 × its noise there (discrepancy principle: the PSF band-limits the sky, so only noise lives below it - a denoiser "
+                      "that smears faint structure changes more); no dark rings round the bright stars (moat ≤ 1 pixel-noise deeper than the reference).")
+    params = (_processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance",
+                                  "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations"],
+                                 {"deconvolution", "denoise"},
+                                 hypertune={"deconvolution": True, "denoise": True, "bxt_auto": True, "bxt_sharpen_stars": True, "bxt_sharpen_nonstellar": True,
+                                            "bxt_halos": True, "linear_denoise_auto": True, "linear_denoise_strength": True, "nxt_iterations": True},
+                                 when={"bg_degree": {"bg_method": ["poly"]}, "bg_smoothing": {"bg_method": ["auto", "graxpert", "rbf"]},
+                                       "deconvolution": [{"deconv_method": _STRENGTH_TOOLS}, {"deconv_stars_method": _STRENGTH_TOOLS}],
+                                       "bxt_auto": [{"deconv_method": _BXT}, {"deconv_stars_method": _BXT}],
+                                       "bxt_sharpen_stars": {"bxt_auto": [False], "deconv_stars_method": _BXT},
+                                       "bxt_halos": {"bxt_auto": [False], "deconv_stars_method": _BXT},
+                                       "bxt_sharpen_nonstellar": {"bxt_auto": [False], "deconv_method": _BXT},
+                                       "denoise": {"denoise_method": ["auto", "nxt", "graxpert", "siril"], "linear_denoise_auto": [True]},
+                                       "linear_denoise_auto": {"denoise_method": ["auto", "nxt", "graxpert", "siril"]},
+                                       "linear_denoise_strength": {"denoise_method": ["auto", "nxt", "graxpert", "siril"], "linear_denoise_auto": [False]},
+                                       "nxt_iterations": {"denoise_method": ["auto", "nxt"], "linear_denoise_auto": [False]}})
+              + [{"name": "deconv_method", "label": "Deconvolution tool (objects)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"],
+                  "default": "auto", "tune": False, "hypertune": True, "pipeline": "deconv_method"},
+                 {"name": "deconv_stars_method", "label": "Deconvolution tool (stars)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"],
+                  "default": "auto", "tune": False, "hypertune": True, "pipeline": "deconv_stars_method"},
+                 {"name": "denoise_method", "label": "Noise reduction tool", "type": "categorical", "choices": ["auto", "nxt", "graxpert", "siril", "none"],
+                  "default": "auto", "tune": False, "hypertune": True, "pipeline": "denoise_method"},
+                 {"name": "graxpert_psfsize", "label": "GraXpert PSF size (px; 0 = measured)", "type": "float", "low": 0.0, "high": 14.0, "default": 0.0, "tune": False,
+                  "pipeline": "graxpert_psfsize", "when": [{"deconv_method": ["graxpert"]}, {"deconv_stars_method": ["graxpert"]}]},
+                 {"name": "satellite_removal", "label": "Cosmic Clarity satellite-trail removal (before the gradient)", "type": "bool", "default": False, "tune": False,
+                  "pipeline": "satellite_removal"}])
+    metrics = {
+        **DEPTH_METRICS,
+        "dm_bright_abs": {"label": "|Δmag| bright reference stars against the reference restore", "direction": "minimize"},
+        "dm_faint_abs": {"label": "|Δmag| faint reference stars against the reference restore", "direction": "minimize"},
+        "large_change": {"label": "Change above the PSF scale away from the stars (× noise)", "direction": "minimize"},
+        "moat": {"label": "Dark ring depth round bright stars (× pixel noise)", "direction": "minimize"},
+        "gain": {"label": "Global scale against the reference (a change of units; the photometry is judged after it)", "direction": "minimize"},
+        "bg_noise": {"label": "Background noise", "direction": "minimize"},
+        "sharpness": {"label": "Sharpness S_F (Krotkov; rewards noise - reported only)", "direction": "maximize"},
+        "seconds": {"label": "Run time (s)", "direction": "minimize"},
+        **TRUTH_METRICS,
+    }
+    options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
+    score = default_objective = "depth"
+    min_gain = 0.01               # 3 sigma of the difference of two runs: identical restorations scatter by sd 0.0023 in depth (GPU BXT / NXT, Sh2-131)
+    NOOP = {"deconv_method": "none", "deconv_stars_method": "none", "denoise_method": "none", "satellite_removal": False}
+
+    def limits(self, ctx):
+        out = {"dm_bright_abs": ("max", 0.05), "dm_faint_abs": ("max", 0.10), "large_change": ("max", 1.25)}
+        ref = ctx.get("ref_moat")
+        out["moat"] = ("max", (ref or 0.0) + 1.0)
+        return out
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        s = ds.ensure_stacked(log, cancel)
+        stack = _read(s._p("stack.fits"))
+        from ..hypertune import available_tools
+        tools = available_tools()
+        auto_dc = "bxt" if tools.get("bxt") else "rl"
+        auto_dn = next((t for t, k in (("nxt", "nxt"), ("graxpert", "graxpert_denoise")) if tools.get(k)), "siril")
+        return {"ds": ds, "session": s, "stack": stack, "study_dir": study_dir, "n": 0, "device": device, "opts": opts, "refs": {},
+                "auto_deconv": auto_dc, "auto_denoise": auto_dn}
+
+    def canonical(self, active, ctx):
+        """What runs: auto = BlurXTerminator when licensed (else Siril RL), the denoiser auto = the first available of NXT / GraXpert / Siril; the
+        Deconvolution slider only switches a BXT-only deconvolution on (> 0) or off; strengths of tools that do not run do not count."""
+        a = dict(active)
+        if "deconv_method" in a or "deconv_stars_method" in a:
+            o = str(a.get("deconv_method", "auto")).replace("auto", ctx.get("auto_deconv", "auto"))
+            st = str(a.get("deconv_stars_method", "auto") or o).replace("auto", ctx.get("auto_deconv", "auto"))
+            a["deconv_method"], a["deconv_stars_method"] = o, st
+            if "deconvolution" in a and not {"rl", "graxpert"} & {o, st}:
+                a["deconvolution"] = float(a["deconvolution"]) > 0
+            if "bxt" not in (o, st):
+                for k in ("bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos"):
+                    a.pop(k, None)
+        if "denoise_method" in a:
+            a["denoise_method"] = str(a["denoise_method"]).replace("auto", ctx.get("auto_denoise", "auto"))
+            if a["denoise_method"] != "nxt":
+                a.pop("nxt_iterations", None)
+        return a
+
+    def _settings(self, ctx, p):
+        from .. import post
+        tool_keys = ("deconv_method", "deconv_stars_method", "denoise_method", "graxpert_psfsize", "satellite_removal")
+        prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k not in tool_keys}}
+        s = ctx["session"]
+        sp = {**(s.meta.get("params") or {}), **(ctx["opts"].get("stack_params") or {}),
+              **{k: p[k] for k in tool_keys if k in p}, "device": str(ctx["device"])}
+        if not p.get("deconv_stars_method"):
+            sp["deconv_stars_method"] = ""
+        return prm, sp
+
+    def _restore(self, ctx, prm, sp, tag, cancel):
+        """post.restore's steps on a copy of the stack.  Everything before the deconvolution (trail removal, gradient, plate solve, BlurXTerminator's
+        correct-only PSF pass, SPCC) depends only on the gradient / colour settings and on whether BXT is among the deconvolution tools: that state is
+        computed once per such key and the trials run from it (a full restore was 2 min a trial on M 31, most of it SPCC)."""
+        import copy
+        from .. import post
+        s = ctx["session"]
+        wd = os.path.join(ctx["study_dir"], "work", tag)
+        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
+        try:
+            r = post.Restorer(wd, s.meta, sp, {**post.DEFAULTS, **prm}, None, _checkpoint(cancel))
+            psf = (r.source != "imagemm.fits" and float(r.p["deconvolution"]) > 0 and r.deconv != ("none", "none") and bool({"auto", "bxt"} & set(r.deconv)))
+            key = json.dumps([{k: r.p.get(k) for k in ("background", "bg_method", "bg_correction", "bg_degree", "bg_smoothing", "white_balance", "spcc_sensor",
+                                                        "spcc_filter", "spcc_white_ref")}, bool(sp.get("satellite_removal")), psf], sort_keys=True, default=str)
+            pre = ctx.setdefault("pre", {})
+            t0 = time.time()
+            if key in pre:
+                c = pre[key]
+                r.arr, r.header, r.info = c["arr"].copy(), c["header"].copy(), copy.deepcopy(c["info"])
+                r.psf_corrected, r.steps.records = c["psf_corrected"], copy.deepcopy(c["records"])
+            else:
+                r.satellite()
+                r.background()
+                solved = r.plate_solve()
+                r.psf_correction()
+                r.colour(solved)
+                pre[key] = {"arr": r.arr.copy(), "header": r.header.copy(), "info": copy.deepcopy(r.info), "psf_corrected": r.psf_corrected,
+                            "records": copy.deepcopy(r.steps.records)}
+            r.deconvolve()
+            r.denoise()
+            meta = r.save()
+            meta["seconds"] = round(time.time() - t0, 1)
+            return r.arr.copy(), meta
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
+
+    def _reference(self, ctx, prm, sp, log, cancel):
+        """The no-op restore (no deconvolution, no noise reduction, no trail removal) with this trial's gradient and colour settings, once per such settings."""
+        key = json.dumps({k: prm.get(k) for k in ("background", "bg_method", "bg_correction", "bg_degree", "bg_smoothing", "white_balance", "spcc_sensor",
+                                                  "spcc_filter", "spcc_white_ref")}, sort_keys=True, default=str)
+        if key not in ctx["refs"]:
+            log("Reference restore (same gradient and colour settings, no deconvolution / noise reduction)")
+            lin, _ = self._restore(ctx, prm, {**sp, **self.NOOP}, "restore_ref", cancel)
+            y = OB.Yardstick(_hwc(lin))
+            ctx["refs"][key] = y
+            ctx["ref_moat"] = y.ref.get("moat")
+            log(f"Reference: {len(y.sx)} stars, FWHM {y.fwhm:.2f} px, {len(y.ax)} sky apertures, depth {y.ref.get('depth', float('nan')):.3f}")
+        return ctx["refs"][key]
+
+    def run(self, ctx, p, log, cancel):
+        s, ds = ctx["session"], ctx["ds"]
+        ctx["n"] += 1
+        prm, sp = self._settings(ctx, p)
+        y = self._reference(ctx, prm, sp, log, cancel)
+        t = time.time()
+        lin, meta = self._restore(ctx, prm, sp, f"restore_{ctx['n']}", cancel)
+        dt = time.time() - t
+        est = _hwc(lin)
+        m = y.measure(est, same_grid=True)
+        out = {k: m.get(k) for k in ("depth", "snr_point", "snr_total", "fwhm", "dm_bright_abs", "dm_faint_abs", "dm_bright", "dm_faint", "large_change", "moat", "gain")}
+        out.update(bg_noise=MX.background_noise(est), sharpness=float(np.mean([MX.sharpness(est[..., c]) for c in range(3)])), seconds=dt,
+                   tools=" + ".join(meta.get("tools") or []) or "none",
+                   failed=[f"{r['tool']}: {r['status']}" for r in meta.get("steps", []) if r.get("status") in ("failed", "unavailable")])
+        if ds.synthetic:
+            out.update(_truth_scores(ds, s, lin, float(ctx["opts"].get("sigma_eval", 1.0))))
+        return out, est
+
+
+# ----------------------------------------------------------------------------- star separation
+class StarsTask(Task):
+    name = "stars"
+    label = "Star separation"
+    description = ("Star removal (post.remove_stars: StarXTerminator, StarNet2, Cosmic Clarity DarkStar) on the dataset's linear image, scored on the reference stars "
+                   "of the linear image: the light left at their positions in the starless image (local-background apertures; light left and holes dug both count), "
+                   "and the change away from every star.  Synthetic data: the starless image against the true sky without stars.")
+    objective_note = ("Score: star_residual = Σ |flux at the reference stars in the starless image| / Σ their flux in the linear image (2.5 FWHM apertures, local "
+                      "annulus background): left-over cores and inpainting holes are both errors.  Constraints: the starless image unchanged above the PSF scale "
+                      "away from the stars within 1 × the noise there (the nebula and the sky are not the remover's to touch), and holes (a star's aperture "
+                      "more than 3 σ below its surroundings) at most 5 % of the stars.")
+    params = [
+        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"], "ht_choices": ["sxt", "starnet", "darkstar"],
+         "default": "auto", "tune": True, "hypertune": True, "processing": "star_removal"},
+        {"name": "starnet_stride", "label": "StarNet2 stride", "type": "categorical", "choices": [64, 128, 256], "default": 256, "tune": False, "hypertune": True,
+         "processing": "starnet_stride", "when": {"star_removal": ["starnet"]}},
+    ]
+    metrics = {
+        "star_residual": {"label": "Star light left + holes at the reference stars (fraction of their flux)", "direction": "minimize"},
+        "holes": {"label": "Stars with a hole dug in the starless image (fraction)", "direction": "minimize"},
+        "offstar_large_change": {"label": "Change above the PSF scale away from the stars (× noise)", "direction": "minimize"},
+        "residual_flux": {"label": "Star flux left in the starless image (fraction, positive only)", "direction": "minimize"},
+        "residual_stars": {"label": "Stars still detected in the starless image (fraction)", "direction": "minimize"},
+        "offstar_change": {"label": "Mean change away from the stars (× noise)", "direction": "minimize"},
+        "seconds": {"label": "Run time (s)", "direction": "minimize"},
+        **{k: v for k, v in TRUTH_METRICS.items() if k in ("truth_nrmse", "truth_faint_nrmse", "truth_ssim", "truth_psnr")},
+    }
+    options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
+    score = default_objective = "star_residual"
+    min_gain = 0.002
+
+    def static_limits(self):
+        return {"offstar_large_change": ("max", 1.0), "holes": ("max", 0.05)}
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        import sep as _sep
+        s = ds.ensure_stacked(log, cancel)
+        src = s._p("linear.fits") if os.path.exists(s._p("linear.fits")) else s._p("stack.fits")
+        lin = _read(src)
+        L = OB.lum(_hwc(lin))
+        y = OB.Yardstick(_hwc(lin))
+        bk = _sep.Background(L, bw=64, bh=64)
+        sub = L - bk.back()
+        objs = _sep.extract(sub, 5.0, err=bk.globalrms, minarea=5)
+        if len(objs) < 20:
+            raise RuntimeError(f"only {len(objs)} stars found: too few to score a star removal")
+        fw = float(np.median(2.0 * np.sqrt(objs["a"] * objs["b"]))) or 3.0
+        r_ap = max(1.5 * fw, 2.0)
+        f0, _, _ = _sep.sum_circle(L, objs["x"], objs["y"], r_ap, bkgann=(2.5 * r_ap, 4 * r_ap), subpix=5)
+        keep = f0 > 0
+        mask = np.zeros(L.shape, np.uint8)
+        for x_, y_ in zip(objs["x"], objs["y"]):
+            cv2.circle(mask, (int(round(x_)), int(round(y_))), int(round(2 * r_ap)), 1, -1)
+        off = mask == 0
+        off[:8], off[-8:], off[:, :8], off[:, -8:] = False, False, False, False
+        log(f"{len(y.sx)} reference stars (FWHM {y.fwhm:.2f} px); {int(keep.sum())} detected stars; {int(off.mean() * 100)} % of the image away from every star")
+        from ..hypertune import available_tools
+        tools = available_tools()
+        return {"ds": ds, "session": s, "lin": lin, "L0": L, "src": os.path.basename(src), "ref_x": objs["x"][keep], "ref_y": objs["y"][keep], "ref_f": f0[keep], "r_ap": r_ap,
+                "fw": fw, "off": off, "noise": float(bk.globalrms), "study_dir": study_dir, "n": 0, "opts": opts, "device": device, "yard": y,
+                "auto_stars": "sxt" if tools.get("sxt") else "starnet"}
+
+    def canonical(self, active, ctx):
+        a = dict(active)
+        if "star_removal" in a:
+            a["star_removal"] = str(a["star_removal"]).replace("auto", ctx.get("auto_stars", "auto"))
+            if a["star_removal"] != "starnet":
+                a.pop("starnet_stride", None)
+        return a
+
+    def run(self, ctx, p, log, cancel):
+        import sep as _sep
+        from scipy.spatial import cKDTree
+        from .. import post
+        s, ds, y = ctx["session"], ctx["ds"], ctx["yard"]
+        ctx["n"] += 1
+        wd = os.path.join(ctx["study_dir"], "work", f"stars_{ctx['n']}")
+        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "linear.fits", "restore_meta.json"))
+        prm = {**post.DEFAULTS, **p}
+        sp = {**(s.meta.get("params") or {}), "device": str(ctx["device"])}
+        t = time.time()
+        try:
+            meta = post.remove_stars(wd, s.meta, prm, sp, None, _checkpoint(cancel))
+            dt = time.time() - t
+            if not os.path.exists(os.path.join(wd, "starless.fits")):
+                raise RuntimeError(f"no starless image: {meta.get('tool')} {meta.get('reason') or ''} {[a.get('note') for a in meta.get('attempts', [])]}")
+            starless = _read(os.path.join(wd, "starless.fits"))
+            L1 = OB.lum(_hwc(starless))
+            # the reference stars of the linear image: what is left there (light and holes both)
+            f1 = y._phot(L1, y.sx, y.sy, y.r_total)
+            ok = np.isfinite(f1) & (y.f_total > 0)
+            m1 = y.measure(_hwc(starless), same_grid=True, normalise_gain=False)
+            sig = m1.get("sigma_total") or float("nan")
+            out = {"star_residual": float(np.abs(f1[ok]).sum() / y.f_total[ok].sum()),
+                   "holes": float(np.mean(f1[ok] < -3.0 * sig)) if np.isfinite(sig) else None,
+                   "offstar_large_change": m1.get("large_change"), "seconds": dt, "tool": meta.get("tool")}
+            r = ctx["r_ap"]
+            fl, _, _ = _sep.sum_circle(L1, ctx["ref_x"], ctx["ref_y"], r, bkgann=(2.5 * r, 4 * r), subpix=5)
+            out["residual_flux"] = float(np.clip(fl, 0, None).sum() / ctx["ref_f"].sum())
+            bk = _sep.Background(L1, bw=64, bh=64)
+            objs = _sep.extract(L1 - bk.back(), 5.0, err=max(bk.globalrms, ctx["noise"]), minarea=5)
+            if len(objs):
+                d, _ = cKDTree(np.stack([objs["x"], objs["y"]], 1)).query(np.stack([ctx["ref_x"], ctx["ref_y"]], 1))
+                out["residual_stars"] = float(np.mean(d < max(1.5 * ctx["fw"], 2.0)))
+            else:
+                out["residual_stars"] = 0.0
+            out["offstar_change"] = float(np.mean(np.abs(L1 - ctx["L0"])[ctx["off"]]) / max(ctx["noise"], 1e-9))
+            if ds.synthetic:
+                out.update(_truth_scores(ds, s, starless, float(ctx["opts"].get("sigma_eval", 1.0)), stars_in_result=False))
+            return out, _hwc(starless)
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------- finishing
+_HUBBLE = ["sho", "hso", "osh", "ohs", "hos"]
+GATE_WEIGHT = 100.0           # finish_score: one failed gate outweighs any difference of the look distance
+_GHS = ["ghs2", "autoghs"]
+
+
+class FinishTask(Task):
+    name = "finish"
+    label = "Stretch & finish (finishing chain)"
+    display_ready = True
+    description = ("The finishing chain (pro.py) on the dataset's cached starless and star layers (or the linear / stacked image): the stretch tool and its "
+                   "settings, highlights, the noise reduction of the stretched image (NoiseXTerminator or Cosmic Clarity Denoise), Cosmic Clarity Sharpen, palette / "
+                   "OIII boost, local contrast, saturation, the star layer and the colour grade.  Scored by the finishing gates (sky level, clipping, sky chroma, sky "
+                   "noise, star count / shape / colour), the nebula contrast and the distance to the reference looks of the target.  Trial images are the finished "
+                   "renders (one chain, same data).  Option 'external': run NoiseXTerminator / GraXpert / Cosmic Clarity on the stretched image in every trial "
+                   "(slower, the export's result; without it those settings have no effect).")
+    objective_note = ("Score (finish_score, lower is better), lexicographic: the number of failed finishing gates first (x 100), then the distance to the reference "
+                      "looks of the target (its own reference photographs, else those of its class: lab.looks, the held-out grader); without references -ln of "
+                      "the contrast-to-noise ratio (nebula p90 - sky) / sky pixel noise.  "
+                      "Constraints: every finishing gate (FINISH-SPEC) no further outside its limit than in the baseline - gate by gate, so that no gate is traded "
+                      "for another (all must pass when the baseline passes).  "
+                      "Every target has reference looks to grade against: its own photographs, else those of its class (emission, dual-band, galaxy, ...).")
+    params = _processing_params(
+        ["stretch_method", "stretch", "stretch_boost", "auto_stretch", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise", "chroma_denoise",
+         "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "palette", "hubble_formula", "oiii_boost", "oiii_unmix",
+         "synthetic_luminance", "saturation", "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "star_color_preservation",
+         "halo_suppress", "scnr", "black_point", "brightness",
+         "grade_amount", "grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast"],
+        {"stretch", "contrast", "hdr", "saturation", "local_contrast", "star_reduction"},
+        hypertune={**{k: True for k in ("stretch_method", "stretch", "stretch_boost", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise",
+                                       "chroma_denoise", "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "saturation",
+                                       "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "star_color_preservation", "halo_suppress",
+                                       "scnr", "black_point", "brightness")},
+                   "palette": "refs_dual", "hubble_formula": "refs_dual", "oiii_boost": "refs_dual", "oiii_unmix": "dual", "synthetic_luminance": "dual",
+                   **{k: "refs" for k in ("grade_amount", "grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat",
+                                          "grade_contrast")}},
+        when={"stretch_boost": {"stretch_method": ["statstretch"]}, "contrast": {"stretch_method": _GHS}, "color_preservation": {"stretch_method": _GHS},
+              "cc_denoise_model": {"cc_denoise": [True]}, "cc_stellar_amount": {"cc_sharpen": ["both", "stellar"]},
+              "cc_nonstellar_amount": {"cc_sharpen": ["both", "nonstellar"]}, "hubble_formula": {"palette": _HUBBLE}, "oiii_boost": {"palette": ["nbn"]}})
+    next(q for q in params if q["name"] == "palette")["ht_choices"] = ["auto", "hoo", "hoo_improved", "sho", "hso", "foraxx", "hoo_warm", "nbn"]
+    # the background target of the stretch sets the sky level, which the sky_median gate prescribes (0.08 - 0.12): searched over its whole range
+    # (0.04 - 0.35) the trials were infeasible by definition - on M 31 26 of 31 broke that gate, the warm start's included
+    next(q for q in params if q["name"] == "stretch")["ht_range"] = (0.08, 0.12)
+    params.append({"name": "ghs_d2", "label": "GHS pass 2 D (ghs2)", "type": "float", "low": 0.3, "high": 6.0, "default": 2.5, "tune": True, "hypertune": True,
+                   "processing": "ghs_d2", "when": {"stretch_method": ["ghs2"]}})
+    params.append({"name": "star_stretch", "label": "Star stretch amount (Seti Astro)", "type": "float", "low": 2.0, "high": 8.0, "default": 5.0, "tune": False,
+                   "hypertune": True, "processing": "star_stretch"})
+    metrics = {
+        "finish_score": {"label": "Finish score: 100 x gates failed + distance to the reference looks (else -ln contrast-to-noise)", "direction": "minimize"},
+        "gate_distance": {"label": "Gates: distance outside the limits (0 = all pass)", "direction": "minimize"},
+        **{f"gate_{k}": {"label": f"Gate {k}: distance outside its limit", "direction": "minimize"} for k in GATE_NAMES},
+        "gates_failed": {"label": "Gates failed (count)", "direction": "minimize"},
+        "cnr": {"label": "Contrast-to-noise: (nebula p90 - sky) / sky pixel noise", "direction": "maximize"},
+        "nebula_contrast": {"label": "Nebula contrast (p90 - sky, lightness)", "direction": "maximize"},
+        "look_distance": {"label": "Distance to the reference looks", "direction": "minimize"},
+        "sky_median": {"label": "Sky level", "direction": "minimize"},
+        "sky_noise": {"label": "Sky pixel noise", "direction": "minimize"},
+        "sky_chroma": {"label": "Sky chroma (max |a|, |b|)", "direction": "minimize"},
+        "clipped": {"label": "Clipped fraction", "direction": "minimize"},
+        "stars_coloured": {"label": "Star colour saturation", "direction": "maximize"},
+        "seconds": {"label": "Run time (s)", "direction": "minimize"},
+    }
+    options = [{"name": "external", "label": "AI noise reduction / Cosmic Clarity per trial (1 = yes)", "type": "int", "default": 0},
+               {"name": "max_side", "label": "Render size (px, 0 = full)", "type": "int", "default": 0}]
+    score = "finish_score"
+    default_objective = "finish_score"
+    min_gain = 0.05              # -ln contrast-to-noise: 5 %
+    min_gain_rel = 0.02          # the distance to the reference looks: 2 % of the baseline's (a gate fixed is worth 100).  The finishing chain is deterministic (three identical renders,
+                                 # identical scores): a margin of significance, not of noise - M 31: a 0.4 % gain had replaced 22 of Auto-finish's settings
+
+    def limits(self, ctx):
+        """No gate may get worse than in the baseline: each gate's violation at most the baseline's.  (A bound on the summed distance let trials buy
+        one gate with another - on M 31, where Auto-finish's result fails five gates, crushing the sky to black fixed the colour gates and 8 such
+        renders passed as feasible.)"""
+        b = (ctx.get("base") or {}).get("gate_violations") or {}
+        return {f"gate_{k}": ("max", float(b.get(k, 0.0)) + 1e-6) for k in GATE_NAMES}
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        from .. import looks, post
+        s = ds.ensure_stacked(log, cancel)
+        p0 = dict(post.DEFAULTS)
+        max_side = int(opts.get("max_side", 0) or 0) or None
+        layers = post._Layers(s.dir, p0, max_side)
+        dual = post._dual_band(s.meta, layers.header)
+        ref_looks, ref_agg, desc, _ = looks.reference_looks(s.meta.get("object"), dual)
+        log(f"Layers: {os.path.basename(layers.src)}{' + stars' if layers.stars is not None else ''}; {desc}")
+        work = os.path.join(study_dir, "work", "finish")
+        os.makedirs(work, exist_ok=True)
+        saved = _store(study_dir, "reference.pkl") or {}
+        return {"ds": ds, "session": s, "layers": layers, "dual": dual, "looks": ref_looks, "work": work, "device": device, "opts": opts, "header": layers.header,
+                "study_dir": study_dir, "base": saved.get("base")}
+
+    def run(self, ctx, p, log, cancel):
+        from .. import finish, gates, looks, post, pro
+        layers = ctx["layers"]
+        prm = {**post.DEFAULTS, **post.EXTRA_DEFAULTS, **(ctx["opts"].get("params") or {}), **p}
+        if cancel.is_set():
+            raise RuntimeError("cancelled")
+        t = time.time()
+        fin = pro.Finisher(ctx["work"], ctx["header"], prm, ctx["dual"], external=bool(int(ctx["opts"].get("external", 0))), device=str(ctx["device"]),
+                           checkpoint=_checkpoint(cancel), keep_pictures=False)
+        img, info = fin.run(layers.base, layers.stars)
+        dt = time.time() - t
+        sm = layers.starnet.get("stars") or {}
+        level = float(pro.mtf_balance(pro.star_stretch_m(float(prm.get("star_stretch", pro.STAR_STRETCH))), 5.0 * float(sm["sky_noise"]))) if sm.get("sky_noise") else None
+        g = gates.compute(img, starless=info.get("starless") if layers.stars is not None and prm["star_reduction"] < 1.0 else None, linear_star_count=sm.get("count"), star_level=level)
+        lum = finish.luminance(img)
+        hs = pro._hist_stats(lum)
+        mask, _ = pro.nebula_mask(lum, hs["mode"])
+        neb = float(np.percentile(lum[mask], 90) - g["sky_median"]["value"]) if mask.any() else 0.0
+        noise = g.get("sky_pixel_noise", {}).get("value")
+        cnr = float(neb / noise) if noise else None
+        gv = _gate_violations(g)
+        out = {"gate_distance": _gate_distance(g), "gates_failed": len(g.get("failed", [])), "nebula_contrast": neb, "sky_median": g["sky_median"]["value"],
+               **{f"gate_{k}": v for k, v in gv.items()},
+               "sky_noise": noise, "cnr": cnr,
+               "sky_chroma": max(g["sky_chroma"]["value"].values()) if isinstance(g.get("sky_chroma", {}).get("value"), dict) else None,
+               "clipped": g["clipped"]["value"], "stars_coloured": g.get("stars_coloured", {}).get("value"), "seconds": dt, "failed": g.get("failed")}
+        # lexicographic: the finishing gates are the specification - fewer failed gates first, then the distance to the reference looks (look distances are
+        # 10 - 60, a gate counts 100).  On M 31 Auto-finish's result failed the star-colour gate after BXT's star sharpening, and a score of the look
+        # distance alone gave the search no reason to fix it
+        fails = len(g.get("failed", []))
+        if ctx["looks"]:
+            st = looks.look_stats(_hwc(img))
+            out["look_distance"] = looks.score(st, ctx["looks"], looks.object_weight(st))[0]
+            out["finish_score"] = GATE_WEIGHT * fails + out["look_distance"]
+        elif cnr and cnr > 0:
+            out["finish_score"] = GATE_WEIGHT * fails - math.log(cnr)
+        if ctx.get("base") is None:
+            ctx["base"] = {"gate_distance": out["gate_distance"], "gate_violations": gv}
+            _store(ctx["study_dir"], "reference.pkl", {"base": ctx["base"]})
+        from .. import export as export_mod
+        return out, export_mod.display_image(img, export_mod.bottom_up(ctx["header"]))        # (H, W, 3) north-up like the exports
+
+
+# ----------------------------------------------------------------------------- super-resolution (Cosmic Clarity)
+class SuperresTask(Task):
+    name = "superres"
+    label = "Super-resolution (Cosmic Clarity)"
+    display_ready = True
+    description = ("Enlarges the dataset's finished image (the last export's finish.fits) 2x, 3x or 4x with Cosmic Clarity Super-Resolution (SetiAstro, its models for "
+                   "those scales) or Lanczos, as the export would.  Scored by the stars' FWHM in the original pixels (resolution gained) under the constraint that "
+                   "the enlargement, binned back, reproduces the original (cycle consistency): an enlargement may add detail, not change the image.")
+    objective_note = ("Score: star FWHM in original pixels (the enlarged FWHM / the factor).  Constraints: the enlargement area-binned back to the original grid within "
+                      "PSNR >= 32 dB of it, and its total flux within 2 % of the original's.")
+    params = [{"name": "superres_tool", "label": "Enlargement", "type": "categorical", "choices": ["lanczos", "cosmic_clarity"], "default": "lanczos", "tune": True},
+              {"name": "superres_factor", "label": "Factor", "type": "categorical", "choices": [2, 3, 4], "default": 2, "tune": False}]
+    metrics = {"fwhm_native": {"label": "Star FWHM (original px)", "direction": "minimize"},
+               "cycle_psnr": {"label": "Binned back against the original: PSNR (dB)", "direction": "maximize"},
+               "flux_ratio_err": {"label": "|total flux ratio - 1|", "direction": "minimize"},
+               "noise_gain": {"label": "Sky pixel noise binned back / original", "direction": "minimize"},
+               "seconds": {"label": "Run time (s)", "direction": "minimize"}}
+    options = []
+    score = default_objective = "fwhm_native"
+    min_gain = 0.05
+
+    def static_limits(self):
+        return {"cycle_psnr": ("min", 32.0), "flux_ratio_err": ("max", 0.02)}
+
+    def prepare(self, ds, opts, device, log, cancel, study_dir):
+        from .. import fitsio
+        s = ds.ensure_stacked(log, cancel)
+        path = s._p("process", "finish", "finish.fits")
+        if not os.path.exists(path):
+            raise RuntimeError("no finished image yet: export the dataset once (its finish.fits is the input)")
+        img, hdr = fitsio.read_rgb(path)
+        log(f"Finished image {img.shape[2]}x{img.shape[1]} from the last export")
+        return {"ds": ds, "session": s, "img": np.clip(img, 0, 1).astype(np.float32), "header": hdr, "device": device, "study_dir": study_dir, "n": 0,
+                "yard": OB.Yardstick(_hwc(img), keep_image=False)}
+
+    def run(self, ctx, p, log, cancel):
+        from .. import export as export_mod
+        from .. import tools
+        img, y = ctx["img"], ctx["yard"]
+        f = int(p.get("superres_factor", 2))
+        C, H, W = img.shape
+        t = time.time()
+        if p.get("superres_tool") == "cosmic_clarity":
+            ctx["n"] += 1
+            work = os.path.join(ctx["study_dir"], "work", f"sr_{ctx['n']}")
+            try:
+                out, _ = tools.cosmic_clarity.run("superres", img, ["--scale", str(f)], work=work, device=str(ctx["device"]), checkpoint=_checkpoint(cancel))
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            out = np.clip(out, 0, 1).astype(np.float32)
+        else:
+            out = np.stack([cv2.resize(img[c], (W * f, H * f), interpolation=cv2.INTER_LANCZOS4) for c in range(C)]).clip(0, 1).astype(np.float32)
+        dt = time.time() - t
+        back = np.stack([cv2.resize(out[c], (W, H), interpolation=cv2.INTER_AREA) for c in range(C)])
+        mse = float(np.mean((back - img) ** 2))
+        m = y.measure(_hwc(out), transform=lambda pts: np.asarray(pts, np.float64) * f + (f - 1) / 2.0)
+        nb, n0 = OB.nmad((back - cv2.GaussianBlur(back, (0, 0), 2.0)).mean(0)[::5, ::5]), OB.nmad((img - cv2.GaussianBlur(img, (0, 0), 2.0)).mean(0)[::5, ::5])
+        res = {"fwhm_native": m.get("fwhm"), "cycle_psnr": float(10 * np.log10(1.0 / max(mse, 1e-12))),
+               "flux_ratio_err": abs(float(out.mean() / max(img.mean(), 1e-12)) - 1.0), "noise_gain": float(nb / n0) if n0 else None, "seconds": dt}
+        crop = _centre_crop(_hwc(out), 900)
+        return res, export_mod.display_image(np.moveaxis(crop, -1, 0), export_mod.bottom_up(ctx["header"]))
+
+
+TASKS = {t.name: t for t in (StackTask(), SatelliteTask(), BackgroundTask(), RestoreTask(), StarsTask(), FinishTask(), SuperresTask())}

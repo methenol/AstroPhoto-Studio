@@ -320,6 +320,41 @@ async function loadAutofinish() {
   try { renderAutofinish((await api(`/api/autofinish?folder=${encodeURIComponent(S.folder)}`)).result); } catch { renderAutofinish(null); }
 }
 
+/* ------------------------------------------------------------ hyper-tune */
+function syncHypertune() { $("#hypertuneTrials").hidden = !$("#sp-hypertune").checked; }
+// the stack / restore options the hyper-tune chose, shown in Integration & options (the processing settings come back as the Auto-finish params)
+function applyHypertune(rep) {
+  const set = [];
+  for (const [k, v] of Object.entries(rep.stack_params || {})) {
+    const el = $("#sp-" + k); if (!el || ["hypertune", "hypertune_trials", "autofinish", "star_remover", "device"].includes(k)) continue;
+    if (el.type === "checkbox") { if (el.checked !== !!v) { el.checked = !!v; set.push(k); } }
+    else if (String(el.value) !== String(v) && (el.tagName !== "SELECT" || [...el.options].some(o => o.value === String(v)))) { el.value = String(v); set.push(k); }
+    if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
+  }
+  return set;
+}
+function renderHypertune(rep) {
+  const box = $("#afReport");
+  const f = v => typeof v === "number" ? +v.toPrecision(4) : esc(v ?? "–");
+  // one block per stage (the panel is narrow): the stage and its score, yours -> best; then what changed, wrapped
+  const rows = (rep.stages || []).map(st => {
+    const ch = Object.entries(st.changed || {}).map(([k, [a, b]]) => `${esc(k)} ${f(a)} → <b>${f(b)}</b>`).join(" · ");
+    const res = st.state === "done"
+      ? `${esc(st.score)} ${f(st.baseline)} → <b>${f(st.best)}</b>${st.is_baseline ? " · yours kept" : ""}${st.feasible === false ? ' · <span style="color:var(--bad)">no trial met every constraint</span>' : ""}`
+      : `<span class="muted">${esc(st.state)}${st.reason ? ": " + esc(st.reason) : ""}</span>`;
+    return `<div class="htstage"><div class="htrow"><b>${esc(st.label || st.stage)}</b>${st.study ? ` <a href="#" data-study="${esc(st.study)}">study</a>` : ""}</div>` +
+      `<div class="mono small">${res}</div>${ch ? `<div class="small muted htch">${ch}</div>` : ""}</div>`;
+  }).join("");
+  const g = rep.export_gates;
+  const html = `<div class="afrow"><span>🔬 <b>Hyper-tune</b> · ${rep.trials_per_stage} trials per stage</span><span>${fmtDur(rep.seconds)}</span></div>` +
+    `<details open><summary>Best of every stage</summary>${rows}` +
+    (g ? `<p class="small muted">Export gates: ${g.passed ? "all pass" : "failed: " + esc((g.failed || []).join(", "))}</p>` : "") + `</details>`;
+  $("#htReport")?.remove();
+  box.insertAdjacentHTML("afterbegin", `<div id="htReport">${html}</div>`);
+  box.hidden = false;
+  $$("#afReport [data-study]").forEach(a => a.onclick = e => { e.preventDefault(); switchTab("lab"); if (typeof Lab !== "undefined" && Lab.open) Lab.open(a.dataset.study); });
+}
+
 function resetStackParams() {
   // every option back to the pipeline's STACK_DEFAULTS (served by /api/system)
   const D = S.system.stack_defaults;
@@ -330,6 +365,7 @@ function resetStackParams() {
     else el.value = String(v);
     if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
   }
+  syncHypertune();
   toast("Integration & compute options reset to defaults");
 }
 
@@ -375,12 +411,16 @@ function stackParams() {
   return {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
+    rejection: g("rejection").value, stack_weighting: g("stack_weighting").value,
+    drizzle_pixfrac: parseFloat(g("drizzle_pixfrac").value) || 0, drizzle_kernel: g("drizzle_kernel").value,
     local_norm: g("local_norm").checked, pattern_correction: g("pattern_correction").checked,
     deconv_method: g("deconv_method").value, deconv_stars_method: g("deconv_stars_method").value, ai_deconvolution: on,
     denoise_method: g("denoise_method").value, superres_method: g("superres_method").value, satellite_removal: g("satellite_removal").checked,
     graxpert_psfsize: parseFloat(g("graxpert_psfsize").value) || 0,
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
+    hypertune: g("hypertune").checked,
+    hypertune_trials: Math.max(10, Math.min(500, parseInt(g("hypertune_trials").value) || 60)),
     device: g("device") ? g("device").value : "auto",
   };
 }
@@ -455,7 +495,9 @@ async function pollJob() {
       const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
       S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
       // the settings Auto-finish tuned (alone, or before the export of Run everything) become the sliders'
-      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast("Auto-finish: settings set from the measurements of the image"); }
+      if (j.result?.hypertune) applyHypertune(j.result.hypertune);
+      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(j.result?.hypertune ? "Hyper-tune: every stage's best settings applied" : "Auto-finish: settings set from the measurements of the image"); }
+      if (j.result?.hypertune) renderHypertune(j.result.hypertune);
       else if (S.status.stacked) schedulePreview(0);
       if (["calibrate", "analyse", "all"].includes(j.kind)) loadCalibration();
       if (j.kind === "calibrate" && j.result?.changed_analysis) toast("Calibration changed: the frame analysis was dropped — run Analyse frames again");
@@ -715,6 +757,8 @@ function bindUI() {
     await openDataset(p);
   };
   $$("[data-job]").forEach(b => b.onclick = () => startJob(b.dataset.job));
+  $("#sp-hypertune").onchange = syncHypertune;
+  syncHypertune();
   $("#calSave").onclick = saveCalibration;
   $("#cancelJob").onclick = () => S.job && api(`/api/jobs/${S.job.id}/cancel`, { method: "POST" });
   $("#pauseJob").onclick = async () => {

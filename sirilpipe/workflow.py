@@ -24,6 +24,8 @@ import shutil
 import statistics
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from . import config
 from .dataset import Frame
 from .siril import quote, ranges
@@ -39,6 +41,10 @@ DRIZZLE_1X = {"scale": 1.0, "pixfrac": 1.0, "kernel": "square"}
 # 2x drizzle only with plenty of data and undersampled stars: PixInsight DrizzleIntegration guidance quoted in
 # workflows.md section 10 (FWHM < ~2 px) and the community minimum of 100 subs (lancepickens: 50+; DESIGN: 100)
 DRIZZLE_2X = {"scale": 2.0, "pixfrac": 0.5, "kernel": "square"}   # pixfrac ~ 1/scale (Siril drizzle docs)
+DRIZZLE_KERNELS = ("square", "point", "turbo", "gaussian", "lanczos2", "lanczos3")   # seqapplyreg -kernel= (Siril 1.4 drizzle)
+# stack rej: Siril's letters; GESDT ("g") is left out (bug #1993, fixed only in 1.4.5); percentile clipping takes fractions, not sigmas
+REJECTIONS = {"winsorized": "w", "sigma": "s", "mad": "a", "linear": "l", "median": "m", "none": "n"}
+WEIGHTINGS = ("wfwhm", "nbstars", "noise", "nbstack", "none")                       # stack -weight= (Siril 1.4); none = no weighting
 DRIZZLE2_MIN_FRAMES = 100
 DRIZZLE2_MAX_FWHM = 2.0
 # Banding (CMOS row noise): Siril's own tool, run on the calibrated CFA subs BEFORE registration, where the pattern still lies along the sensor rows
@@ -97,13 +103,31 @@ def keep_percent(sensitivity: float) -> float:
 def decide_resampling(params: dict, n_included: int, median_fwhm: float | None, cfa: bool = True) -> dict:
     """How the registered frames are resampled: Bayer drizzle 1x (default), 2x only when the rule allows,
     demosaic + Lanczos when asked (or when the data is not a Bayer mosaic).  ``reason`` is recorded in
-    stack_meta so the user sees why a requested scale was not used."""
+    stack_meta so the user sees why a requested scale was not used.  ``drizzle_pixfrac`` (0 = the rule's: 1 / scale)
+    and ``drizzle_kernel`` set the drop size and kernel of a drizzle explicitly."""
+    out = _decide_resampling(params, n_included, median_fwhm, cfa)
+    if out.get("mode") == "drizzle":
+        try:
+            pf = float(params.get("drizzle_pixfrac") or 0)
+        except (TypeError, ValueError):
+            pf = 0.0
+        kern = str(params.get("drizzle_kernel") or "square").lower()
+        if pf > 0:
+            out["pixfrac"] = round(float(np.clip(pf, 0.1, 1.0)), 3)
+            out["reason"] += f"; pixfrac {out['pixfrac']:g} (chosen)"
+        if kern in DRIZZLE_KERNELS and kern != out.get("kernel"):
+            out["kernel"] = kern
+            out["reason"] += f"; {kern} kernel (chosen)"
+    return out
+
+
+def _decide_resampling(params: dict, n_included: int, median_fwhm: float | None, cfa: bool = True) -> dict:
     mode = str(params.get("mode", "auto") or "auto").lower()
     want = float(params.get("scale", 1.0) or 1.0)
     out: dict = {"mode": "drizzle", "requested_scale": want, "reason": ""}
     if want > 1.0 and str(params.get("superres_method") or "drizzle") == "cosmic_clarity":
         # the super-resolution is Cosmic Clarity's, on the finished image (post._superres_final): the stack itself is integrated at 1x
-        out = decide_resampling({**params, "scale": 1.0, "superres_method": "drizzle"}, n_included, median_fwhm, cfa)
+        out = _decide_resampling({**params, "scale": 1.0, "superres_method": "drizzle"}, n_included, median_fwhm, cfa)
         out.update(requested_scale=want, superres="cosmic_clarity",
                    reason=out["reason"] + f"; the {want:g}x super-resolution is Cosmic Clarity's, on the finished image")
         return out
@@ -133,12 +157,26 @@ def decide_resampling(params: dict, n_included: int, median_fwhm: float | None, 
 
 
 def rejection(params: dict, resampling: dict) -> dict:
-    """Rejection type and sigmas: Winsorized (``w``); MAD (``a``) for drizzled data above 1x (the Siril stacking
-    doc calls it the most effective for the sparse R/B coverage); never GESDT (bug #1993 fixed only in 1.4.5)."""
+    """Rejection type and sigmas: auto = Winsorized (``w``); MAD (``a``) for drizzled data above 1x (the Siril stacking
+    doc calls it the most effective for the sparse R/B coverage); never GESDT (bug #1993 fixed only in 1.4.5).
+    ``rejection`` names one of REJECTIONS explicitly."""
     lo = float(params.get("sigma_low", 4.0) or 4.0)
     hi = float(params.get("sigma_high", 3.0) or 3.0)
-    kind = "a" if (resampling["mode"] == "drizzle" and resampling.get("scale", 1.0) > 1.0) else "w"
-    return {"type": kind, "name": {"w": "winsorized", "a": "mad"}[kind], "low": lo, "high": hi}
+    want = str(params.get("rejection") or "auto").lower()
+    if want in REJECTIONS:
+        kind = REJECTIONS[want]
+    else:
+        kind = "a" if (resampling["mode"] == "drizzle" and resampling.get("scale", 1.0) > 1.0) else "w"
+    names = {v: k for k, v in REJECTIONS.items()}
+    return {"type": kind, "name": names[kind], "low": lo, "high": hi}
+
+
+def weighting(params: dict) -> str:
+    """The stack's frame weighting (``-weight=``): ``stack_weighting`` one of WEIGHTINGS; default wfwhm (siril.md 5.6)."""
+    w = str(params.get("stack_weighting") or "wfwhm").lower()
+    if w not in WEIGHTINGS:
+        w = "wfwhm"
+    return "" if w == "none" else w
 
 
 def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]]:

@@ -644,7 +644,7 @@ class Session:
             if state.get("hdr") and len(groups) > 1:
                 arr, hdr, hdr_info = self._stack_hdr(runner, seq, rows, inc, groups, rs, rej, progress)
             else:
-                runner.run(workflow.stack_script(self.process, seq, rej, len(inc)), "stack", expect=["stack_raw.fit"],
+                runner.run(workflow.stack_script(self.process, seq, rej, len(inc), weight=workflow.weighting(sp)), "stack", expect=["stack_raw.fit"],
                            label="Stacking")
                 arr, hdr = fitsio.read_rgb(os.path.join(self.process, "stack_raw.fit"))
             self._time("stack", time.time() - t0)
@@ -798,7 +798,7 @@ class Session:
             "drizzle": {"scale": scale, "pixfrac": rs.get("pixfrac"), "kernel": rs.get("kernel")} if rs["mode"] == "drizzle" else None,
             "resampling_reason": rs["reason"],
             "rejection": {"type": rej["name"], "low": rej["low"], "high": rej["high"]},
-            "weights": "wfwhm", "normalisation": "addscale", "framing": rs.get("framing", "max"),
+            "weights": workflow.weighting(sp) or "none", "normalisation": "addscale", "framing": rs.get("framing", "max"),
             "crop": [x, y, w, h], "crop_info": info, "shape": [w, h], "stack_canvas": [W, H],
             "pixel_scale": (ps / scale) if ps else None,
             "fwhm_px": (medf * scale) if medf else None,
@@ -1057,8 +1057,13 @@ class Session:
 
     def run_all(self, stack_params: dict | None = None, params: dict | None = None, export_opts: dict | None = None,
                 progress=None) -> dict:
-        """analysis -> stack -> plate solve -> restore -> (star removal) -> (auto-finish) -> export."""
+        """analysis -> stack -> plate solve -> restore -> (star removal) -> (auto-finish) -> export.  ``hypertune`` in the stack params: every stage
+        tuned first by a study of it (sirilpipe.hypertune, ``hypertune_trials`` trials each)."""
         sp, pr, eo = dict(stack_params or {}), dict(params or {}), dict(export_opts or {})
+        if sp.get("hypertune"):
+            from sirilpipe import hypertune
+            with self.local_copy(progress):
+                return hypertune.run_all(self, sp, pr, eo, progress, int(sp.get("hypertune_trials") or 60), workdir=self.workdir)
         t0 = time.time()
         with self.local_copy(progress):              # the stages that read the subs
             self.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), progress, sp)

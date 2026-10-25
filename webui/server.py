@@ -80,6 +80,12 @@ STACK_DEFAULTS = {
                                # imagemm = VeraLux ImageMM (needs torch); none.  Cosmic Clarity Sharpen is the finishing setting cc_sharpen (stretched image)
     "deconv_stars_method": "auto",  # deconvolution of the stars, the same choices (post.deconv_choice; a request naming only deconv_method: the stars follow it)
     "denoise_method": "auto",  # linear noise reduction: auto = NXT when licensed, else GraXpert / Siril; nxt | graxpert | siril (that tool only); none.  CC Denoise: cc_denoise
+    "rejection": "auto",       # stack rejection: auto = winsorized (MAD for drizzle > 1x); winsorized | sigma | mad | linear | median | none (workflow.REJECTIONS)
+    "stack_weighting": "wfwhm",  # stack -weight=: wfwhm | nbstars | noise | nbstack | none
+    "drizzle_pixfrac": 0.0,    # drizzle drop size; 0 = the rule's (1 / scale)
+    "drizzle_kernel": "square",  # drizzle kernel: square | point | turbo | gaussian | lanczos2 | lanczos3
+    "hypertune": False,        # Run everything: before each stage, an experiment-lab study of that stage on this dataset; the stage then runs with its best trial
+    "hypertune_trials": 60,    # trials per stage study (the baseline included); 30-120 search the stages' spaces
     "satellite_removal": False,  # Cosmic Clarity satellite-trail removal on the stack before the restoration
     "graxpert_psfsize": 0.0,   # GraXpert deconvolution -psfsize (Image FWHM, px); 0 = the star FWHM measured on the linear image
     # VeraLux ImageMM (sirilpipe/veralux_imagemm.py; the script's GUI defaults).  The 1.x ImageMM keys (imagemm_delta,
@@ -644,12 +650,12 @@ def _active_seconds(j: dict, now: float | None = None) -> float:
 def _typical_seconds(j: dict) -> tuple[float | None, str | None]:
     """How long this kind of job took before: on the same dataset, or on another one scaled by
     the number of subs (the work of every stage grows with it)."""
-    same = [h for h in list(JOBS.values()) if h is not j and h["state"] == "done" and h["kind"] == j["kind"]
+    same = [h for h in list(JOBS.values()) if h is not j and h["state"] == "done" and h["kind"] == j["kind"] and h.get("variant") == j.get("variant")
             and h.get("folder") == j.get("folder") and h.get("active_seconds")]
     if same:
         h = max(same, key=lambda q: q.get("ended", 0))
         return h["active_seconds"], "the last run on this dataset"
-    other = [h for h in list(JOBS.values()) if h is not j and h["state"] == "done" and h["kind"] == j["kind"]
+    other = [h for h in list(JOBS.values()) if h is not j and h["state"] == "done" and h["kind"] == j["kind"] and h.get("variant") == j.get("variant")
              and h.get("active_seconds") and h.get("n_subs") and j.get("n_subs")]
     if other:
         h = max(other, key=lambda q: q.get("ended", 0))
@@ -662,7 +668,7 @@ def _job_view(j: dict) -> dict:
     rate of progress, and an estimate of the whole job from earlier runs."""
     now = time.time()
     v = {k: val for k, val in j.items() if k not in ("params", "stack_params", "export_opts")}
-    v["label"] = JOB_KINDS.get(j["kind"], j["kind"])
+    v["label"] = JOB_KINDS.get(j["kind"], j["kind"]) + (" (hyper-tuned)" if j.get("variant") == "hypertune" else "")
     v["elapsed"] = round(((j.get("ended") or now) - j["started"]) if j.get("started") else 0.0, 1)
     v["active"] = round(_active_seconds(j, now), 1)
     if j["state"] in ("running", "paused") and j.get("stage_started"):
@@ -733,6 +739,10 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
         return {"autofinish": _norm_autofinish(s.autofinish(params, progress))}
     if kind == "export":
         return s.export(params, progress=progress, **export_opts)
+    if kind == "all" and sp.get("hypertune"):
+        # Hyper-tune each stage: an experiment-lab study of every stage before it runs (sirilpipe.hypertune); the studies appear in the Experiments tab
+        from sirilpipe import hypertune
+        return hypertune.run_all(s, sp, params, export_opts, progress, int(sp.get("hypertune_trials") or 60), workdir=CONFIG["workdir"])
     if kind == "all":
         s.run_analysis(float(sp["sensitivity"]), progress, sp)
         s.run_stack(sp, progress)
@@ -905,6 +915,8 @@ def start_job(body: dict = Body(...)):
                     "log": [], "stages": [], "created": time.time(), "started": None, "result": None,
                     "params": body.get("params") or {}, "stack_params": body.get("stack_params") or {},
                     "export_opts": body.get("export") or {}}
+    if kind == "all" and (body.get("stack_params") or {}).get("hypertune"):
+        JOBS[job_id]["variant"] = "hypertune"          # its own label, and its own history for the time estimate (hours, not minutes)
     # set by /api/v1 (webui/api.py): who submitted it, which profile, the client's own reference
     for k in ("origin", "profile", "client_ref", "label"):
         if body.get(k):
@@ -1266,6 +1278,9 @@ def download(path: str, inline: bool = False):
 
 # ------------------------------------------------------------------ removed features
 
+SERVER_STARTED = time.time()
+
+
 def _lab(*parts) -> str:
     d = os.path.join(CONFIG["workdir"], "lab", *parts)
     os.makedirs(d, exist_ok=True)
@@ -1304,9 +1319,15 @@ def _read_status(d: str) -> dict:
         st = _json.load(open(p))
     except Exception:
         return {"state": "new"}
-    if st.get("state") in ("starting", "preparing", "running") and not _alive(st.get("pid")):
-        st["state"] = "died"
-        st["message"] = (st.get("message") or "") + " (the process is gone)"
+    if st.get("state") in ("starting", "preparing", "running"):
+        if st.get("in_process"):
+            # a hyper-tune study runs inside the server: one started before this server came up was interrupted with it
+            if float(st.get("started") or 0) < SERVER_STARTED:
+                st["state"] = "died"
+                st["message"] = (st.get("message") or "") + " (the server restarted)"
+        elif not _alive(st.get("pid")):
+            st["state"] = "died"
+            st["message"] = (st.get("message") or "") + " (the process is gone)"
     return st
 
 
@@ -1457,8 +1478,10 @@ def _load_trials(d: str, cfg: dict):
         return None, []
     rows = []
     for t in study.trials:
+        cons = t.user_attrs.get("constraints")
         rows.append({"number": t.number, "state": t.state.name, "params": t.params,
                      "values": t.values, "metrics": t.user_attrs.get("metrics"), "error": t.user_attrs.get("error"),
+                     "feasible": None if cons is None else all(v <= 0 for v in cons), "duplicate_of": t.user_attrs.get("duplicate_of"),
                      "baseline": bool(t.user_attrs.get("baseline") or t.system_attrs.get("fixed_params")),
                      "seconds": (t.datetime_complete - t.datetime_start).total_seconds()
                      if t.datetime_complete and t.datetime_start else None,
@@ -1481,27 +1504,25 @@ def lab_list():
         study, rows = _load_trials(d, cfg)
         done = [r for r in rows if r["state"] == "COMPLETE"]
         best = None
-        if done and len(cfg["objectives"]) == 1:
-            sign = 1 if (cfg["objectives"][0].get("direction") or "minimize") == "minimize" else -1
-            best = min((r["values"][0] for r in done), key=lambda v: sign * v)
+        if done and len(cfg["objectives"]) == 1 and study is not None:
+            try:
+                best = _best_trial(study, cfg)[0].values[0]
+            except Exception:
+                best = None
         out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "dataset": cfg["dataset"].get("name"),
                     "state": st.get("state"), "message": st.get("message"), "n_trials": cfg.get("n_trials"),
-                    "n_complete": len(done), "n_total": len(rows), "best": best,
+                    "n_complete": len(done), "n_total": len(rows), "best": best, "hypertune": bool(cfg.get("hypertune")),
                     "objectives": cfg["objectives"], "created": cfg.get("created")})
     return clean_json({"studies": out})
 
 
 def _best_trial(study, cfg):
-    """The best trial as the study's objectives define it: the optimum of a single objective;
-    with several objectives, the Pareto-optimal trial that is best on the first (primary)."""
-    objs = cfg["objectives"]
-    if len(objs) == 1:
-        return study.best_trial, f"best {objs[0]['metric']} ({objs[0].get('direction', 'minimize')})"
-    front = study.best_trials
-    sign = 1 if objs[0].get("direction", "minimize") == "minimize" else -1
-    t = min(front, key=lambda q: sign * q.values[0])
-    return t, (f"Pareto-optimal on {' × '.join(o['metric'] for o in objs)}, best {objs[0]['metric']} "
-               f"of the {len(front)} on the front")
+    """The best trial as the study's objectives define it (sirilpipe.lab.run.best_trial): among the trials that meet the task's
+    constraints, the optimum of a single objective (the baseline kept when the gain is below the task's resolution); with
+    several objectives, the Pareto-optimal trial that is best on the first (primary)."""
+    from sirilpipe.lab.run import best_trial
+    from sirilpipe.lab.tasks import TASKS
+    return best_trial(study, cfg, TASKS.get(cfg.get("task")))
 
 
 @app.get("/api/lab/best")
@@ -1555,7 +1576,10 @@ def lab_detail(sid: str, log_lines: int = 200):
     best, importance = [], {}
     if study is not None and any(r["state"] == "COMPLETE" for r in rows):
         try:
-            best = [t.number for t in study.best_trials]
+            if len(cfg["objectives"]) == 1:
+                best = [_best_trial(study, cfg)[0].number]
+            else:
+                best = [t.number for t in study.best_trials]
         except Exception:
             best = []
         tuned = [k for k, v in cfg.get("space", {}).items() if v.get("tune")]
@@ -1579,7 +1603,14 @@ def lab_detail(sid: str, log_lines: int = 200):
     pipeline_map = {p["name"]: p.get("pipeline") for p in params}
     processing_map = {p["name"]: p.get("processing") for p in params}
     code_map = {p["name"]: p.get("code") for p in params}
-    return clean_json({"id": sid, "config": cfg, "status": st, "trials": rows, "best": best,
+    best_info = None
+    if best:
+        try:
+            best_info = _best_trial(study, cfg)[1]
+        except Exception:
+            best_info = None
+    return clean_json({"id": sid, "config": cfg, "status": st, "trials": rows, "best": best, "best_criterion": best_info,
+                       "objective_note": getattr(task, "objective_note", "") if task else "",
                        "importance": importance, "log": "".join(log), "pipeline_map": pipeline_map,
                        "processing_map": processing_map, "code_map": code_map, "metrics": metrics,
                        "legacy_task": task is None})
@@ -1599,6 +1630,8 @@ def lab_stop(sid: str):
     st = _read_status(_study_dir(sid))
     if st.get("state") not in ("starting", "preparing", "running"):
         raise HTTPException(409, "The study is not running")
+    if st.get("in_process"):
+        raise HTTPException(409, "This study is part of a hyper-tuned Run everything job: cancel the job (Jobs tab or the Progress card) to stop it")
     # graceful: the runner cancels the running trial and marks the study stopped
     os.kill(int(st["pid"]), signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
     return {"ok": True}

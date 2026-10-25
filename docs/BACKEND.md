@@ -133,7 +133,8 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 | Cosmic Clarity | Sharpen / Denoise / Super-Resolution / DarkStar / satellite trails, chosen in *Integration & options* and *Stars*; models from the Tools card |
 | Diagnostics | stage logs, reference frame, integration coverage map, Siril rejection map |
 | Explore | plate solution from Siril's WCS (own solver as fallback), Gaia DR3 + SIMBAD annotation |
-| Experiments (Optuna) | `sirilpipe/lab/`: finishing chain, linear restoration, registration & integration, star separation, gradient removal; synthetic datasets with truth; *From experiment* in the Process tab |
+| Experiments (Optuna) | `sirilpipe/lab/`: registration & integration, satellite trails, gradient removal, linear restoration, star separation, finishing chain, super-resolution; paired no-reference objectives with constraints (`lab/objectives.py`), conditional search spaces; synthetic datasets with truth; *From experiment* in the Process tab |
+| Hyper-tune each stage | `sirilpipe/hypertune.py`: Run everything with a study of every stage before it runs (`stack_params.hypertune`, `hypertune_trials`), in the job's own process; studies in the Experiments tab, report in `hypertune.json` |
 | ImageMM | VeraLux ImageMM v1.0.0 headless: `deconv_method = imagemm` (needs `IMAGEMM=cuda`), `restored_resolution` = r, `imagemm_*` = the script's parameters |
 | CLI | `python -m sirilpipe run|stack|analyse|calibration|devices|tools` |
 | `/api/v1` | unchanged |

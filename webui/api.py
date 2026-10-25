@@ -256,7 +256,8 @@ def submit(body: dict = Body(...)):
 
     body: path | paths, source (images | uploads), kind (default all = analyse, stack, restore,
     star remover, auto-finish, export; stack_params.autofinish = false exports the given settings
-    as they are), profile (a name from /profiles), stack_params / params (override the
+    as they are; stack_params.hypertune = true runs an experiment of every stage first, hypertune_trials
+    trials each, and each stage with its best trial: hours), profile (a name from /profiles), stack_params / params (override the
     profile and the defaults), preset (a processing preset of the web UI), export (quality,
     upscale, tiff), client_ref (the client's id for this job: submitting it again returns the job
     already queued or done instead of a second one), label (shown in the Jobs panel)."""

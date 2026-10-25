@@ -136,7 +136,9 @@ const Lab = (() => {
   function buildTask() {
     const t = L.byName[$("#lbTask").value];
     $("#lbTaskDesc").textContent = t.description;
-    $("#lbOptions").innerHTML = t.options.map(o => o.type === "categorical"
+    const cons = Object.entries(t.constraints || {}).map(([k, [kind, b]]) => `${k} ${kind === "max" ? "≤" : "≥"} ${b}`);
+    $("#lbTaskObj").innerHTML = t.objective_note ? `<b>Objective.</b> ${esc(t.objective_note)}` : (cons.length ? `Constraints: ${esc(cons.join(", "))}` : "");
+    $("#lbOptions").innerHTML = t.options.filter(o => !o.internal).map(o => o.type === "categorical"
       ? `<label>${esc(o.label)}<select data-opt="${o.name}">${o.choices.map(c => `<option ${c === o.default ? "selected" : ""}>${c}</option>`).join("")}</select></label>`
       : `<label>${esc(o.label)}<input data-opt="${o.name}" data-t="${o.type}" type="number" step="any" value="${o.default}"></label>`).join("");
     L.space = {};
@@ -159,8 +161,9 @@ const Lab = (() => {
       const fixed = s.tune ? "" : p.type === "bool" ? `<select class="fixed" data-k="value"><option value="true" ${s.value ? "selected" : ""}>on</option><option value="false" ${!s.value ? "selected" : ""}>off</option></select>`
         : p.type === "categorical" ? `<select class="fixed" data-k="value">${p.choices.map(c => `<option ${String(c) === String(s.value) ? "selected" : ""}>${c}</option>`).join("")}</select>`
         : `<input class="fixed" type="number" step="any" data-k="value" value="${s.value}">`;
+      const cond = p.when ? (Array.isArray(p.when) ? p.when : [p.when]).map(a => Object.entries(a).map(([k, v]) => `${k} ∈ {${v.join(", ")}}`).join(" and ")).join(" or ") : "";
       return `<div class="lbparam" data-p="${p.name}"><div class="hd"><input type="checkbox" data-k="tune" ${s.tune ? "checked" : ""}>
-        <span title="${esc(p.pipeline ? "pipeline setting: " + p.pipeline : p.processing ? "processing setting: " + p.processing : p.code ? "constant in " + p.code + ": " + p.name : "not a pipeline setting")}">${esc(p.label)}</span>${fixed}</div>${body}</div>`;
+        <span title="${esc((p.pipeline ? "pipeline setting: " + p.pipeline : p.processing ? "processing setting: " + p.processing : p.code ? "constant in " + p.code + ": " + p.name : "not a pipeline setting") + (cond ? ". Sampled only when " + cond : ""))}">${esc(p.label)}${cond ? ' <span class="muted">⤷</span>' : ""}</span>${fixed}</div>${body}</div>`;
     }).join("");
     $$("#lbSpace [data-k]").forEach(inp => inp.onchange = () => {
       const name = inp.closest("[data-p]").dataset.p, s = L.space[name], k = inp.dataset.k;
@@ -202,7 +205,7 @@ const Lab = (() => {
     const sampler = $("#lbSampler").value;
     const cfg = { name: $("#lbName").value.trim(), task: t.name, dataset: ds, options, space, objectives, sampler,
       n_trials: parseInt($("#lbTrials").value) || 30, timeout_min: parseFloat($("#lbTimeout").value) || 0,
-      seed: parseInt($("#lbSeed").value) || 0, device: $("#lbDevice").value, baseline: $("#lbBaseline").checked };
+      seed: parseInt($("#lbSeed").value) || 0, device: $("#lbDevice").value, baseline: $("#lbBaseline").checked, constraints: $("#lbConstraints").checked };
     try {
       const r = await api("/api/lab/studies", { method: "POST", body: { config: cfg } });
       toast("Study started"); L.sel = r.id; await loadStudies(); loadDetail(); tick();
@@ -214,7 +217,7 @@ const Lab = (() => {
     const r = await api("/api/lab/studies");
     L.studies = r.studies;
     $("#lbStudies").innerHTML = r.studies.length ? r.studies.map(s => `<div class="lbst ${s.id === L.sel ? "sel" : ""}" data-id="${esc(s.id)}">
-      <b>${esc(s.name)}</b><span class="state ${esc(s.state)}">${esc(s.state)}</span>
+      <b>${esc(s.name)}</b>${s.hypertune ? '<span class="ht">hyper-tune</span>' : ""}<span class="state ${esc(s.state)}">${esc(s.state)}</span>
       <span class="meta">${esc(L.byName[s.task]?.label || s.task)} · ${esc(s.dataset)} · ${s.n_complete}/${s.n_trials} trials</span>
       <span class="meta">${s.best !== null && s.best !== undefined ? `best ${esc(s.objectives[0].metric)} ${f4(s.best)}` : s.objectives.map(o => o.metric).join(" × ")}</span></div>`).join("")
       : `<p class="muted small">No studies yet. Configure one on the left.</p>`;
@@ -282,6 +285,8 @@ const Lab = (() => {
     const head = `<div class="card"><h3>${esc(cfg.name)} <span class="state ${esc(st.state)}">${esc(st.state)}</span></h3>
       <div class="small">${esc(L.byName[cfg.task]?.label || cfg.task)} on <b>${esc(cfg.dataset.name)}</b> (${esc(cfg.dataset.kind)}) · ${esc(cfg.sampler)} · ${done.length}/${cfg.n_trials} trials complete${D.trials.length - done.length ? `, ${D.trials.length - done.length} other` : ""} · device ${esc(cfg.device)}</div>
       <div class="small muted" style="margin-top:4px">${esc(st.message || "")}</div>
+      ${D.best_criterion ? `<div class="small" style="margin-top:4px">Best: trial #${D.best?.[0]} — ${esc(D.best_criterion)}</div>` : ""}
+      ${D.objective_note ? `<details class="small muted" style="margin-top:4px"><summary>How this experiment is scored</summary>${esc(D.objective_note)}</details>` : ""}
       <div class="row gap" style="margin-top:10px">
         ${running ? `<button class="btn small" id="lbStop">Stop</button>` : `<button class="btn small" id="lbCont">Run more trials</button> <input id="lbMore" type="number" value="10" min="1" style="width:70px">
         <button class="btn small ghost" id="lbDel">Delete study</button>`}
@@ -328,11 +333,13 @@ const Lab = (() => {
     }
     // trials table
     const mcols = Object.keys(D.metrics).filter(k => D.trials.some(t => t.metrics && typeof t.metrics[k] === "number") && !cfg.objectives.some(o => o.metric === k)).slice(0, 5);
-    const table = `<div class="card"><h3>Trials</h3><div class="lbtable"><table><thead><tr><th>#</th><th>State</th>
+    const hasCons = D.trials.some(t => t.feasible !== null && t.feasible !== undefined);
+    const table = `<div class="card"><h3>Trials</h3><div class="lbtable"><table><thead><tr><th>#</th><th>State</th>${hasCons ? "<th title=\"Meets every constraint of the experiment\">OK</th>" : ""}
       ${cfg.objectives.map(o => `<th>${esc(o.metric)} ${o.direction === "minimize" ? "↓" : "↑"}</th>`).join("")}
       ${tuned.map(k => `<th>${esc(k)}</th>`).join("")}${mcols.map(k => `<th>${esc(k)}</th>`).join("")}<th>Time</th></tr></thead><tbody>
-      ${[...D.trials].reverse().map(t => `<tr data-n="${t.number}" ${t.image ? "data-img" : ""} class="${(D.best || []).includes(t.number) ? "best" : ""} ${t.state === "FAIL" ? "fail" : ""}" title="${esc(t.error || "")}">
-        <td>${t.number}${t.baseline ? " ●" : ""}</td><td>${esc(t.state.toLowerCase())}</td>
+      ${[...D.trials].reverse().map(t => `<tr data-n="${t.number}" ${t.image ? "data-img" : ""} class="${(D.best || []).includes(t.number) ? "best" : ""} ${t.state === "FAIL" ? "fail" : ""} ${t.feasible === false ? "infeasible" : ""}" title="${esc(t.error || (t.metrics?.violations ? "constraints: " + Object.entries(t.metrics.violations).map(([k, v]) => `${k} ${v > 0 ? "broken by " + f4(v) : "met"}`).join(", ") : ""))}">
+        <td>${t.number}${t.baseline ? " ●" : ""}${t.duplicate_of !== null && t.duplicate_of !== undefined ? ` <span class="muted" title="same active settings as trial ${t.duplicate_of}: its result reused">=${t.duplicate_of}</span>` : ""}</td><td>${esc(t.state.toLowerCase())}</td>
+        ${hasCons ? `<td>${t.feasible === true ? "✓" : t.feasible === false ? '<span style="color:var(--bad)">✗</span>' : "–"}</td>` : ""}
         ${cfg.objectives.map((o, i) => `<td class="num">${t.values ? f4(t.values[i]) : "–"}</td>`).join("")}
         ${tuned.map(k => `<td class="num">${esc(f4(t.params[k]))}</td>`).join("")}
         ${mcols.map(k => `<td class="num">${f4(t.metrics?.[k])}</td>`).join("")}
@@ -444,5 +451,6 @@ const Lab = (() => {
     return `<div class="lbchart"><h4>${esc(k)} vs ${esc(o.metric)}</h4><svg viewBox="0 0 ${W} ${H}">${ax}${done.map((t, i) => dot(X(sx, xs[i]), Y(sy, t.values[0]), t)).join("")}</svg></div>`;
   }
 
-  return { show, hidePop };
+  async function open(id) { L.sel = id; L.trialSel = null; await show(); await loadStudies(); loadDetail(); }
+  return { show, hidePop, open };
 })();

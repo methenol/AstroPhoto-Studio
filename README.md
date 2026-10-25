@@ -465,15 +465,64 @@ table with a preview of every result, and the log.  Trial 0 is the pipeline's cu
 study, continue it, or apply its best trial to the pipeline (from the study, or with **From experiment** in
 *Integration & compute options*).
 
-Experiments: **Stretch & finish** (the finishing chain: stretch tool and settings, highlights, noise
-reduction, palette, saturation, stars; scored by the finishing gates, the nebula contrast and the distance
-to the reference looks), **Linear restoration** (gradient model, deconvolution and denoise strengths;
-star FWHM, background noise, sharpness, photometry against the stack), **Registration & integration**
-(rejection sigmas, frame selection, drizzle; background noise, FWHM, roundness), **Star separation**
-(residual star flux and stars left in the starless image, change away from the stars) and **Gradient
-removal** (gradient left in the sky, emission removed).  Synthetic datasets (Seestar-format subs of an
-analytic sky with stars, nebulae, galaxies, dither, field rotation, Moffat seeing, noise, hot pixels,
-satellite trails) are also scored against their exact truth, registered onto the stack's grid.
+Experiments, in pipeline order, each with a score and constraints (shown under the experiment in the tab;
+a trial that breaks a constraint is marked ✗, the samplers steer away from such regions, and the best trial
+is the best one that meets them - the baseline stays unless a trial beats it by more than the measurement's
+resolution).  The measurements are paired: the same stars and the same empty-sky apertures, chosen once on a
+reference image, are measured in every trial, so the differences between trials are not lost in the
+scatter of a new detection.
+
+| Experiment | Searches | Score | Constraints |
+|---|---|---|---|
+| **Registration & integration** | rejection algorithm and sigmas, frame weighting, frame selection, Bayer drizzle / demosaic, drizzle drop size and kernel, banding correction | *depth*: (ln S/N of point sources + ln S/N of extended sources) / 2 of the reference stars, the noise from empty apertures (Labbé et al. 2003) | star ellipticity, single-pixel outliers (hot pixels a lax rejection lets through) and satellite / aircraft trails no worse than the baseline; the auto-crop keeps 90 % of the field |
+| **Satellite trails (Cosmic Clarity)** | Cosmic Clarity trail removal on the stack | trail pixels left (Hough transform on the sky) | nothing else changed above the PSF scale |
+| **Gradient removal** | sky-survey reference, GraXpert, Siril polynomial / RBF, subtract / divide, degree, smoothing | emission changed by the model (validated on a synthetic sky: ρ +0.99 with the error against the truth; the flatness of the "sky" was ρ −0.19, since a model that eats faint nebula flattens it best) | gradient left in the sky ≤ 3 × the pixel noise, the model's own structure at 1-10 % of the frame ≤ 15 % of the image's |
+| **Linear restoration** | deconvolution tool of the objects and of the stars (BXT, GraXpert, RL) and strengths (BXT Sharpen Stars / Nonstellar / Halos), noise-reduction tool and strength (NXT with iterations, GraXpert, Siril) | *depth* of the restored image | star flux conserved (\|Δmag\| ≤ 0.05 bright / 0.10 faint), the image above the PSF scale unchanged within 1.25 × its noise (discrepancy principle), no dark rings round bright stars |
+| **Star separation** | StarXTerminator, StarNet2 (stride), Cosmic Clarity DarkStar | star light left + holes dug at the reference stars | nebula / sky untouched above the PSF scale, holes ≤ 5 % of the stars |
+| **Stretch & finish** | stretch tool and settings, highlights, NXT / Cosmic Clarity Denoise, Cosmic Clarity Sharpen, saturation, local contrast, stars, palette and colour grade | distance to the reference looks of the target (its own photographs, else its class's) | every finishing gate no worse than in the baseline, gate by gate |
+| **Super-resolution (Cosmic Clarity)** | Cosmic Clarity Super-Resolution vs Lanczos, 2-4× | star FWHM in original pixels | binned back, the enlargement reproduces the original (PSNR ≥ 32 dB, flux within 2 %) |
+
+A parameter that has no effect under the other settings (the RBF smoothing of a polynomial model, the Cosmic
+Clarity amounts with Sharpen off) is not sampled, and a trial that repeats an earlier trial's settings reuses its
+result.  Synthetic datasets (Seestar-format subs of an analytic sky with stars, nebulae, galaxies, dither, field
+rotation, Moffat seeing, noise, hot pixels, satellite trails) are also scored against their exact truth,
+registered onto the stack's grid.
+
+### Hyper-tune each stage
+
+The **Hyper-tune each stage** checkbox under *Run everything & export* (off by default; *Trials per stage*
+appears when it is ticked) makes Run everything search the best configuration this framework offers for the
+target: before each stage - registration & integration, satellite trails, gradient removal, restoration, star
+separation, finishing - it runs that stage's experiment on this dataset (a normal study in the Experiments tab,
+named *Hyper-tune <target>: <stage>*), the first trial being your current settings, then runs the stage with the
+best trial and moves on; the export renders the best finishing trial.  The stacking stage is two studies: the
+resampling (Bayer drizzle / demosaic) and the banding correction change the registration itself, so their
+combinations are each tried once, then the integration settings (rejection, sigmas, weighting, frame selection,
+drizzle drop and kernel) are searched on the chosen registration.  The restoration is two studies as well, in the
+pipeline's own order: the deconvolution (tools for objects and stars, strengths, BlurXTerminator's settings), then
+the noise reduction (tool, strength, NXT iterations) on the chosen deconvolution; one study over both, at 60
+trials, was still improving at its end.  The finishing study starts with a few small perturbations of your
+settings (Auto-finish's) before searching the full ranges, and no finishing gate may end up further outside its
+limit than in your settings: gate by gate, so that no gate is traded for another.  Settings that run the same
+thing count once (on a plate-solved field the gradient's "auto" is the sky survey, whatever its smoothing; "auto"
+deconvolution is BlurXTerminator when it is licensed).  60 trials a stage is the default; 30-120 search
+the stages' spaces (finishing, with some 30 settings, gains the most from more); stages with few distinct choices
+(satellite trails, star removal) reuse repeated trials' results instantly.  The budget counts distinct evaluations: a
+setting the sampler proposes again returns its earlier result at no cost and the search samples on, until it has
+evaluated that many different settings or the space is used up.  A trial replaces your settings only by more than
+the measurement's measured resolution: identical restorations scatter by 0.0023 in depth (BlurXTerminator and
+NoiseXTerminator on the GPU are not bit-reproducible), so restoration needs a gain of 0.01; Siril's stacking is
+deterministic (0.005); the finishing chain is deterministic too, and its score (a distance to the reference looks)
+must improve by 2 % of the baseline's, a margin of significance so that Auto-finish's settings are not traded for
+a negligible gain.
+Restoration trials share everything before the deconvolution (gradient, plate solve, colour calibration), so a
+trial is the deconvolution and the noise reduction only (seconds instead of minutes).  With Auto-finish on, its result is the
+finishing study's baseline.  The tools offered are those that can run here (a tool that is not licensed or
+installed is not searched); the output scale, the crop, an ImageMM restoration (hours per run) and - unless
+reference photographs of the target exist - the palette and colour grade stay yours.  Expect hours: a stack trial
+re-stacks the subs.  The report (every stage's study, its score yours → best and what changed) appears above the
+sliders and in `hypertune.json` in the session folder; the chosen options are set in *Integration & options*.
+CLI: `python -m sirilpipe run DIR --hypertune 60`; API: `"stack_params": {"hypertune": true, "hypertune_trials": 60}`.  60 trials a stage is the default; 30-120 search the stages' spaces.
 
 ## Research & benchmarks
 

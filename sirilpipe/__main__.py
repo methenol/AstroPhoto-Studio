@@ -39,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="stack_params, e.g. -s scale=2 -s mode=demosaic -s sensitivity=1.5")
         p.add_argument("--param", "-p", action="append", default=[], metavar="KEY=VALUE", help="processing params")
         p.add_argument("--no-solve", action="store_true", help="skip plate solving")
+        if name == "run":
+            p.add_argument("--hypertune", type=int, default=0, metavar="TRIALS",
+                           help="hyper-tune each stage first: an experiment study of TRIALS trials per stage (much longer; the studies land in WORKDIR/lab/studies)")
     sub.add_parser("devices", help="the GPUs the AI tools can use (nvidia-smi) and which tools are available")
     sub.add_parser("tools", help="status of Siril, GraXpert, StarNet2 and the RC-Astro tools (licences, models)")
     return ap
@@ -87,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
                 s.plate_solve(prog)
             print(json.dumps(clean_json(s.meta), indent=1))
         elif args.cmd == "run":
+            if args.hypertune:
+                sp.update(hypertune=True, hypertune_trials=int(args.hypertune))
             print(json.dumps(clean_json(s.run_all(sp, pr, {}, prog)), indent=1))
     print(f"done in {time.time() - t0:.0f} s; session folder {s.dir}", file=sys.stderr)
     return 0

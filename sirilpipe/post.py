@@ -87,10 +87,16 @@ IGNORED_KEYS: tuple = ()
 # HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1), ``hubble_formula`` the formula preset of Hubble_Palette_from_Dual-Band_OSC.py (auto: Classic,
 # Improved with oiii_unmix / hoo_improved).
 EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride", "hubble_formula",
-              "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "cc_denoise", "cc_denoise_model")
+              "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "cc_denoise", "cc_denoise_model",
+              "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations")
 # Cosmic Clarity (siril-scripts CosmicClarity_Native.py) on the stretched image: off by default (an optional path); the amounts and the model are the script's defaults
 EXTRA_DEFAULTS = {"stretch_boost": 0.0, "hubble_formula": "auto", "cc_sharpen": "off", "cc_stellar_amount": 0.5, "cc_nonstellar_amount": 0.5,
-                  "cc_denoise": False, "cc_denoise_model": "full"}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
+                  "cc_denoise": False, "cc_denoise_model": "full",
+                  # BlurXTerminator / the linear denoiser: auto = the strengths from the measured signal-to-noise (finish.bxt_ss / bxt_sn / nxt_dn /
+                  # graxpert_strength, the published ranges); off = the values below (BXT Sharpen Stars / Sharpen Nonstellar / Adjust Star Halos; the
+                  # denoiser's own strength: NXT --dn, GraXpert -strength, Siril denoise -mod; NXT --it iterations, its default 2)
+                  "bxt_auto": True, "bxt_sharpen_stars": 0.3, "bxt_sharpen_nonstellar": 0.55, "bxt_halos": 0.0,
+                  "linear_denoise_auto": True, "linear_denoise_strength": 0.7, "nxt_iterations": 2}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
 
 
 def _R(group, key, label, lo, hi, step):
@@ -109,7 +115,7 @@ def _S(group, key, label, options):
 # meaning is unchanged).  spcc_sensor / spcc_filter options are completed by the server from the SPCC database.
 PARAM_SPEC: list[dict] = [
     _B("Linear", "background", "Gradient removal (GraXpert AI background extraction)"),
-    _S("Linear", "bg_method", "Gradient model (auto: the NSNS sky survey when the stack is plate-solved and the field is covered, else GraXpert AI; reference: the survey only; poly / rbf: Siril subsky)", ["auto", "reference", "poly", "rbf"]),
+    _S("Linear", "bg_method", "Gradient model (auto: the NSNS sky survey when the stack is plate-solved and the field is covered, else GraXpert AI; reference: the survey only; graxpert: GraXpert AI only; poly / rbf: Siril subsky)", ["auto", "reference", "graxpert", "poly", "rbf"]),
     _S("Linear", "bg_correction", "Gradient correction", ["subtract", "divide"]),
     _R("Linear", "bg_degree", "Polynomial degree (poly model)", 1, 4, 1),
     _R("Linear", "bg_smoothing", "Gradient smoothing", 0, 1, 0.05),
@@ -119,6 +125,13 @@ PARAM_SPEC: list[dict] = [
     _S("Linear", "spcc_white_ref", "Colour calibration: white reference", ["average_spiral_galaxy", "g2v"]),
     _R("Linear", "denoise", "Light denoise before stretch (the tool: Integration & options > Noise reduction; NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
     _R("Linear", "deconvolution", "Deconvolution strength (the tool: Integration & options > Deconvolution; BlurXTerminator on/off, Richardson-Lucy blend, GraXpert -strength)", 0, 1, 0.05),
+    _B("Linear", "bxt_auto", "BlurXTerminator strengths from the signal-to-noise (off: the three values below)"),
+    _R("Linear", "bxt_sharpen_stars", "BlurXTerminator Sharpen Stars (when not from the signal-to-noise)", 0, 0.7, 0.01),
+    _R("Linear", "bxt_sharpen_nonstellar", "BlurXTerminator Sharpen Nonstellar (when not from the signal-to-noise)", 0, 1, 0.01),
+    _R("Linear", "bxt_halos", "BlurXTerminator Adjust Star Halos (when not from the signal-to-noise)", -0.5, 0.5, 0.01),
+    _B("Linear", "linear_denoise_auto", "Linear denoise strength from the signal-to-noise x the Light denoise slider (off: the strength below)"),
+    _R("Linear", "linear_denoise_strength", "Linear denoise: the tool's own strength (NXT --dn, GraXpert -strength, Siril -mod; when not from the signal-to-noise)", 0, 1, 0.01),
+    _R("Linear", "nxt_iterations", "NoiseXTerminator iterations (--it, when not from the signal-to-noise; NXT's default 2)", 1, 5, 1),
     _S("Stretch", "stretch_method", "Stretch tool (statstretch: Seti Astro Statistical Stretch, the default; ghs2: Siril ght, the GHS two-pass recipe; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
        ["statstretch", "ghs2", "autoghs", "modasinh", "autostretch", "hms"]),
     _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
@@ -207,6 +220,13 @@ def _save_json(path: str, doc: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=1, default=export_mod._json_default)
     os.replace(tmp, path)
+
+
+def _flag(v) -> bool:
+    """A boolean setting that may arrive as a string ("false", "0", "off": an API client, a lab study's categorical)."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "off", "no", "none")
+    return bool(v)
 
 
 def _sanitize(arr: np.ndarray) -> np.ndarray:
@@ -613,7 +633,7 @@ class Restorer:
         if not p["background"]:
             s.add("gradient", "none", "skipped", note="background=false")
             return
-        method = p["bg_method"] if p["bg_method"] in ("poly", "rbf", "reference") else "auto"
+        method = p["bg_method"] if p["bg_method"] in ("poly", "rbf", "reference", "graxpert") else "auto"
         smoothing = float(p["bg_smoothing"])
         t0 = time.time()
         if method in ("auto", "reference"):
@@ -644,7 +664,7 @@ class Restorer:
             except Exception as e:                                    # noqa: BLE001  offline, outside the survey, no plate solution: the sample-based models follow
                 s.add("gradient", "sky survey reference (skyref)", "failed" if method == "reference" else "skipped", time.time() - t0, note=f"{type(e).__name__}: {str(e)[:160]}")
                 method = "auto"
-        if method == "auto":
+        if method in ("auto", "graxpert"):
             try:
                 src, dst = self._file(self.arr, "bge_in.fits"), self._out("bge_out.fits")
                 meta = tools.graxpert.background_extraction(src, dst, smoothing=smoothing, correction=p["bg_correction"],
@@ -657,6 +677,8 @@ class Restorer:
                 raise
             except (ToolUnavailable, ToolError) as e:
                 s.add("gradient", "graxpert", "failed", time.time() - t0, note=str(e))
+                if method == "graxpert":                                 # chosen explicitly: recorded, nothing else runs in its place
+                    return
         # Siril: polynomial or RBF subtraction (also the fallback when the AI model is missing)
         if method == "poly":
             cmd = f"subsky {int(np.clip(p['bg_degree'], 1, 4))} -samples=20 -tolerance=1.0"
@@ -892,6 +914,11 @@ class Restorer:
                 # the other's sharpening at 0 (RC-Astro: Sharpen Stars / Sharpen Nonstellar act on the stars / the nonstellar structure).
                 snr = self.snr()
                 ss, sn = round(finish.bxt_ss(snr), 3), round(finish.bxt_sn(snr), 3)     # research/pro-workflow.md A5: 1-2 h stacks ss 0.25-0.35, sn 0.5-0.6
+                ash = 0.0
+                if not _flag(self.p.get("bxt_auto", True)):                # the user's (or a study's) own BXT values
+                    ss = round(float(np.clip(self.p.get("bxt_sharpen_stars", ss), 0.0, 0.7)), 3)
+                    sn = round(float(np.clip(self.p.get("bxt_sharpen_nonstellar", sn), 0.0, 1.0)), 3)
+                    ash = round(float(np.clip(self.p.get("bxt_halos", 0.0), -0.5, 0.5)), 3)
                 if region == "objects":
                     ss = 0.0
                 elif region == "stars":
@@ -900,9 +927,9 @@ class Restorer:
                 fwhm = float(self.meta.get("fwhm_px") or 0)
                 if self.p.get("bxt_manual_psf") and 1.0 < fwhm:        # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
                     extra = {"ansp": False, "nsd": min(8.0, fwhm)}
-                self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=0.0, **extra)
-                s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, region=region, ss=round(ss, 3), sn=round(sn, 3), snr=round(snr, 2),
-                      flags=meta.get("flags"), **extra)
+                self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=ash, **extra)
+                s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, region=region, ss=round(ss, 3), sn=round(sn, 3), ash=ash, snr=round(snr, 2),
+                      strengths="signal-to-noise" if _flag(self.p.get("bxt_auto", True)) else "manual", flags=meta.get("flags"), **extra)
                 return
             except Cancelled:
                 raise
@@ -991,15 +1018,19 @@ class Restorer:
         # GraXpert 1.0 on the same linear data resolves the Heart's filaments.
         snr = self.snr()
         scale = min(1.0, d / 0.95)
+        manual = not _flag(p.get("linear_denoise_auto", True))      # the tool's own strength, not the signal-to-noise ladder x the slider
+        mstrength = float(np.clip(p.get("linear_denoise_strength", 0.7), 0.0, 1.0))
         order = {"nxt": ["nxt"], "graxpert": ["graxpert"], "siril": ["siril"]}.get(method, ["nxt", "graxpert", "siril"])
         for tool in order:
             t0 = time.time()
             if tool == "nxt":
                 try:
                     tools.rcastro.require("nxt")
-                    dn = round(finish.nxt_dn(snr) * scale, 3)
-                    self.arr, meta = self._rc("nxt", self.arr, "nxt", dn=dn)
-                    s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, snr=round(snr, 2), flags=meta.get("flags"))
+                    dn = round(mstrength if manual else finish.nxt_dn(snr) * scale, 3)
+                    extra = {"it": int(np.clip(int(p.get("nxt_iterations", 2) or 2), 1, 5))} if manual else {}
+                    self.arr, meta = self._rc("nxt", self.arr, "nxt", dn=dn, **extra)
+                    s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, snr=round(snr, 2), strengths="manual" if manual else "signal-to-noise",
+                          flags=meta.get("flags"), **extra)
                     return
                 except Cancelled:
                     raise
@@ -1008,7 +1039,7 @@ class Restorer:
             elif tool == "graxpert":
                 try:
                     src, dst = self._file(self.arr, "gxd_in.fits"), self._out("gxd_out.fits")
-                    strength = round(finish.graxpert_strength(snr) * scale, 3)
+                    strength = round(mstrength if manual else finish.graxpert_strength(snr) * scale, 3)
                     meta = tools.graxpert.denoise(src, dst, strength=strength, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
                     self.arr = _sanitize(fitsio.read_rgb(dst)[0])
                     s.add("denoise", "graxpert", seconds=time.time() - t0, strength=strength, snr=round(snr, 2), model=meta.get("model"),
@@ -1019,7 +1050,7 @@ class Restorer:
                 except (ToolUnavailable, ToolError) as e:
                     s.add("denoise", "graxpert", "unavailable", time.time() - t0, note=str(e))
             else:
-                mod = round(min(1.0, 0.85 * d), 2)
+                mod = round(mstrength if manual else min(1.0, 0.85 * d), 2)
                 try:
                     out, _ = _siril_image(self.work, s, "dn", self.arr, self.header, f"denoise -mod={mod}", "Noise reduction")
                     self.arr = _sanitize(out)
