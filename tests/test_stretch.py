@@ -71,3 +71,16 @@ def test_a_failing_trial_is_left_out_of_the_fit_not_the_whole_run(tmp_path, monk
     assert outs[2] is None and float(outs[1][0].mean()) == pytest.approx(0.2)
     with pytest.raises(SirilError):                                   # every trial failing still fails
         st._run_trials([plane], [["BAD 1"], ["BAD 2"]], "fit0_p1")
+
+
+def test_autoghs_shadowsclip_puts_sirils_symmetry_point_left_of_the_sky_peak():
+    """Siril's autoghs: SP = median + shadowsclip x std of the image.  A nebula inflates the std far above the sky noise (M 42: 160 x), so a fixed
+    -1.2 put SP below 0 (the sky mapped negative, a black render); the shadowsclip is derived so SP = sky - 1.2 noise sigma."""
+    rng = np.random.default_rng(1)
+    lum = (2e-4 + rng.normal(0, 4e-5, (400, 600))).astype(np.float32)
+    lum[100:300, 150:450] += 0.02                                      # a bright nebula: std >> noise
+    k = stretch.autoghs_shadowsclip(lum, 2e-4, 4e-5)
+    x = lum[::2, ::2]
+    sp = float(np.median(x)) + k * float(np.std(x))
+    assert sp == pytest.approx(2e-4 - 1.2 * 4e-5, abs=1e-7) and sp > 0
+    assert -0.05 < k < 0                                               # nothing like the old -1.2

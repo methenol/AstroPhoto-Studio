@@ -27,8 +27,11 @@ SIGNAL_SIGMA = 4.0                  # "signal" = more than this many sigmas abov
 METHODS = ("ghs2", "autoghs", "modasinh", "autostretch", "statstretch", "hms")
 TRIAL_SIDE = 900                    # px: the trial stretches of the non-analytic methods run on a copy reduced to this long side
 TRIAL_POINTS = 9                    # values of the method's parameter tried per Siril run
-AUTOGHS_K = -1.2                    # autoghs shadowsclip k: SP = median + k sigma = the left half-maximum of the sky peak (median - 1.18 sigma), the GHS tutorial's "just left of the
-                                    # peak" that the two-pass recipe uses too; at k 0 the sky sits on SP, where GHS keeps it near 0 whatever D (IC 1805 2026-10-16: dark at D 15)
+AUTOGHS_K = -1.2                    # SP target in sky-noise sigmas: the left half-maximum of the sky peak (median - 1.18 noise sigma), the GHS tutorial's "just left of the
+                                    # peak" that the two-pass recipe uses too; at k 0 the sky sits on SP, where GHS keeps it near 0 whatever D (IC 1805 2026-10-16: dark at D 15).
+                                    # Siril's autoghs computes SP = median + shadowsclip x the image's STANDARD DEVIATION (measured 2026-10-25: SP(k) linear in k with slope
+                                    # = np.std of the image), which a nebula inflates far above the sky noise (M 42: 160 x): -1.2 put SP at -0.0077, the sky mapped below 0
+                                    # and the fit chose D 0.055 (a black render).  autoghs_shadowsclip converts the sky-noise target into the shadowsclip Siril needs.
 AUTOGHS_B, AUTOGHS_HP = 13.0, 0.7   # Siril's own defaults (siril command reference)
 AUTOGHS_MAX_PASSES = 4              # repeated autoghs passes at most (D 10 x 2 passes put the Heart's sky at 0.116, 4 passes of D 3 at 0.114)
 AUTOSTRETCH_CLIP = -2.8             # autostretch's own default shadowsclip
@@ -41,6 +44,15 @@ HMS_CONVERGENCE = 3.5                                     # "Color convergence":
 HMS_PROFILE = "Rec.709 (Recommended)"
 MODASINH_SP_SIGMAS = -1.2           # modasinh: SP this many noise sigmas from the sky mode: the left half-maximum of the sky peak (as autoghs / the GHS recipe); above the sky the
                                     # sky maps below SP and no D within Siril's 0-10 reaches the 0.10 background (IC 1805 2026-10-16)
+
+
+def autoghs_shadowsclip(lum: np.ndarray, sky: float, noise: float) -> float:
+    """The ``shadowsclip`` that puts Siril's autoghs symmetry point (median + shadowsclip x std of the image) on the sky's left half-maximum
+    (``sky`` + AUTOGHS_K x ``noise``, never below 0)."""
+    x = np.asarray(lum, dtype=np.float32)[::2, ::2]
+    med, sd = float(np.median(x)), float(np.std(x))
+    sp = max(float(sky) + AUTOGHS_K * float(noise), 0.0)
+    return float((sp - med) / sd) if sd > 0 else 0.0
 
 
 def community_python() -> str | None:
@@ -202,7 +214,8 @@ class SirilStretcher:
             # autoghs's stretchamount is a linear D of at most 10: one pass lifts a black-pointed deep-sky stack by ~11x at best (IC 1805 2026-10-16: sky 0.005 at D 10),
             # so the command is repeated ``passes`` times with the same D (GHS practice: several moderate stretches), the pass count chosen by the fit
             d = float(np.clip(np.nan_to_num(float(value), nan=1.0), 1e-3, 9.999999))      # Siril: 0 < D <= 10 (see modasinh)
-            return [f"autoghs -linked {AUTOGHS_K:g} {d:.6f} -b={AUTOGHS_B:g} -hp={AUTOGHS_HP:g} -lp=0 -clipmode=clip"] * int(ctx.get("passes", 1))
+            k = float(ctx.get("autoghs_k", AUTOGHS_K))
+            return [f"autoghs -linked {k:.6f} {d:.6f} -b={AUTOGHS_B:g} -hp={AUTOGHS_HP:g} -lp=0 -clipmode=clip"] * int(ctx.get("passes", 1))
         if method == "modasinh":
             sp = float(np.clip(ctx["sky"] + MODASINH_SP_SIGMAS * ctx.get("band", ctx["noise"]), 0.0, 0.9))
             # Siril accepts 0 < D <= 10 only: a value printed as 10.000001 (the grid's end in floating point) or a NaN
@@ -227,7 +240,11 @@ class SirilStretcher:
         of the lightness reduced to ``TRIAL_SIDE``."""
         lo_min, hi_max = {"autoghs": (0.05, 10.0), "modasinh": (0.05, 10.0), "autostretch": (0.01, 0.9), "statstretch": (0.02, 0.9), "hms": (0.3, 6.0)}[method]
         in_lum = _reduce(ctx["lum"], TRIAL_SIDE)                      # lo_min / hi_max: the tool's own limits (modasinh / autoghs: Siril rejects D > 10)
+        if method == "autoghs":                                        # SP from the statistics of the image Siril is given (trial copy / full planes)
+            ctx["autoghs_k"] = autoghs_shadowsclip(ctx["lum"], ctx["sky"], ctx["noise"])
         ctx_t = {**ctx, "lum": in_lum}
+        if method == "autoghs":
+            ctx_t["autoghs_k"] = autoghs_shadowsclip(np.clip(in_lum, 0.0, 1.0), ctx["sky"], ctx["noise"])
         mono = [np.clip(in_lum, 0.0, 1.0).astype(np.float32)]
         by_sky = method in ("autostretch", "statstretch", "hms") or aims.get("neb") is None
         target = aims["sky"] if by_sky else aims["neb"] - aims["sky"]
@@ -243,10 +260,13 @@ class SirilStretcher:
                 else:
                     outs = self._run_trials(mono, [self.command(method, v, ctx_t) for v in vals], f"fit{rnd}_p{passes}")
                 for v, o in zip(vals, outs):
-                    sky, neb = self._levels(o[0], in_lum, ctx_t) if o is not None else (float("nan"), float("nan"))
+                    valid = o is not None and float(o[0].min()) >= -1e-4 and float(o[0].max()) <= 1.0 + 1e-4     # a stretch maps [0, 1] into [0, 1]
+                    sky, neb = self._levels(o[0], in_lum, ctx_t) if valid else (float("nan"), float("nan"))
                     trials.append((v, sky, neb))
                 ys = np.array([(t[1] if by_sky else t[2] - t[1]) for t in trials[-TRIAL_POINTS:]])
                 fin = np.isfinite(ys)                                 # a trial Siril could not complete has no level
+                if not fin.any():
+                    raise SirilError(f"{method}: no trial value between {vals[0]:.4g} and {vals[-1]:.4g} gave a valid stretch ({passes} pass(es))")
                 failed_above = np.array(vals)[~fin & (np.array(vals) > max(np.array(vals)[fin]))] if fin.any() else np.array([])
                 xs, ys = np.array(vals)[fin], ys[fin]
                 order = np.argsort(ys)
