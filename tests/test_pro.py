@@ -9,7 +9,7 @@ import sys
 import numpy as np
 import pytest
 
-from sirilpipe import autofinish as af, finish, fitsio, gates, nbn, pro, siril
+from sirilpipe import autofinish as af, finish, fitsio, gates, nbn, post, pro, siril
 
 RNG = np.random.default_rng(3)
 
@@ -163,3 +163,18 @@ def test_the_chain_runs_in_siril_and_records_every_step(tmp_path):
     assert "ght -D=" in cmds and "linstretch -BP=" in cmds and "mtf 0 0.004098 1" in cmds and 'pm "~(~$rc_sl$*~$rc_st$)"' in cmds and "clahe 1.5" in cmds
     g = gates.compute(out, starless=info["starless"])
     assert g["sky_median"]["pass"] and g["clipped"]["pass"]
+
+
+def test_the_chosen_palette_decides_and_the_oiii_boost_only_tunes_nbn(tmp_path, monkeypatch):
+    """With an OIII boost set, every palette of the menu rendered as NBN (boost != 1 switched NBN on by itself): the preview stuck in NBN."""
+    calls = []
+    monkeypatch.setattr(pro.Finisher, "_palette_nbn", lambda self, arr, boost: calls.append(("nbn", boost)) or arr)
+    monkeypatch.setattr(pro.Finisher, "_palette_hubble", lambda self, arr, pal: calls.append(("hubble", pal)) or arr)
+    monkeypatch.setattr(pro.Finisher, "_palette_pm", lambda self, arr, pal: calls.append(("pm", pal)) or arr)
+    monkeypatch.setattr(pro.Finisher, "ha_luminance", lambda self, out, ha: out)
+    arr = RNG.uniform(0.05, 0.3, (3, 32, 32)).astype(np.float32)
+    for pal, boost, want in (("hoo", 2.0, ("hubble", "hoo")), ("sho", 1.5, ("hubble", "sho")), ("foraxx", 2.0, ("pm", "foraxx")), ("nbn", 2.0, ("nbn", 2.0)), ("nbn", 1.0, ("nbn", 1.0))):
+        calls.clear()
+        fin = pro.Finisher(str(tmp_path), {}, {**post.DEFAULTS, "palette": pal, "oiii_boost": boost}, True, external=False)
+        fin.colour(arr)
+        assert calls == [want], (pal, boost, calls)

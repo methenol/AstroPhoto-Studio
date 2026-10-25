@@ -323,3 +323,26 @@ def test_banding_stage_runs_only_when_measured(session, monkeypatch):
     monkeypatch.setattr(workflow, "row_banding_ratio", lambda paths, pattern="RGGB": {"ratio": 0.98, "needed": 1.1, "banded": False, "n_subs": 8})
     session.run_stack({"pattern_correction": False})
     assert not [s for s, _ in FakeRunner.log if s.startswith("banding")]
+
+
+def test_previews_of_a_dataset_never_overlap_and_a_superseded_one_is_skipped(session, monkeypatch):
+    """Two renders at once shared process/preview and overwrote each other's Siril inputs (an error at a random stage for every quick slider move)."""
+    import threading
+    import time as _time
+    from sirilpipe import post
+    active, overlap = [0], [False]
+
+    def fake_preview(d, meta, params, max_side=1600):
+        active[0] += 1
+        overlap[0] |= active[0] > 1
+        _time.sleep(0.05)
+        active[0] -= 1
+        return b"jpeg"
+    monkeypatch.setattr(post, "preview_jpeg", fake_preview)
+    ts = [threading.Thread(target=session.preview_jpeg, args=({"saturation": 1 + i / 10},)) for i in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not overlap[0]
+    with pytest.raises(sess.PreviewSuperseded):
+        session.preview_jpeg({}, superseded=lambda: True)
+    assert session.preview_jpeg({}, superseded=lambda: False) == b"jpeg"

@@ -21,7 +21,7 @@ step   tool and published parameters (source)
 4      palette (dual-band): Hubble_Palette_from_Dual-Band_OSC.py itself (siril-scripts, run headless by ``hubble_palette_worker.py``): HOO (default; Classic Ha = R,
        OIII = (G + B) / 2, or Improved OIII = (G + B - 0.3 R) / 2) and the Hubble-like SHO / HSO / OSH / OHS / HOS with its synthetic SII, formula preset
        ``hubble_formula`` (Classic / Improved / Advanced / NonLinear S2); Foraxx (The Coldest Nights) and HOO warm by Siril ``pm``; NBN (Blanshan / Cranfield,
-       Cuiv's script: ``nbn.py``) when ``oiii_boost`` != 1; SCNR (``scnr``) after the Ha-in-green palettes SHO / OHS.  Broadband: ``rmgreen 3 <scnr>`` (SCNR).
+       Cuiv's script: ``nbn.py``) as the palette ``nbn``, with its OIII boost ``oiii_boost``; SCNR (``scnr``) after the Ha-in-green palettes SHO / OHS.  Broadband: ``rmgreen 3 <scnr>`` (SCNR).
 5      local contrast under a background mask, after the noise reduction: Siril ``clahe`` (contrast limit 1.5 = Brecher's LHE limit), 150 px then 40 px tiles
        (Brecher M51 / IC 1848 / Sh2-140 scales), blended at 0.4 x ``local_contrast`` (0.5 -> 0.2 = the lowest published strengths 0.18-0.2).
 6      saturation: ``ght -sat`` (Siril's GHS saturation stretch, ghsastro) with D fitted so the subject's mean HSL saturation is multiplied by the ``saturation`` setting, under the
@@ -697,7 +697,9 @@ class Finisher:
         boost = float(p.get("oiii_boost", 1.0))
         if self.dual and pal != "natural":
             ha = arr[0].copy()
-            if pal == "nbn" or abs(boost - 1.0) > 1e-6:
+            # the palette chosen decides; the OIII boost is NBN's own setting.  It used to switch NBN on by itself (boost != 1), so with a boost set
+            # every other palette of the menu rendered as NBN - the preview "stuck" in NBN whatever palette was picked
+            if pal == "nbn":
                 out = self._palette_nbn(arr, boost)
             elif pal in HUBBLE_PALETTES:
                 out = self._palette_hubble(arr, pal)

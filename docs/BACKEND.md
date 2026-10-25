@@ -93,7 +93,7 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    **Hubble_Palette_from_Dual-Band_OSC.py** itself (siril-scripts, Carlo Mollicone – AstroBOH; GUI-only, run headless inside Siril by
    `sirilpipe/hubble_palette_worker.py`, which selects the palette and formula preset and presses its *Apply*): HOO (default, Classic or
    Improved) and the Hubble-like SHO / HSO / OSH / OHS / HOS with its synthetic SII, presets Classic / Improved / Advanced / NonLinear S2
-   (`hubble_formula`); SCNR after the Ha-in-green palettes (SHO, OHS); foraxx / hoo_warm by `pm`; NBN port when `oiii_boost` != 1; broadband `rmgreen 3`; local contrast by `clahe`
+   (`hubble_formula`); SCNR after the Ha-in-green palettes (SHO, OHS); foraxx / hoo_warm by `pm`; NBN port as the palette `nbn` (its OIII boost `oiii_boost`); broadband `rmgreen 3`; local contrast by `clahe`
    under a mask (150 and 40 px); the GHS saturation stretch (`ght -sat`, D fitted so the subject's mean saturation reaches its target, under the range mask); stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
    (`pm "~(~$starless$*~$stars$)"`); black point at the toe and `icc_convert_to sRGB relative`; sRGB JPEG + 16-bit TIFF + the JSON sidecar.  The exporter computes and prints the
    **gates** of research/FINISH-SPEC.md (`gates.py`) and stores them in the sidecar.  The preview runs the same chain without the AI steps.  The outer 24 px of the stack are trimmed.

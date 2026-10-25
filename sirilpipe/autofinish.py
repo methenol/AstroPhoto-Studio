@@ -16,7 +16,7 @@ hdr                    on (1 = the published values: GHS HP < 1, Statistical Str
 luminance_denoise      NoiseXTerminator ``--dn`` on the stretched starless: 0.85 on the noisiest data (per-pixel object SNR <= 3) down to 0.6 on clean data (SNR >= 15)
                        (RC-Astro / Brecher 0.6-0.85-0.9: the noisier the data the stronger)
 chroma_denoise         NXT colour denoise 0.95 (NXT manual: colour 90-100 %)
-palette / oiii_boost   dual-band: HOO Classic (Ha = R, OIII = (G + B) / 2), NBN only when the user sets an OIII boost; broadband: natural colour
+palette / oiii_boost   dual-band: HOO Classic (Ha = R, OIII = (G + B) / 2), NBN only when the user picks the palette nbn (its OIII boost is the user's); broadband: natural colour
 scnr                   broadband: 0.6 (SW Skies 0.60-0.75, low end) when the subject has a green cast (median G - (R + B) / 2 > 0.01 after the stretch), else 0; dual-band: 0
                        (green is the OIII; NBN never applies SCNR to HOO)
 local_contrast         the blend of the Siril ``clahe`` passes: 0.2 (0.5, the lowest published strength: Sh2-140 / IC 417) for noisy data (SNR <= 3), 0.35 (0.875, M51's second
@@ -255,7 +255,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
             decide("palette", "hoo", "dual-band filter", None, None, "dual-band: HOO Classic, Ha = R and OIII = (G + B) / 2 (Hubble_Palette_from_Dual-Band_OSC.py)")
         else:
             decide("palette", user_pal, "settings", None, None, f"the settings name the palette {user_pal}")
-        decide("oiii_boost", float(p0.get("oiii_boost", 1.0)), "dual-band filter", None, None, "NBN (OIII boost != 1) is only run on request")
+        decide("oiii_boost", float(p0.get("oiii_boost", 1.0)), "dual-band filter", None, None, "the OIII boost of the NBN palette is the user's setting (NBN runs only when picked as the palette)")
         pal_p = {**p1, "palette": tuned["palette"], "oiii_boost": float(p0.get("oiii_boost", 1.0)), "hdr": hdr_value, "scnr": 0.0}
         col = pro.Finisher(work, layers.header, pal_p, True, external=False, checkpoint=checkpoint, keep_pictures=False).colour(s0)
         if tuned["palette"] in pro.HA_GREEN_PALETTES:

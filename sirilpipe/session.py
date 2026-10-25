@@ -39,6 +39,10 @@ STAGES = ["Scanning frames", "Calibrating", "Registering (pass 1/2)", "Registeri
           "Applying registration", "Stacking", "Cropping", "Plate solving"]
 
 
+class PreviewSuperseded(Exception):
+    """A newer preview of the dataset was requested while this one waited for the render lock."""
+
+
 def local_copy_enabled() -> bool:
     """``ASTROPHOTO_LOCAL_COPY``: jobs read the subs from a local copy (Session.local_copy)."""
     return os.environ.get("ASTROPHOTO_LOCAL_COPY", "").strip().lower() in ("1", "true", "yes", "on")
@@ -74,6 +78,7 @@ class Session:
         self.lock = threading.RLock()
         self.cancel_flag = threading.Event()
         self.pause_flag = threading.Event()
+        self.preview_lock = threading.Lock()     # one preview render at a time (they share process/preview)
         self._local: dict[str, str] = {}         # original path -> local copy while local_copy() is active
         self._local_root: str | None = None      # the local copy's folder while local_copy() is active
         self._local_progress = None
@@ -1037,9 +1042,16 @@ class Session:
             opts = {"quality": quality, "upscale": upscale, "tiff": tiff}
             return post.export(self.dir, self.meta, params or {}, opts, self._cb(progress), self.checkpoint)
 
-    def preview_jpeg(self, params: dict | None = None, max_side: int = 1600) -> bytes:
+    def preview_jpeg(self, params: dict | None = None, max_side: int = 1600, superseded=None) -> bytes:
+        """One render at a time per dataset: every render works in ``process/preview`` with the same file names, and two at once (a slider
+        moved while the last preview still rendered) overwrote each other's Siril inputs - a failure at whatever stage met the other render's
+        files ("Local contrast", "stretch-fit0_p3", ...).  ``superseded``: called once the lock is held; True = a newer preview was asked for
+        meanwhile, this one is not rendered (PreviewSuperseded)."""
         from sirilpipe import post
-        return post.preview_jpeg(self.dir, self.meta, params or {}, max_side=max_side)
+        with self.preview_lock:
+            if superseded is not None and superseded():
+                raise PreviewSuperseded()
+            return post.preview_jpeg(self.dir, self.meta, params or {}, max_side=max_side)
 
     def run_all(self, stack_params: dict | None = None, params: dict | None = None, export_opts: dict | None = None,
                 progress=None) -> dict:

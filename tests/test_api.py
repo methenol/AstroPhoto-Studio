@@ -221,8 +221,11 @@ class FakeSession:
         self.prefs = prefs
         return prefs
 
-    def preview_jpeg(self, params, max_side=1600):
+    def preview_jpeg(self, params, max_side=1600, superseded=None):
         import cv2
+        if superseded is not None and (superseded() or params.get("_superseded")):
+            from sirilpipe.session import PreviewSuperseded
+            raise PreviewSuperseded()
         ok, buf = cv2.imencode(".jpg", np.full((6, 9, 3), 128, np.uint8))
         return buf.tobytes()
 
@@ -720,6 +723,8 @@ def test_preview(env):
     r = c.post("/api/preview", json={"folder": folder, "params": {}, "which": "after", "size": 1400})
     assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
     assert r.headers["x-width"] == "9" and r.headers["x-height"] == "6" and "x-render-time" in r.headers
+    s2 = c.post("/api/preview", json={"folder": folder, "params": {"_superseded": True}, "which": "after", "size": 1400})
+    assert s2.status_code == 204 and s2.headers.get("x-superseded") == "1"     # a newer preview was asked for: this one is not rendered
     b = c.post("/api/preview", json={"folder": folder, "which": "before"})
     assert b.status_code == 400                                         # not stacked yet
     with server.JOB_LOCK:                                               # a job running: 409 unless cached

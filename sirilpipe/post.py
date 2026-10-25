@@ -19,6 +19,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 from datetime import datetime
 
@@ -125,7 +126,7 @@ PARAM_SPEC: list[dict] = [
               "script; foraxx; hoo_warm; nbn: narrowband normalisation)", ["auto", "natural", "hoo", "hoo_improved", "sho", "hso", "osh", "ohs", "hos", "foraxx", "hoo_warm", "nbn"]),
     _S("Colour", "hubble_formula", "Hubble palette formulas (the script's presets; auto: Classic, Improved with the Ha-leak removal): classic OIII = (G+B)/2, SII = (Ha+OIII)/2; "
               "improved OIII = (G+B-0.3R)/2, SII = 0.3R; advanced; nonlinear_s2 SII = 0.3 R^1.4", ["auto", "classic", "improved", "advanced", "nonlinear_s2"]),
-    _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (NBN runs when this is not 1)", 0.5, 3, 0.05),
+    _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (palette NBN)", 0.5, 3, 0.05),
     _R("Colour", "synthetic_luminance", "Ha as luminance (dual-band): share of the lightness taken from the Ha plane (Siril rgbcomp -lum)", 0, 1, 0.05),
     _B("Colour", "oiii_unmix", "Remove the Ha leak from OIII (palette auto: Improved OIII = (G + B - 0.3 R) / 2 instead of Classic)"),
     _R("Colour", "saturation", "Colour strength: the subject's mean saturation x this (Siril ght -sat, the GHS saturation stretch, under the subject mask)", 1, 4, 0.05),
@@ -1223,6 +1224,7 @@ def _reduce(arr: np.ndarray, max_side: int) -> np.ndarray:
 
 
 _PREVIEW_CACHE: dict[tuple, _Layers] = {}
+_PREVIEW_CACHE_LOCK = threading.Lock()                    # previews of two datasets may render at once (each dataset's own are serialised by the Session)
 
 
 
@@ -1235,12 +1237,13 @@ def preview_jpeg(session_dir: str, stack_meta: dict, params: dict, max_side: int
     key = (session_dir, p["star_separation"]) + tuple(
         os.path.getmtime(_p(session_dir, f)) if os.path.exists(_p(session_dir, f)) else 0
         for f in ("stack.fits", "linear.fits", "starless.fits", "stars.fits", "starnet_meta.json"))
-    layers = _PREVIEW_CACHE.get(key)
+    with _PREVIEW_CACHE_LOCK:
+        layers = _PREVIEW_CACHE.get(key)
     if layers is None:
         layers = _Layers(session_dir, p, None)           # full resolution: the noise statistics and the colour resolution are those of the export
-        if len(_PREVIEW_CACHE) >= 1:
-            _PREVIEW_CACHE.pop(next(iter(_PREVIEW_CACHE)))
-        _PREVIEW_CACHE[key] = layers
+        with _PREVIEW_CACHE_LOCK:
+            _PREVIEW_CACHE.clear()                         # one dataset's layers at a time (memory)
+            _PREVIEW_CACHE[key] = layers
     work = _p(session_dir, "process", "preview")
     os.makedirs(work, exist_ok=True)
     img, _ = _render(layers, p, _dual_band(stack_meta or {}, layers.header), external=False, work=work)

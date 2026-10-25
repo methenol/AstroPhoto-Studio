@@ -37,7 +37,7 @@ from sirilpipe import __version__  # noqa: E402
 from sirilpipe import finish as finish_mod  # noqa: E402
 from sirilpipe import tools as tools_mod  # noqa: E402
 from sirilpipe.post import DEFAULTS, EXTRA_DEFAULTS, PARAM_SPEC  # noqa: E402
-from sirilpipe.session import Cancelled, Session  # noqa: E402
+from sirilpipe.session import Cancelled, PreviewSuperseded, Session  # noqa: E402
 from sirilpipe.util import clean_json, dataset_slug, restoration_done, slugify, split_folders  # noqa: E402
 
 CONFIG = {"images": os.path.join(ROOT, "images"), "workdir": os.path.join(ROOT, "output")}
@@ -1129,6 +1129,10 @@ def _raw_stack_jpeg(s: Session, side: int) -> bytes:
     return _autostretch_jpeg(fits.getdata(f), side)
 
 
+PREVIEW_SEQ: dict[str, int] = {}             # session dir -> number of the newest preview request
+PREVIEW_SEQ_LOCK = threading.Lock()
+
+
 @app.post("/api/preview")
 def preview(body: dict = Body(...)):
     s = get_session(body["folder"])
@@ -1141,12 +1145,17 @@ def preview(body: dict = Body(...)):
         return _preview_response(PREVIEW_CACHE[key], 0.0)
     if JOB_LOCK.locked():
         raise HTTPException(409, "A pipeline job is running - preview available when it finishes")
+    if which != "before":
+        with PREVIEW_SEQ_LOCK:                   # the newest request per dataset wins: an older one still waiting for the render lock is skipped
+            n = PREVIEW_SEQ[s.dir] = PREVIEW_SEQ.get(s.dir, 0) + 1
     try:
         t0 = time.time()
         if which == "before":
             data = _raw_stack_jpeg(s, size)
         else:
-            data = s.preview_jpeg(params, max_side=size)
+            data = s.preview_jpeg(params, max_side=size, superseded=lambda: PREVIEW_SEQ.get(s.dir) != n)
+    except PreviewSuperseded:
+        return Response(status_code=204, headers={"X-Superseded": "1"})
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         raise HTTPException(400, str(e))
     if len(PREVIEW_CACHE) > 24:

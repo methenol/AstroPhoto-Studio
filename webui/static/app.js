@@ -482,6 +482,7 @@ async function fetchImage(which) {
   const size = $("#previewSize").value;
   const r = await fetch("/api/preview", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ folder: S.folder, params: S.params, which, size: size === "full" ? null : parseInt(size) }) });
+  if (r.status === 204) { const e = new Error("superseded"); e.superseded = true; throw e; }   // a newer preview was asked for: it renders instead
   if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail; } catch { } const e = new Error(m); e.status = r.status; throw e; }
   return { url: URL.createObjectURL(await r.blob()), t: r.headers.get("X-Render-Time"), w: +r.headers.get("X-Width"), h: +r.headers.get("X-Height") };
 }
@@ -504,6 +505,7 @@ async function requestPreview() {
     if (first || sizeChanged) fitView();
     layoutSplit();
   } catch (e) {
+    if (e.superseded || seq !== S.previewSeq) return;     // an older request: the newest one reports for itself
     // 409: a job holds the pipeline (one at a time) - say so in the pane instead of a toast that
     // disappears, and try again when the job is likely done
     if (e.status === 409 && !$("#imgAfter").src) {
