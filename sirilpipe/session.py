@@ -721,6 +721,8 @@ class Session:
             shifts = {}
             runner = self._runner(progress)
             workflow.clean_registered(self.process)
+            # every stacked frame, not only the subsets': seqapplyreg aborts when the registration's reference frame is not among those applied
+            # ("the reference image has a null matrix") - and a half of alternate frames lacks it every second time
             runner.run(workflow.apply_script(self.process, seq, n, [i for i in range(len(rows)) if i not in set(inc)], rs), "apply_registration",
                        expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc), label="Applying registration (frame subsets)")
             rseq = parse_seq(os.path.join(self.process, f"r_{seq}_.seq"))

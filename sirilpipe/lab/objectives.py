@@ -681,4 +681,7 @@ class HeldOut:
         f = lum(img)
         m = self.mask & valid_region(f)
         r = self.B - self._predict(_ho_highpass(f, self.sigma_hp), self.w)
-        return float(np.mean((r[m].astype(np.float64) ** 2) * self.w[m]))
+        q = (r.astype(np.float64) ** 2) * self.w
+        # per tile, for the paired comparison of two trials on the same held-out pixels (lab.run.best_trial)
+        self.last_tiles = [float(np.mean(q[y0:y1, x0:x1][m[y0:y1, x0:x1]])) for (y0, y1, x0, x1), _, _ in self.tiles if m[y0:y1, x0:x1].any()]
+        return float(np.mean(q[m]))

@@ -183,6 +183,20 @@ def best_trial(study, cfg: dict, task=None):
             why = (f"baseline kept: the best {objs[0]['metric']} ({best.values[0]:.4g}, trial {best.number}) improves it by less than {gain:g} "
                    f"(the measurement's resolution)")
             best = base
+        elif base is not None and best.number != base.number and task is not None and objs[0]["metric"] == getattr(task, "score", None):
+            # a held-out score: the two trials were compared with the same held-out pixels, so the gain is tested tile by tile (a paired test):
+            # it must exceed two standard errors of the per-tile gains
+            tb = (base.user_attrs.get("metrics") or {}).get("heldout_tiles")
+            tt = (best.user_attrs.get("metrics") or {}).get("heldout_tiles")
+            if tb and tt and len(tb) == len(tt) and len(tb) >= 4:
+                d = 0.5 * np.log(np.asarray(tb, float) / np.maximum(np.asarray(tt, float), 1e-12))
+                mu, se = float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d)))
+                if mu <= 2.0 * se:
+                    why = (f"baseline kept: the best {objs[0]['metric']} ({best.values[0]:.4g}, trial {best.number}) gains {mu:.4g} over the held-out "
+                           f"tiles, within two standard errors ({2 * se:.3g}) of no gain")
+                    best = base
+                else:
+                    why += f"; held-out gain {mu:.4g} over {len(d)} tiles, {mu / max(se, 1e-12):.1f} standard errors"
         return best, why + note
 
     def dominates(a, b):

@@ -533,6 +533,7 @@ class StackTask(Task):
                 log(f"Held-out reference: {h.n_stars} stars masked, noise variance {h.nlf[0]:.3g} + {h.nlf[1]:.3g} x level; baseline chi2 {h.chi2_r0:.4f}")
             h = ctx["heldout"]
             out["heldout_chi2"] = h.chi2(est)
+            out["heldout_tiles"] = h.last_tiles
             out["stack_score"] = 0.5 * math.log(h.chi2_r0 / max(out["heldout_chi2"], 1e-12))
         elif out.get("depth") is not None:
             out["stack_score"] = out["depth"]
@@ -1150,6 +1151,7 @@ class RestoreTask(Task):
         if ctx.get("heldout") is not None:
             h = ctx["heldout"]
             out["heldout_chi2"] = h.chi2(est)
+            out["heldout_tiles"] = h.last_tiles
             out["fidelity_gain"] = 0.5 * math.log(h.chi2_r0 / max(out["heldout_chi2"], 1e-12))
             out["restore_score"] = float(out["fidelity_gain"] + keep)
         elif out.get("depth_gain") is not None:
