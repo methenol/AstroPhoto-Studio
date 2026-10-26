@@ -1352,6 +1352,7 @@ def lab_tasks():
     from sirilpipe.lab.tasks import TASKS
     return clean_json({"tasks": [t.describe() for t in TASKS.values()], "synthetic_defaults": DEFAULT_SPEC,
                        "samplers": [{"name": "tpe", "label": "TPE (Bayesian, multivariate)"},
+                                    {"name": "es", "label": "(1+1)-CMA-ES, constrained (local search from your settings; one objective)"},
                                     {"name": "nsga2", "label": "NSGA-II (multi-objective)"},
                                     {"name": "random", "label": "Random search"},
                                     {"name": "grid", "label": "Grid (needs steps)"}]})

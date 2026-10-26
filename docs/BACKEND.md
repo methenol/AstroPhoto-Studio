@@ -128,7 +128,7 @@ The `docker`-marked test runs the pipeline inside the image on a NAS dataset.
 | Colour calibration from the stars' physics | Siril SPCC with the Siril SPCC database (narrowband mode for dual-band), online Gaia DR3; the chunk of the Gaia catalogue covering the field (1 of 48) is fetched once and cached under `.home/.local/share/siril/siril_cat1_healpix8_xpsamp` so later fields in that region calibrate offline (`-catalog=localgaia`); a failed SPCC is retried once, then the stars white balance + neutralisation |
 | Gradient removal against a sky survey | NSNS DR0.2 through CDS hips2fits (`sirilpipe/skyref.py`), `bg_method` auto / reference |
 | Auto-finish | published rules on the image's own measurements (no reference images) |
-| Reference looks | the 58 reference photographs' statistics (`sirilpipe/looks.py`) grade the Experiments tab's finishing trials (`look_distance`) |
+| Reference looks | the 58 reference photographs' statistics (`sirilpipe/looks.py`, data kept): no objective uses them - Auto-finish measures the image itself, the finishing task scores structural fidelity |
 | AI star remover | StarXTerminator, else StarNet2 (`star_removal`); Cosmic Clarity DarkStar on request |
 | Cosmic Clarity | Sharpen / Denoise / Super-Resolution / DarkStar / satellite trails, chosen in *Integration & options* and *Stars*; models from the Tools card |
 | Diagnostics | stage logs, reference frame, integration coverage map, Siril rejection map |

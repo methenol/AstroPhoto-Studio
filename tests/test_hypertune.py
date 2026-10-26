@@ -144,15 +144,15 @@ def _study(values, cons, baseline=0, direction="maximize"):
 
 
 def test_best_trial_feasible_and_min_gain():
-    task = TASKS["restore"]                                               # score depth (maximize), min_gain 0.005
-    cfg = {"objectives": [{"metric": "depth", "direction": "maximize"}], "task": "restore"}
+    task = TASKS["restore"]                                               # score restore_score (maximize), min_gain 0.01
+    cfg = {"objectives": [{"metric": "restore_score", "direction": "maximize"}], "task": "restore"}
     st = _study([3.0, 3.5, 3.2], [[0.0], [0.4], [-0.1]])                  # trial 1 is best but breaks a constraint
     t, _ = labrun.best_trial(st, cfg, task)
     assert t.number == 2
     st = _study([3.0, 3.003], [[0.0], [0.0]])                             # better by less than the resolution: the baseline stays
     t, why = labrun.best_trial(st, cfg, task)
     assert t.number == 0 and "baseline kept" in why
-    st = _study([19.30, 19.23], [[0.0], [0.0]], direction="minimize")   # a distance: the gain must exceed 2 % of the baseline's
+    st = _study([0.300, 0.297], [[0.0], [0.0]], direction="minimize")   # 1 - H: the gain must exceed half a percent of the structure
     t, why = labrun.best_trial(st, {"objectives": [{"metric": "finish_score", "direction": "minimize"}]}, TASKS["finish"])
     assert t.number == 0 and "baseline kept" in why
     st = _study([3.0, 3.1], [[0.5], [0.2]])                               # none feasible: the least infeasible
@@ -164,15 +164,14 @@ def test_best_trial_feasible_and_min_gain():
 def test_build_space_prunes_tools_and_keeps_style_choices():
     tools = {k: True for k in ("bxt", "nxt", "sxt", "graxpert_bge", "graxpert_denoise", "graxpert_deconv", "starnet", "cc_sharpen", "cc_denoise", "cc_darkstar", "cc_satellite")}
     tools["bxt"] = tools["nxt"] = False
-    sp, notes = hypertune.build_space(TASKS["restore"], {"deconv_method": "bxt"}, {}, dual=False, refs=False, tools=tools)
+    sp, notes = hypertune.build_space(TASKS["restore"], {"deconv_method": "bxt"}, {}, dual=False, tools=tools)
     assert "bxt" not in sp["deconv_method"]["choices"] and sp["deconv_method"]["value"] != "bxt"
     assert "nxt" not in sp["denoise_method"]["choices"] and notes
-    fin, _ = hypertune.build_space(TASKS["finish"], {}, {"palette": "hoo"}, dual=True, refs=False, tools=tools)
-    assert not fin["palette"]["tune"] and fin["palette"]["value"] == "hoo"        # style: only against references
+    fin, _ = hypertune.build_space(TASKS["finish"], {}, {"palette": "hoo"}, dual=True, tools=tools)
+    assert not fin["palette"]["tune"] and fin["palette"]["value"] == "hoo"        # style: the user's, never searched
+    assert not fin["grade_amount"]["tune"] and not fin["hubble_formula"]["tune"]
     assert fin["synthetic_luminance"]["tune"] and fin["cc_sharpen"]["tune"]
-    fin2, _ = hypertune.build_space(TASKS["finish"], {}, {}, dual=True, refs=True, tools=tools)
-    assert fin2["palette"]["tune"] and fin2["grade_amount"]["tune"]
-    st, _ = hypertune.build_space(TASKS["stack"], {"scale": 2.0, "drizzle_pixfrac": 0.0}, {}, dual=False, refs=False, tools=tools)
+    st, _ = hypertune.build_space(TASKS["stack"], {"scale": 2.0, "drizzle_pixfrac": 0.0}, {}, dual=False, tools=tools)
     assert st["drizzle_pixfrac"]["value"] == 0.5 and not st["scale"]["tune"]
     assert hypertune.rule_pixfrac({"scale": 2.0, "superres_method": "cosmic_clarity"}) == 1.0
 
@@ -234,7 +233,7 @@ def test_run_study_in_process(tmp_path, monkeypatch):
     best = json.loads((d / "best.json").read_text())
     assert best["feasible"] and best["processing"] == {} and best["not_pipeline"]["mode"] == "a"
     assert best["not_pipeline"]["x"] <= 0.25 and best["not_pipeline"]["x"] > 0.1     # the constrained optimum is at the bound
-    assert _ToyTask.runs == 25 and any("reused" in m for m in lines)                 # 25 distinct evaluations; repeats (mode b: 2 settings) reused on top
+    assert _ToyTask.runs <= 25 and any("reused" in m for m in lines)                 # exactly 25 trials; repeats (mode b: 2 settings) reused
     # cancelling through the log callback stops the study and re-raises in the caller
     d2 = tmp_path / "s2"
     d2.mkdir()
@@ -268,17 +267,17 @@ def test_depth_rewards_resolution_at_equal_flux_and_noise(yard):
 
 
 def test_finish_searches_full_ranges():
-    sp, _ = hypertune.build_space(TASKS["finish"], {}, {"saturation": 1.45, "black_point": 0.0}, dual=False, refs=False, tools={})
+    sp, _ = hypertune.build_space(TASKS["finish"], {}, {"saturation": 1.45, "black_point": 0.0}, dual=False, tools={})
     assert sp["saturation"]["low"] == 1 and sp["saturation"]["high"] == 4 and sp["black_point"]["tune"] and sp["stretch"]["tune"]
 
 
 def test_registration_grid_space():
-    sp, _ = hypertune.build_space(TASKS["stack"], {"mode": "auto", "pattern_correction": True}, {}, dual=False, refs=False, tools={},
+    sp, _ = hypertune.build_space(TASKS["stack"], {"mode": "auto", "pattern_correction": True}, {}, dual=False, tools={},
                                   only=("mode", "pattern_correction"))
     assert [k for k, v in sp.items() if v.get("tune")] == ["mode", "pattern_correction"]
     grid = labrun.grid_space(labrun.baseline_space(sp, TASKS["stack"]), TASKS["stack"])
     assert grid == {"mode": ["auto", "demosaic"], "pattern_correction": [True, False]}
-    st, _ = hypertune.build_space(TASKS["stack"], {}, {}, dual=False, refs=False, tools={}, exclude=("mode", "pattern_correction"))
+    st, _ = hypertune.build_space(TASKS["stack"], {}, {}, dual=False, tools={}, exclude=("mode", "pattern_correction"))
     assert not st["mode"]["tune"] and st["sigma_low"]["tune"] and st["rejection"]["tune"]
 
 
@@ -299,7 +298,9 @@ def test_exhausted_space_stops(tmp_path, monkeypatch):
     (d / "config.json").write_text(json.dumps({"name": "tiny", "task": "tiny", "dataset": {"kind": "real", "folder": str(tmp_path)}, "space": {"mode": {"tune": True}},
                                                "objectives": [{"metric": "x", "direction": "minimize"}], "n_trials": 60, "constraints": False}))
     st = labrun.run_study(str(d))
-    assert st["state"] == "done" and Tiny.n == 2                         # two settings exist: two evaluations, then the space is exhausted
+    assert st["state"] == "done" and Tiny.n == 2                         # two settings exist: two evaluations, the other trials reuse them
+    import optuna
+    assert len(optuna.load_study(study_name="tiny", storage=f"sqlite:///{d / 'study.db'}").trials) == 60      # the user's number of trials
 
 
 def test_background_canonical_settings():
@@ -340,3 +341,78 @@ def test_warm_start_perturbs_the_baseline(tmp_path, monkeypatch):
     xs = [t.params["x"] for t in sorted(st.trials, key=lambda t: t.number)[:5]]
     assert xs[0] == 0.5 and all(abs(x - 0.5) < 0.25 for x in xs[1:]) and len(set(xs)) == 5
     assert all(t.params["mode"] == "a" for t in sorted(st.trials, key=lambda t: t.number)[:5])
+
+
+def test_sky_level_midtones_solve():
+    # mtf(x; m) = (m - 1) x / ((2m - 1) x - m): the midtones solved in pro.Finisher.finalise take the sky exactly to the target
+    for x in (0.02, 0.05, 0.083, 0.2):
+        for y in (0.08, 0.10, 0.12):
+            m = x * (y - 1.0) / (2.0 * x * y - x - y)
+            assert (m - 1) * x / ((2 * m - 1) * x - m) == pytest.approx(y, rel=1e-9)
+    sp, _ = hypertune.build_space(TASKS["finish"], {}, {}, dual=False, tools={})
+    assert sp["sky_level"]["low"] == 0.08 and sp["sky_level"]["high"] == 0.12 and sp["sky_levelling"]["tune"]
+
+
+def test_restore_canonical_gradient_and_space():
+    t = TASKS["restore"]
+    ctx = {"auto_deconv": "bxt", "auto_denoise": "nxt", "skyref": True}
+    a = t.canonical({"bg_method": "auto", "bg_smoothing": 0.2, "bg_correction": "divide", "denoise_method": "nxt"}, ctx)
+    b = t.canonical({"bg_method": "auto", "bg_smoothing": 0.7, "bg_correction": "subtract", "denoise_method": "nxt"}, ctx)
+    assert a == b and a["bg_method"] == "sky-survey reference"
+    c = t.canonical({"bg_method": "auto", "bg_smoothing": 0.2}, {**ctx, "skyref": False})
+    assert c == {"bg_method": "graxpert", "bg_smoothing": 0.2}
+    sp, _ = hypertune.build_space(t, {}, {}, dual=False, tools={})
+    assert all(sp[k]["tune"] for k in ("bg_method", "bg_smoothing", "satellite_removal", "deconv_method", "denoise_method"))
+    assert "cc_superres" not in sp and "superres_method" not in sp                   # super-resolution: the user's choice, never searched
+    assert t.score == "restore_score" and {"sky_flatness", "model_structure", "dm_bright_abs"} <= set(t.limits({}))
+
+
+def _finished(hdr, sky0, sigma, sky=0.10, bp=-2.8):
+    """A finisher's stretch of a linear luminance: black point at sky0 + bp sigma, the midtones solved so that the sky lands at ``sky``."""
+    lo = sky0 + bp * sigma
+    x = np.clip((hdr - lo) / (1.0 - lo), 0, 1)
+    xs = (sky0 - lo) / (1.0 - lo)
+    m = xs * (sky - 1) / (2 * xs * sky - xs - sky) if xs > 0 else 0.5
+    return np.clip((m - 1) * x / ((2 * m - 1) * x - m), 0, 1)
+
+
+def test_structural_fidelity_ranks_degradations():
+    import cv2
+    rng = np.random.default_rng(1)
+    clean = star_field(seed=3, n=300, size=400, noise=0.0)[..., 0]
+    yy, xx = np.mgrid[0:400, 0:400].astype(np.float32)
+    clean = clean + 0.02 * np.exp(-((xx - 200) ** 2 + (yy - 190) ** 2) / (2 * 50.0 ** 2)) \
+        + 0.003 * np.exp(-((xx - 80) ** 2 + (yy - 320) ** 2) / (2 * 30.0 ** 2))                 # a nebula and a faint one
+    hdr = clean + rng.normal(0, 0.002, clean.shape)
+    good = _finished(hdr, 0.05, 0.002)
+    H0, _ = OB.structural_fidelity(hdr, good)
+    bad = {"black point above the sky": _finished(hdr, 0.05, 0.002, bp=1.0), "blurred": cv2.GaussianBlur(good.astype(np.float32), (0, 0), 2.0),
+           "noise added": np.clip(good + rng.normal(0, 0.02, good.shape), 0, 1), "over-sharpened": np.clip(good + 3 * (good - cv2.GaussianBlur(good, (0, 0), 1.5)), 0, 1),
+           "over-stretched": _finished(hdr, 0.05, 0.002, sky=0.2)}
+    for k, x in bad.items():
+        assert OB.structural_fidelity(hdr, x)[0] < H0 - 0.015, k
+    # a noiseless truth judged at the data's noise gives nearly the same answer as the data itself
+    Ht, _ = OB.structural_fidelity(clean, good, noise_from=hdr)
+    assert abs(Ht - H0) < 0.05
+
+
+def test_constrained_es_improves_from_a_feasible_start():
+    import optuna
+    from sirilpipe.lab.es import ConstrainedOnePlusOneES
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    n = 8
+    space = {f"x{i}": {"tune": True, "low": -5.0, "high": 5.0} for i in range(n)}
+    pdefs = {k: {"name": k, "type": "float", "low": -5.0, "high": 5.0} for k in space}
+    st = optuna.create_study(sampler=ConstrainedOnePlusOneES(space, pdefs, "minimize", seed=0))
+    st.enqueue_trial({k: 3.0 for k in space}, user_attrs={"baseline": True})
+
+    def obj(t):
+        x = np.array([t.suggest_float(f"x{i}", -5, 5) for i in range(n)])
+        g = [2.0 - x[0]]                                         # the optimum sits on the constraint x0 = 2
+        t.set_user_attr("constraints", g)
+        t.set_constraint("g0", g[0])
+        return float(np.sum((x - 1) ** 2))
+    st.optimize(obj, n_trials=50)
+    feas = [t for t in st.trials if t.user_attrs["constraints"][0] <= 0]
+    assert len(feas) >= 20
+    assert min(t.value for t in feas) < 0.5 * st.trials[0].value

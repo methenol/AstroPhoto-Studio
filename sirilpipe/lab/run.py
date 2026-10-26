@@ -9,7 +9,7 @@
      "options": {...task options...},
      "space": {param: {"tune": bool, "low", "high", "log", "step", "choices", "value"}},
      "objectives": [{"metric": ..., "direction": "minimize" | "maximize"}, ...],
-     "sampler": "tpe" | "random" | "nsga2" | "grid", "seed": 0,
+     "sampler": "tpe" | "es" | "random" | "nsga2" | "grid", "seed": 0,
      "n_trials": 30, "timeout_min": 0, "device": "auto", "baseline": true, "constraints": true}
 
 Trials are stored in ``<study_dir>/study.db`` (SQLite, Optuna RDB storage); every metric is
@@ -281,10 +281,17 @@ def run_study(study_dir: str, cancel: threading.Event | None = None, on_log=None
             sampler = optuna.samplers.NSGAIISampler(seed=seed, constraints_func=cfun)
         elif name == "grid":
             sampler = optuna.samplers.GridSampler(grid_space(space, task), seed=seed)
+        elif name == "es":
+            # (1+1)-CMA-ES for constrained optimisation (Arnold & Hansen 2012): local search from the baseline under the constraints (lab.es)
+            from .es import ConstrainedOnePlusOneES
+            sampler = ConstrainedOnePlusOneES(space, pdefs, directions[0], seed=seed, sigma0=float(cfg.get("es_sigma0", 0.02)))
         else:
             # multivariate TPE (Falkner et al. 2018) models interactions between parameters; group=True for the conditional spaces
+            # the random start comes on top of the enqueued trials (baseline, warm start): counted among them, it never ran - on M 31 the finishing
+            # sampler then proposed the final sky level "off", the baseline's, 30 times out of 30
+            enq = (1 if cfg.get("baseline", True) else 0) + int(cfg.get("warm_start", 0) or 0)
             sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True, group=True, constraints_func=cfun,
-                                                 n_startup_trials=min(10, max(3, int(cfg.get("n_trials", 30)) // 4)))
+                                                 n_startup_trials=min(10, max(3, int(cfg.get("n_trials", 30)) // 4)) + enq)
         storage = f"sqlite:///{os.path.join(study_dir, 'study.db')}"
         study = optuna.create_study(study_name=cfg["name"], storage=storage, directions=directions, sampler=sampler,
                                     load_if_exists=True)
@@ -403,23 +410,10 @@ def run_study(study_dir: str, cancel: threading.Event | None = None, on_log=None
             log(f"Trial {trial.number} done: " + ", ".join(f"{o['metric']} = {v:.5g}" for o, v in zip(objectives, vals)) + feas)
             return vals if len(vals) > 1 else vals[0]
 
-        # the budget is n_trials DISTINCT evaluations: a sampler that proposes settings already evaluated gets the result back at no cost, and the study
-        # samples on; it ends early when the space is used up (``exhausted`` repeats in a row: two Cosmic Clarity choices, five star removers)
+        # exactly n_trials trials (the user's number per stage); a trial whose settings repeat an evaluated one returns that result at no cost
         timeout = float(cfg.get("timeout_min") or 0) * 60 or None
-        exhausted = max(20, n_trials // 2)
-        streak = {"n": 0}
-
-        def distinct():
-            return sum(1 for t in study.trials if t.state.is_finished() and t.user_attrs.get("duplicate_of") is None)
-
-        def budget(st, ft):
-            streak["n"] = streak["n"] + 1 if ft.user_attrs.get("duplicate_of") is not None else 0
-            if distinct() >= n_trials or streak["n"] >= exhausted:
-                if streak["n"] >= exhausted:
-                    log(f"{streak['n']} proposals in a row repeated evaluated settings: the search space is exhausted")
-                st.stop()
-        if distinct() < n_trials:
-            study.optimize(objective, n_trials=max(0, 10 * n_trials), timeout=timeout, catch=(Exception,), gc_after_trial=True, callbacks=[budget])
+        done = sum(1 for t in study.trials if t.state.is_finished())
+        study.optimize(objective, n_trials=max(0, n_trials - done), timeout=timeout, catch=(Exception,), gc_after_trial=True)
         try:
             best = best_record(study, cfg, task)
             _write_json(os.path.join(study_dir, "best.json"), best)

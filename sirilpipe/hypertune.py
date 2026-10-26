@@ -6,12 +6,13 @@ previews can be inspected and continued there):
 
   stack       Registration & integration (Session.run_stack, re-stacking the session itself): rejection algorithm / sigmas, frame weighting, frame
               selection, resampling, drizzle drop size / kernel, banding correction.  Score: depth (point- and extended-source S/N, empty apertures).
-  satellite   Cosmic Clarity satellite-trail removal on the stack (when its models are installed).  Score: trail pixels left.
-  background  the gradient model.  Score: the gradient left in the sky, the model's own structure constrained.
-  restore     deconvolution / noise reduction tools and strengths.  Score: depth, with flux conservation, fidelity above the PSF scale and no dark rings.
+  restore     one study of the whole restoration: satellite-trail removal (Cosmic Clarity, a variable), the gradient model, deconvolution / noise
+              reduction tools and strengths (super-resolution is the user's choice of output and runs as chosen).  Score: depth, with flux conservation, fidelity above the PSF scale, no dark
+              rings, the gradient model's emission loss / structure bounded and no more trails than the removal leaves.
   stars       the star remover.  Score: star light left + holes, nebula untouched.
   finish      after Auto-finish (when on: its settings are the study's baseline), the finishing chain, the export's own (NXT / Cosmic Clarity per trial).
-              Score: distance to the reference looks (else contrast-to-noise), the finishing gates no worse than the baseline.
+              Score: structural fidelity to the linear data (the significant structure made visible, TMQI's measure adapted to the data's
+              noise), every finishing gate no worse than the baseline.  No reference image is involved anywhere.
 
 The objective of the whole run is the chain of these: each stage is optimised for what that stage can be judged on without a ground truth, on
 the output of the best earlier stages (coordinate-wise, the stage order the pipeline itself has); the export then renders the best finishing
@@ -19,7 +20,7 @@ trial at full resolution and records its gates.  What is searched: every paramet
 the tools that can run here (an unlicensed BlurXTerminator would otherwise be "chosen" by a trial that ran no deconvolution); the baseline of each
 study is the user's own settings, and a trial replaces it only when it is feasible and better by more than the measurement's resolution
 (``Task.min_gain``).  Choices of output and of style the search has no measure for stay the user's: the drizzle / super-resolution scale, the crop,
-the palette and colour grade unless reference looks of the target exist, and an ImageMM restoration (hours per run: its study is not run; the
+the palette and colour grade, and an ImageMM restoration (hours per run: its study is not run; the
 stage runs as chosen).
 """
 from __future__ import annotations
@@ -32,8 +33,7 @@ import time
 
 log = logging.getLogger(__name__)
 
-STAGES = [("stack", "Registration & integration"), ("satellite", "Satellite trails (Cosmic Clarity)"), ("background", "Gradient removal"),
-          ("restore", "Linear restoration"), ("stars", "Star separation"), ("finish", "Finishing")]
+STAGES = [("stack", "Register & integrate"), ("restore", "Restore"), ("stars", "Remove stars"), ("finish", "Finish")]
 MIN_TRIALS, MAX_TRIALS, DEFAULT_TRIALS = 10, 500, 60
 
 
@@ -101,7 +101,7 @@ def _current(p: dict, sp: dict, params: dict):
     return p["default"]
 
 
-def build_space(task, sp: dict, params: dict, *, dual: bool, refs: bool, tools: dict, extra_fixed: dict | None = None,
+def build_space(task, sp: dict, params: dict, *, dual: bool, tools: dict, extra_fixed: dict | None = None,
                 only: tuple[str, ...] | None = None, exclude: tuple[str, ...] = ()) -> tuple[dict, list[str]]:
     """The hyper-tune search space of ``task``: its ``hypertune`` parameters tuned (choices without the tools that cannot run), the others fixed at
     the user's values (``only``: tune just these; ``exclude``: never these).  Returns (space, notes)."""
@@ -115,7 +115,7 @@ def build_space(task, sp: dict, params: dict, *, dual: bool, refs: bool, tools: 
             space[p["name"]] = {"tune": False, "value": cur}
             continue
         cond = p.get("hypertune")
-        on = cond is True or (cond == "dual" and dual) or (cond == "refs" and refs) or (cond == "refs_dual" and refs and dual)
+        on = cond is True or (cond == "dual" and dual)
         if not on:
             space[p["name"]] = {"tune": False, "value": cur}
             continue
@@ -185,16 +185,6 @@ class HyperTune:
         name = (self.s.meta.get("object") if self.s.meta else None) or os.path.basename(os.path.normpath(folders[0]))
         return {"kind": "real", "folder": os.pathsep.join(folders), "name": f"{name}" + (f" · {len(folders)} nights" if len(folders) > 1 else "")}
 
-    def _refs(self) -> bool:
-        """Whether reference photographs of this very target exist (looks.py): only then are the palette and the colour grade - matters of style -
-        searched; the looks of a class of targets still grade the finishing trials, but are no basis for choosing a style."""
-        from . import looks
-        try:
-            n = looks._norm((self.s.meta or {}).get("object"))
-            return bool(n) and any(n in {looks._norm(a) for a in t["names"]} for t in looks.references().get("targets", {}).values())
-        except Exception:                                       # noqa: BLE001
-            return False
-
     def _dual(self) -> bool:
         from . import post
         try:
@@ -203,11 +193,12 @@ class HyperTune:
             return False
 
     def study(self, stage: str, label: str, options: dict | None = None, extra_fixed: dict | None = None, only: tuple[str, ...] | None = None,
-              exclude: tuple[str, ...] = (), sampler: str = "tpe", n_trials: int | None = None, key: str | None = None, warm: bool = False) -> dict:
+              exclude: tuple[str, ...] = (), sampler: str | None = None, n_trials: int | None = None, key: str | None = None, warm: bool = False) -> dict:
         """Create and run the study of one stage in-process; returns its best record (lab.run.best_record) with the study id."""
         from .lab import run as labrun
         task = self.tasks[stage]
-        space, notes = build_space(task, self.sp, self.params, dual=self._dual(), refs=self._refs(), tools=self.tools, extra_fixed=extra_fixed,
+        sampler = sampler or getattr(task, "ht_sampler", "tpe")
+        space, notes = build_space(task, self.sp, self.params, dual=self._dual(), tools=self.tools, extra_fixed=extra_fixed,
                                    only=only, exclude=exclude)
         tuned = [k for k, v in space.items() if v.get("tune")]
         if sampler == "grid":                                   # every combination once (the user's own value may add a choice)
@@ -294,16 +285,9 @@ class HyperTune:
         t0 = time.time()
         s.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), self.progress, sp)
         self._check()
-        # 1. registration & integration: the trials re-stack this session.  The resampling and the banding correction change the registration itself (a full
-        # calibration + registration of the subs per change): their few combinations are evaluated exhaustively first, then the integration settings
-        # (rejection, weighting, frame selection, drizzle drop / kernel) are searched on the chosen registration, which their trials only re-apply
+        # one study per pipeline stage, the user's number of trials each: 1. Register & integrate (the trials re-stack this session)
         user_sp = dict(sp)
-        reg = ("mode", "pattern_correction")
-        rec = self.study("stack", "Registration (resampling, banding correction)", options={"in_place": 1, "crop": 1024, "stack_params": user_sp},
-                         only=reg, sampler="grid", n_trials=4, key="registration")
-        self.adopt(rec, keys=reg)
-        rec = self.study("stack", "Integration (rejection, weighting, frame selection, drizzle)",
-                         options={"in_place": 1, "crop": 1024, "stack_params": dict(self.sp)}, exclude=reg, key="stack")
+        rec = self.study("stack", "Register & integrate", options={"in_place": 1, "crop": 1024, "stack_params": user_sp})
         self.adopt(rec)
         pf = (rec.get("settings") or {}).get("drizzle_pixfrac")
         if pf is not None and not float(user_sp.get("drizzle_pixfrac") or 0) and abs(float(pf) - rule_pixfrac(user_sp)) < 1e-9:
@@ -312,46 +296,30 @@ class HyperTune:
         s.run_stack(self.sp, self.progress)
         s.plate_solve(self.progress)
         self._check()
-        # 2. satellite trails (Cosmic Clarity), when its models are installed
-        if self.tools.get("cc_satellite"):
-            rec = self.study("satellite", "Satellite trails (Cosmic Clarity)")
-            self.adopt(rec)
-        else:
-            self.report["stages"].append({"stage": "satellite", "label": "Satellite trails (Cosmic Clarity)", "state": "skipped",
-                                          "reason": "Cosmic Clarity's satellite models are not installed"})
-        # 3. gradient removal, 4. restoration
-        rec = self.study("background", "Gradient removal")
-        self.adopt(rec)
+        # 2. Restore: satellite-trail removal, gradient model, deconvolution and noise reduction in one study
         if "imagemm" in post.deconv_choice(self.sp):
-            self.report["stages"].append({"stage": "restore", "label": "Linear restoration", "state": "skipped",
+            self.report["stages"].append({"stage": "restore", "label": "Restore", "state": "skipped",
                                           "reason": "ImageMM chosen: a multi-frame restoration takes hours per run, its settings are not searched; the stage runs as chosen"})
         else:
-            # deconvolution and noise reduction are two steps of the restore, run in that order: each is searched on its own with the full budget (one study
-            # over both, 60 trials on M 31, was still improving at trial 49 and had not combined NXT's best strength with BXT's star sharpening)
-            denoise = ("denoise_method", "denoise", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations")
-            rec = self.study("restore", "Deconvolution (objects / stars tools, strengths)", options={"stack_params": dict(self.sp)}, exclude=denoise,
-                             key="deconvolution")
-            self.adopt(rec)
-            rec = self.study("restore", "Noise reduction (tool, strength, iterations)", options={"stack_params": dict(self.sp)},
-                             only=denoise, key="restore")
+            rec = self.study("restore", "Restore", options={"stack_params": dict(self.sp)})
             self.adopt(rec)
         self.progress(0, 1, "Hyper-tune · restoring with the best settings")
         s.run_denoise(self.sp, self.progress, self.params)
         self._check()
-        # 5. star separation
+        # 3. Remove stars
         if self.sp.get("star_remover", True):
-            rec = self.study("stars", "Star separation")
+            rec = self.study("stars", "Remove stars")
             self.adopt(rec)
             self.progress(0, 1, "Hyper-tune · separating the stars with the best tool")
             s.train_star_remover(self.params, self.sp, self.progress)
             self._check()
-        # 6. auto-finish (the finishing study's baseline), 7. finishing
+        # 4. Finish: Auto-finish first when on (its result is the finishing study's baseline), then the finishing study
         fin = None
         if self.sp.get("autofinish", True):
             fin = s.autofinish(self.params, self.progress)
             self.params = dict(fin.get("params") or self.params)
             self._check()
-        rec = self.study("finish", "Finishing", options={"external": 1, "max_side": 0, "params": dict(self.params)}, warm=True)
+        rec = self.study("finish", "Finish", options={"external": 1, "max_side": 0, "params": dict(self.params)})
         self.adopt(rec)
         # 8. export with the best of every stage
         self.progress(0, 1, "Hyper-tune · exporting with the best settings of every stage")

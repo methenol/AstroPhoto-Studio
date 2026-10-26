@@ -137,6 +137,7 @@ const Lab = (() => {
     const t = L.byName[$("#lbTask").value];
     $("#lbTaskDesc").textContent = t.description;
     const cons = Object.entries(t.constraints || {}).map(([k, [kind, b]]) => `${k} ${kind === "max" ? "≤" : "≥"} ${b}`);
+    if (t.sampler && [...$("#lbSampler").options].some(o => o.value === t.sampler)) $("#lbSampler").value = t.sampler;
     $("#lbTaskObj").innerHTML = t.objective_note ? `<b>Objective.</b> ${esc(t.objective_note)}` : (cons.length ? `Constraints: ${esc(cons.join(", "))}` : "");
     $("#lbOptions").innerHTML = t.options.filter(o => !o.internal).map(o => o.type === "categorical"
       ? `<label>${esc(o.label)}<select data-opt="${o.name}">${o.choices.map(c => `<option ${c === o.default ? "selected" : ""}>${c}</option>`).join("")}</select></label>`

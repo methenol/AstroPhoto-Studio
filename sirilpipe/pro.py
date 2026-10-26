@@ -1027,13 +1027,23 @@ class Finisher:
         if bp > 1e-5:
             lines.append(f"linstretch -BP={bp:.6f}")
         mid = finish.brightness_to_mid(float(p.get("brightness", 0.0)))
+        level = None
+        if str(p.get("sky_levelling", False)).lower() not in ("false", "0", "", "none"):
+            # the final sky level: the midtones that take the sky (after the black point) exactly to sky_level - mtf(x; m) = (m-1)x / ((2m-1)x - m)
+            # solved for m - the way a finisher sets the sky last (Brecher's backgrounds 0.09-0.11; the sky_median gate 0.08-0.12)
+            y = float(np.clip(float(p.get("sky_level", 0.10)), 0.02, 0.5))
+            x = (sky - bp) / max(1.0 - bp, 1e-9)
+            if 1e-5 < x < 0.999:
+                mid = float(np.clip(x * (y - 1.0) / (2.0 * x * y - x - y), 0.02, 0.98))
+                level = y
         if abs(mid - 0.5) > 1e-4:
             lines.append(f"mtf 0 {mid:.4f} 1")
         lines += ["icc_assign sRGB", "icc_convert_to sRGB relative"]
         t0 = time.time()
         out = self.siril("fin", arr, lines + ["save finish"], "Final", out="finish")
         self.record("final black point + ICC", "siril linstretch / icc_convert_to", out, commands=lines, seconds=time.time() - t0,
-                    params={"BP": round(bp, 6), "toe": round(toe, 5), "toe_percentile": TOE_PERCENTILE, "background": round(sky, 4), "icc": "sRGB, relative colorimetric"},
+                    params={"BP": round(bp, 6), "toe": round(toe, 5), "toe_percentile": TOE_PERCENTILE, "background": round(sky, 4), "icc": "sRGB, relative colorimetric",
+                            "midtones": round(mid, 5), "sky_level": level},
                     source="Brecher: black point at the toe of the histogram, ICC to sRGB IEC61966-2.1 relative colorimetric (pro-workflow.md A16)")
         return out
 

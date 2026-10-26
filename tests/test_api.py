@@ -760,7 +760,7 @@ def test_lab_routes(env):
     assert {t["name"] for t in r["tasks"]} == {"finish", "restore", "stack", "stars", "background", "satellite", "superres"}
     assert all(t["params"] and t["metrics"] and t["default_objective"] in t["metrics"] for t in r["tasks"])
     assert all(t["score"] in t["metrics"] and all(k in t["metrics"] for k in t["constraints"]) for t in r["tasks"])
-    assert [s["name"] for s in r["samplers"]] == ["tpe", "nsga2", "random", "grid"]
+    assert [s["name"] for s in r["samplers"]] == ["tpe", "es", "nsga2", "random", "grid"]
     assert "width" in r["synthetic_defaults"]
     d = c.get("/api/lab/datasets").json()
     assert "real" in d and "synthetic" in d and d["sep"]

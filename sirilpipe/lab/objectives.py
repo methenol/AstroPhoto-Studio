@@ -478,3 +478,86 @@ def violations(m: dict, limits: dict) -> dict:
             continue
         out[k] = float(v - bound) if kind == "max" else float(bound - v)
     return out
+
+
+# ----------------------------------------------------------------------------- finishing: structural fidelity of the finished image to its linear data
+# TMQI structural fidelity (H. Yeganeh and Z. Wang, "Objective Quality Assessment of Tone-Mapped Images", IEEE TIP 22(2), 657-667, 2013; the authors'
+# TMQI.m v1.0): local SSIM-like fidelity between the HDR source and the tone-mapped (finished) image, with the local signal strengths passed through a
+# psychometric (Galton's ogive) visibility mapping, over 5 scales (2x2 box down-sampling), Gaussian 11x11 sigma 1.5 window, C1 = 0.01, C2 = 10, the
+# finished side's threshold from the Mannos CSF at 16, 8, 4, 2, 1 cycles/degree, the scales weighted {0.0448, 0.2856, 0.3001, 0.2363, 0.1333}.
+# ONE adaptation for astronomical data, on the source side only: TMQI.m rescales the HDR luminance to 2^32 - 1 and applies the visual threshold, so any
+# variation of the source - its noise included - counts as significant, which suits daylight HDR photographs (nearly noise-free) and would reward a
+# finish that stretches the sky's noise into view.  Here the source's local signal is significant when its local standard deviation exceeds the noise at
+# that scale (Immerkaer 1996, "Fast noise variance estimation", CVIU 64(2)) by 3 sigma of the window's standard-deviation estimate: u = sigma_n
+# (1 + 3 / sqrt(2 N_eff)), the ogive's spread u / 3 as in the paper (Crozier's ratio k = 3).  The paper's statistical naturalness term (fitted to the
+# brightness / contrast of ~3000 everyday photographs) is not used: the finishing gates (FINISH-SPEC) are the astronomical image's bounds.
+TMQI_WEIGHTS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
+
+
+def _tmqi_window() -> np.ndarray:
+    g = cv2.getGaussianKernel(11, 1.5)
+    w = g @ g.T
+    return (w / w.sum()).astype(np.float64)
+
+
+def immerkaer_sigma(img: np.ndarray) -> float:
+    """Noise standard deviation by Immerkaer's Laplacian-difference estimator: sqrt(pi/2) / (6 (W-2)(H-2)) sum |I * N|."""
+    n = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], np.float64)
+    r = cv2.filter2D(img.astype(np.float64), -1, n, borderType=cv2.BORDER_REFLECT)[1:-1, 1:-1]
+    return float(np.sqrt(np.pi / 2.0) * np.abs(r).sum() / (6.0 * r.size))
+
+
+def _normcdf(x, mu, sd):
+    from scipy.special import ndtr
+    return ndtr((x - mu) / max(sd, 1e-12))
+
+
+def structural_fidelity(hdr_lum: np.ndarray, ldr_lum: np.ndarray, mode: str = "hits", noise_from: np.ndarray | None = None) -> tuple[float, list[float]]:
+    """S of the finished luminance ``ldr_lum`` (display values 0-1) against the linear luminance ``hdr_lum`` (same grid): (S, the five scales' s_l).
+    ``noise_from``: the image whose noise sets the significance (same grid and units as ``hdr_lum``; default ``hdr_lum`` itself) - a noiseless
+    truth is judged at the noise of the data it stands for."""
+    w = _tmqi_window()
+    neff = 1.0 / float((w ** 2).sum())
+    lo, hi = float(np.min(hdr_lum)), float(np.max(hdr_lum))
+    k_norm = (2.0 ** 32 - 1) / max(hi - lo, 1e-30)
+    a = (np.asarray(hdr_lum, np.float64) - lo) * k_norm
+    nz = None if noise_from is None else (np.asarray(noise_from, np.float64) - lo) * k_norm
+    b = np.asarray(ldr_lum, np.float64) * 255.0
+    s_local, f = [], 32.0
+    for _ in range(5):
+        f /= 2.0
+        mu1, mu2 = cv2.filter2D(a, -1, w, borderType=cv2.BORDER_REFLECT), cv2.filter2D(b, -1, w, borderType=cv2.BORDER_REFLECT)
+        s1 = cv2.filter2D(a * a, -1, w, borderType=cv2.BORDER_REFLECT) - mu1 * mu1
+        s2 = cv2.filter2D(b * b, -1, w, borderType=cv2.BORDER_REFLECT) - mu2 * mu2
+        s12 = cv2.filter2D(a * b, -1, w, borderType=cv2.BORDER_REFLECT) - mu1 * mu2
+        e = 5                                                         # filter2 'valid': the window's half width off every side
+        sg1, sg2, s12 = np.sqrt(np.maximum(s1, 0))[e:-e, e:-e], np.sqrt(np.maximum(s2, 0))[e:-e, e:-e], s12[e:-e, e:-e]
+        u1 = immerkaer_sigma(a if nz is None else nz) * (1.0 + 3.0 / np.sqrt(2.0 * neff))     # the source: significant above its own noise at this scale
+        p1 = _normcdf(sg1, u1, u1 / 3.0)
+        csf = 100.0 * 2.6 * (0.0192 + 0.114 * f) * np.exp(-(0.114 * f) ** 1.1)
+        u2 = 128.0 / (1.4 * csf)                                       # the finished image: TMQI.m's visibility threshold
+        p2 = _normcdf(sg2, u2, u2 / 3.0)
+        corr = (s12 + 10.0) / (sg1 * sg2 + 10.0)
+        if mode == "tmqi":
+            smap = ((2 * p1 * p2 + 0.01) / (p1 * p1 + p2 * p2 + 0.01)) * corr
+            s_local.append(float(np.mean(smap)))
+        else:
+            # detection: hits = significant structure made visible (and kept in its shape: the correlation), false alarms = insignificant variation (noise)
+            # made visible; Youden's J = hit rate - false-alarm rate (W. J. Youden, Cancer 3, 32-35, 1950)
+            sig = float(p1.sum()) or 1e-9
+            hit = float((p1 * p2 * np.clip(corr, 0, 1)).sum()) / sig
+            fa = float(((1 - p1) * p2).sum()) / (float((1 - p1).sum()) or 1e-9)
+            s_local.append(hit - fa if mode == "youden" else hit)
+        k = np.ones((2, 2)) / 4.0
+        a = cv2.filter2D(a, -1, k, borderType=cv2.BORDER_REFLECT)[::2, ::2]
+        b = cv2.filter2D(b, -1, k, borderType=cv2.BORDER_REFLECT)[::2, ::2]
+        if nz is not None:
+            nz = cv2.filter2D(nz, -1, k, borderType=cv2.BORDER_REFLECT)[::2, ::2]
+    S = float(np.prod([max(s, 1e-9) ** wt for s, wt in zip(s_local, TMQI_WEIGHTS)])) if mode == "tmqi" else float(np.dot(s_local, TMQI_WEIGHTS))
+    return S, s_local
+
+
+def luminance_y(rgb: np.ndarray) -> np.ndarray:
+    """Y of linear sRGB (TMQI.m's RGBtoYxy row), (3, H, W) or (H, W, 3) -> (H, W)."""
+    x = rgb if rgb.shape[0] == 3 and rgb.ndim == 3 else np.moveaxis(rgb, -1, 0)
+    return (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).astype(np.float64)

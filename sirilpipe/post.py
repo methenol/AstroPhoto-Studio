@@ -88,7 +88,8 @@ IGNORED_KEYS: tuple = ()
 # Improved with oiii_unmix / hoo_improved).
 EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride", "hubble_formula",
               "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "cc_denoise", "cc_denoise_model",
-              "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations")
+              "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations",
+              "sky_levelling", "sky_level")
 # Cosmic Clarity (siril-scripts CosmicClarity_Native.py) on the stretched image: off by default (an optional path); the amounts and the model are the script's defaults
 EXTRA_DEFAULTS = {"stretch_boost": 0.0, "hubble_formula": "auto", "cc_sharpen": "off", "cc_stellar_amount": 0.5, "cc_nonstellar_amount": 0.5,
                   "cc_denoise": False, "cc_denoise_model": "full",
@@ -96,7 +97,9 @@ EXTRA_DEFAULTS = {"stretch_boost": 0.0, "hubble_formula": "auto", "cc_sharpen": 
                   # graxpert_strength, the published ranges); off = the values below (BXT Sharpen Stars / Sharpen Nonstellar / Adjust Star Halos; the
                   # denoiser's own strength: NXT --dn, GraXpert -strength, Siril denoise -mod; NXT --it iterations, its default 2)
                   "bxt_auto": True, "bxt_sharpen_stars": 0.3, "bxt_sharpen_nonstellar": 0.55, "bxt_halos": 0.0,
-                  "linear_denoise_auto": True, "linear_denoise_strength": 0.7, "nxt_iterations": 2}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
+                  "linear_denoise_auto": True, "linear_denoise_strength": 0.7, "nxt_iterations": 2,
+                  # the final sky level: off = the Midtones slider; on = the midtones that put the sky at sky_level after the black point
+                  "sky_levelling": False, "sky_level": 0.10}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
 
 
 def _R(group, key, label, lo, hi, step):
@@ -169,6 +172,8 @@ PARAM_SPEC: list[dict] = [
     _R("Detail", "sharpen", "Final sharpening (Siril unsharp under the subject mask, after the noise reduction)", 0, 1.5, 0.05),
     _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
     _R("Finish", "brightness", "Midtones", -1, 1, 0.05),
+    _B("Finish", "sky_levelling", "Final sky level: set the midtones so that the sky ends at the level below (instead of the Midtones slider)"),
+    _R("Finish", "sky_level", "Final sky level (with the option above; the sky gate is 0.08-0.12)", 0.05, 0.15, 0.005),
     _R("Grade", "grade_amount", "Grade strength", 0, 1, 0.05),
     _R("Grade", "grade_temperature", "Temperature (cool - warm)", -1, 1, 0.05),
     _R("Grade", "grade_tint", "Tint (green - magenta)", -1, 1, 0.05),

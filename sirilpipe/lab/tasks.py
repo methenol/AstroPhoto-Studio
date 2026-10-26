@@ -10,8 +10,8 @@ Search spaces.  A parameter may be conditional: ``when`` = {other: [values]} (al
 (any may hold); an inactive parameter is not sampled and keeps its fixed value, so a trial is never spent on a setting
 that has no effect (the RBF smoothing of a polynomial model, the Cosmic Clarity amounts with Sharpen off).
 ``hypertune`` marks the parameters the hyper-tuned pipeline (sirilpipe.hypertune) searches: True, or a condition on
-the dataset ("dual": dual-band data only, "refs": only when reference looks of the target exist - the palette and the
-colour grade are matters of style, judged only against references); ``ht_choices`` narrows a categorical there.
+the dataset ("dual": dual-band data only); the palette and the colour grade are matters of style, the user's, never searched;
+``ht_choices`` narrows a categorical there.
 
 Scores and constraints.  ``score`` is the task's figure of merit (the hyper-tune objective and the lab's default),
 ``limits(ctx)`` its constraints ({metric: ("max" | "min", bound)}), whose violations every trial records (Optuna's
@@ -235,7 +235,7 @@ class Task:
         return {"name": self.name, "label": self.label, "description": self.description, "params": self.params,
                 "metrics": self.metrics, "options": self.options, "default_objective": self.default_objective or self.score,
                 "score": self.score, "min_gain": self.min_gain, "min_gain_rel": self.min_gain_rel, "objective_note": self.objective_note,
-                "constraints": {k: list(v) for k, v in self.static_limits().items()}}
+                "constraints": {k: list(v) for k, v in self.static_limits().items()}, "sampler": getattr(self, "ht_sampler", "tpe")}
 
     def defaults(self) -> dict:
         return {p["name"]: p["default"] for p in self.params}
@@ -648,6 +648,75 @@ def model_structure(before: np.ndarray, after: np.ndarray, valid: np.ndarray) ->
     return float(np.std(band(d)[v]) / max(np.std(band(a)[v]), 1e-12))
 
 
+def gradient_context(s, study_dir: str, device, log, cancel) -> dict:
+    """What the gradient model is judged on, set once on the stack as the restore stage loads it: the scoring tiles (sky / emission), the valid
+    region, the stars' photometry (the photometric scale) and whether the sky-survey reference covers the field (then auto = the survey model)."""
+    from .. import post
+    # the stack as the restore stage loads it (post.Restorer: row order, _sanitize - an HDR stack peaking at 2.13 is divided by it - and
+    # normalise_scale); comparing the file's own values with the restored ones scored that rescale as removed signal
+    wd = os.path.join(study_dir, "work", "bg_ref")
+    _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json"))
+    try:
+        stack = post.Restorer(wd, s.meta, {}, dict(post.DEFAULTS), None, None).arr.copy()
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+    img = _hwc(stack)
+    yard = _sky_yardstick(img)
+    log(f"{len(yard['tiles'])} gradient scoring tiles: {int(yard['sky'].sum())} sky, {int(yard['emission'].sum())} emission")
+    # does the sky-survey reference apply to this field (plate-solved, covered)?  Then "auto" is the survey model, which ignores the smoothing and the
+    # correction - those trials are one setting (canonical); on M 31 37 of 60 trials had been auto with differing, unused smoothing values
+    skyref_ok = False
+    wd = os.path.join(study_dir, "work", "bg_probe")
+    _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
+    try:
+        r = post.Restorer(wd, s.meta, {"device": str(device)}, {**post.DEFAULTS, "bg_method": "reference"}, None, _checkpoint(cancel))
+        r.background()
+        # the survey's own record: when it fails, background() falls back to GraXpert, whose record comes last (a synthetic field without a plate
+        # solution had read as covered, so GraXpert trials of different smoothings counted as one setting)
+        skyref_ok = any(x["step"] == "gradient" and str(x.get("tool", "")).startswith("sky survey") and x.get("status") in (None, "done")
+                        for x in r.steps.records)
+    except Exception as e:                     # noqa: BLE001
+        log(f"Sky-survey reference probe: {e}")
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+    log("The sky-survey reference covers this field: auto = the survey model" if skyref_ok else "No sky-survey reference for this field: auto = GraXpert")
+    try:                                       # the photometric scale: the stars' local-background photometry, which no gradient model changes
+        stars = OB.Yardstick(img, keep_image=False)
+    except Exception as e:                     # noqa: BLE001
+        stars = None
+        log(f"No star photometry for the photometric scale ({e}): results are compared as they are")
+    return {"stack": stack, "img": img, "yard": yard, "valid": OB.valid_region(OB.lum(img)), "stars": stars, "skyref": skyref_ok}
+
+
+def gradient_metrics(g: dict, before: np.ndarray, res: np.ndarray) -> dict:
+    """The gradient model's effect, ``before`` -> ``res`` ((h, w, 3), the image before and after the model) on the tiles of ``gradient_context``:
+    emission_change (|fraction of the emission tiles' signal above the sky the model changed|), sky_flatness (the gradient left in the sky tiles, a
+    robust quadratic's range in pixel noise) and model_structure (what it removed at 1 - 10 % of the frame)."""
+    yard = g["yard"]
+    # a global rescale is no change of the emission: post._sanitize divides the result by its peak when the gradient model's pedestal lifts
+    # a saturated core above 1 (M 31: x 0.89, which had scored every model as removing 11 % of the galaxy); the stars' fluxes give the scale
+    gain = 1.0
+    if g.get("stars") is not None:
+        dm = g["stars"].measure(res, same_grid=True, normalise_gain=False).get("dm_median")
+        if dm is not None and np.isfinite(dm):
+            gain = float(10 ** (-0.4 * dm))
+    res_n = res / np.float32(gain)
+    T1 = _tile_medians(res_n, yard)
+    sky = yard["sky"]
+    cx, cy = yard["cx"][sky], yard["cy"][sky]
+    A = np.stack([np.ones(sky.sum()), cx, cy, cx * cx, cx * cy, cy * cy], 1)
+    coef, *_ = np.linalg.lstsq(A, T1[sky], rcond=None)
+    out = {"sky_flatness": float(np.ptp(A @ coef) / max(yard["noise"], 1e-12)), "model_structure": model_structure(before, res_n, g["valid"]),
+           "bg_gain": gain, "signal_removed": 0.0}                   # no emission tiles: nothing a model could take away
+    em = yard["emission"]
+    if em.any() and sky.any():
+        b0 = yard["med0"][em] - np.median(yard["med0"][sky])
+        b1 = T1[em] - np.median(T1[sky])
+        out["signal_removed"] = float(np.clip(1.0 - b1.sum() / max(b0.sum(), 1e-12), -1.0, 1.0))
+    out["emission_change"] = abs(out["signal_removed"])
+    return out
+
+
 class BackgroundTask(Task):
     name = "background"
     label = "Gradient removal"
@@ -674,6 +743,7 @@ class BackgroundTask(Task):
         "sky_flatness": {"label": "Gradient left in the sky (× pixel noise)", "direction": "minimize"},
         "model_structure": {"label": "Structure the model removed at 1-10 % of the frame (fraction)", "direction": "minimize"},
         "signal_removed": {"label": "Extended emission removed (fraction, emission tiles)", "direction": "minimize"},
+        "bg_gain": {"label": "Global scale of the result (stars' photometry; judged after it)", "direction": "minimize"},
         "seconds": {"label": "Run time (s)", "direction": "minimize"},
         **{k: v for k, v in TRUTH_METRICS.items() if k in ("truth_nrmse", "truth_faint_nrmse", "truth_ssim", "truth_psnr")},
     }
@@ -685,42 +755,9 @@ class BackgroundTask(Task):
         return {"model_structure": ("max", 0.15), "sky_flatness": ("max", 3.0)}
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
-        from .. import post
         s = ds.ensure_stacked(log, cancel)
-        stack = _read(s._p("stack.fits"))
-        # the stack as the restore stage loads it (post.Restorer: row order, _sanitize - an HDR stack peaking at 2.13 is divided by it - and
-        # normalise_scale); comparing the file's own values with the restored ones scored that rescale as removed signal
-        wd = os.path.join(study_dir, "work", "bg_ref")
-        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json"))
-        try:
-            stack = post.Restorer(wd, s.meta, {}, dict(post.DEFAULTS), None, None).arr.copy()
-        finally:
-            shutil.rmtree(wd, ignore_errors=True)
-        img = _hwc(stack)
-        yard = _sky_yardstick(img)
-        log(f"{len(yard['tiles'])} scoring tiles: {int(yard['sky'].sum())} sky, {int(yard['emission'].sum())} emission")
-        # does the sky-survey reference apply to this field (plate-solved, covered)?  Then "auto" is the survey model, which ignores the smoothing and the
-        # correction - those trials are one setting (canonical); on M 31 37 of 60 trials had been auto with differing, unused smoothing values
-        skyref_ok = False
-        wd = os.path.join(study_dir, "work", "bg_probe")
-        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
-        try:
-            from .. import post
-            r = post.Restorer(wd, s.meta, {"device": str(device)}, {**post.DEFAULTS, "bg_method": "reference"}, None, _checkpoint(cancel))
-            r.background()
-            skyref_ok = (([x for x in r.steps.records if x["step"] == "gradient"] or [{}])[-1]).get("status") == "done"
-        except Exception as e:                     # noqa: BLE001
-            log(f"Sky-survey reference probe: {e}")
-        finally:
-            shutil.rmtree(wd, ignore_errors=True)
-        log("The sky-survey reference covers this field: auto = the survey model" if skyref_ok else "No sky-survey reference for this field: auto = GraXpert")
-        try:                                       # the photometric scale: the stars' local-background photometry, which no gradient model changes
-            stars = OB.Yardstick(img, keep_image=False)
-        except Exception as e:                     # noqa: BLE001
-            stars = None
-            log(f"No star photometry for the photometric scale ({e}): results are compared as they are")
-        return {"ds": ds, "session": s, "stack": stack, "img": img, "yard": yard, "study_dir": study_dir, "n": 0, "opts": opts, "device": device,
-                "valid": OB.valid_region(OB.lum(img)), "stars": stars, "skyref": skyref_ok}
+        g = gradient_context(s, study_dir, device, log, cancel)
+        return {"ds": ds, "session": s, "study_dir": study_dir, "n": 0, "opts": opts, "device": device, **g}
 
     def canonical(self, active, ctx):
         m = str(active.get("bg_method", "auto"))
@@ -745,32 +782,9 @@ class BackgroundTask(Task):
             dt = time.time() - t
             res = _hwc(r.arr)
             step = ([x for x in r.steps.records if x["step"] == "gradient"] or [{}])[-1]        # auto: the survey may be skipped, its fallback ran
-            # a global rescale is no change of the emission: post._sanitize divides the result by its peak when the gradient model's pedestal lifts
-            # a saturated core above 1 (M 31: x 0.89, which had scored every model as removing 11 % of the galaxy); the stars' fluxes give the scale
-            gain = 1.0
-            if ctx.get("stars") is not None:
-                dm = ctx["stars"].measure(res, same_grid=True, normalise_gain=False).get("dm_median")
-                if dm is not None and np.isfinite(dm):
-                    gain = float(10 ** (-0.4 * dm))
-            res_n = res / np.float32(gain)
             if step.get("status") not in (None, "done"):
                 raise RuntimeError(f"{step.get('tool')} {step.get('status')}: {step.get('note') or ''}")
-            T1 = _tile_medians(res_n, yard)
-            sky = yard["sky"]
-            # the gradient left: range of a robust quadratic over the sky tiles, in units of the pixel noise
-            cx, cy = yard["cx"][sky], yard["cy"][sky]
-            A = np.stack([np.ones(sky.sum()), cx, cy, cx * cx, cx * cy, cy * cy], 1)
-            coef, *_ = np.linalg.lstsq(A, T1[sky], rcond=None)
-            fitv = A @ coef
-            out = {"sky_flatness": float(np.ptp(fitv) / max(yard["noise"], 1e-12)), "seconds": dt, "method_used": step.get("tool"), "note": step.get("note"),
-                   "model_structure": model_structure(before, res_n, ctx["valid"]), "gain": gain}
-            em = yard["emission"]
-            out["signal_removed"] = 0.0                              # no emission tiles: nothing a model could take away
-            if em.any() and sky.any():
-                before_t = yard["med0"][em] - np.median(yard["med0"][sky])
-                after = T1[em] - np.median(T1[sky])
-                out["signal_removed"] = float(np.clip(1.0 - after.sum() / max(before_t.sum(), 1e-12), -1.0, 1.0))
-            out["emission_change"] = abs(out["signal_removed"])
+            out = {**gradient_metrics(ctx, before, res), "seconds": dt, "method_used": step.get("tool"), "note": step.get("note")}
             if ds.synthetic:
                 out.update(_truth_scores(ds, s, r.arr, float(ctx["opts"].get("sigma_eval", 4.0)), stars_in_result=True, fit_plane=False))
             return out, res
@@ -786,21 +800,32 @@ _STRENGTH_TOOLS = ["auto", "rl", "graxpert"]          # the Deconvolution slider
 class RestoreTask(Task):
     name = "restore"
     label = "Linear restoration (restore stage)"
-    description = ("The linear stage (post.restore) on a copy of the stack: the deconvolution tool of the objects and of the stars (BlurXTerminator, GraXpert, Siril RL) "
-                   "with their strengths, the noise reduction tool (NoiseXTerminator, GraXpert, Siril) with its strength, colour calibration and gradient settings.  "
-                   "Every trial is measured against a reference restore run once with the same gradient and colour settings and no deconvolution or noise "
-                   "reduction: the same stars and sky apertures.  Each trial runs the whole linear stage (about a minute).")
-    objective_note = ("Score: depth of the restored image (point- and extended-source S/N on the reference stars, empty-aperture noise): sharpening and noise "
-                      "reduction both raise it.  Constraints closing its exploits: star flux conserved (|median Δmag| bright ≤ 0.05, faint ≤ 0.10 in the "
-                      "2.5 FWHM aperture: GraXpert's stars model shrank stars by removing their light); the image above the PSF scale, away from the stars, "
-                      "unchanged within 1.25 × its noise there (discrepancy principle: the PSF band-limits the sky, so only noise lives below it - a denoiser "
-                      "that smears faint structure changes more); no dark rings round the bright stars (moat ≤ 1 pixel-noise deeper than the reference).")
+    description = ("The linear stage (post.restore) on a copy of the stack, all of its variables in one search: Cosmic Clarity's satellite-trail removal, the "
+                   "gradient model (sky-survey reference, GraXpert, Siril polynomial / RBF; subtraction or division), the deconvolution tool of the objects and "
+                   "of the stars (BlurXTerminator, GraXpert, Siril RL) with their strengths and the noise reduction tool (NoiseXTerminator, GraXpert, Siril) "
+                   "with its strength.  Depth is measured on one set of stars and empty-sky apertures, chosen on the baseline's restore, in every trial; the "
+                   "photometry and fidelity constraints against the trial's own state before the deconvolution (the same trail removal and gradient model), "
+                   "so that they judge what the deconvolution and the noise reduction did.  The state before the deconvolution (trail removal, gradient, "
+                   "plate solve, colour calibration) is computed once per such settings.")
+    objective_note = ("Score (restore_score, higher is better) = depth_gain + ln(1 - emission_change).  depth_gain: the log S/N (point- and "
+                      "extended-source S/N on fixed reference stars, empty-aperture noise) the deconvolution and the noise reduction add to the trial's own "
+                      "state before them (same trail removal and gradient model) - paired, because the depth is not invariant to the gradient model (a "
+                      "model that eats the nebula takes its structure out of the noise apertures: +0.40 on a synthetic sky).  ln(1 - emission_change): a "
+                      "gradient model that takes a fraction f of the nebula's signal lowers the nebula's S/N by ln(1 - f), the noise being untouched "
+                      "(emission_change ranked 12 gradient models against a synthetic sky's truth at Spearman rho +0.99).  Constraints closing the exploits: star flux conserved (|median dmag| bright <= 0.05, faint <= 0.10: "
+                      "GraXpert's stars model shrank stars by removing their light); the image above the PSF scale, away from the stars, unchanged within "
+                      "1.25 x its noise there (discrepancy principle: a denoiser that smears faint structure changes more); no dark rings round the bright "
+                      "stars (moat <= 1 pixel-noise deeper than before the deconvolution); the gradient left in the sky tiles <= 3 x the pixel noise and the "
+                      "model's own structure at 1 - 10 % of the frame <= 15 % of the image's there (a gradient has none at those scales); no more satellite "
+                      "trails left than Cosmic Clarity's removal leaves in this stack (+25 %), so that the removal is on when the stack has trails.")
     params = (_processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance",
                                   "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations"],
                                  {"deconvolution", "denoise"},
-                                 hypertune={"deconvolution": True, "denoise": True, "bxt_auto": True, "bxt_sharpen_stars": True, "bxt_sharpen_nonstellar": True,
+                                 hypertune={"bg_method": True, "bg_smoothing": True, "bg_degree": True, "bg_correction": True,
+                                            "deconvolution": True, "denoise": True, "bxt_auto": True, "bxt_sharpen_stars": True, "bxt_sharpen_nonstellar": True,
                                             "bxt_halos": True, "linear_denoise_auto": True, "linear_denoise_strength": True, "nxt_iterations": True},
                                  when={"bg_degree": {"bg_method": ["poly"]}, "bg_smoothing": {"bg_method": ["auto", "graxpert", "rbf"]},
+                                       "bg_correction": {"bg_method": ["auto", "graxpert", "poly", "rbf"]},
                                        "deconvolution": [{"deconv_method": _STRENGTH_TOOLS}, {"deconv_stars_method": _STRENGTH_TOOLS}],
                                        "bxt_auto": [{"deconv_method": _BXT}, {"deconv_stars_method": _BXT}],
                                        "bxt_sharpen_stars": {"bxt_auto": [False], "deconv_stars_method": _BXT},
@@ -819,42 +844,58 @@ class RestoreTask(Task):
                  {"name": "graxpert_psfsize", "label": "GraXpert PSF size (px; 0 = measured)", "type": "float", "low": 0.0, "high": 14.0, "default": 0.0, "tune": False,
                   "pipeline": "graxpert_psfsize", "when": [{"deconv_method": ["graxpert"]}, {"deconv_stars_method": ["graxpert"]}]},
                  {"name": "satellite_removal", "label": "Cosmic Clarity satellite-trail removal (before the gradient)", "type": "bool", "default": False, "tune": False,
-                  "pipeline": "satellite_removal"}])
+                  "hypertune": True, "pipeline": "satellite_removal"}])
+    # reference = auto without its fallback: the same model wherever auto uses the survey
+    next(q for q in params if q["name"] == "bg_method")["ht_choices"] = ["auto", "graxpert", "poly", "rbf"]
     metrics = {
+        "restore_score": {"label": "Restore score: depth gained by the deconvolution / noise reduction + ln(1 - emission changed by the gradient model)", "direction": "maximize"},
+        "depth_gain": {"label": "Depth gained over the state before the deconvolution (ln S/N)", "direction": "maximize"},
+        "depth_before": {"label": "Depth before the deconvolution (after trail removal and gradient model)", "direction": "maximize"},
         **DEPTH_METRICS,
-        "dm_bright_abs": {"label": "|Δmag| bright reference stars against the reference restore", "direction": "minimize"},
-        "dm_faint_abs": {"label": "|Δmag| faint reference stars against the reference restore", "direction": "minimize"},
-        "large_change": {"label": "Change above the PSF scale away from the stars (× noise)", "direction": "minimize"},
-        "moat": {"label": "Dark ring depth round bright stars (× pixel noise)", "direction": "minimize"},
-        "gain": {"label": "Global scale against the reference (a change of units; the photometry is judged after it)", "direction": "minimize"},
+        "dm_bright_abs": {"label": "|dmag| bright reference stars against the state before the deconvolution", "direction": "minimize"},
+        "dm_faint_abs": {"label": "|dmag| faint reference stars against the state before the deconvolution", "direction": "minimize"},
+        "large_change": {"label": "Change above the PSF scale away from the stars (x noise)", "direction": "minimize"},
+        "moat": {"label": "Dark ring depth round bright stars (x pixel noise)", "direction": "minimize"},
+        "gain": {"label": "Global scale against the state before the deconvolution (a change of units; the photometry is judged after it)", "direction": "minimize"},
+        "emission_change": {"label": "Emission changed by the gradient model (|fraction of the emission tiles' signal|)", "direction": "minimize"},
+        "signal_removed": {"label": "Extended emission removed by the gradient model (fraction, emission tiles)", "direction": "minimize"},
+        "sky_flatness": {"label": "Gradient left in the sky (x pixel noise)", "direction": "minimize"},
+        "model_structure": {"label": "Structure the gradient model removed at 1-10 % of the frame (fraction)", "direction": "minimize"},
+        "trails": {"label": "Satellite / aircraft trail pixels per million left", "direction": "minimize"},
         "bg_noise": {"label": "Background noise", "direction": "minimize"},
         "sharpness": {"label": "Sharpness S_F (Krotkov; rewards noise - reported only)", "direction": "maximize"},
         "seconds": {"label": "Run time (s)", "direction": "minimize"},
         **TRUTH_METRICS,
     }
-    options = [{"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0}]
-    score = default_objective = "depth"
+    options = [{"name": "sigma_eval", "label": "Truth comparison resolution sigma (px)", "type": "float", "default": 1.0}]
+    score = default_objective = "restore_score"
     min_gain = 0.01               # 3 sigma of the difference of two runs: identical restorations scatter by sd 0.0023 in depth (GPU BXT / NXT, Sh2-131)
     NOOP = {"deconv_method": "none", "deconv_stars_method": "none", "denoise_method": "none", "satellite_removal": False}
+    CACHE = 4                     # states before the deconvolution kept (one per trail removal / gradient / colour settings; a full-frame M 31 state is 150 MB)
 
     def limits(self, ctx):
-        out = {"dm_bright_abs": ("max", 0.05), "dm_faint_abs": ("max", 0.10), "large_change": ("max", 1.25)}
-        ref = ctx.get("ref_moat")
-        out["moat"] = ("max", (ref or 0.0) + 1.0)
+        out = {"dm_bright_abs": ("max", 0.05), "dm_faint_abs": ("max", 0.10), "large_change": ("max", 1.25),
+               "sky_flatness": ("max", 3.0), "model_structure": ("max", 0.15)}
+        out["moat"] = ("max", (ctx.get("ref_moat") or 0.0) + 1.0)
+        if ctx.get("trails_min") is not None:
+            # no trial may leave more satellite trails than Cosmic Clarity's removal takes out of this stack (the depth's robust noise does not see them)
+            t = float(ctx["trails_min"])
+            out["trails"] = ("max", max(1.25 * t, t + 20.0))
         return out
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
         s = ds.ensure_stacked(log, cancel)
-        stack = _read(s._p("stack.fits"))
         from ..hypertune import available_tools
         tools = available_tools()
         auto_dc = "bxt" if tools.get("bxt") else "rl"
         auto_dn = next((t for t, k in (("nxt", "nxt"), ("graxpert", "graxpert_denoise")) if tools.get(k)), "siril")
-        return {"ds": ds, "session": s, "stack": stack, "study_dir": study_dir, "n": 0, "device": device, "opts": opts, "refs": {},
-                "auto_deconv": auto_dc, "auto_denoise": auto_dn}
+        g = gradient_context(s, study_dir, device, log, cancel)
+        return {"ds": ds, "session": s, "study_dir": study_dir, "n": 0, "device": device, "opts": opts, "refs": {}, "pre": {},
+                "auto_deconv": auto_dc, "auto_denoise": auto_dn, "cc_satellite": bool(tools.get("cc_satellite")), "grad": g, "skyref": g["skyref"]}
 
     def canonical(self, active, ctx):
-        """What runs: auto = BlurXTerminator when licensed (else Siril RL), the denoiser auto = the first available of NXT / GraXpert / Siril; the
+        """What runs: auto = BlurXTerminator when licensed (else Siril RL), the denoiser auto = the first available of NXT / GraXpert / Siril, the
+        gradient model auto = the sky-survey reference where it covers the field (its smoothing / correction unused), else GraXpert; the
         Deconvolution slider only switches a BXT-only deconvolution on (> 0) or off; strengths of tools that do not run do not count."""
         a = dict(active)
         if "deconv_method" in a or "deconv_stars_method" in a:
@@ -870,6 +911,14 @@ class RestoreTask(Task):
             a["denoise_method"] = str(a["denoise_method"]).replace("auto", ctx.get("auto_denoise", "auto"))
             if a["denoise_method"] != "nxt":
                 a.pop("nxt_iterations", None)
+        if "bg_method" in a:
+            m = str(a["bg_method"])
+            if m == "reference" or (m == "auto" and ctx.get("skyref")):
+                for k in ("bg_smoothing", "bg_degree", "bg_correction"):
+                    a.pop(k, None)
+                a["bg_method"] = "sky-survey reference" if ctx.get("skyref") else "reference (unavailable)"
+            elif m == "auto":
+                a["bg_method"] = "graxpert"
         return a
 
     def _settings(self, ctx, p):
@@ -884,9 +933,10 @@ class RestoreTask(Task):
         return prm, sp
 
     def _restore(self, ctx, prm, sp, tag, cancel):
-        """post.restore's steps on a copy of the stack.  Everything before the deconvolution (trail removal, gradient, plate solve, BlurXTerminator's
-        correct-only PSF pass, SPCC) depends only on the gradient / colour settings and on whether BXT is among the deconvolution tools: that state is
-        computed once per such key and the trials run from it (a full restore was 2 min a trial on M 31, most of it SPCC)."""
+        """post.restore's steps on a copy of the stack: (restored image, its meta, the state before the deconvolution, the gradient model's metrics).
+        Everything before the deconvolution (trail removal, gradient, plate solve, BlurXTerminator's correct-only PSF pass, SPCC) depends only on
+        the gradient / colour settings, the trail removal and whether BXT is among the deconvolution tools: that state is computed once per such
+        key and the trials run from it (a full restore was 2 min a trial on M 31, most of it SPCC)."""
         import copy
         from .. import post
         s = ctx["session"]
@@ -900,51 +950,95 @@ class RestoreTask(Task):
             pre = ctx.setdefault("pre", {})
             t0 = time.time()
             if key in pre:
-                c = pre[key]
+                c = pre.pop(key)
+                pre[key] = c                                            # most recently used last
                 r.arr, r.header, r.info = c["arr"].copy(), c["header"].copy(), copy.deepcopy(c["info"])
                 r.psf_corrected, r.steps.records = c["psf_corrected"], copy.deepcopy(c["records"])
             else:
                 r.satellite()
+                before = _hwc(r.arr)
                 r.background()
+                step = ([x for x in r.steps.records if x["step"] == "gradient"] or [{}])[-1]
+                if r.p.get("background") and step.get("status") not in (None, "done", "skipped"):
+                    raise RuntimeError(f"gradient model {step.get('tool')} {step.get('status')}: {step.get('note') or ''}")
+                grad = gradient_metrics(ctx["grad"], before, _hwc(r.arr)) if r.p.get("background") else {"emission_change": 0.0}
+                grad["gradient_tool"] = step.get("tool")
+                del before
                 solved = r.plate_solve()
                 r.psf_correction()
                 r.colour(solved)
+                while len(pre) >= self.CACHE:
+                    pre.pop(next(iter(pre)))
                 pre[key] = {"arr": r.arr.copy(), "header": r.header.copy(), "info": copy.deepcopy(r.info), "psf_corrected": r.psf_corrected,
-                            "records": copy.deepcopy(r.steps.records)}
+                            "records": copy.deepcopy(r.steps.records), "grad": grad}
             r.deconvolve()
             r.denoise()
             meta = r.save()
             meta["seconds"] = round(time.time() - t0, 1)
-            return r.arr.copy(), meta
+            return r.arr.copy(), meta, key
         finally:
             shutil.rmtree(wd, ignore_errors=True)
 
-    def _reference(self, ctx, prm, sp, log, cancel):
-        """The no-op restore (no deconvolution, no noise reduction, no trail removal) with this trial's gradient and colour settings, once per such settings."""
-        key = json.dumps({k: prm.get(k) for k in ("background", "bg_method", "bg_correction", "bg_degree", "bg_smoothing", "white_balance", "spcc_sensor",
-                                                  "spcc_filter", "spcc_white_ref")}, sort_keys=True, default=str)
-        if key not in ctx["refs"]:
-            log("Reference restore (same gradient and colour settings, no deconvolution / noise reduction)")
-            lin, _ = self._restore(ctx, prm, {**sp, **self.NOOP}, "restore_ref", cancel)
-            y = OB.Yardstick(_hwc(lin))
-            ctx["refs"][key] = y
-            ctx["ref_moat"] = y.ref.get("moat")
-            log(f"Reference: {len(y.sx)} stars, FWHM {y.fwhm:.2f} px, {len(y.ax)} sky apertures, depth {y.ref.get('depth', float('nan')):.3f}")
-        return ctx["refs"][key]
+    def _paired(self, ctx, key, log):
+        """The yardstick of the paired constraints: the trial's own state before the deconvolution (same trail removal, gradient and colour)."""
+        refs = ctx["refs"]
+        if key not in refs:
+            while len(refs) >= self.CACHE:
+                refs.pop(next(iter(refs)))
+            refs[key] = OB.Yardstick(_hwc(ctx["pre"][key]["arr"]))
+        return refs[key]
+
+    def _trails_bound(self, ctx, prm, sp, lin0, log, cancel):
+        """The trails left in this stack (``lin0``: its restore without trail removal), and what Cosmic Clarity's removal leaves (once): the bound
+        of the trails constraint."""
+        t0, t1 = trail_pixels(_hwc(lin0)), None
+        if ctx.get("cc_satellite"):
+            try:
+                lin1, _, _ = self._restore(ctx, prm, {**sp, **self.NOOP, "satellite_removal": True}, "restore_trails1", cancel)
+                t1 = trail_pixels(_hwc(lin1))
+            except Exception as e:                       # noqa: BLE001
+                log(f"Cosmic Clarity trail removal on the reference: {e}")
+        ctx["trails_min"] = min(t0, t1) if t1 is not None else t0
+        log(f"Satellite trails: {t0:.0f} pixels per million in the stack" + (f", {t1:.0f} after Cosmic Clarity's removal" if t1 is not None else ""))
 
     def run(self, ctx, p, log, cancel):
         s, ds = ctx["session"], ctx["ds"]
         ctx["n"] += 1
         prm, sp = self._settings(ctx, p)
-        y = self._reference(ctx, prm, sp, log, cancel)
+        if "depth_yard" not in ctx:
+            # the stars and empty-sky apertures of the depth, once for the whole study: the baseline's (trial 0) settings without deconvolution / noise
+            # reduction - every trial's depth on the same positions (depth is a ratio of fluxes to noise: neither a gradient's pedestal nor a change
+            # of units moves it)
+            lin, _, _ = self._restore(ctx, prm, {**sp, **self.NOOP}, "restore_ref", cancel)
+            ctx["depth_yard"] = OB.Yardstick(_hwc(lin), keep_image=False)
+            y = ctx["depth_yard"]
+            log(f"Depth reference: {len(y.sx)} stars, FWHM {y.fwhm:.2f} px, {len(y.ax)} sky apertures, depth {y.ref.get('depth', float('nan')):.3f}")
+            self._trails_bound(ctx, prm, sp, lin, log, cancel)
         t = time.time()
-        lin, meta = self._restore(ctx, prm, sp, f"restore_{ctx['n']}", cancel)
+        lin, meta, key = self._restore(ctx, prm, sp, f"restore_{ctx['n']}", cancel)
         dt = time.time() - t
         est = _hwc(lin)
-        m = y.measure(est, same_grid=True)
-        out = {k: m.get(k) for k in ("depth", "snr_point", "snr_total", "fwhm", "dm_bright_abs", "dm_faint_abs", "dm_bright", "dm_faint", "large_change", "moat", "gain")}
+        yp = self._paired(ctx, key, log)
+        ctx["ref_moat"] = yp.ref.get("moat")
+        m = yp.measure(est, same_grid=True)
+        d = ctx["depth_yard"].measure(est, same_grid=True, normalise_gain=False)
+        out = {k: m.get(k) for k in ("dm_bright_abs", "dm_faint_abs", "dm_bright", "dm_faint", "large_change", "moat", "gain")}
+        out.update({k: d.get(k) for k in ("depth", "snr_point", "snr_total", "fwhm")})
+        pre = ctx["pre"][key]
+        if "depth0" not in pre:
+            # the depth of this trial's own state before the deconvolution (the same trail removal and gradient model), on the same stars and apertures:
+            # the depth gained is the deconvolution's and the noise reduction's.  The depth itself is not invariant to the gradient model - the nebula's
+            # structure in the empty-sky apertures and annuli is noise to it: on the synthetic sky GraXpert, which took 85 % of the nebula, read 0.40
+            # deeper than a quadratic with the same (no) restoration
+            pre["depth0"] = ctx["depth_yard"].measure(_hwc(pre["arr"]), same_grid=True, normalise_gain=False).get("depth")
+        out["depth_before"] = pre["depth0"]
+        out["depth_gain"] = (out["depth"] - pre["depth0"]) if out.get("depth") is not None and pre["depth0"] is not None else None
+        g = pre["grad"]
+        out.update({k: g.get(k) for k in ("emission_change", "signal_removed", "sky_flatness", "model_structure", "gradient_tool")})
+        if out.get("depth_gain") is not None:
+            out["restore_score"] = float(out["depth_gain"] + math.log(max(1.0 - float(g.get("emission_change") or 0.0), 1e-3)))
         out.update(bg_noise=MX.background_noise(est), sharpness=float(np.mean([MX.sharpness(est[..., c]) for c in range(3)])), seconds=dt,
-                   tools=" + ".join(meta.get("tools") or []) or "none",
+                   trails=trail_pixels(est), tools=" + ".join(meta.get("tools") or []) or "none",
                    failed=[f"{r['tool']}: {r['status']}" for r in meta.get("steps", []) if r.get("status") in ("failed", "unavailable")])
         if ds.synthetic:
             out.update(_truth_scores(ds, s, lin, float(ctx["opts"].get("sigma_eval", 1.0))))
@@ -1067,7 +1161,22 @@ class StarsTask(Task):
 
 # ----------------------------------------------------------------------------- finishing
 _HUBBLE = ["sho", "hso", "osh", "ohs", "hos"]
-GATE_WEIGHT = 100.0           # finish_score: one failed gate outweighs any difference of the look distance
+GATE_WEIGHT = 1.0             # finish_score: one failed gate outweighs any difference of the structural fidelity (0 - 1)
+MIN_GAIN_H = 0.005            # half a percent of the significant structure made visible
+
+
+def _finish_source(layers) -> np.ndarray:
+    """The linear luminance the finish renders (the starless layer plus the star layer, or the linear image): the HDR side of the fidelity."""
+    lin = layers.base if layers.stars is None else layers.base + layers.stars
+    return OB.luminance_y(np.nan_to_num(lin, nan=0.0))
+
+
+def _finish_ldr(img: np.ndarray, shape) -> np.ndarray:
+    """The finished image's luminance on the linear grid (the finishing chain keeps the grid; a crop or a resize would show as a shape mismatch)."""
+    y = OB.luminance_y(np.clip(img, 0.0, 1.0))
+    if y.shape != tuple(shape):
+        y = cv2.resize(y, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+    return y
 _GHS = ["ghs2", "autoghs"]
 
 
@@ -1076,50 +1185,61 @@ class FinishTask(Task):
     label = "Stretch & finish (finishing chain)"
     display_ready = True
     description = ("The finishing chain (pro.py) on the dataset's cached starless and star layers (or the linear / stacked image): the stretch tool and its "
-                   "settings, highlights, the noise reduction of the stretched image (NoiseXTerminator or Cosmic Clarity Denoise), Cosmic Clarity Sharpen, palette / "
-                   "OIII boost, local contrast, saturation, the star layer and the colour grade.  Scored by the finishing gates (sky level, clipping, sky chroma, sky "
-                   "noise, star count / shape / colour), the nebula contrast and the distance to the reference looks of the target.  Trial images are the finished "
-                   "renders (one chain, same data).  Option 'external': run NoiseXTerminator / GraXpert / Cosmic Clarity on the stretched image in every trial "
-                   "(slower, the export's result; without it those settings have no effect).")
-    objective_note = ("Score (finish_score, lower is better), lexicographic: the number of failed finishing gates first (x 100), then the distance to the reference "
-                      "looks of the target (its own reference photographs, else those of its class: lab.looks, the held-out grader); without references -ln of "
-                      "the contrast-to-noise ratio (nebula p90 - sky) / sky pixel noise.  "
-                      "Constraints: every finishing gate (FINISH-SPEC) no further outside its limit than in the baseline - gate by gate, so that no gate is traded "
-                      "for another (all must pass when the baseline passes).  "
-                      "Every target has reference looks to grade against: its own photographs, else those of its class (emission, dual-band, galaxy, ...).")
+                   "settings, highlights, the noise reduction of the stretched image (NoiseXTerminator or Cosmic Clarity Denoise), Cosmic Clarity Sharpen, "
+                   "dual-band unmixing, local contrast, saturation, the star layer and the sky level.  Scored by the structural fidelity of the finished image to "
+                   "its own linear data (how much of the structure the data holds above its noise the finish makes visible, TMQI's multi-scale measure), "
+                   "subject to every finishing gate (sky level, clipping, sky chroma, sky noise, star count / shape / colour).  No reference image: the palette "
+                   "and the colour grade are the user's.  Trial images are the finished renders (one chain, same data).  Option 'external': run "
+                   "NoiseXTerminator / GraXpert / Cosmic Clarity on the stretched image in every trial (slower, the export's result; without it those settings "
+                   "have no effect).")
+    objective_note = ("Score (finish_score, lower is better): the number of failed finishing gates, then 1 - H.  H is the structural fidelity of the finished "
+                      "luminance to the linear luminance (Yeganeh & Wang, IEEE TIP 2013, the authors' TMQI.m: 11x11 Gaussian windows, 5 scales, the Mannos "
+                      "CSF thresholds of visibility on the finished side), adapted to astronomical data: a structure counts where the linear data's local "
+                      "deviation is significant above its own noise (Immerkaer's estimator, 3 sigma), and H is the fraction of that structure the finish makes "
+                      "visible in its shape (hit rate x local correlation, scale-weighted).  Constraints: every finishing gate (FINISH-SPEC) no further outside "
+                      "its limit than in the baseline - gate by gate, so that no gate is traded for another.  The gates bound what H alone would reward: "
+                      "the sky's noise stretched into view, clipping, a sky off its level.")
     params = _processing_params(
         ["stretch_method", "stretch", "stretch_boost", "auto_stretch", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise", "chroma_denoise",
          "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "palette", "hubble_formula", "oiii_boost", "oiii_unmix",
          "synthetic_luminance", "saturation", "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "star_color_preservation",
-         "halo_suppress", "scnr", "black_point", "brightness",
+         "halo_suppress", "scnr", "black_point", "brightness", "sky_levelling", "sky_level",
          "grade_amount", "grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast"],
         {"stretch", "contrast", "hdr", "saturation", "local_contrast", "star_reduction"},
         hypertune={**{k: True for k in ("stretch_method", "stretch", "stretch_boost", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise",
                                        "chroma_denoise", "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "saturation",
                                        "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "star_color_preservation", "halo_suppress",
-                                       "scnr", "black_point", "brightness")},
-                   "palette": "refs_dual", "hubble_formula": "refs_dual", "oiii_boost": "refs_dual", "oiii_unmix": "dual", "synthetic_luminance": "dual",
-                   **{k: "refs" for k in ("grade_amount", "grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat",
-                                          "grade_contrast")}},
+                                       "scnr", "black_point", "brightness", "sky_levelling", "sky_level")},
+                   # the palette, its formula / OIII boost and the colour grade are matters of style: the user's, never searched
+                   "oiii_unmix": "dual", "synthetic_luminance": "dual"},
         when={"stretch_boost": {"stretch_method": ["statstretch"]}, "contrast": {"stretch_method": _GHS}, "color_preservation": {"stretch_method": _GHS},
               "cc_denoise_model": {"cc_denoise": [True]}, "cc_stellar_amount": {"cc_sharpen": ["both", "stellar"]},
-              "cc_nonstellar_amount": {"cc_sharpen": ["both", "nonstellar"]}, "hubble_formula": {"palette": _HUBBLE}, "oiii_boost": {"palette": ["nbn"]}})
-    next(q for q in params if q["name"] == "palette")["ht_choices"] = ["auto", "hoo", "hoo_improved", "sho", "hso", "foraxx", "hoo_warm", "nbn"]
+              "cc_nonstellar_amount": {"cc_sharpen": ["both", "nonstellar"]}, "hubble_formula": {"palette": _HUBBLE}, "oiii_boost": {"palette": ["nbn"]},
+              "brightness": {"sky_levelling": [False]}, "sky_level": {"sky_levelling": [True]}})
     # the background target of the stretch sets the sky level, which the sky_median gate prescribes (0.08 - 0.12): searched over its whole range
     # (0.04 - 0.35) the trials were infeasible by definition - on M 31 26 of 31 broke that gate, the warm start's included
     next(q for q in params if q["name"] == "stretch")["ht_range"] = (0.08, 0.12)
+    # the final sky level, likewise: within the gate's band.  With it on, the black point and every step before move the sky no more - the midtones
+    # put it back (Auto-finish's result sat at 0.083: 50 of 63 trials over the free midtones fell below 0.08 on M 31)
+    next(q for q in params if q["name"] == "sky_level")["ht_range"] = (0.08, 0.12)
+    # the extra black point, on top of the one the chain sets at the histogram toe (pro.Finisher.finalise, Brecher: never into the background body): at
+    # most the sky band's width (0.12 -> 0.08).  Beyond the sky level it clips the sky to 0, which no midtones bring back - on the synthetic set the
+    # black points of 0.11-0.17 crushed the sky in 6 of 40 trials, sky levelling on or off
+    next(q for q in params if q["name"] == "black_point")["ht_range"] = (0.0, 0.04)
     params.append({"name": "ghs_d2", "label": "GHS pass 2 D (ghs2)", "type": "float", "low": 0.3, "high": 6.0, "default": 2.5, "tune": True, "hypertune": True,
                    "processing": "ghs_d2", "when": {"stretch_method": ["ghs2"]}})
     params.append({"name": "star_stretch", "label": "Star stretch amount (Seti Astro)", "type": "float", "low": 2.0, "high": 8.0, "default": 5.0, "tune": False,
                    "hypertune": True, "processing": "star_stretch"})
     metrics = {
-        "finish_score": {"label": "Finish score: 100 x gates failed + distance to the reference looks (else -ln contrast-to-noise)", "direction": "minimize"},
+        "finish_score": {"label": "Finish score: gates failed + (1 - structural fidelity H)", "direction": "minimize"},
+        "fidelity": {"label": "Structural fidelity H: significant linear structure made visible (0-1)", "direction": "maximize"},
+        "truth_fidelity": {"label": "Truth: structural fidelity to the true sky (synthetic data)", "direction": "maximize"},
+        **{f"fidelity_s{i + 1}": {"label": f"Fidelity at scale {i + 1} ({2 ** i} px)", "direction": "maximize"} for i in range(5)},
         "gate_distance": {"label": "Gates: distance outside the limits (0 = all pass)", "direction": "minimize"},
         **{f"gate_{k}": {"label": f"Gate {k}: distance outside its limit", "direction": "minimize"} for k in GATE_NAMES},
         "gates_failed": {"label": "Gates failed (count)", "direction": "minimize"},
         "cnr": {"label": "Contrast-to-noise: (nebula p90 - sky) / sky pixel noise", "direction": "maximize"},
         "nebula_contrast": {"label": "Nebula contrast (p90 - sky, lightness)", "direction": "maximize"},
-        "look_distance": {"label": "Distance to the reference looks", "direction": "minimize"},
         "sky_median": {"label": "Sky level", "direction": "minimize"},
         "sky_noise": {"label": "Sky pixel noise", "direction": "minimize"},
         "sky_chroma": {"label": "Sky chroma (max |a|, |b|)", "direction": "minimize"},
@@ -1131,9 +1251,10 @@ class FinishTask(Task):
                {"name": "max_side", "label": "Render size (px, 0 = full)", "type": "int", "default": 0}]
     score = "finish_score"
     default_objective = "finish_score"
-    min_gain = 0.05              # -ln contrast-to-noise: 5 %
-    min_gain_rel = 0.02          # the distance to the reference looks: 2 % of the baseline's (a gate fixed is worth 100).  The finishing chain is deterministic (three identical renders,
-                                 # identical scores): a margin of significance, not of noise - M 31: a 0.4 % gain had replaced 22 of Auto-finish's settings
+    # the search: the (1+1)-CMA-ES for constrained optimisation from the baseline (lab.es) - constrained TPE over the full ranges left 50 of 60 trials
+    # outside the gates on M 31, its only feasible trials the warm-start perturbations of the baseline
+    ht_sampler = "es"
+    min_gain = MIN_GAIN_H        # the finishing chain is deterministic (three identical renders, identical scores): a margin of significance, not of noise
 
     def limits(self, ctx):
         """No gate may get worse than in the baseline: each gate's violation at most the baseline's.  (A bound on the summed distance let trials buy
@@ -1143,22 +1264,35 @@ class FinishTask(Task):
         return {f"gate_{k}": ("max", float(b.get(k, 0.0)) + 1e-6) for k in GATE_NAMES}
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
-        from .. import looks, post
+        from .. import post
         s = ds.ensure_stacked(log, cancel)
         p0 = dict(post.DEFAULTS)
         max_side = int(opts.get("max_side", 0) or 0) or None
         layers = post._Layers(s.dir, p0, max_side)
         dual = post._dual_band(s.meta, layers.header)
-        ref_looks, ref_agg, desc, _ = looks.reference_looks(s.meta.get("object"), dual)
-        log(f"Layers: {os.path.basename(layers.src)}{' + stars' if layers.stars is not None else ''}; {desc}")
+        log(f"Layers: {os.path.basename(layers.src)}{' + stars' if layers.stars is not None else ''}")
+        hdr = _finish_source(layers)
+        truth = None
+        if ds.synthetic:
+            # validation: the fidelity to the true sky (registered onto the layers, scaled to their units by a robust fit), significance at the data's noise
+            try:
+                lin = layers.base if layers.stars is None else layers.base + layers.stars
+                tr, valid, _ = truth_on_stack(ds, s, lin, extended=True, stars=True)
+                tl, ok = OB.luminance_y(tr), valid & np.isfinite(hdr)
+                A = np.stack([tl[ok][::7], np.ones(int(ok[::1].sum()))[::7]], 1)
+                coef, *_ = np.linalg.lstsq(A, hdr[ok][::7], rcond=None)
+                truth = np.where(valid, coef[0] * tl + coef[1], hdr)
+                log(f"Truth registered onto the layers (scale {coef[0]:.4g})")
+            except Exception as e:                       # noqa: BLE001
+                log(f"No truth fidelity: {type(e).__name__}: {e}")
         work = os.path.join(study_dir, "work", "finish")
         os.makedirs(work, exist_ok=True)
         saved = _store(study_dir, "reference.pkl") or {}
-        return {"ds": ds, "session": s, "layers": layers, "dual": dual, "looks": ref_looks, "work": work, "device": device, "opts": opts, "header": layers.header,
+        return {"ds": ds, "session": s, "layers": layers, "dual": dual, "hdr": hdr, "truth": truth, "work": work, "device": device, "opts": opts, "header": layers.header,
                 "study_dir": study_dir, "base": saved.get("base")}
 
     def run(self, ctx, p, log, cancel):
-        from .. import finish, gates, looks, post, pro
+        from .. import finish, gates, post, pro
         layers = ctx["layers"]
         prm = {**post.DEFAULTS, **post.EXTRA_DEFAULTS, **(ctx["opts"].get("params") or {}), **p}
         if cancel.is_set():
@@ -1183,16 +1317,14 @@ class FinishTask(Task):
                "sky_noise": noise, "cnr": cnr,
                "sky_chroma": max(g["sky_chroma"]["value"].values()) if isinstance(g.get("sky_chroma", {}).get("value"), dict) else None,
                "clipped": g["clipped"]["value"], "stars_coloured": g.get("stars_coloured", {}).get("value"), "seconds": dt, "failed": g.get("failed")}
-        # lexicographic: the finishing gates are the specification - fewer failed gates first, then the distance to the reference looks (look distances are
-        # 10 - 60, a gate counts 100).  On M 31 Auto-finish's result failed the star-colour gate after BXT's star sharpening, and a score of the look
-        # distance alone gave the search no reason to fix it
+        # lexicographic: the finishing gates are the specification - fewer failed gates first (H is 0 - 1, a gate counts 1), then the structural
+        # fidelity.  On M 31 Auto-finish's result failed the star-colour gate after BXT's star sharpening
         fails = len(g.get("failed", []))
-        if ctx["looks"]:
-            st = looks.look_stats(_hwc(img))
-            out["look_distance"] = looks.score(st, ctx["looks"], looks.object_weight(st))[0]
-            out["finish_score"] = GATE_WEIGHT * fails + out["look_distance"]
-        elif cnr and cnr > 0:
-            out["finish_score"] = GATE_WEIGHT * fails - math.log(cnr)
+        H, hl = OB.structural_fidelity(ctx["hdr"], _finish_ldr(img, ctx["hdr"].shape), mode="hits")
+        out.update({"fidelity": H, **{f"fidelity_s{i + 1}": v for i, v in enumerate(hl)}})
+        if ctx.get("truth") is not None:
+            out["truth_fidelity"] = OB.structural_fidelity(ctx["truth"], _finish_ldr(img, ctx["hdr"].shape), mode="hits", noise_from=ctx["hdr"])[0]
+        out["finish_score"] = GATE_WEIGHT * fails + (1.0 - H)
         if ctx.get("base") is None:
             ctx["base"] = {"gate_distance": out["gate_distance"], "gate_violations": gv}
             _store(ctx["study_dir"], "reference.pkl", {"base": ctx["base"]})
