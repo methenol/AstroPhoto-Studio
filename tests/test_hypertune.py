@@ -350,7 +350,8 @@ def test_sky_level_midtones_solve():
             m = x * (y - 1.0) / (2.0 * x * y - x - y)
             assert (m - 1) * x / ((2 * m - 1) * x - m) == pytest.approx(y, rel=1e-9)
     sp, _ = hypertune.build_space(TASKS["finish"], {}, {}, dual=False, tools={})
-    assert sp["sky_level"]["low"] == 0.08 and sp["sky_level"]["high"] == 0.12 and sp["sky_levelling"]["tune"]
+    lv = next(q for q in TASKS["finish"].params if q["name"] == "sky_level")
+    assert sp["sky_level"]["low"] == lv["low"] and sp["sky_level"]["high"] == lv["high"] and sp["sky_levelling"]["tune"]   # its whole range
 
 
 def test_restore_canonical_gradient_and_space():
@@ -416,3 +417,23 @@ def test_constrained_es_improves_from_a_feasible_start():
     feas = [t for t in st.trials if t.user_attrs["constraints"][0] <= 0]
     assert len(feas) >= 20
     assert min(t.value for t in feas) < 0.5 * st.trials[0].value
+
+
+def test_held_out_fidelity_ranks_restorations(monkeypatch):
+    import cv2
+    monkeypatch.setattr(OB, "HO_TILES", (2, 2))
+    monkeypatch.setattr(OB, "HO_FIT_PX", 8000)
+    rng = np.random.default_rng(2)
+    truth = star_field(seed=5, n=250, size=512, noise=0.0)[..., 0]
+    yy, xx = np.mgrid[0:512, 0:512].astype(np.float32)
+    truth = truth + 0.02 * np.exp(-((xx - 256) ** 2 + (yy - 240) ** 2) / (2 * 60.0 ** 2)) * (1 + 0.5 * np.sin(xx / 6.0) * np.sin(yy / 7.0))
+    blur = lambda x, s: cv2.GaussianBlur(x.astype(np.float32), (0, 0), s)
+    S = blur(truth, 1.4) + rng.normal(0, 0.002, truth.shape).astype(np.float32)          # the held-out (sharper) stack
+    R = blur(truth, 2.2) + rng.normal(0, 0.002, truth.shape).astype(np.float32)          # the frames the trials restore
+    ho = OB.HeldOut(np.repeat(S[..., None], 3, -1), np.repeat(R[..., None], 3, -1), fwhm=3.3)
+    c = lambda x: ho.chi2(np.repeat(np.asarray(x, np.float32)[..., None], 3, -1))
+    oracle = blur(truth, 1.0) + rng.normal(0, 0.0007, truth.shape).astype(np.float32)   # sharper and cleaner than R: the ideal restoration
+    smeared = blur(R, 3.0)                                                                 # a denoiser that takes the structure with the noise
+    invented = R + 0.004 * np.sin(xx / 2.5).astype(np.float32)                             # structure the sky does not have
+    assert c(oracle) < ho.chi2_r0 < c(smeared)
+    assert c(invented) > ho.chi2_r0

@@ -420,7 +420,7 @@ function stackParams() {
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
     hypertune: g("hypertune").checked,
-    hypertune_trials: Math.max(10, Math.min(500, parseInt(g("hypertune_trials").value) || 60)),
+    hypertune_trials: Math.max(10, Math.min(500, parseInt(g("hypertune_trials").value) || 25)),
     device: g("device") ? g("device").value : "auto",
   };
 }

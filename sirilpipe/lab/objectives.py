@@ -561,3 +561,124 @@ def luminance_y(rgb: np.ndarray) -> np.ndarray:
     """Y of linear sRGB (TMQI.m's RGBtoYxy row), (3, H, W) or (H, W, 3) -> (H, W)."""
     x = rgb if rgb.shape[0] == 3 and rgb.ndim == 3 else np.moveaxis(rgb, -1, 0)
     return (0.2126 * x[0] + 0.7152 * x[1] + 0.0722 * x[2]).astype(np.float64)
+
+
+# ----------------------------------------------------------------------------- restoration: held-out validation against independent frames
+# The restoration is run on a stack of part of the frames (R); the sharpest frames, stacked on their own on the same pixel grid (S), are held
+# out.  Their noise is independent of R's, so E||S - k * f(R)||^2 = ||x_S - k * f(R)||^2 + E||n_S||^2 for any restoration f and any kernel k
+# fixed beforehand: the error against S estimates, up to a constant, the error against the true sky x_S at S's resolution (the identity
+# Noise2Noise rests on, Lehtinen et al. 2018, used here to validate rather than to train).  k is the kernel that matches the restoration to
+# S's point-spread function, fitted by least squares per tile as in difference imaging (Alard & Lupton 1998, ApJ 503, 325; the pixel-kernel
+# form of Bramich 2008, MNRAS 386, L77, with a differential background): a deconvolution that recovers the true sky is blurred back to S
+# exactly, one that invents or misplaces structure is not, and a denoiser lowers the error by removing R's noise unless it removes signal
+# with it.  The residual is weighted by the inverse of its noise variance, a linear function of the signal level (photon and sky noise;
+# the noise-level function of Foi et al. 2008, IEEE TIP 17(10)), fitted once on the unrestored R: the score is the mean chi^2 (1 = noise).
+# Both sides are high-passed (8 FWHM) first - the gradient model is judged on its own (emission_change) - and detected stars are masked
+# (a kernel per tile cannot match every star's centroid and colour; stars are judged by the photometry constraints).
+HO_KERNEL = 6                    # kernel half width (13 x 13: S's FWHM ~4 px against a deconvolved ~2 px)
+HO_TILES = (4, 8)                # the kernel varies over the field (aberrations, BlurXTerminator's correction)
+HO_FIT_PX = 25000                # pixels per tile in the kernel fit (169 + 1 unknowns)
+
+
+def _ho_highpass(L: np.ndarray, sigma: float) -> np.ndarray:
+    L = np.ascontiguousarray(L, np.float32)
+    return (L - cv2.GaussianBlur(L, (0, 0), sigma)).astype(np.float32)
+
+
+class HeldOut:
+    """The held-out reference: S (the sharpest frames' stack, restored without deconvolution / noise reduction) and the noise model."""
+
+    def __init__(self, S: np.ndarray, R0: np.ndarray, fwhm: float, seed: int = 0):
+        S, R0 = lum(S), lum(R0)
+        self.sigma_hp = 8.0 * float(fwhm)
+        self.B = _ho_highpass(S, self.sigma_hp)
+        valid = valid_region(S) & valid_region(R0)
+        sky = float(np.median(S[valid]))
+        noise = immerkaer_sigma(self.B.astype(np.float64))
+        bk = sep.Background(np.ascontiguousarray(self.B), bw=64, bh=64)
+        objs = sep.extract(np.ascontiguousarray(self.B - bk.back()), 3.0, err=bk.globalrms, minarea=4)
+        stars = np.zeros(S.shape, np.uint8)
+        for x_, y_, a_ in zip(objs["x"], objs["y"], objs["a"]):
+            cv2.circle(stars, (int(round(x_)), int(round(y_))), int(round(3 * a_ + 4)), 1, -1)
+        self.mask = valid & (stars == 0) & (S < 0.9 * float(S.max()))
+        self.n_stars = int(len(objs))
+        self.level = np.maximum(cv2.GaussianBlur(S, (0, 0), 3.0) - sky, 0).astype(np.float32)
+        # the kernel-fit pixels of each tile, drawn once: every trial is fitted on the same pixels (a fresh draw per trial scattered the score)
+        rng = np.random.default_rng(seed)
+        H, W = S.shape
+        k = HO_KERNEL
+        self.tiles = []
+        for ty in range(HO_TILES[0]):
+            for tx in range(HO_TILES[1]):
+                y0, y1, x0, x1 = ty * H // HO_TILES[0], (ty + 1) * H // HO_TILES[0], tx * W // HO_TILES[1], (tx + 1) * W // HO_TILES[1]
+                yy, xx = np.nonzero(self.mask[y0 + k:y1 - k, x0 + k:x1 - k])
+                if len(yy) < 2000:
+                    continue
+                sel = rng.choice(len(yy), min(HO_FIT_PX, len(yy)), replace=False)
+                self.tiles.append(((y0, y1, x0, x1), yy[sel] + y0 + k, xx[sel] + x0 + k))
+        # the noise-level function, from the unrestored R matched to S (no weights yet)
+        r0 = self.B - self._predict(_ho_highpass(R0, self.sigma_hp), np.ones_like(self.B))
+        m = self.mask
+        q = np.quantile(self.level[m], np.linspace(0, 0.999, 25))
+        lx, ly = [], []
+        for lo, hi in zip(q[:-1], q[1:]):
+            sel = m & (self.level >= lo) & (self.level < hi)
+            if sel.sum() > 500:
+                d = r0[sel]
+                lx.append(float(np.median(self.level[sel])))
+                ly.append(float((1.4826 * np.median(np.abs(d - np.median(d)))) ** 2))
+        b, a = np.polyfit(lx, ly, 1) if len(lx) >= 3 else (0.0, float(noise ** 2))
+        a = max(float(a), 1e-3 * max(ly or [noise ** 2]))
+        self.nlf = (a, max(float(b), 0.0))
+        self.w = (1.0 / (self.nlf[0] + self.nlf[1] * self.level)).astype(np.float32)
+        self.chi2_r0 = self.chi2(R0)
+
+    def _predict(self, A: np.ndarray, w: np.ndarray) -> np.ndarray:
+        """S's high-pass predicted from ``A`` (the trial's high-pass) by the least-squares kernel of each tile (weights ``w``).  On the GPU
+        (PyTorch CUDA) when there is one: the design matrices (25 000 x 170 a tile) and the convolutions are its work."""
+        k = HO_KERNEL
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return self._predict_torch(A, w, torch)
+        except ImportError:
+            pass
+        out = np.zeros_like(A)
+        offs = [(dy, dx) for dy in range(-k, k + 1) for dx in range(-k, k + 1)]
+        for (y0, y1, x0, x1), ys, xs in self.tiles:
+            sw = np.sqrt(w[ys, xs]).astype(np.float64)[:, None]
+            X = np.hstack([np.stack([A[ys - dy, xs - dx] for dy, dx in offs], 1), np.ones((len(ys), 1))]).astype(np.float64)
+            coef, *_ = np.linalg.lstsq(X * sw, self.B[ys, xs].astype(np.float64) * sw[:, 0], rcond=None)
+            kern = coef[:-1].reshape(2 * k + 1, 2 * k + 1).astype(np.float32)
+            out[y0:y1, x0:x1] = cv2.filter2D(A[y0:y1, x0:x1], -1, kern, borderType=cv2.BORDER_REFLECT) + np.float32(coef[-1])
+        return out
+
+    def _predict_torch(self, A: np.ndarray, w: np.ndarray, torch) -> np.ndarray:
+        import torch.nn.functional as F
+        k = HO_KERNEL
+        dev = torch.device("cuda")
+        At = torch.from_numpy(np.ascontiguousarray(A, np.float32)).to(dev)
+        Bt = torch.from_numpy(np.ascontiguousarray(self.B, np.float32)).to(dev)
+        Wt = torch.from_numpy(np.ascontiguousarray(w, np.float32)).to(dev)
+        d = torch.arange(-k, k + 1, device=dev)
+        dy, dx = torch.meshgrid(d, d, indexing="ij")
+        dy, dx = dy.reshape(-1), dx.reshape(-1)
+        out = torch.zeros_like(At)
+        for (y0, y1, x0, x1), ys, xs in self.tiles:
+            yt = torch.from_numpy(ys).to(dev)[:, None]
+            xt = torch.from_numpy(xs).to(dev)[:, None]
+            X = At[yt - dy[None, :], xt - dx[None, :]].double()
+            X = torch.cat([X, torch.ones((X.shape[0], 1), dtype=X.dtype, device=dev)], 1)
+            sw = Wt[yt[:, 0], xt[:, 0]].double().sqrt()[:, None]
+            coef = torch.linalg.lstsq(X * sw, (Bt[yt[:, 0], xt[:, 0]].double() * sw[:, 0])[:, None]).solution[:, 0]
+            kern = coef[:-1].reshape(1, 1, 2 * k + 1, 2 * k + 1).float()
+            tile = F.pad(At[None, None, y0:y1, x0:x1], (k, k, k, k), mode="reflect")
+            out[y0:y1, x0:x1] = F.conv2d(tile, kern)[0, 0] + coef[-1].float()        # conv2d is a correlation, as cv2.filter2D
+        return out.cpu().numpy()
+
+    def chi2(self, img: np.ndarray) -> float:
+        """Mean chi^2 of S against the restoration ``img`` (on S's grid) matched to S's PSF: 1 = only noise left."""
+        f = lum(img)
+        m = self.mask & valid_region(f)
+        r = self.B - self._predict(_ho_highpass(f, self.sigma_hp), self.w)
+        return float(np.mean((r[m].astype(np.float64) ** 2) * self.w[m]))

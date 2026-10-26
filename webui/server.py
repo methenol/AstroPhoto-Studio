@@ -85,7 +85,7 @@ STACK_DEFAULTS = {
     "drizzle_pixfrac": 0.0,    # drizzle drop size; 0 = the rule's (1 / scale)
     "drizzle_kernel": "square",  # drizzle kernel: square | point | turbo | gaussian | lanczos2 | lanczos3
     "hypertune": False,        # Run everything: before each stage, an experiment-lab study of that stage on this dataset; the stage then runs with its best trial
-    "hypertune_trials": 60,    # trials per stage study (the baseline included); 30-120 search the stages' spaces
+    "hypertune_trials": 25,    # trials per stage study (the baseline included); 20-30 is the target
     "satellite_removal": False,  # Cosmic Clarity satellite-trail removal on the stack before the restoration
     "graxpert_psfsize": 0.0,   # GraXpert deconvolution -psfsize (Image FWHM, px); 0 = the star FWHM measured on the linear image
     # VeraLux ImageMM (sirilpipe/veralux_imagemm.py; the script's GUI defaults).  The 1.x ImageMM keys (imagemm_delta,
@@ -742,7 +742,7 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
     if kind == "all" and sp.get("hypertune"):
         # Hyper-tune each stage: an experiment-lab study of every stage before it runs (sirilpipe.hypertune); the studies appear in the Experiments tab
         from sirilpipe import hypertune
-        return hypertune.run_all(s, sp, params, export_opts, progress, int(sp.get("hypertune_trials") or 60), workdir=CONFIG["workdir"])
+        return hypertune.run_all(s, sp, params, export_opts, progress, int(sp.get("hypertune_trials") or hypertune.DEFAULT_TRIALS), workdir=CONFIG["workdir"])
     if kind == "all":
         s.run_analysis(float(sp["sensitivity"]), progress, sp)
         s.run_stack(sp, progress)

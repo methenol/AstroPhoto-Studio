@@ -53,6 +53,38 @@ def local_copy_dir(workdir: str) -> str:
     return os.path.abspath(os.environ.get("ASTROPHOTO_LOCAL_DIR") or os.path.join(workdir, ".local_copy"))
 
 
+_ORIENTATIONS = {"identity": lambda a: a, "rot180": lambda a: a[:, ::-1, ::-1], "flipud": lambda a: a[:, ::-1, :], "fliplr": lambda a: a[:, :, ::-1]}
+
+
+def _integer_offset(ref: np.ndarray, img: np.ndarray, win: int = 768) -> tuple[int, int, float]:
+    """Where ``ref``'s pixel (0, 0) lies in ``img`` (both (3, h, w), one pixel grid up to a whole-pixel shift): the peak of the normalised
+    cross-correlation (cv2.TM_CCOEFF_NORMED) of ``ref``'s central window, log-scaled green plane, searched over all of ``img``."""
+    import cv2
+    def lg(a):
+        g = np.asarray(a[1], np.float32)
+        return np.ascontiguousarray(np.log(np.maximum(g, 1e-5)), dtype=np.float32)
+    R, I = lg(ref), lg(img)
+    h, w = R.shape
+    s = min(win, h // 2, w // 2)
+    y0, x0 = h // 2 - s // 2, w // 2 - s // 2
+    res = cv2.matchTemplate(I, R[y0:y0 + s, x0:x0 + s], cv2.TM_CCOEFF_NORMED)
+    _, mx, _, loc = cv2.minMaxLoc(res)
+    return int(loc[0] - x0), int(loc[1] - y0), float(mx)
+
+
+def place_on(ref: np.ndarray, img: np.ndarray) -> tuple[np.ndarray, dict]:
+    """``img`` (a stack of the same registration, any canvas) on ``ref``'s pixel grid: the orientation (plate solving turns an upside-down
+    stack north-up, so stack.fits may be turned against Siril's raw output) and the whole-pixel offset with the best template match."""
+    best = None
+    for name, f in _ORIENTATIONS.items():
+        o = np.ascontiguousarray(f(img))
+        dx, dy, sc = _integer_offset(ref, o)
+        if best is None or sc > best[0]:
+            best = (sc, name, dx, dy, o)
+    sc, name, dx, dy, o = best
+    return stackpost.paste(o, ref.shape[1:], -dx, -dy), {"orientation": name, "offset": [dx, dy], "match": round(sc, 4)}
+
+
 class Session:
     """All state for one dataset.  Thread-safe for the server's pattern (one job at a time per dataset;
     status/frames reads from request threads)."""
@@ -658,6 +690,70 @@ class Session:
             self._invalidate_after_stack()
             return clean_json(meta)
 
+    def stack_subsets(self, subsets: dict, progress=None, stack_params: dict | None = None, place: bool = True) -> dict:
+        """Stacks of subsets of the stacked frames, on ``stack.fits``'s pixel grid: {name: [row indices]} -> {name: (3, h, w) array}.
+        The registration is applied once to every stacked frame with the stack's resampling, as ``run_stack`` does; each subset is then stacked
+        from that one registered sequence with the stack's rejection and weighting (``workflow.subset_stack_script``) - all of its frames lie on
+        the one -framing=max canvas, so a subset stack cut to the stack's crop has the stack's pixel grid, without any resampling or offset to
+        estimate.  Used by the experiments' held-out validation (lab.tasks.RestoreTask): independent frames carry independent noise.  Not for
+        HDR (multi-exposure) stacks.  ``stack_params``: stack with these settings instead of the stack's (frame selection included: a subset
+        keeps its frames that the selection accepts); ``place=False``: return each subset stack on its own canvas (no stack.fits needed)."""
+        with self.lock:
+            meta = read_json(self._p("stack_meta.json"), {}) or {}
+            if meta.get("hdr"):
+                raise RuntimeError("frame subsets of an HDR (multi-exposure) stack are not supported")
+            sp = dict(stack_params if stack_params is not None else (meta.get("params") or {}))
+            sens = float(sp.get("sensitivity", 1.0) or 1.0)
+            state = self._ensure_registered(progress, sens, self._debayer(sp), banding=self._banding_param(sp))
+            if stack_params is not None and (self.analysis or {}).get("sensitivity") != sens:
+                self._apply_selection(sens)
+                self.analysis = {**(self.analysis or {}), "sensitivity": sens}
+                write_json(self._p("analysis.json"), self.analysis)
+            rows = self._load_rows()
+            seq, n = state["seq"], state["n"]
+            inc = [i for i, r in enumerate(rows) if r["included"]]
+            medf = statistics.median([rows[i]["fwhm"] for i in inc if rows[i].get("fwhm")] or [0.0]) or None
+            rs = workflow.decide_resampling(sp, len(inc), medf, cfa=True)       # the stack's own decision (it depends on the frame count)
+            if meta.get("framing") and stack_params is None:
+                rs = {**rs, "framing": meta["framing"]}
+            rej = workflow.rejection(sp, rs)
+            main = fitsio.read_rgb(self._p("stack.fits"))[0] if place else None
+            shifts = {}
+            runner = self._runner(progress)
+            workflow.clean_registered(self.process)
+            runner.run(workflow.apply_script(self.process, seq, n, [i for i in range(len(rows)) if i not in set(inc)], rs), "apply_registration",
+                       expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc), label="Applying registration (frame subsets)")
+            rseq = parse_seq(os.path.join(self.process, f"r_{seq}_.seq"))
+            pos_of = {sf.filenum - 1: k + 1 for k, sf in enumerate(rseq.frames)}      # frame index -> 1-based position in the r_ sequence
+            n_reg = len(rseq.frames)
+            out = {}
+            try:
+                for name, members in subsets.items():
+                    members = [i for i in members if i in pos_of]
+                    if len(members) < 3:
+                        raise RuntimeError(f"subset {name}: {len(members)} registered frames, need 3")
+                    mset = set(members)
+                    others = [pos_of[i] for i in pos_of if i not in mset]
+                    ref = min(members, key=lambda i: rows[i].get("wfwhm") or rows[i].get("fwhm") or 1e9)
+                    o = f"stack_sub_{name}"
+                    runner.run(workflow.subset_stack_script(self.process, seq, n_reg, others, pos_of[ref], rej, o, len(members), weight=workflow.weighting(sp)),
+                               "stack", expect=[f"{o}.fit"], label=f"Stacking ({name}: {len(members)} frames)")
+                    a, _ = fitsio.read_rgb(os.path.join(self.process, f"{o}.fit"))
+                    # -maximize sizes the canvas to the frames stacked, so the subset's canvas is shifted against the stack's by a whole number of
+                    # pixels (one registration, one grid), and plate solving may have turned stack.fits north-up: both found exactly (place_on)
+                    if place:
+                        out[name], shifts[name] = place_on(main, a)
+                    else:
+                        out[name] = np.ascontiguousarray(a)
+                        shifts[name] = {"frames": len(members)}
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(self.process, f"{o}.fit"))
+            finally:
+                workflow.clean_registered(self.process)
+            log.info("frame-subset stacks placed: %s", shifts)
+            self.last_subsets = shifts
+            return out
+
     def _stack_hdr(self, runner: SirilRunner, seq: str, rows: list[dict], inc: list[int], groups: list[int], rs: dict,
                    rej: dict, progress):
         """Stack each exposure group of the one registered sequence, then blend them (workflows.md 9.2).
@@ -1063,7 +1159,7 @@ class Session:
         if sp.get("hypertune"):
             from sirilpipe import hypertune
             with self.local_copy(progress):
-                return hypertune.run_all(self, sp, pr, eo, progress, int(sp.get("hypertune_trials") or 60), workdir=self.workdir)
+                return hypertune.run_all(self, sp, pr, eo, progress, int(sp.get("hypertune_trials") or hypertune.DEFAULT_TRIALS), workdir=self.workdir)
         t0 = time.time()
         with self.local_copy(progress):              # the stages that read the subs
             self.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), progress, sp)

@@ -34,7 +34,7 @@ import time
 log = logging.getLogger(__name__)
 
 STAGES = [("stack", "Register & integrate"), ("restore", "Restore"), ("stars", "Remove stars"), ("finish", "Finish")]
-MIN_TRIALS, MAX_TRIALS, DEFAULT_TRIALS = 10, 500, 60
+MIN_TRIALS, MAX_TRIALS, DEFAULT_TRIALS = 10, 500, 25
 
 
 def available_tools() -> dict:
@@ -73,7 +73,9 @@ NEEDS = {("deconv_method", "bxt"): "bxt", ("deconv_stars_method", "bxt"): "bxt",
          ("deconv_stars_method", "graxpert"): "graxpert_deconv", ("denoise_method", "nxt"): "nxt", ("denoise_method", "graxpert"): "graxpert_denoise",
          ("star_removal", "sxt"): "sxt", ("star_removal", "starnet"): "starnet", ("star_removal", "darkstar"): "cc_darkstar",
          ("bg_method", "graxpert"): "graxpert_bge", ("cc_sharpen", "both"): "cc_sharpen", ("cc_sharpen", "stellar"): "cc_sharpen",
-         ("cc_sharpen", "nonstellar"): "cc_sharpen", ("cc_denoise", True): "cc_denoise", ("satellite_removal", True): "cc_satellite"}
+         ("cc_sharpen", "nonstellar"): "cc_sharpen", ("cc_denoise", True): "cc_denoise", ("satellite_removal", True): "cc_satellite",
+         # "auto" deconvolution is BlurXTerminator, or Siril RL (CPU only) without its licence: searched only where it is BXT
+         ("deconv_method", "auto"): "bxt", ("deconv_stars_method", "auto"): "bxt"}
 
 
 def task_param(task, name: str) -> dict:

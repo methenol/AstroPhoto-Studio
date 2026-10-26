@@ -365,9 +365,14 @@ class StackTask(Task):
                    "sigmas, frame weighting, frame selection sensitivity, resampling (Bayer drizzle / demosaic), drizzle drop size and kernel, banding correction.  "
                    "Scored by the depth of the stack on the reference stars of the first trial (mapped onto each stack by astroalign, so another crop or drizzle "
                    "scale compares directly); synthetic data also against the truth seen through the subs' mean PSF.")
-    objective_note = ("Score: depth = (ln S/N of point sources + ln S/N of extended sources) / 2, the reference stars' aperture fluxes over the empty-aperture noise "
-                      "(Labbe et al. 2003): more frames, better rejection and sharper registration all raise it, and it is unit-free, so stacks normalised or "
-                      "resampled differently compare.  Constraints against the baseline: star ellipticity at most 0.02 worse (registration / frame selection), "
+    objective_note = ("Score: stack_score - held-out validation.  The registered frames go alternately (in time) to two halves of the same statistics; "
+                      "the held-out half is stacked once with the baseline's settings, each trial stacks the other half with its own (selection, weighting, "
+                      "rejection, resampling).  The trial's stack, matched to the held-out stack's PSF by a kernel fitted per tile (difference imaging: Alard "
+                      "& Lupton 1998, Bramich 2008), is compared with it in noise-weighted chi2 (noise variance linear in the level, detected stars masked, "
+                      "both high-passed at 8 FWHM): the halves' noise is independent, so the chi2 measures the trial stack's error against the true sky at "
+                      "the held-out resolution - more frames and a better weighting lower it, artefacts a lax rejection lets through and the blur of poor "
+                      "frames raise it.  stack_score = 0.5 ln(chi2 baseline / chi2).  Depth (matched-aperture S/N, Labbe et al. 2003) is reported.  "
+                      "Without a frame list the whole stack's depth is the score.  Constraints against the baseline: star ellipticity at most 0.02 worse (registration / frame selection), "
                       "single-pixel outliers (hot pixels, cosmic rays a lax rejection lets through) at most 1.5 x (or +2 per Mpx), trail pixels at most 1.25 x "
                       "(or +20 per million: on M 31 the search's best trials raised the high rejection sigma to ~7, which lets trails through on a night that has "
                       "them), and the auto-crop keeping "
@@ -394,6 +399,8 @@ class StackTask(Task):
         {"name": "crop_threshold", "label": "Crop: minimum frame coverage", "type": "float", "low": 0.1, "high": 1.0, "default": 0.3, "tune": False, "pipeline": "crop_threshold"},
     ]
     metrics = {
+        "stack_score": {"label": "Stack score: fidelity against the held-out frames, 0.5 ln(chi2 baseline / chi2)", "direction": "maximize"},
+        "heldout_chi2": {"label": "Held-out mean chi2 (1 = noise only): the held-out half against the trial's stack matched to its PSF", "direction": "minimize"},
         **DEPTH_METRICS,
         "ellipticity": {"label": "Star ellipticity (median 1 - b / a)", "direction": "minimize"},
         "outliers": {"label": "Single-pixel outliers per Mpx (hot pixels / cosmic rays left)", "direction": "minimize"},
@@ -409,8 +416,9 @@ class StackTask(Task):
     options = [{"name": "crop", "label": "Preview / crop metrics (px per side)", "type": "int", "default": 1024},
                {"name": "sigma_eval", "label": "Truth comparison resolution σ (px)", "type": "float", "default": 1.0},
                {"name": "in_place", "label": "Stack the session itself (hyper-tune; 0 = the study's own folder)", "type": "int", "default": 0, "internal": True}]
-    score = default_objective = "depth"
-    min_gain = 0.005              # Siril stacking is deterministic (four identical stacks: the same depth to 1e-15); 0.5 % in S/N
+    score = default_objective = "stack_score"
+    min_gain = 0.002              # Siril stacking is deterministic (four identical stacks: the same depth to 1e-15), the held-out fit too (fixed pixels);
+                                  # both halves' sky noise dilute the held-out score: on M 31 eight stacking settings spread over -0.012 .. +0.001
 
     def limits(self, ctx):
         b = ctx.get("base") or {}
@@ -440,7 +448,36 @@ class StackTask(Task):
             log("Calibrating and registering once (the trials reuse the registration unless its settings change)")
             s.run_analysis(1.0, _prog(log, 20), stack_params={})
         saved = _store(study_dir, "reference.pkl") or {}
-        return {"ds": ds, "session": s, "opts": opts, "device": device, "study_dir": study_dir, "yard": saved.get("yard"), "base": saved.get("base")}
+        ctx = {"ds": ds, "session": s, "opts": opts, "device": device, "study_dir": study_dir, "yard": saved.get("yard"), "base": saved.get("base")}
+        self._held_out(ctx, log)
+        return ctx
+
+    def _held_out(self, ctx, log):
+        """Held-out validation of the stack: the registered frames, in time order, alternately to two halves of the same statistics; the held-out
+        half is stacked once with the baseline's settings (the user's), the trials stack the other half with theirs (Session.stack_subsets) -
+        frame selection, weighting, rejection and resampling all act within it.  Without a frame list (or < 6 frames) the trials stack the whole
+        session and are scored on depth (logged)."""
+        s = ctx["session"]
+        try:
+            rows = s._load_rows()
+            reg = sorted((i for i, r in enumerate(rows) if r.get("registered")), key=lambda i: (rows[i].get("time") or "", i))
+            if len(reg) < 6:
+                raise RuntimeError(f"{len(reg)} registered frames")
+            held, trial = reg[0::2], reg[1::2]
+            base_sp = dict(ctx["opts"].get("stack_params") or {})
+            H = s.stack_subsets({"held": held}, stack_params=base_sp, place=False)["held"]
+            v = OB.valid_region(OB.lum(_hwc(H)))
+            ys, xs = np.nonzero(v)
+            y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+            my, mx = (y1 - y0) // 20, (x1 - x0) // 20                         # the rim, where few frames overlap, off
+            ctx["held_box"] = (y0 + my, y1 - my, x0 + mx, x1 - mx)
+            ctx["held"] = np.ascontiguousarray(H[:, y0 + my:y1 - my, x0 + mx:x1 - mx])
+            ctx["trial_frames"] = trial
+            log(f"Held out: {len(held)} of {len(reg)} frames (every second one in time), stacked with the baseline's settings; the trials stack the other "
+                f"{len(trial)} with theirs")
+        except Exception as e:                         # noqa: BLE001
+            ctx["held"] = None
+            log(f"No held-out frames ({type(e).__name__}: {e}): the trials stack the session and are scored on depth")
 
     def run(self, ctx, p, log, cancel):
         from .. import gates
@@ -449,10 +486,19 @@ class StackTask(Task):
               **{k: p[k] for k in ("rejection", "sigma_low", "sigma_high", "stack_weighting", "sensitivity", "mode", "drizzle_pixfrac", "drizzle_kernel",
                                    "scale", "pattern_correction", "crop_threshold") if k in p}}
         t = time.time()
-        meta = s.run_stack(sp, _prog(log, 20))
-        dt = time.time() - t
         from .. import post
-        st, _ = post.normalise_scale(_read(s._p("stack.fits")))
+        if ctx.get("held") is not None:
+            from ..session import place_on
+            T = s.stack_subsets({"trial": ctx["trial_frames"]}, _prog(log, 20), stack_params=sp, place=False)["trial"]
+            nf = int((getattr(s, "last_subsets", {}).get("trial") or {}).get("frames") or 0)
+            T_on, _ = place_on(ctx["held"], T)
+            meta = {"n_frames": nf, "scale": 1.0, "resampling_reason": None, "rejection": None}
+            st = T_on
+        else:
+            meta = s.run_stack(sp, _prog(log, 20))
+            st = _read(s._p("stack.fits"))
+        dt = time.time() - t
+        st, _ = post.normalise_scale(st)
         est = _hwc(st)
         if ctx["yard"] is None:                                 # the first trial (the baseline) is the reference of the paired measurements
             ctx["yard"] = OB.Yardstick(est, keep_image=False)
@@ -460,6 +506,10 @@ class StackTask(Task):
         y = ctx["yard"]
         scale = float(meta.get("scale") or 1.0) / float((ctx.get("base") or {}).get("scale") or float(meta.get("scale") or 1.0))
         field = est.shape[0] * est.shape[1] / (y.shape[0] * y.shape[1] * scale * scale)
+        if ctx.get("held") is not None:                          # on the held-out grid: the share of it the trial's frames cover, against the baseline's
+            vf = float(OB.valid_region(OB.lum(est)).mean())
+            ctx.setdefault("vf0", vf)
+            field = vf / max(ctx["vf0"], 1e-9)
         try:
             m = y.measure(est)
         except Exception as e:                                   # noqa: BLE001  the reference stars cannot be mapped onto it (a stack cropped to part of the field)
@@ -476,6 +526,16 @@ class StackTask(Task):
                    trails=trail_pixels(est),
                    scale=float(meta.get("scale") or 1.0),
                    resampling=meta.get("resampling_reason"), rejection=(meta.get("rejection") or {}).get("type"))
+        if ctx.get("held") is not None:
+            if ctx.get("heldout") is None:                     # the baseline trial: the noise model and the unprocessed chi2 of the held-out comparison
+                ctx["heldout"] = OB.HeldOut(_hwc(ctx["held"]), est, OB.Yardstick(_hwc(ctx["held"]), keep_image=False).fwhm)
+                h = ctx["heldout"]
+                log(f"Held-out reference: {h.n_stars} stars masked, noise variance {h.nlf[0]:.3g} + {h.nlf[1]:.3g} x level; baseline chi2 {h.chi2_r0:.4f}")
+            h = ctx["heldout"]
+            out["heldout_chi2"] = h.chi2(est)
+            out["stack_score"] = 0.5 * math.log(h.chi2_r0 / max(out["heldout_chi2"], 1e-12))
+        elif out.get("depth") is not None:
+            out["stack_score"] = out["depth"]
         if ctx["base"] is None:
             ctx["base"] = dict(out)
             _store(ctx["study_dir"], "reference.pkl", {"yard": y, "base": ctx["base"]})
@@ -648,14 +708,14 @@ def model_structure(before: np.ndarray, after: np.ndarray, valid: np.ndarray) ->
     return float(np.std(band(d)[v]) / max(np.std(band(a)[v]), 1e-12))
 
 
-def gradient_context(s, study_dir: str, device, log, cancel) -> dict:
+def gradient_context(s, study_dir: str, device, log, cancel, src_dir: str | None = None) -> dict:
     """What the gradient model is judged on, set once on the stack as the restore stage loads it: the scoring tiles (sky / emission), the valid
     region, the stars' photometry (the photometric scale) and whether the sky-survey reference covers the field (then auto = the survey model)."""
     from .. import post
     # the stack as the restore stage loads it (post.Restorer: row order, _sanitize - an HDR stack peaking at 2.13 is divided by it - and
     # normalise_scale); comparing the file's own values with the restored ones scored that rescale as removed signal
     wd = os.path.join(study_dir, "work", "bg_ref")
-    _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json"))
+    _copy_products(src_dir or s.dir, wd, ("stack.fits", "stack_meta.json"))
     try:
         stack = post.Restorer(wd, s.meta, {}, dict(post.DEFAULTS), None, None).arr.copy()
     finally:
@@ -667,7 +727,7 @@ def gradient_context(s, study_dir: str, device, log, cancel) -> dict:
     # correction - those trials are one setting (canonical); on M 31 37 of 60 trials had been auto with differing, unused smoothing values
     skyref_ok = False
     wd = os.path.join(study_dir, "work", "bg_probe")
-    _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
+    _copy_products(src_dir or s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
     try:
         r = post.Restorer(wd, s.meta, {"device": str(device)}, {**post.DEFAULTS, "bg_method": "reference"}, None, _checkpoint(cancel))
         r.background()
@@ -803,21 +863,22 @@ class RestoreTask(Task):
     description = ("The linear stage (post.restore) on a copy of the stack, all of its variables in one search: Cosmic Clarity's satellite-trail removal, the "
                    "gradient model (sky-survey reference, GraXpert, Siril polynomial / RBF; subtraction or division), the deconvolution tool of the objects and "
                    "of the stars (BlurXTerminator, GraXpert, Siril RL) with their strengths and the noise reduction tool (NoiseXTerminator, GraXpert, Siril) "
-                   "with its strength.  Depth is measured on one set of stars and empty-sky apertures, chosen on the baseline's restore, in every trial; the "
-                   "photometry and fidelity constraints against the trial's own state before the deconvolution (the same trail removal and gradient model), "
-                   "so that they judge what the deconvolution and the noise reduction did.  The state before the deconvolution (trail removal, gradient, "
-                   "plate solve, colour calibration) is computed once per such settings.")
-    objective_note = ("Score (restore_score, higher is better) = depth_gain + ln(1 - emission_change).  depth_gain: the log S/N (point- and "
-                      "extended-source S/N on fixed reference stars, empty-aperture noise) the deconvolution and the noise reduction add to the trial's own "
-                      "state before them (same trail removal and gradient model) - paired, because the depth is not invariant to the gradient model (a "
-                      "model that eats the nebula takes its structure out of the noise apertures: +0.40 on a synthetic sky).  ln(1 - emission_change): a "
-                      "gradient model that takes a fraction f of the nebula's signal lowers the nebula's S/N by ln(1 - f), the noise being untouched "
-                      "(emission_change ranked 12 gradient models against a synthetic sky's truth at Spearman rho +0.99).  Constraints closing the exploits: star flux conserved (|median dmag| bright <= 0.05, faint <= 0.10: "
-                      "GraXpert's stars model shrank stars by removing their light); the image above the PSF scale, away from the stars, unchanged within "
-                      "1.25 x its noise there (discrepancy principle: a denoiser that smears faint structure changes more); no dark rings round the bright "
-                      "stars (moat <= 1 pixel-noise deeper than before the deconvolution); the gradient left in the sky tiles <= 3 x the pixel noise and the "
-                      "model's own structure at 1 - 10 % of the frame <= 15 % of the image's there (a gradient has none at those scales); no more satellite "
-                      "trails left than Cosmic Clarity's removal leaves in this stack (+25 %), so that the removal is on when the stack has trails.")
+                   "with its strength.  The trials restore a stack of the frames other than the sharpest third, which is held out as the independent "
+                   "reference of the score; the best trial's settings then restore the full stack.  The photometry constraints are measured against the "
+                   "trial's own state before the deconvolution (the same trail removal and gradient model).  The state before the deconvolution (trail "
+                   "removal, gradient, plate solve, colour calibration) is computed once per such settings.")
+    objective_note = ("Score (restore_score, higher is better) = fidelity_gain + ln(1 - emission_change).  fidelity_gain: held-out validation - the "
+                      "sharpest third of the frames is stacked on its own and held out; every trial restores the other frames, and the restoration, matched "
+                      "to the held-out stack's PSF by a kernel fitted per tile (difference imaging: Alard & Lupton 1998, Bramich 2008), is compared with it "
+                      "in noise-weighted chi2 (noise variance linear in the signal level, fitted on the unrestored stack; detected stars masked; both "
+                      "high-passed at 8 FWHM).  The held-out noise is independent of the trial's, so the chi2 measures the error against the true sky at "
+                      "the held-out resolution: a deconvolution that recovers real structure and a denoiser that removes noise lower it, one that invents, "
+                      "smears or misplaces structure raises it.  fidelity_gain = 0.5 ln(chi2 unrestored / chi2).  ln(1 - emission_change): a gradient model "
+                      "that takes a fraction f of the nebula's signal lowers its S/N by ln(1 - f) (emission_change ranked 12 gradient models against a "
+                      "synthetic sky's truth at Spearman rho +0.99).  Constraints for what the chi2 does not see: star flux conserved (|median dmag| bright "
+                      "<= 0.05, faint <= 0.10), no dark rings round the bright stars (moat), the gradient left in the sky <= 3 x the noise, the model's "
+                      "structure at 1 - 10 % of the frame <= 15 %, no more satellite trails than Cosmic Clarity's removal leaves.  Without frames to hold "
+                      "out (an HDR stack, < 6 frames) the depth gained replaces the fidelity gain (logged).")
     params = (_processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance",
                                   "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations"],
                                  {"deconvolution", "denoise"},
@@ -847,8 +908,18 @@ class RestoreTask(Task):
                   "hypertune": True, "pipeline": "satellite_removal"}])
     # reference = auto without its fallback: the same model wherever auto uses the survey
     next(q for q in params if q["name"] == "bg_method")["ht_choices"] = ["auto", "graxpert", "poly", "rbf"]
+    # the hyper-tune searches the tools that run on the GPU: Siril's Richardson-Lucy deconvolution and its denoiser have no GPU implementation
+    # (a Siril RL trial took 10-25 min of CPU on M 31 against about a minute for BlurXTerminator / GraXpert); both stay the user's to choose
+    for _q in params:
+        if _q["name"] in ("deconv_method", "deconv_stars_method"):
+            _q["ht_choices"] = ["auto", "bxt", "graxpert", "none"]
+        elif _q["name"] == "denoise_method":
+            _q["ht_choices"] = ["auto", "nxt", "graxpert", "none"]
+    del _q
     metrics = {
-        "restore_score": {"label": "Restore score: depth gained by the deconvolution / noise reduction + ln(1 - emission changed by the gradient model)", "direction": "maximize"},
+        "restore_score": {"label": "Restore score: fidelity gained against the held-out frames + ln(1 - emission changed by the gradient model)", "direction": "maximize"},
+        "fidelity_gain": {"label": "Fidelity gained against the held-out sharpest frames: 0.5 ln(chi2 unrestored / chi2)", "direction": "maximize"},
+        "heldout_chi2": {"label": "Held-out mean chi2 (1 = noise only): the sharpest frames' stack against the restoration matched to its PSF", "direction": "minimize"},
         "depth_gain": {"label": "Depth gained over the state before the deconvolution (ln S/N)", "direction": "maximize"},
         "depth_before": {"label": "Depth before the deconvolution (after trail removal and gradient model)", "direction": "maximize"},
         **DEPTH_METRICS,
@@ -874,8 +945,9 @@ class RestoreTask(Task):
     CACHE = 4                     # states before the deconvolution kept (one per trail removal / gradient / colour settings; a full-frame M 31 state is 150 MB)
 
     def limits(self, ctx):
-        out = {"dm_bright_abs": ("max", 0.05), "dm_faint_abs": ("max", 0.10), "large_change": ("max", 1.25),
-               "sky_flatness": ("max", 3.0), "model_structure": ("max", 0.15)}
+        # the held-out fidelity judges the image's structure (stars masked); the constraints cover what it does not see: the stars' photometry
+        # and dark rings, the gradient model's flatness and structure, the satellite trails
+        out = {"dm_bright_abs": ("max", 0.05), "dm_faint_abs": ("max", 0.10), "sky_flatness": ("max", 3.0), "model_structure": ("max", 0.15)}
         out["moat"] = ("max", (ctx.get("ref_moat") or 0.0) + 1.0)
         if ctx.get("trails_min") is not None:
             # no trial may leave more satellite trails than Cosmic Clarity's removal takes out of this stack (the depth's robust noise does not see them)
@@ -889,9 +961,39 @@ class RestoreTask(Task):
         tools = available_tools()
         auto_dc = "bxt" if tools.get("bxt") else "rl"
         auto_dn = next((t for t, k in (("nxt", "nxt"), ("graxpert", "graxpert_denoise")) if tools.get(k)), "siril")
-        g = gradient_context(s, study_dir, device, log, cancel)
+        src, sharp = self._held_out(s, study_dir, log, cancel)
+        g = gradient_context(s, study_dir, device, log, cancel, src_dir=src)
         return {"ds": ds, "session": s, "study_dir": study_dir, "n": 0, "device": device, "opts": opts, "refs": {}, "pre": {},
-                "auto_deconv": auto_dc, "auto_denoise": auto_dn, "cc_satellite": bool(tools.get("cc_satellite")), "grad": g, "skyref": g["skyref"]}
+                "auto_deconv": auto_dc, "auto_denoise": auto_dn, "cc_satellite": bool(tools.get("cc_satellite")), "grad": g, "skyref": g["skyref"],
+                "src_dir": src, "sharp_dir": sharp}
+
+    HELD_OUT = 1.0 / 3.0          # the sharpest third of the frames is held out
+
+    def _held_out(self, s, study_dir, log, cancel):
+        """The held-out frames: the sharpest third of the stacked frames (FWHM) stacked on their own, the rest stacked for the trials to restore -
+        both on stack.fits's pixel grid (Session.stack_subsets).  Returns (trials' source dir, held-out dir), or (None, None) when the stack
+        cannot be split (an HDR stack, fewer than 6 frames, no frame list): then the trials restore the stack and are scored on depth (logged)."""
+        from .. import fitsio
+        try:
+            rows = s._load_rows()
+            inc = sorted((i for i, r in enumerate(rows) if r.get("included")), key=lambda i: rows[i].get("fwhm") or 1e9)
+            k = int(round(len(inc) * self.HELD_OUT))
+            if k < 3 or len(inc) - k < 3:
+                raise RuntimeError(f"{len(inc)} frames: too few to hold out a third")
+            st = s.stack_subsets({"sharp": inc[:k], "rest": inc[k:]})
+            hdr = fitsio.read_rgb(s._p("stack.fits"))[1]
+            dirs = {}
+            for name, arr in st.items():
+                d = os.path.join(study_dir, "work", f"heldout_{name}")
+                _copy_products(s.dir, d, ("stack_meta.json", "skyref.npz"))
+                fitsio.write_rgb(os.path.join(d, "stack.fits"), arr, hdr)
+                dirs[name] = d
+            fw = lambda ix: float(np.median([rows[i]["fwhm"] for i in ix if rows[i].get("fwhm")]))
+            log(f"Held out: the {k} sharpest frames (median FWHM {fw(inc[:k]):.2f} px); the trials restore the other {len(inc) - k} ({fw(inc[k:]):.2f} px)")
+            return dirs["rest"], dirs["sharp"]
+        except Exception as e:                         # noqa: BLE001
+            log(f"No held-out frames ({type(e).__name__}: {e}): the trials restore the stack and are scored on the depth gained")
+            return None, None
 
     def canonical(self, active, ctx):
         """What runs: auto = BlurXTerminator when licensed (else Siril RL), the denoiser auto = the first available of NXT / GraXpert / Siril, the
@@ -932,7 +1034,7 @@ class RestoreTask(Task):
             sp["deconv_stars_method"] = ""
         return prm, sp
 
-    def _restore(self, ctx, prm, sp, tag, cancel):
+    def _restore(self, ctx, prm, sp, tag, cancel, src: str | None = None):
         """post.restore's steps on a copy of the stack: (restored image, its meta, the state before the deconvolution, the gradient model's metrics).
         Everything before the deconvolution (trail removal, gradient, plate solve, BlurXTerminator's correct-only PSF pass, SPCC) depends only on
         the gradient / colour settings, the trail removal and whether BXT is among the deconvolution tools: that state is computed once per such
@@ -941,13 +1043,13 @@ class RestoreTask(Task):
         from .. import post
         s = ctx["session"]
         wd = os.path.join(ctx["study_dir"], "work", tag)
-        _copy_products(s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
+        _copy_products(src or ctx.get("src_dir") or s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
         try:
             r = post.Restorer(wd, s.meta, sp, {**post.DEFAULTS, **prm}, None, _checkpoint(cancel))
             psf = (r.source != "imagemm.fits" and float(r.p["deconvolution"]) > 0 and r.deconv != ("none", "none") and bool({"auto", "bxt"} & set(r.deconv)))
             key = json.dumps([{k: r.p.get(k) for k in ("background", "bg_method", "bg_correction", "bg_degree", "bg_smoothing", "white_balance", "spcc_sensor",
                                                         "spcc_filter", "spcc_white_ref")}, bool(sp.get("satellite_removal")), psf], sort_keys=True, default=str)
-            pre = ctx.setdefault("pre", {})
+            pre = ctx.setdefault("pre", {}) if src is None else {}
             t0 = time.time()
             if key in pre:
                 c = pre.pop(key)
@@ -1014,6 +1116,15 @@ class RestoreTask(Task):
             y = ctx["depth_yard"]
             log(f"Depth reference: {len(y.sx)} stars, FWHM {y.fwhm:.2f} px, {len(y.ax)} sky apertures, depth {y.ref.get('depth', float('nan')):.3f}")
             self._trails_bound(ctx, prm, sp, lin, log, cancel)
+            if ctx.get("sharp_dir"):
+                # the held-out reference: the sharpest frames' stack through the same linear stage (gradient, colour) without deconvolution / noise
+                # reduction, and the noise model from the unrestored trial source
+                sh, _, _ = self._restore(ctx, prm, {**sp, **self.NOOP}, "restore_heldout", cancel, src=ctx["sharp_dir"])
+                fw = OB.Yardstick(_hwc(sh), keep_image=False).fwhm
+                ctx["heldout"] = OB.HeldOut(_hwc(sh), _hwc(lin), fw)
+                h = ctx["heldout"]
+                log(f"Held-out reference: FWHM {fw:.2f} px, {h.n_stars} stars masked, noise variance {h.nlf[0]:.3g} + {h.nlf[1]:.3g} x level; "
+                    f"unrestored chi2 {h.chi2_r0:.4f}")
         t = time.time()
         lin, meta, key = self._restore(ctx, prm, sp, f"restore_{ctx['n']}", cancel)
         dt = time.time() - t
@@ -1035,8 +1146,14 @@ class RestoreTask(Task):
         out["depth_gain"] = (out["depth"] - pre["depth0"]) if out.get("depth") is not None and pre["depth0"] is not None else None
         g = pre["grad"]
         out.update({k: g.get(k) for k in ("emission_change", "signal_removed", "sky_flatness", "model_structure", "gradient_tool")})
-        if out.get("depth_gain") is not None:
-            out["restore_score"] = float(out["depth_gain"] + math.log(max(1.0 - float(g.get("emission_change") or 0.0), 1e-3)))
+        keep = math.log(max(1.0 - float(g.get("emission_change") or 0.0), 1e-3))
+        if ctx.get("heldout") is not None:
+            h = ctx["heldout"]
+            out["heldout_chi2"] = h.chi2(est)
+            out["fidelity_gain"] = 0.5 * math.log(h.chi2_r0 / max(out["heldout_chi2"], 1e-12))
+            out["restore_score"] = float(out["fidelity_gain"] + keep)
+        elif out.get("depth_gain") is not None:
+            out["restore_score"] = float(out["depth_gain"] + keep)
         out.update(bg_noise=MX.background_noise(est), sharpness=float(np.mean([MX.sharpness(est[..., c]) for c in range(3)])), seconds=dt,
                    trails=trail_pixels(est), tools=" + ".join(meta.get("tools") or []) or "none",
                    failed=[f"{r['tool']}: {r['status']}" for r in meta.get("steps", []) if r.get("status") in ("failed", "unavailable")])
@@ -1057,7 +1174,8 @@ class StarsTask(Task):
                       "away from the stars within 1 × the noise there (the nebula and the sky are not the remover's to touch), and holes (a star's aperture "
                       "more than 3 σ below its surroundings) at most 5 % of the stars.")
     params = [
-        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"], "ht_choices": ["sxt", "starnet", "darkstar"],
+        # the hyper-tune searches the GPU tools: StarNet2's build is CPU-only (tools.py) - it stays the user's to choose
+        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"], "ht_choices": ["sxt", "darkstar"],
          "default": "auto", "tune": True, "hypertune": True, "processing": "star_removal"},
         {"name": "starnet_stride", "label": "StarNet2 stride", "type": "categorical", "choices": [64, 128, 256], "default": 256, "tune": False, "hypertune": True,
          "processing": "starnet_stride", "when": {"star_removal": ["starnet"]}},
@@ -1216,16 +1334,8 @@ class FinishTask(Task):
               "cc_denoise_model": {"cc_denoise": [True]}, "cc_stellar_amount": {"cc_sharpen": ["both", "stellar"]},
               "cc_nonstellar_amount": {"cc_sharpen": ["both", "nonstellar"]}, "hubble_formula": {"palette": _HUBBLE}, "oiii_boost": {"palette": ["nbn"]},
               "brightness": {"sky_levelling": [False]}, "sky_level": {"sky_levelling": [True]}})
-    # the background target of the stretch sets the sky level, which the sky_median gate prescribes (0.08 - 0.12): searched over its whole range
-    # (0.04 - 0.35) the trials were infeasible by definition - on M 31 26 of 31 broke that gate, the warm start's included
-    next(q for q in params if q["name"] == "stretch")["ht_range"] = (0.08, 0.12)
-    # the final sky level, likewise: within the gate's band.  With it on, the black point and every step before move the sky no more - the midtones
-    # put it back (Auto-finish's result sat at 0.083: 50 of 63 trials over the free midtones fell below 0.08 on M 31)
-    next(q for q in params if q["name"] == "sky_level")["ht_range"] = (0.08, 0.12)
-    # the extra black point, on top of the one the chain sets at the histogram toe (pro.Finisher.finalise, Brecher: never into the background body): at
-    # most the sky band's width (0.12 -> 0.08).  Beyond the sky level it clips the sky to 0, which no midtones bring back - on the synthetic set the
-    # black points of 0.11-0.17 crushed the sky in 6 of 40 trials, sky levelling on or off
-    next(q for q in params if q["name"] == "black_point")["ht_range"] = (0.0, 0.04)
+    # every setting is searched over its whole range: what is feasible is the objective's to decide (the finishing gates are its constraints),
+    # not a narrowed search space
     params.append({"name": "ghs_d2", "label": "GHS pass 2 D (ghs2)", "type": "float", "low": 0.3, "high": 6.0, "default": 2.5, "tune": True, "hypertune": True,
                    "processing": "ghs_d2", "when": {"stretch_method": ["ghs2"]}})
     params.append({"name": "star_stretch", "label": "Star stretch amount (Seti Astro)", "type": "float", "low": 2.0, "high": 8.0, "default": 5.0, "tune": False,

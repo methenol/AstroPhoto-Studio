@@ -521,6 +521,19 @@ def stack_script(process_dir: str, seq: str, rej: dict, n_stacked: int, out: str
     return f"cd {quote(process_dir)}\n" + " ".join(args) + "\n"
 
 
+def subset_stack_script(process_dir: str, seq: str, n_reg: int, others: list[int], ref_pos: int, rej: dict, out: str, n_stacked: int,
+                        weight: str = "wfwhm") -> str:
+    """Stack a subset of the registered sequence with the stack's own flags (``stack_script``): ``others`` = 1-based positions (in the r_
+    sequence) of the frames left out, ``ref_pos`` = the position of a frame of the subset (``setref``: the normalisation reference must be one
+    of the stacked frames).  Every frame of the r_ sequence lies on the one -framing=max canvas, so the subset stack has the stack's pixel grid."""
+    lines = [f"cd {quote(process_dir)}", f"select r_{seq} 1 {n_reg}"]
+    for a, b in ranges([o - 1 for o in others]):
+        lines.append(f"unselect r_{seq} {a + 1} {b + 1}")
+    lines.append(f"setref r_{seq} {ref_pos}")
+    body = stack_script(process_dir, seq, rej, n_stacked, out=out, weight=weight).split("\n", 1)[1]
+    return "\n".join(lines) + "\n" + body.replace(" -rejmap", "")
+
+
 def group_stack_script(process_dir: str, seq: str, n_reg: int, others: list[int], ref_pos: int, rej: dict,
                        out: str, n_stacked: int) -> str:
     """Stack ONE exposure group of the registered sequence (HDR).  ``others`` = 1-based positions (in the r_
