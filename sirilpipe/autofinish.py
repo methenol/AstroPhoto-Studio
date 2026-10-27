@@ -305,26 +305,56 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
                   f"lowered to {amount_st:g} (published 5 / 4 / 3) so that the clipped fraction of the stretched stars is {clip_st * 100:.3f} % (limit {CLIP_LIMIT * 100:.2f} %)"))
         p1["star_stretch"] = amount_st
         sm = layers.starnet.get("stars") or {}
-        level = float(pro.mtf_balance(pro.star_stretch_m(amount_st), 5.0 * float(sm.get("sky_noise") or 2e-5)))
-        boost, ms = STAR_BOOSTS[0], {"saturation": None}
-        for boost in [b for b in STAR_BOOSTS if dual or b <= STAR_BOOST_BROADBAND_MAX]:   # the smallest published boost whose stretched stars reach the colour limit (measured, not predicted)
-            sb = pro.Finisher(work, layers.header, {**p1, "star_saturation": boost, "star_intensity": 1.0}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
-            st_b = sb.stars(layers.stars)
-            ms = gates.measure_stars(st_b, level / gates.STAR_SIGMA)
-            if (ms["saturation"] or 0.0) >= STAR_COLOUR_MIN:
+        sky_n = float(sm.get("sky_noise") or 2e-5)
+
+        def star_colour(prm):
+            # measured as the gates measure it, on the recombined picture (screen blend, star reduction, halo suppression): colour (stars_coloured),
+            # colours on the blackbody locus (stars_physical) and the linear layer's stars still visible (stars_count) - on the star layer alone
+            # M 31's stars read 0.10 at boost 1.0 and the finished picture 0.034
+            fb = pro.Finisher(work, layers.header, prm, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+            st_x = fb.stars(layers.stars)
+            full = fb.halos(fb.recombine(col, st_x))
+            lvl = float(pro.mtf_balance(pro.star_stretch_m(float(prm.get("star_stretch", amount_st))), 5.0 * sky_n))
+            g_ = gates.compute(full, starless=col, linear_stars=layers.stars, linear_noise=sky_n, star_level=lvl, linear_base=layers.base)
+            return st_x, {"saturation": g_["stars_coloured"]["value"], "off_locus": g_["stars_physical"]["value"],
+                          "ok": all(g_[k]["pass"] for k in ("stars_coloured", "stars_physical", "stars_count")),
+                          "physical": g_["stars_physical"]["pass"] and g_["stars_count"]["pass"]}
+
+        # the smallest intervention whose stars pass the three star gates: the colour boost first (Seti's published 1 / 1.5 / 2), then a gentler
+        # star stretch (the published 5 / 4 / 3, never above the clipping-safe amount) - on M 31 the stretch of 5 left the stars white at every
+        # boost (0.05 at 2, with 76 % of them green or magenta), a stretch of 3 with the boost 2 gave 0.115, all on the locus, all kept - and only
+        # then colour preservation (the Lupton et al. 2004 colour-preserving star stretch, pro.Finisher.stars)
+        amounts = [a_ for a_ in (5.0, 4.0, 3.0) if a_ <= amount_st]
+        cands = [(am, bo, 0.0) for am in amounts for bo in STAR_BOOSTS] + [(am, bo, cp) for cp in (0.25, 0.5, 0.75, 1.0) for am in amounts for bo in STAR_BOOSTS]
+        chosen, best_phys = None, None
+        for am, bo, cp in cands:
+            st_x, ms_x = star_colour({**p1, "star_stretch": am, "star_saturation": bo, "star_intensity": 1.0, "star_color_preservation": cp})
+            if ms_x["physical"] and (best_phys is None or (ms_x["saturation"] or 0.0) > (best_phys[4]["saturation"] or 0.0)):
+                best_phys = (am, bo, cp, st_x, ms_x)
+            if ms_x["ok"]:
+                chosen = (am, bo, cp, st_x, ms_x)
                 break
-        st = st_b
+        am, boost, cp, st, ms = chosen or best_phys or (amount_st, STAR_BOOSTS[0], 0.0, *star_colour({**p1, "star_saturation": STAR_BOOSTS[0], "star_intensity": 1.0}))
+        if am != amount_st:
+            decide("star_stretch", am, "star_C", ms["saturation"], STAR_COLOUR_MIN,
+                   f"Seti Astro Star Stretch amount {am:g} (published 5 / 4 / 3): the stars of the clipping-safe amount {amount_st:g} did not pass the star gates "
+                   "at any colour boost")
+            p1["star_stretch"] = am
+        level = float(pro.mtf_balance(pro.star_stretch_m(p1["star_stretch"]), 5.0 * sky_n))
         decide("star_saturation", boost, "star_C", ms["saturation"], STAR_COLOUR_MIN,
-               f"Seti colour boost {boost} (default 1.0, maximum 2.0): the smallest whose stretched stars' flux colour reaches saturation {STAR_COLOUR_MIN} (measured {ms['saturation']})")
+               f"Seti colour boost {boost} with colour preservation {cp}: the smallest intervention whose stars, in the recombined picture, pass the star gates "
+               f"(colour {ms['saturation']} >= {STAR_COLOUR_MIN}, off the blackbody locus {ms.get('off_locus')}, the linear stars kept)"
+               + ("" if chosen else " - none passed all three: the most coloured of the physically coloured"))
+        decide("star_color_preservation", cp, "star_C", ms["saturation"], STAR_COLOUR_MIN, "with the colour boost above")
         lin_n = (layers.starnet.get("stars") or {}).get("count")
         if lin_n:
             for cand in [c for c in (0.6, 0.5, 0.4, 0.3, 0.2) if c <= red]:
                 rc = pro.Finisher(work, layers.header, {**p1, "star_reduction": cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
-                full = rc.recombine(col, st)
-                n_now = gates.measure_stars(gates.star_layer(full, col), level / gates.STAR_SIGMA)["count"]
-                dev = abs(n_now - lin_n) / lin_n
+                full = rc.halos(rc.recombine(col, st))
+                sc = gates.compute(full, starless=col, linear_stars=layers.stars, linear_noise=sky_n, star_level=level)["stars_count"]["value"]
+                dev = float(sc.get("deviation") or 0.0) if isinstance(sc, dict) else 0.0     # the share of the linear stars no longer visible
                 tuned["star_reduction"] = cand
-                steps[[x["step"] for x in steps].index("star_reduction")].update({"to": cand, "after": {"star_count": n_now, "linear": lin_n, "deviation": round(dev, 3)}})
+                steps[[x["step"] for x in steps].index("star_reduction")].update({"to": cand, "after": {"stars_count": sc, "deviation": round(dev, 3)}})
                 if dev <= 0.18:
                     break
         decide("star_intensity", 1.0, "star_frac", star_info["per_megapixel"], None, "stars as stretched (the screen blend and the reduction value set their weight)")

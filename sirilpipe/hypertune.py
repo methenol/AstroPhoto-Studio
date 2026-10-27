@@ -285,8 +285,7 @@ class HyperTune:
         from . import post
         s, sp = self.s, self.sp
         t0 = time.time()
-        s.run_analysis(float(sp.get("sensitivity", 1.0) or 1.0), self.progress, sp)
-        self._check()
+        # the calibration and registration are the stack stage's work: they run inside its experiment (StackTask.prepare), not before it
         # one study per pipeline stage, the user's number of trials each: 1. Register & integrate (the trials re-stack this session)
         user_sp = dict(sp)
         rec = self.study("stack", "Register & integrate", options={"in_place": 1, "crop": 1024, "stack_params": user_sp})
@@ -315,13 +314,11 @@ class HyperTune:
             self.progress(0, 1, "Hyper-tune · separating the stars with the best tool")
             s.train_star_remover(self.params, self.sp, self.progress)
             self._check()
-        # 4. Finish: Auto-finish first when on (its result is the finishing study's baseline), then the finishing study
+        # 4. Finish: the experiment first, from your settings; with Auto-finish on, its proposal is one trial of the study (the stage itself is not
+        # run before its experiment), and the best trial finishes the export
         fin = None
-        if self.sp.get("autofinish", True):
-            fin = s.autofinish(self.params, self.progress)
-            self.params = dict(fin.get("params") or self.params)
-            self._check()
-        rec = self.study("finish", "Finish", options={"external": 1, "max_side": 0, "params": dict(self.params)})
+        rec = self.study("finish", "Finish", options={"external": 1, "max_side": 0, "params": dict(self.params),
+                                                      "autofinish_candidate": int(bool(self.sp.get("autofinish", True)))})
         self.adopt(rec)
         # 8. export with the best of every stage
         self.progress(0, 1, "Hyper-tune · exporting with the best settings of every stage")

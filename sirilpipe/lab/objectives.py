@@ -575,9 +575,11 @@ def luminance_y(rgb: np.ndarray) -> np.ndarray:
 # the noise-level function of Foi et al. 2008, IEEE TIP 17(10)), fitted once on the unrestored R: the score is the mean chi^2 (1 = noise).
 # Both sides are high-passed (8 FWHM) first - the gradient model is judged on its own (emission_change) - and detected stars are masked
 # (a kernel per tile cannot match every star's centroid and colour; stars are judged by the photometry constraints).
-HO_KERNEL = 6                    # kernel half width (13 x 13: S's FWHM ~4 px against a deconvolved ~2 px)
-HO_TILES = (4, 8)                # the kernel varies over the field (aberrations, BlurXTerminator's correction)
-HO_FIT_PX = 25000                # pixels per tile in the kernel fit (169 + 1 unknowns)
+HO_KERNEL = 6                    # least kernel half width (13 x 13: S's FWHM ~4 px against a deconvolved ~2 px); 1.5 FWHM when wider.  A 21 x 21 or
+                                 # 29 x 29 kernel and star masks out to the wings (43 % of the field) left the ranking of M 31's restorations as it was
+HO_TILES = (8, 16)               # the kernel varies over the field (aberrations, BlurXTerminator's correction): 4 x 8 tiles had charged an aberration
+                                 # correction that varies within a tile as error (BXT -0.036 at 4 x 8, -0.025 at 8 x 16 and 16 x 32 - it converges)
+HO_FIT_PX = 8000                 # pixels per tile in the kernel fit (169 + 1 unknowns)
 
 
 def _ho_highpass(L: np.ndarray, sigma: float) -> np.ndarray:
@@ -588,9 +590,10 @@ def _ho_highpass(L: np.ndarray, sigma: float) -> np.ndarray:
 class HeldOut:
     """The held-out reference: S (the sharpest frames' stack, restored without deconvolution / noise reduction) and the noise model."""
 
-    def __init__(self, S: np.ndarray, R0: np.ndarray, fwhm: float, seed: int = 0):
+    def __init__(self, S: np.ndarray, R0: np.ndarray, fwhm: float, seed: int = 0, kernel: int | None = None, wing_mask: bool = False):
         S, R0 = lum(S), lum(R0)
         self.sigma_hp = 8.0 * float(fwhm)
+        self.k = int(kernel if kernel is not None else max(HO_KERNEL, int(math.ceil(1.5 * float(fwhm)))))
         self.B = _ho_highpass(S, self.sigma_hp)
         valid = valid_region(S) & valid_region(R0)
         sky = float(np.median(S[valid]))
@@ -600,13 +603,24 @@ class HeldOut:
         stars = np.zeros(S.shape, np.uint8)
         for x_, y_, a_ in zip(objs["x"], objs["y"], objs["a"]):
             cv2.circle(stars, (int(round(x_)), int(round(y_))), int(round(3 * a_ + 4)), 1, -1)
+        if wing_mask:
+            # the stars out to where their wings sink into the noise: the 1.5 sigma isophote, widened by 2 FWHM
+            _, seg = sep.extract(np.ascontiguousarray(self.B - bk.back()), 1.5, err=bk.globalrms, minarea=6, segmentation_map=True, deblend_cont=1.0)
+            r = max(3, int(round(2 * float(fwhm))))
+            stars |= cv2.dilate((seg > 0).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
         self.mask = valid & (stars == 0) & (S < 0.9 * float(S.max()))
         self.n_stars = int(len(objs))
+        # the brightest unsaturated, compact stars: the photometric scale between two stacks (HeldOutRGB's channel gains)
+        ok = (objs["peak"] < 0.5 * float(np.max(self.B))) & (objs["a"] < 3.0 * float(fwhm)) & (objs["x"] > 20) & (objs["y"] > 20) & \
+             (objs["x"] < S.shape[1] - 20) & (objs["y"] < S.shape[0] - 20)
+        sel = np.argsort(-objs["flux"][ok])[:300]
+        self.star_xy = (objs["x"][ok][sel].astype(np.float64), objs["y"][ok][sel].astype(np.float64))
+        self.star_r = max(3.0, 1.5 * float(fwhm))
         self.level = np.maximum(cv2.GaussianBlur(S, (0, 0), 3.0) - sky, 0).astype(np.float32)
         # the kernel-fit pixels of each tile, drawn once: every trial is fitted on the same pixels (a fresh draw per trial scattered the score)
         rng = np.random.default_rng(seed)
         H, W = S.shape
-        k = HO_KERNEL
+        k = self.k
         self.tiles = []
         for ty in range(HO_TILES[0]):
             for tx in range(HO_TILES[1]):
@@ -634,47 +648,70 @@ class HeldOut:
         self.chi2_r0 = self.chi2(R0)
 
     def _predict(self, A: np.ndarray, w: np.ndarray) -> np.ndarray:
-        """S's high-pass predicted from ``A`` (the trial's high-pass) by the least-squares kernel of each tile (weights ``w``).  On the GPU
-        (PyTorch CUDA) when there is one: the design matrices (25 000 x 170 a tile) and the convolutions are its work."""
-        k = HO_KERNEL
+        """S's high-pass predicted from ``A`` (the trial's high-pass) by the least-squares kernel of each tile (weights ``w``)."""
+        return self.apply_kernels(A, self.fit_kernels(A, w, self.B))
+
+    def fit_kernels(self, A: np.ndarray, w: np.ndarray, B: np.ndarray) -> list:
+        """The least-squares matching kernel (and differential background) of each tile, ``A`` -> ``B``: [(box, kernel, offset)].  On the
+        GPU (PyTorch CUDA) when there is one: the design matrices (8 000 x 170 a tile) are its work."""
+        k = self.k
         try:
             import torch
-            if torch.cuda.is_available():
-                return self._predict_torch(A, w, torch)
+            cuda = torch.cuda.is_available()
         except ImportError:
-            pass
-        out = np.zeros_like(A)
+            cuda = False
+        out = []
+        if cuda:
+            dev = torch.device("cuda")
+            At = torch.from_numpy(np.ascontiguousarray(A, np.float32)).to(dev)
+            Bt = torch.from_numpy(np.ascontiguousarray(B, np.float32)).to(dev)
+            Wt = torch.from_numpy(np.ascontiguousarray(w, np.float32)).to(dev)
+            d = torch.arange(-k, k + 1, device=dev)
+            dy, dx = torch.meshgrid(d, d, indexing="ij")
+            dy, dx = dy.reshape(-1), dx.reshape(-1)
+            for box, ys, xs in self.tiles:
+                yt = torch.from_numpy(ys).to(dev)[:, None]
+                xt = torch.from_numpy(xs).to(dev)[:, None]
+                X = At[yt - dy[None, :], xt - dx[None, :]].double()
+                X = torch.cat([X, torch.ones((X.shape[0], 1), dtype=X.dtype, device=dev)], 1)
+                sw = Wt[yt[:, 0], xt[:, 0]].double().sqrt()[:, None]
+                coef = torch.linalg.lstsq(X * sw, (Bt[yt[:, 0], xt[:, 0]].double() * sw[:, 0])[:, None]).solution[:, 0].cpu().numpy()
+                out.append((box, coef[:-1].reshape(2 * k + 1, 2 * k + 1).astype(np.float32), float(coef[-1])))
+            return out
         offs = [(dy, dx) for dy in range(-k, k + 1) for dx in range(-k, k + 1)]
-        for (y0, y1, x0, x1), ys, xs in self.tiles:
+        for box, ys, xs in self.tiles:
             sw = np.sqrt(w[ys, xs]).astype(np.float64)[:, None]
             X = np.hstack([np.stack([A[ys - dy, xs - dx] for dy, dx in offs], 1), np.ones((len(ys), 1))]).astype(np.float64)
-            coef, *_ = np.linalg.lstsq(X * sw, self.B[ys, xs].astype(np.float64) * sw[:, 0], rcond=None)
-            kern = coef[:-1].reshape(2 * k + 1, 2 * k + 1).astype(np.float32)
-            out[y0:y1, x0:x1] = cv2.filter2D(A[y0:y1, x0:x1], -1, kern, borderType=cv2.BORDER_REFLECT) + np.float32(coef[-1])
+            coef, *_ = np.linalg.lstsq(X * sw, B[ys, xs].astype(np.float64) * sw[:, 0], rcond=None)
+            out.append((box, coef[:-1].reshape(2 * k + 1, 2 * k + 1).astype(np.float32), float(coef[-1])))
         return out
 
-    def _predict_torch(self, A: np.ndarray, w: np.ndarray, torch) -> np.ndarray:
-        import torch.nn.functional as F
-        k = HO_KERNEL
-        dev = torch.device("cuda")
-        At = torch.from_numpy(np.ascontiguousarray(A, np.float32)).to(dev)
-        Bt = torch.from_numpy(np.ascontiguousarray(self.B, np.float32)).to(dev)
-        Wt = torch.from_numpy(np.ascontiguousarray(w, np.float32)).to(dev)
-        d = torch.arange(-k, k + 1, device=dev)
-        dy, dx = torch.meshgrid(d, d, indexing="ij")
-        dy, dx = dy.reshape(-1), dx.reshape(-1)
-        out = torch.zeros_like(At)
-        for (y0, y1, x0, x1), ys, xs in self.tiles:
-            yt = torch.from_numpy(ys).to(dev)[:, None]
-            xt = torch.from_numpy(xs).to(dev)[:, None]
-            X = At[yt - dy[None, :], xt - dx[None, :]].double()
-            X = torch.cat([X, torch.ones((X.shape[0], 1), dtype=X.dtype, device=dev)], 1)
-            sw = Wt[yt[:, 0], xt[:, 0]].double().sqrt()[:, None]
-            coef = torch.linalg.lstsq(X * sw, (Bt[yt[:, 0], xt[:, 0]].double() * sw[:, 0])[:, None]).solution[:, 0]
-            kern = coef[:-1].reshape(1, 1, 2 * k + 1, 2 * k + 1).float()
-            tile = F.pad(At[None, None, y0:y1, x0:x1], (k, k, k, k), mode="reflect")
-            out[y0:y1, x0:x1] = F.conv2d(tile, kern)[0, 0] + coef[-1].float()        # conv2d is a correlation, as cv2.filter2D
-        return out.cpu().numpy()
+    def apply_kernels(self, A: np.ndarray, kernels: list) -> np.ndarray:
+        """``A`` convolved tile by tile with ``kernels`` (from fit_kernels), plus each tile's offset; on the GPU when there is one."""
+        k = self.k
+        try:
+            import torch
+            import torch.nn.functional as F
+            cuda = torch.cuda.is_available()
+        except ImportError:
+            cuda = False
+        if cuda:
+            At = torch.from_numpy(np.ascontiguousarray(A, np.float32)).to("cuda")
+            out = torch.zeros_like(At)
+            for (y0, y1, x0, x1), kern, off in kernels:
+                tile = F.pad(At[None, None, y0:y1, x0:x1], (k, k, k, k), mode="reflect")
+                kt = torch.from_numpy(kern).to("cuda")[None, None]
+                out[y0:y1, x0:x1] = F.conv2d(tile, kt)[0, 0] + off             # conv2d is a correlation, as cv2.filter2D
+            return out.cpu().numpy()
+        out = np.zeros_like(A)
+        for (y0, y1, x0, x1), kern, off in kernels:
+            out[y0:y1, x0:x1] = cv2.filter2D(A[y0:y1, x0:x1], -1, kern, borderType=cv2.BORDER_REFLECT) + np.float32(off)
+        return out
+
+    def residual(self, img: np.ndarray) -> np.ndarray:
+        """S's high-pass minus the PSF-matched prediction from ``img``: what one side has and the other has not (a trail one stack let through)."""
+        f = lum(img)
+        return self.B - self._predict(_ho_highpass(f, self.sigma_hp), self.w)
 
     def chi2(self, img: np.ndarray) -> float:
         """Mean chi^2 of S against the restoration ``img`` (on S's grid) matched to S's PSF: 1 = only noise left."""
@@ -685,3 +722,89 @@ class HeldOut:
         # per tile, for the paired comparison of two trials on the same held-out pixels (lab.run.best_trial)
         self.last_tiles = [float(np.mean(q[y0:y1, x0:x1][m[y0:y1, x0:x1]])) for (y0, y1, x0, x1), _, _ in self.tiles if m[y0:y1, x0:x1].any()]
         return float(np.mean(q[m]))
+
+
+class HeldOutRGB:
+    """The held-out comparison per colour channel, the matching kernels shared: fitted per tile on luminance and applied to R, G and B (the
+    PSF difference between two stacks of the same frames is achromatic), each channel with its own noise model; the score the mean over the
+    channels.  On luminance alone it was blind to colour artefacts - a Bayer-drizzled stack (pixfrac 0.72, turbo) won the M 31 stack study, and
+    its R / B band networks then failed the finish's sky chroma (6.9 against 2.0) and band-structure gates in every finishing trial; with a free
+    kernel per channel the fit filtered such a pattern out (chi2 +2 % for R / B bands of 1.5 sigma)."""
+
+    def __init__(self, S: np.ndarray, R0: np.ndarray, fwhm: float, **kw):
+        S, R0 = np.asarray(S, np.float32), np.asarray(R0, np.float32)
+        if S.ndim == 2:
+            S, R0 = S[..., None], R0[..., None]
+        self.L = HeldOut(lum(S), lum(R0), fwhm, **kw)
+        L = self.L
+        self.n_stars, self.nlf = L.n_stars, L.nlf
+        self.Bc = [_ho_highpass(np.ascontiguousarray(S[..., c]), L.sigma_hp) for c in range(S.shape[-1])]
+        kern = L.fit_kernels(_ho_highpass(lum(R0), L.sigma_hp), L.w, L.B)
+        m = L.mask
+        q = np.quantile(L.level[m], np.linspace(0, 0.999, 25))
+        self.wc = []
+        for c, Bc in enumerate(self.Bc):
+            r = self._resid(Bc, _ho_highpass(np.ascontiguousarray(R0[..., c]), L.sigma_hp), kern)
+            lx, ly = [], []
+            for lo, hi in zip(q[:-1], q[1:]):
+                sel = m & (L.level >= lo) & (L.level < hi)
+                if sel.sum() > 500:
+                    d = r[sel]
+                    lx.append(float(np.median(L.level[sel])))
+                    ly.append(float((1.4826 * np.median(np.abs(d - np.median(d)))) ** 2))
+            b, a = np.polyfit(lx, ly, 1) if len(lx) >= 3 else (0.0, float(np.var(r[m])))
+            a = max(float(a), 1e-3 * max(ly or [float(np.var(r[m]))]))
+            self.wc.append((1.0 / (a + max(float(b), 0.0) * L.level)).astype(np.float32))
+        self.last_tiles: list = []
+        self.per_channel: list = []
+        self.chi2_r0 = self.chi2(R0)
+
+    def _resid(self, Bc, Ac, kern):
+        """Bc minus Ac matched by the shared kernels, with this channel's own gain (one for the frame) and each tile's own offset: a colour-balance
+        or background difference between two stacks is no artefact - Siril's normalisation and channel equalisation are each stack's own, and a
+        demosaiced stack weights the channels unlike a Bayer-drizzled one (IC 1805: G chi2 ~10 from a channel scale alone).  The gain is the
+        median ratio of the bright stars' aperture fluxes, which a colour balance scales and a spatial artefact hardly touches (a least-squares
+        gain over the pixels shrank to absorb R / B band networks)."""
+        P = self.L.apply_kernels(Ac, [(box, kk, 0.0) for box, kk, _ in kern])
+        g = 1.0
+        xs, ys = self.L.star_xy
+        if len(xs) >= 10:
+            r = self.L.star_r
+            fb = sep.sum_circle(np.ascontiguousarray(Bc, dtype=np.float32), xs, ys, r, bkgann=(2 * r, 3 * r))[0]
+            fp = sep.sum_circle(np.ascontiguousarray(P, dtype=np.float32), xs, ys, r, bkgann=(2 * r, 3 * r))[0]
+            ok = (fb > 0) & (fp > 0)
+            if ok.sum() >= 10:
+                g = float(np.median(fb[ok] / fp[ok]))
+        m = self.L.mask
+        r_ = (Bc - np.float32(g) * P).astype(np.float32)
+        for (y0, y1, x0, x1), _, _ in kern:                        # each tile's own offset
+            mm = m[y0:y1, x0:x1]
+            if mm.any():
+                r_[y0:y1, x0:x1] -= np.float32(np.mean(r_[y0:y1, x0:x1][mm]))
+        return r_
+
+    def _channels(self, img):
+        img = np.asarray(img, np.float32)
+        return np.repeat(img[..., None], len(self.Bc), -1) if img.ndim == 2 else img
+
+    def chi2(self, img: np.ndarray) -> float:
+        img = self._channels(img)
+        L = self.L
+        kern = L.fit_kernels(_ho_highpass(lum(img), L.sigma_hp), L.w, L.B)
+        m = L.mask & valid_region(lum(img))
+        vals, tiles = [], []
+        for c, (Bc, wc) in enumerate(zip(self.Bc, self.wc)):
+            r = self._resid(Bc, _ho_highpass(np.ascontiguousarray(img[..., c]), L.sigma_hp), kern)
+            qd = (r.astype(np.float64) ** 2) * wc
+            vals.append(float(np.mean(qd[m])))
+            tiles.append([float(np.mean(qd[y0:y1, x0:x1][m[y0:y1, x0:x1]])) for (y0, y1, x0, x1), _, _ in kern if m[y0:y1, x0:x1].any()])
+        n = min(len(t) for t in tiles)
+        self.last_tiles = [float(np.mean([t[i] for t in tiles])) for i in range(n)] if all(len(t) == n for t in tiles) else []
+        self.per_channel = vals
+        return float(np.mean(vals))
+
+    def residual(self, img: np.ndarray) -> np.ndarray:
+        img = self._channels(img)
+        L = self.L
+        kern = L.fit_kernels(_ho_highpass(lum(img), L.sigma_hp), L.w, L.B)
+        return np.mean([self._resid(Bc, _ho_highpass(np.ascontiguousarray(img[..., c]), L.sigma_hp), kern) for c, Bc in enumerate(self.Bc)], axis=0)

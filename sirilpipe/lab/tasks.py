@@ -122,7 +122,10 @@ def stretch(img: np.ndarray, ref: dict | None = None) -> tuple[np.ndarray, dict]
         sig = float(1.4826 * np.median(np.abs(L - med))) or 1e-6
         hi = float(np.percentile(L, 99.8))
         ref = {"bg": med, "k": 2 * sig, "top": float(np.arcsinh(max(hi - med, 1e-6) / (2 * sig)))}
-    y = np.arcsinh(np.maximum(img - ref["bg"], 0) / ref["k"]) / ref["top"]
+    # each image at its own sky level, the contrast (k, top) the study's: gradient models differ in the pedestal they keep (the sky-survey model
+    # lifts it, Siril / GraXpert keep the stack's), and one shared black point showed a model that kept 0.002 less as having erased M 31's halo
+    bg = float(np.median(img.mean(-1)))
+    y = np.arcsinh(np.maximum(img - bg, 0) / ref["k"]) / ref["top"]
     return (np.clip(y, 0, 1)[..., ::-1] * 255 + 0.5).astype(np.uint8), ref
 
 
@@ -325,7 +328,7 @@ def _processing_params(keys: list[str], tune: set[str], hypertune: dict | None =
 
 
 GATE_NAMES = ("sky_median", "clipped", "white", "sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise", "stars_count",
-              "stars_round", "stars_coloured")
+              "stars_round", "stars_coloured", "stars_physical")
 
 
 def _gate_violations(g: dict) -> dict:
@@ -401,6 +404,7 @@ class StackTask(Task):
     metrics = {
         "stack_score": {"label": "Stack score: fidelity against the held-out frames, 0.5 ln(chi2 baseline / chi2)", "direction": "maximize"},
         "heldout_chi2": {"label": "Held-out mean chi2 (1 = noise only): the held-out half against the trial's stack matched to its PSF", "direction": "minimize"},
+        "trails_heldout": {"label": "Trail pixels per million the trial's stack has and the held-out half has not (in their residual)", "direction": "minimize"},
         **DEPTH_METRICS,
         "ellipticity": {"label": "Star ellipticity (median 1 - b / a)", "direction": "minimize"},
         "outliers": {"label": "Single-pixel outliers per Mpx (hot pixels / cosmic rays left)", "direction": "minimize"},
@@ -429,13 +433,19 @@ class StackTask(Task):
             out["outliers"] = ("max", max(1.5 * b["outliers"], b["outliers"] + 2.0))
         if b.get("trails") is not None:                      # a lax rejection (high sigma near 7 kept depth rising on M 31) lets trails through
             out["trails"] = ("max", max(1.25 * b["trails"], b["trails"] + 20.0))
+        if b.get("trails_heldout") is not None:
+            out["trails_heldout"] = ("max", max(1.25 * b["trails_heldout"], b["trails_heldout"] + 20.0))
         return out
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
         from ..session import Session
         if int(opts.get("in_place", 0) or 0) and ds.given is not None:
             s = ds.given
-            log("Stacking the session itself (hyper-tune): the registration of its analysis is reused")
+            # inside the experiment: the calibration and registration the trials start from (the user's settings); a trial whose settings
+            # change the registration (banding correction, resampling) registers again
+            sp0 = dict(opts.get("stack_params") or {})
+            log("Calibrating and registering the session (the trials reuse the registration unless their settings change it)")
+            s.run_analysis(float(sp0.get("sensitivity", 1.0) or 1.0), _prog(log, 20), stack_params=sp0)
         else:
             base = ds.ensure_stacked(log, cancel) if ds.synthetic else ds.session()
             wd = os.path.join(study_dir, "work", "stack")
@@ -466,6 +476,7 @@ class StackTask(Task):
             held, trial = reg[0::2], reg[1::2]
             base_sp = dict(ctx["opts"].get("stack_params") or {})
             H = s.stack_subsets({"held": held}, stack_params=base_sp, place=False)["held"]
+            ctx["ref_frame"] = getattr(s, "last_reference", None)          # every trial's stack on this frame's grid
             v = OB.valid_region(OB.lum(_hwc(H)))
             ys, xs = np.nonzero(v)
             y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
@@ -489,10 +500,10 @@ class StackTask(Task):
         from .. import post
         if ctx.get("held") is not None:
             from ..session import place_on
-            T = s.stack_subsets({"trial": ctx["trial_frames"]}, _prog(log, 20), stack_params=sp, place=False)["trial"]
+            T = s.stack_subsets({"trial": ctx["trial_frames"]}, _prog(log, 20), stack_params=sp, place=False, ref_frame=ctx.get("ref_frame"))["trial"]
             nf = int((getattr(s, "last_subsets", {}).get("trial") or {}).get("frames") or 0)
-            T_on, _ = place_on(ctx["held"], T)
-            meta = {"n_frames": nf, "scale": 1.0, "resampling_reason": None, "rejection": None}
+            T_on, placed = place_on(ctx["held"], T)
+            meta = {"n_frames": nf, "scale": 1.0, "resampling_reason": None, "rejection": None, "placement": placed}
             st = T_on
         else:
             meta = s.run_stack(sp, _prog(log, 20))
@@ -525,16 +536,21 @@ class StackTask(Task):
         out.update(bg_noise=MX.background_noise(x), roundness=ms.get("ellipticity"), n_frames=meta["n_frames"], seconds=dt, field_fraction=float(field),
                    trails=trail_pixels(est),
                    scale=float(meta.get("scale") or 1.0),
-                   resampling=meta.get("resampling_reason"), rejection=(meta.get("rejection") or {}).get("type"))
+                   resampling=meta.get("resampling_reason"), rejection=(meta.get("rejection") or {}).get("type"), placement=meta.get("placement"))
         if ctx.get("held") is not None:
             if ctx.get("heldout") is None:                     # the baseline trial: the noise model and the unprocessed chi2 of the held-out comparison
-                ctx["heldout"] = OB.HeldOut(_hwc(ctx["held"]), est, OB.Yardstick(_hwc(ctx["held"]), keep_image=False).fwhm)
+                ctx["heldout"] = OB.HeldOutRGB(_hwc(ctx["held"]), est, OB.Yardstick(_hwc(ctx["held"]), keep_image=False).fwhm)
                 h = ctx["heldout"]
                 log(f"Held-out reference: {h.n_stars} stars masked, noise variance {h.nlf[0]:.3g} + {h.nlf[1]:.3g} x level; baseline chi2 {h.chi2_r0:.4f}")
             h = ctx["heldout"]
             out["heldout_chi2"] = h.chi2(est)
             out["heldout_tiles"] = h.last_tiles
+            out["heldout_chi2_rgb"] = [round(v, 5) for v in h.per_channel]
             out["stack_score"] = 0.5 * math.log(h.chi2_r0 / max(out["heldout_chi2"], 1e-12))
+            # trails the trial's rejection let through and the held-out stack's did not: bright lines of the trial's stack, dark in the residual.
+            # Faint enough to escape detection in the stack itself (M 31, high sigma 6.6: 0 ppm), they surfaced after deconvolution (~200 ppm)
+            r = -h.residual(est)
+            out["trails_heldout"] = trail_pixels(np.repeat(np.ascontiguousarray(r, np.float32)[..., None], 3, -1))
         elif out.get("depth") is not None:
             out["stack_score"] = out["depth"]
         if ctx["base"] is None:
@@ -1122,7 +1138,7 @@ class RestoreTask(Task):
                 # reduction, and the noise model from the unrestored trial source
                 sh, _, _ = self._restore(ctx, prm, {**sp, **self.NOOP}, "restore_heldout", cancel, src=ctx["sharp_dir"])
                 fw = OB.Yardstick(_hwc(sh), keep_image=False).fwhm
-                ctx["heldout"] = OB.HeldOut(_hwc(sh), _hwc(lin), fw)
+                ctx["heldout"] = OB.HeldOutRGB(_hwc(sh), _hwc(lin), fw)
                 h = ctx["heldout"]
                 log(f"Held-out reference: FWHM {fw:.2f} px, {h.n_stars} stars masked, noise variance {h.nlf[0]:.3g} + {h.nlf[1]:.3g} x level; "
                     f"unrestored chi2 {h.chi2_r0:.4f}")
@@ -1152,6 +1168,7 @@ class RestoreTask(Task):
             h = ctx["heldout"]
             out["heldout_chi2"] = h.chi2(est)
             out["heldout_tiles"] = h.last_tiles
+            out["heldout_chi2_rgb"] = [round(v, 5) for v in h.per_channel]
             out["fidelity_gain"] = 0.5 * math.log(h.chi2_r0 / max(out["heldout_chi2"], 1e-12))
             out["restore_score"] = float(out["fidelity_gain"] + keep)
         elif out.get("depth_gain") is not None:
@@ -1312,12 +1329,13 @@ class FinishTask(Task):
                    "and the colour grade are the user's.  Trial images are the finished renders (one chain, same data).  Option 'external': run "
                    "NoiseXTerminator / GraXpert / Cosmic Clarity on the stretched image in every trial (slower, the export's result; without it those settings "
                    "have no effect).")
-    objective_note = ("Score (finish_score, lower is better): the number of failed finishing gates, then 1 - H.  H is the structural fidelity of the finished "
+    objective_note = ("Score (finish_score, lower is better): the number of failed finishing gates plus their distance outside the limits (relative "
+                      "units: a direction towards passing), then 1 - H.  H is the structural fidelity of the finished "
                       "luminance to the linear luminance (Yeganeh & Wang, IEEE TIP 2013, the authors' TMQI.m: 11x11 Gaussian windows, 5 scales, the Mannos "
                       "CSF thresholds of visibility on the finished side), adapted to astronomical data: a structure counts where the linear data's local "
                       "deviation is significant above its own noise (Immerkaer's estimator, 3 sigma), and H is the fraction of that structure the finish makes "
-                      "visible in its shape (hit rate x local correlation, scale-weighted).  Constraints: every finishing gate (FINISH-SPEC) no further outside "
-                      "its limit than in the baseline - gate by gate, so that no gate is traded for another.  The gates bound what H alone would reward: "
+                      "visible in its shape (hit rate x local correlation, scale-weighted).  Constraints: every finishing gate (FINISH-SPEC) the baseline passes "
+                      "still passes - gate by gate, so that no gate is traded for another; a gate the baseline fails is free, and fixing it lowers the score.  The gates bound what H alone would reward: "
                       "the sky's noise stretched into view, clipping, a sky off its level.")
     params = _processing_params(
         ["stretch_method", "stretch", "stretch_boost", "auto_stretch", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise", "chroma_denoise",
@@ -1343,7 +1361,7 @@ class FinishTask(Task):
     params.append({"name": "star_stretch", "label": "Star stretch amount (Seti Astro)", "type": "float", "low": 2.0, "high": 8.0, "default": 5.0, "tune": False,
                    "hypertune": True, "processing": "star_stretch"})
     metrics = {
-        "finish_score": {"label": "Finish score: gates failed + (1 - structural fidelity H)", "direction": "minimize"},
+        "finish_score": {"label": "Finish score: gates failed + their distance outside the limits + (1 - structural fidelity H)", "direction": "minimize"},
         "fidelity": {"label": "Structural fidelity H: significant linear structure made visible (0-1)", "direction": "maximize"},
         "truth_fidelity": {"label": "Truth: structural fidelity to the true sky (synthetic data)", "direction": "maximize"},
         **{f"fidelity_s{i + 1}": {"label": f"Fidelity at scale {i + 1} ({2 ** i} px)", "direction": "maximize"} for i in range(5)},
@@ -1369,11 +1387,12 @@ class FinishTask(Task):
     min_gain = MIN_GAIN_H        # the finishing chain is deterministic (three identical renders, identical scores): a margin of significance, not of noise
 
     def limits(self, ctx):
-        """No gate may get worse than in the baseline: each gate's violation at most the baseline's.  (A bound on the summed distance let trials buy
-        one gate with another - on M 31, where Auto-finish's result fails five gates, crushing the sky to black fixed the colour gates and 8 such
-        renders passed as feasible.)"""
+        """Every gate the baseline passes must still pass - gate by gate, so that no passing gate is bought with another (a bound on the summed
+        distance had let a sky crushed to black buy the colour gates on M 31).  A gate the baseline fails is free: the score counts the failed
+        gates first, so a trial that fixes one is better.  (Pinning failed gates at their baseline violation as well made the baseline a corner
+        of the feasible region: with three failed gates, 23 of 25 trials of the constrained ES broke one, M 31 2026-10-26.)"""
         b = (ctx.get("base") or {}).get("gate_violations") or {}
-        return {f"gate_{k}": ("max", float(b.get(k, 0.0)) + 1e-6) for k in GATE_NAMES}
+        return {f"gate_{k}": ("max", 1e-6) for k in GATE_NAMES if float(b.get(k, 0.0)) <= 0.0}
 
     def prepare(self, ds, opts, device, log, cancel, study_dir):
         from .. import post
@@ -1400,7 +1419,14 @@ class FinishTask(Task):
         work = os.path.join(study_dir, "work", "finish")
         os.makedirs(work, exist_ok=True)
         saved = _store(study_dir, "reference.pkl") or {}
-        return {"ds": ds, "session": s, "layers": layers, "dual": dual, "hdr": hdr, "truth": truth, "work": work, "device": device, "opts": opts, "header": layers.header,
+        cands = []
+        if int(opts.get("autofinish_candidate", 0) or 0):
+            # Auto-finish's proposal as one trial of the experiment (enqueued after the baseline by lab.run): measured by the same objective,
+            # chosen only if it is the best
+            fin = s.autofinish(dict(opts.get("params") or {}), None)
+            cands.append({"label": "Auto-finish", "params": dict(fin.get("params") or {})})
+            log("Auto-finish's proposal queued as a trial")
+        return {"ds": ds, "session": s, "layers": layers, "dual": dual, "candidates": cands, "hdr": hdr, "truth": truth, "work": work, "device": device, "opts": opts, "header": layers.header,
                 "study_dir": study_dir, "base": saved.get("base")}
 
     def run(self, ctx, p, log, cancel):
@@ -1416,7 +1442,12 @@ class FinishTask(Task):
         dt = time.time() - t
         sm = layers.starnet.get("stars") or {}
         level = float(pro.mtf_balance(pro.star_stretch_m(float(prm.get("star_stretch", pro.STAR_STRETCH))), 5.0 * float(sm["sky_noise"]))) if sm.get("sky_noise") else None
-        g = gates.compute(img, starless=info.get("starless") if layers.stars is not None and prm["star_reduction"] < 1.0 else None, linear_star_count=sm.get("count"), star_level=level)
+        if "lin_count" not in ctx:
+            # the linear star count with the gate's own statistic (a stored count may predate it)
+            ctx["lin_count"] = finish.count_stars(layers.stars, float(sm["sky_noise"]))[0] if layers.stars is not None and sm.get("sky_noise") else sm.get("count")
+        g = gates.compute(img, starless=info.get("starless") if layers.stars is not None and prm["star_reduction"] < 1.0 else None, linear_star_count=ctx["lin_count"],
+                          star_level=level, linear_stars=layers.stars, linear_noise=sm.get("sky_noise"),
+                          linear_base=layers.base)
         lum = finish.luminance(img)
         hs = pro._hist_stats(lum)
         mask, _ = pro.nebula_mask(lum, hs["mode"])
@@ -1429,14 +1460,15 @@ class FinishTask(Task):
                "sky_noise": noise, "cnr": cnr,
                "sky_chroma": max(g["sky_chroma"]["value"].values()) if isinstance(g.get("sky_chroma", {}).get("value"), dict) else None,
                "clipped": g["clipped"]["value"], "stars_coloured": g.get("stars_coloured", {}).get("value"), "seconds": dt, "failed": g.get("failed")}
-        # lexicographic: the finishing gates are the specification - fewer failed gates first (H is 0 - 1, a gate counts 1), then the structural
-        # fidelity.  On M 31 Auto-finish's result failed the star-colour gate after BXT's star sharpening
+        # the finishing gates are the specification: each failed gate counts 1 plus how far outside its limit it is (relative units) - the distance
+        # gives the search a direction towards passing (with the count alone, halving a gate's violation scored as nothing: on M 31 no trial of 25
+        # came near the band-structure or star-colour limits) - then the structural fidelity H (0 - 1)
         fails = len(g.get("failed", []))
         H, hl = OB.structural_fidelity(ctx["hdr"], _finish_ldr(img, ctx["hdr"].shape), mode="hits")
         out.update({"fidelity": H, **{f"fidelity_s{i + 1}": v for i, v in enumerate(hl)}})
         if ctx.get("truth") is not None:
             out["truth_fidelity"] = OB.structural_fidelity(ctx["truth"], _finish_ldr(img, ctx["hdr"].shape), mode="hits", noise_from=ctx["hdr"])[0]
-        out["finish_score"] = GATE_WEIGHT * fails + (1.0 - H)
+        out["finish_score"] = GATE_WEIGHT * (fails + out["gate_distance"]) + (1.0 - H)
         if ctx.get("base") is None:
             ctx["base"] = {"gate_distance": out["gate_distance"], "gate_violations": gv}
             _store(ctx["study_dir"], "reference.pkl", {"base": ctx["base"]})

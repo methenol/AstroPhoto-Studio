@@ -314,6 +314,16 @@ def run_study(study_dir: str, cancel: threading.Event | None = None, on_log=None
             base = {k: sp.get("value", pdefs[k]["default"]) for k, sp in space.items() if sp.get("tune") and k in pdefs}
             if base:
                 study.enqueue_trial(base, user_attrs={"baseline": True})
+                # candidates the task proposes (Auto-finish's settings for the finish): trials of the experiment like any other
+                for cand in ctx.get("candidates") or []:
+                    q = {k: cand["params"].get(k, v) for k, v in base.items()}
+                    for k, v in q.items():
+                        sp_, pd_ = space[k], pdefs[k]
+                        if pd_["type"] in ("float", "int") and isinstance(v, (int, float)) and not isinstance(v, bool):
+                            q[k] = min(max(v, float(sp_.get("low", pd_["low"]))), float(sp_.get("high", pd_["high"])))
+                        elif pd_["type"] == "categorical" and str(v) not in [str(c) for c in (sp_.get("choices") or pd_["choices"])]:
+                            q[k] = base[k]
+                    study.enqueue_trial(q, user_attrs={"candidate": cand.get("label")})
                 # warm start (``warm_start`` trials): perturbations of the baseline - each numeric setting moved by a normal draw of 5 % of its range, the
                 # choices kept - so that the sampler meets the feasible region before its random start wanders the full ranges (finishing on M 31: of 29
                 # trials over the full ranges only the baseline was usable)

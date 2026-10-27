@@ -82,7 +82,24 @@ def place_on(ref: np.ndarray, img: np.ndarray) -> tuple[np.ndarray, dict]:
         if best is None or sc > best[0]:
             best = (sc, name, dx, dy, o)
     sc, name, dx, dy, o = best
-    return stackpost.paste(o, ref.shape[1:], -dx, -dy), {"orientation": name, "offset": [dx, dy], "match": round(sc, 4)}
+    if sc >= 0.98:
+        return stackpost.paste(o, ref.shape[1:], -dx, -dy), {"orientation": name, "offset": [dx, dy], "match": round(sc, 4)}
+    # not the same pixel grid: a stack registered again picked another reference frame (two nights' field rotation, IC 1805: a trial's stack at
+    # 13-17 px FWHM against the held-out's 6) - registered by its stars (astroalign similarity on the brightest point sources), Lanczos warp
+    import astroalign as aa
+    import cv2
+    from .lab.objectives import star_points
+    try:
+        hw = lambda a_: np.ascontiguousarray(np.moveaxis(a_, 0, -1))
+        tf, _ = aa.find_transform(star_points(hw(img)), star_points(hw(ref)), max_control_points=120)
+        M = tf.params[:2].astype(np.float64)
+        H, W = ref.shape[1:]
+        out = np.stack([cv2.warpAffine(np.ascontiguousarray(img[c], dtype=np.float32), M, (W, H), flags=cv2.INTER_LANCZOS4, borderValue=0.0)
+                        for c in range(img.shape[0])])
+        return np.clip(out, 0.0, None), {"orientation": "registered", "match_integer": round(sc, 4), "rotation_deg": round(float(np.degrees(tf.rotation)), 4),
+                                         "scale": round(float(tf.scale), 6), "translation": [round(float(v), 2) for v in tf.translation]}
+    except Exception as e:                                       # noqa: BLE001
+        return stackpost.paste(o, ref.shape[1:], -dx, -dy), {"orientation": name, "offset": [dx, dy], "match": round(sc, 4), "register_error": str(e)[:200]}
 
 
 class Session:
@@ -690,18 +707,27 @@ class Session:
             self._invalidate_after_stack()
             return clean_json(meta)
 
-    def stack_subsets(self, subsets: dict, progress=None, stack_params: dict | None = None, place: bool = True) -> dict:
+    def _reference_name(self, seq: str, rows: list[dict]) -> str | None:
+        """The file name of the frame the registration made its reference (its homography the identity)."""
+        try:
+            for fr in parse_seq(os.path.join(self.process, f"{seq}_.seq")).frames:
+                if fr.H and len(fr.H) == 9 and max(abs(a - b) for a, b in zip(fr.H, (1, 0, 0, 0, 1, 0, 0, 0, 1))) < 1e-9 and fr.index < len(rows):
+                    return rows[fr.index].get("name")
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def stack_subsets(self, subsets: dict, progress=None, stack_params: dict | None = None, place: bool = True, ref_frame: str | None = None) -> dict:
         """Stacks of subsets of the stacked frames, on ``stack.fits``'s pixel grid: {name: [row indices]} -> {name: (3, h, w) array}.
         The registration is applied once to every stacked frame with the stack's resampling, as ``run_stack`` does; each subset is then stacked
         from that one registered sequence with the stack's rejection and weighting (``workflow.subset_stack_script``) - all of its frames lie on
         the one -framing=max canvas, so a subset stack cut to the stack's crop has the stack's pixel grid, without any resampling or offset to
-        estimate.  Used by the experiments' held-out validation (lab.tasks.RestoreTask): independent frames carry independent noise.  Not for
-        HDR (multi-exposure) stacks.  ``stack_params``: stack with these settings instead of the stack's (frame selection included: a subset
+        estimate.  Used by the experiments' held-out validation (lab.tasks.RestoreTask): independent frames carry independent noise.  An HDR
+        (multi-exposure) session stacks each subset as the stack is stacked: each exposure group of the subset on its own, blended (_stack_hdr).
+        ``stack_params``: stack with these settings instead of the stack's (frame selection included: a subset
         keeps its frames that the selection accepts); ``place=False``: return each subset stack on its own canvas (no stack.fits needed)."""
         with self.lock:
             meta = read_json(self._p("stack_meta.json"), {}) or {}
-            if meta.get("hdr"):
-                raise RuntimeError("frame subsets of an HDR (multi-exposure) stack are not supported")
             sp = dict(stack_params if stack_params is not None else (meta.get("params") or {}))
             sens = float(sp.get("sensitivity", 1.0) or 1.0)
             state = self._ensure_registered(progress, sens, self._debayer(sp), banding=self._banding_param(sp))
@@ -723,10 +749,17 @@ class Session:
             workflow.clean_registered(self.process)
             # every stacked frame, not only the subsets': seqapplyreg aborts when the registration's reference frame is not among those applied
             # ("the reference image has a null matrix") - and a half of alternate frames lacks it every second time
-            runner.run(workflow.apply_script(self.process, seq, n, [i for i in range(len(rows)) if i not in set(inc)], rs), "apply_registration",
+            # ``ref_frame`` (a frame's file name): the registration applied relative to that frame, whatever reference this registration chose -
+            # the experiments' stacks then share one grid (two IC 1805 nights: a registration of other settings chose another reference and its
+            # stack came out 0.2 degrees rotated against the held-out stack).  It is applied even when no subset stacks it.
+            ref_idx = next((i for i, r in enumerate(rows) if ref_frame and r.get("name") == ref_frame and r.get("registered")), None)
+            applied = set(inc) | ({ref_idx} if ref_idx is not None else set())
+            self.last_reference = rows[ref_idx]["name"] if ref_idx is not None else self._reference_name(seq, rows)
+            runner.run(workflow.apply_script(self.process, seq, n, [i for i in range(len(rows)) if i not in applied], rs, reference=ref_idx), "apply_registration",
                        expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc), label="Applying registration (frame subsets)")
             rseq = parse_seq(os.path.join(self.process, f"r_{seq}_.seq"))
-            pos_of = {sf.filenum - 1: k + 1 for k, sf in enumerate(rseq.frames)}      # frame index -> 1-based position in the r_ sequence
+            pos_all = {sf.filenum - 1: k + 1 for k, sf in enumerate(rseq.frames)}             # frame index -> 1-based position in the r_ sequence
+            pos_of = {i: p_ for i, p_ in pos_all.items() if i in set(inc)}                    # the stacked frames among them
             n_reg = len(rseq.frames)
             out = {}
             try:
@@ -735,12 +768,16 @@ class Session:
                     if len(members) < 3:
                         raise RuntimeError(f"subset {name}: {len(members)} registered frames, need 3")
                     mset = set(members)
-                    others = [pos_of[i] for i in pos_of if i not in mset]
-                    ref = min(members, key=lambda i: rows[i].get("wfwhm") or rows[i].get("fwhm") or 1e9)
                     o = f"stack_sub_{name}"
-                    runner.run(workflow.subset_stack_script(self.process, seq, n_reg, others, pos_of[ref], rej, o, len(members), weight=workflow.weighting(sp)),
-                               "stack", expect=[f"{o}.fit"], label=f"Stacking ({name}: {len(members)} frames)")
-                    a, _ = fitsio.read_rgb(os.path.join(self.process, f"{o}.fit"))
+                    groups = sorted({rows[i].get("group", 0) for i in members})
+                    if state.get("hdr") and len(groups) > 1:
+                        a, _, _ = self._stack_hdr(runner, seq, rows, members, groups, rs, rej, progress, only_inc=True)
+                    else:
+                        others = [p_ for i, p_ in pos_all.items() if i not in mset]          # every registered frame not in the subset
+                        ref = min(members, key=lambda i: rows[i].get("wfwhm") or rows[i].get("fwhm") or 1e9)
+                        runner.run(workflow.subset_stack_script(self.process, seq, n_reg, others, pos_of[ref], rej, o, len(members), weight=workflow.weighting(sp)),
+                                   "stack", expect=[f"{o}.fit"], label=f"Stacking ({name}: {len(members)} frames)")
+                        a, _ = fitsio.read_rgb(os.path.join(self.process, f"{o}.fit"))
                     # -maximize sizes the canvas to the frames stacked, so the subset's canvas is shifted against the stack's by a whole number of
                     # pixels (one registration, one grid), and plate solving may have turned stack.fits north-up: both found exactly (place_on)
                     if place:
@@ -757,7 +794,7 @@ class Session:
             return out
 
     def _stack_hdr(self, runner: SirilRunner, seq: str, rows: list[dict], inc: list[int], groups: list[int], rs: dict,
-                   rej: dict, progress):
+                   rej: dict, progress, only_inc: bool = False):
         """Stack each exposure group of the one registered sequence, then blend them (workflows.md 9.2).
 
         All groups were registered together (one reference, one pixel grid).  Each group is stacked on its own with
@@ -777,7 +814,10 @@ class Session:
             if len(members) < 3:
                 info.setdefault("dropped", []).append({"group": g, "n": len(members), "why": "fewer than 3 frames"})
                 continue
-            others = [pos_of[i] for i in inc if rows[i].get("group", 0) != g]
+            # every other frame of the registered sequence left out: the other groups' - and, for a frame subset (only_inc), the frames the
+            # subset does not hold, which the sequence carries too (without it each half of an HDR held-out split stacked all its group's frames)
+            mem = set(members)
+            others = [p_ for i, p_ in pos_of.items() if i not in mem] if only_inc else [pos_of[i] for i in inc if rows[i].get("group", 0) != g]
             best = min(members, key=lambda i: rows[i].get("wfwhm") or 1e9)
             out = f"stack_raw_g{g}"
             runner.run(workflow.group_stack_script(self.process, seq, n_reg, others, pos_of[best], rej, out, len(members)),

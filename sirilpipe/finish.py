@@ -315,12 +315,23 @@ def object_coverage(lum: np.ndarray, sigma_k: float = 3.0) -> float:
     return float((s > sky + sigma_k * sig).mean()) if sig > 0 else 0.0
 
 
+def star_positions(stars_lin: np.ndarray, noise_sigma: float, min_sigma: float = 5.0) -> tuple[np.ndarray, np.ndarray]:
+    """(ys, xs) of the stars count_stars counts."""
+    if noise_sigma <= 0:
+        return np.zeros(0, int), np.zeros(0, int)
+    lum = cv2.GaussianBlur(np.ascontiguousarray(stars_lin.mean(0)), (0, 0), 1.0)
+    dil = cv2.dilate(lum, np.ones((7, 7), np.uint8))
+    return np.nonzero((lum == dil) & (lum > min_sigma * noise_sigma))
+
+
 def count_stars(stars_lin: np.ndarray, noise_sigma: float, min_sigma: float = 5.0) -> tuple[int, float]:
     """Detectable stars: local maxima of the (lightly smoothed) star layer above ``min_sigma`` x the sky's pixel noise
     ``noise_sigma`` (of the starless layer), and their number per megapixel."""
     if noise_sigma <= 0:
         return 0, 0.0
-    lum = cv2.GaussianBlur(np.ascontiguousarray(stars_lin.max(0)), (0, 0), 1.0)
+    # the channel mean, as the picture's count (gates.measure_stars): detection must not depend on colour - on the maximum channel a colour boost of
+    # 2 lifted faint stars' chroma noise over the threshold and the picture counted 4.7 x the linear stars (M 31)
+    lum = cv2.GaussianBlur(np.ascontiguousarray(stars_lin.mean(0)), (0, 0), 1.0)
     dil = cv2.dilate(lum, np.ones((7, 7), np.uint8))
     n = int(((lum == dil) & (lum > min_sigma * noise_sigma)).sum())
     return n, n / (lum.size / 1e6)

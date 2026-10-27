@@ -242,6 +242,12 @@ def fit_ghs2(h: dict, neb_med: float, neb_hi: float, *, b1: float, b2: float, d2
 
 # =========================================================================== the chain
 
+def mtf_curve(x: np.ndarray, m: float) -> np.ndarray:
+    """Siril's midtones transfer function, mtf(x; m) = (m - 1) x / ((2m - 1) x - m), on [0, 1]."""
+    x = np.asarray(x, np.float32)
+    return np.where(x <= 0.0, 0.0, np.where(x >= 1.0, 1.0, (m - 1.0) * x / ((2.0 * m - 1.0) * x - m))).astype(np.float32)
+
+
 class Finisher:
     """One run of the chain.  ``external`` = the AI steps (NoiseXTerminator / GraXpert on the stretched image) run; the preview passes False."""
 
@@ -947,20 +953,23 @@ class Finisher:
                     source="Seti Astro Star Stretch = mtf with m = 1/(3^a+1), a = 5 (SASpro star_stretch.py / numba_utils); dual-band magenta: invert, SCNR, invert (Brecher, astrodoc.ca IC 1848)")
         c = float(np.clip(p.get("star_color_preservation", 0.5), 0.0, 1.0))
         if c > 1e-3:
-            # the colour-preserving star stretch (arcsinh-style): the stretched LIGHTNESS with the linear colour ratios, composed by Siril rgbcomp -lum, blended by c
+            # the colour-preserving stretch of Lupton et al. 2004 (PASP 116, 133; PixInsight's ArcsinhStretch): every pixel's RGB multiplied by one
+            # factor F(I) / I of its intensity I (the channel mean), F the star stretch's own curve (mtf with m) times the intensity setting, then
+            # clipped by dividing by the largest channel - the channel ratios, and so the order of R, G and B, stay the linear ones.  Blended with the
+            # per-channel stretch by c.  (A Siril rgbcomp -lum composition in L*a*b* kept each pixel's a* / b* while replacing its lightness: the
+            # dim wings took the core's chroma, out of gamut, and gamut clipping shifted their hue - 45 % of M 31's well-measured stars off the
+            # blackbody locus at c = 0.5)
             t0 = time.time()
-            lum = finish.luminance(out)
-            lines2 = ["rgbcomp -lum=sc_l sc_c -out=sc_lrgb", "load sc_lrgb", f'pm "{1.0 - c:.4f}*$sc_in$+{c:.4f}*$sc_lrgb$"']
-            colour = np.clip(stars / np.maximum(stars.max(0, keepdims=True), 1e-9), 0, 1).astype(np.float32)
-            lp = self.mono("sc_l", lum)
-            try:
-                out2 = self.siril("sc", out, lines2, "Star colour", extra={"sc_c": colour})
-            finally:
-                for fp in (lp, os.path.join(self.cwd, "sc_lrgb.fit")):
-                    if os.path.exists(fp):
-                        os.remove(fp)
-            self.record("stars colour preservation", "siril rgbcomp -lum / pm", out2, commands=lines2, seconds=time.time() - t0, params={"star_color_preservation": c},
-                        source="LRGB composition of the stretched lightness with the linear colour ratios (the arcsinh / colour-preserving star stretch: PixInsight ArcsinhStretch, Seti Star Stretch colour boost)")
+            x = np.clip(np.nan_to_num(stars.astype(np.float32)), 0.0, None)
+            I = x.mean(0)
+            F = mtf_curve(np.clip(I, 0.0, 1.0), m) * inten
+            k = np.where(I > 1e-12, F / np.maximum(I, 1e-12), 0.0)
+            lup = x * k[None]
+            mx = lup.max(0)
+            lup = np.where(mx > 1.0, lup / np.maximum(mx, 1e-12), lup)[...]
+            out2 = np.clip((1.0 - c) * out + c * lup, 0.0, 1.0).astype(np.float32)
+            self.record("stars colour preservation", "Lupton et al. 2004 colour-preserving stretch", out2, seconds=time.time() - t0, params={"star_color_preservation": c},
+                        source="RGB scaled by F(I)/I, clipped by the largest channel (Lupton, Blanton, Fekete et al. 2004, PASP 116, 133; PixInsight ArcsinhStretch)")
             return out2
         return out
 

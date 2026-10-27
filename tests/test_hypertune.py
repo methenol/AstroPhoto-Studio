@@ -437,3 +437,54 @@ def test_held_out_fidelity_ranks_restorations(monkeypatch):
     invented = R + 0.004 * np.sin(xx / 2.5).astype(np.float32)                             # structure the sky does not have
     assert c(oracle) < ho.chi2_r0 < c(smeared)
     assert c(invented) > ho.chi2_r0
+
+
+def test_held_out_rgb_sees_colour_artefacts(monkeypatch):
+    import cv2
+    monkeypatch.setattr(OB, "HO_TILES", (2, 2))
+    monkeypatch.setattr(OB, "HO_FIT_PX", 6000)
+    rng = np.random.default_rng(3)
+    base = star_field(seed=7, n=200, size=384, noise=0.0)
+    yy, xx = np.mgrid[0:384, 0:384].astype(np.float32)
+    base = base + (0.01 * np.exp(-((xx - 190) ** 2 + (yy - 200) ** 2) / (2 * 50.0 ** 2)))[..., None]
+    noisy = lambda: (base + rng.normal(0, 0.002, base.shape)).astype(np.float32)
+    S, R = noisy(), noisy()
+    ho = OB.HeldOutRGB(S, R, fwhm=3.0)
+    # band networks in R and B that cancel in the channel mean: luminance-blind, colour-visible
+    band = (0.003 * np.sign(np.sin(yy / 3.0))).astype(np.float32)
+    art = R.copy()
+    art[..., 0] += band
+    art[..., 2] -= band
+    lum_ho = OB.HeldOut(S, R, fwhm=3.0)
+    assert abs(lum_ho.chi2(art) - lum_ho.chi2_r0) < 0.01                 # the luminance comparison does not see it
+    assert ho.chi2(art) > ho.chi2_r0 * 1.2                                # the per-channel one does
+
+
+
+def test_sky_gates_exclude_stars():
+    import cv2
+    from sirilpipe import gates
+    rng = np.random.default_rng(6)
+    stars = star_field(seed=9, n=900, size=600, noise=0.0)[..., 0]
+    sky = 0.10 + rng.normal(0, 0.003, stars.shape).astype(np.float32)
+    img = np.clip(sky + 0.8 * stars / stars.max() * 4, 0, 1).astype(np.float32)
+    rgb = np.repeat(img[None], 3, 0)
+    g = gates.compute(rgb)
+    assert g["sky_band_structure"]["pass"], g["sky_band_structure"]                   # a star field on a flat sky is no sky structure
+    yy, xx = np.mgrid[0:600, 0:600].astype(np.float32)
+    blobs = 0.03 * np.sin(xx / 18.0) * np.sin(yy / 23.0)                                 # watercolour blobs of 50-70 px
+    g2 = gates.compute(np.repeat(np.clip(img + blobs, 0, 1)[None], 3, 0))
+    assert not g2["sky_band_structure"]["pass"]
+
+
+def test_held_out_rgb_ignores_channel_scale(monkeypatch):
+    monkeypatch.setattr(OB, "HO_TILES", (2, 2))
+    monkeypatch.setattr(OB, "HO_FIT_PX", 6000)
+    rng = np.random.default_rng(5)
+    base = star_field(seed=11, n=300, size=384, noise=0.0)
+    noisy = lambda: (base + rng.normal(0, 0.002, base.shape)).astype(np.float32)
+    S, R = noisy(), noisy()
+    ho = OB.HeldOutRGB(S, R, fwhm=3.0)
+    scaled = R.copy()
+    scaled[..., 1] *= 1.15                                                  # another stack's channel normalisation
+    assert abs(ho.chi2(scaled) - ho.chi2_r0) < 0.03 * ho.chi2_r0

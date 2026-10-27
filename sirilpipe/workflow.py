@@ -465,10 +465,14 @@ def register_script(process_dir: str, seq: str, n: int, resampling: dict | None 
     return "\n".join([f"cd {quote(process_dir)}", f"select {seq} 1 {n}", f"register {seq} {REGISTER_ARGS}"]) + "\n"
 
 
-def apply_script(process_dir: str, seq: str, n: int, excluded: list[int], resampling: dict) -> str:
+def apply_script(process_dir: str, seq: str, n: int, excluded: list[int], resampling: dict, reference: int | None = None) -> str:
     """``unselect`` the excluded frames (0-based indices; Siril's select/unselect are 1-based and inclusive),
-    then ``seqapplyreg`` of the included ones.  ``-filter-included`` makes Siril honour the selection."""
+    then ``seqapplyreg`` of the included ones.  ``-filter-included`` makes Siril honour the selection.  ``reference``: the 0-based index of the
+    frame whose grid the output takes (``setref``; it must be among the frames applied) - the experiments' frame subsets set it, so that stacks
+    of registrations that chose different reference frames share one grid."""
     lines = [f"cd {quote(process_dir)}", f"select {seq} 1 {n}"]
+    if reference is not None:
+        lines.append(f"setref {seq} {int(reference) + 1}")
     for a, b in ranges(excluded):
         lines.append(f"unselect {seq} {a + 1} {b + 1}")
     args = [f"seqapplyreg {seq}", f"-framing={resampling.get('framing', 'max')}", f"-scale={resampling.get('scale', 1.0):g}"]

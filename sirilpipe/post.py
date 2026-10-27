@@ -1536,8 +1536,10 @@ def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict |
         try:
             sm = layers.starnet.get("stars") or {}
             level = float(pro.mtf_balance(pro.star_stretch_m(float(p.get("star_stretch", pro.STAR_STRETCH))), 5.0 * float(sm["sky_noise"]))) if sm.get("sky_noise") else None
+            lin_n = finish.count_stars(layers.stars, float(sm["sky_noise"]))[0] if layers.stars is not None and sm.get("sky_noise") else sm.get("count")
             gate_report = gates.compute(img, starless=info.get("starless") if layers.stars is not None and p["star_reduction"] < 1.0 else None,
-                                        linear_star_count=sm.get("count"), star_level=level)
+                                        linear_star_count=lin_n, star_level=level, linear_stars=layers.stars, linear_noise=sm.get("sky_noise"),
+                                        linear_base=layers.base)
             print(gates.format_gates(gate_report), flush=True)
             fitsio.write_rgb(_p(work, "finish.fits"), img, layers.header)
         except Exception as e:                                           # noqa: BLE001  the gates never stop an export
