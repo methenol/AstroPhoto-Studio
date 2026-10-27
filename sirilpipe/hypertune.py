@@ -73,9 +73,7 @@ NEEDS = {("deconv_method", "bxt"): "bxt", ("deconv_stars_method", "bxt"): "bxt",
          ("deconv_stars_method", "graxpert"): "graxpert_deconv", ("denoise_method", "nxt"): "nxt", ("denoise_method", "graxpert"): "graxpert_denoise",
          ("star_removal", "sxt"): "sxt", ("star_removal", "starnet"): "starnet", ("star_removal", "darkstar"): "cc_darkstar",
          ("bg_method", "graxpert"): "graxpert_bge", ("cc_sharpen", "both"): "cc_sharpen", ("cc_sharpen", "stellar"): "cc_sharpen",
-         ("cc_sharpen", "nonstellar"): "cc_sharpen", ("cc_denoise", True): "cc_denoise", ("satellite_removal", True): "cc_satellite",
-         # "auto" deconvolution is BlurXTerminator, or Siril RL (CPU only) without its licence: searched only where it is BXT
-         ("deconv_method", "auto"): "bxt", ("deconv_stars_method", "auto"): "bxt"}
+         ("cc_sharpen", "nonstellar"): "cc_sharpen", ("cc_denoise", True): "cc_denoise", ("satellite_removal", True): "cc_satellite"}
 
 
 def task_param(task, name: str) -> dict:
@@ -286,7 +284,11 @@ class HyperTune:
         s, sp = self.s, self.sp
         t0 = time.time()
         # the calibration and registration are the stack stage's work: they run inside its experiment (StackTask.prepare), not before it
-        # one study per pipeline stage, the user's number of trials each: 1. Register & integrate (the trials re-stack this session)
+        # one study per pipeline stage, the user's number of trials each: 1. Register & integrate (the trials re-stack this session); the session's
+        # calibration choices are the baseline of the calibration settings
+        from .lab.tasks import CALIB_KEYS, apply_calibration
+        self.sp.update({f"calib_{k}": s.calib_prefs.get(k) for k in CALIB_KEYS if f"calib_{k}" not in self.sp})
+        sp = self.sp
         user_sp = dict(sp)
         rec = self.study("stack", "Register & integrate", options={"in_place": 1, "crop": 1024, "stack_params": user_sp})
         self.adopt(rec)
@@ -294,6 +296,7 @@ class HyperTune:
         if pf is not None and not float(user_sp.get("drizzle_pixfrac") or 0) and abs(float(pf) - rule_pixfrac(user_sp)) < 1e-9:
             self.sp["drizzle_pixfrac"] = 0.0                    # the best trial kept the rule's drop size: keep the rule
         self.progress(0, 1, "Hyper-tune · stacking with the best registration & integration settings")
+        apply_calibration(s, self.sp)                                   # the adopted calibration choices
         s.run_stack(self.sp, self.progress)
         s.plate_solve(self.progress)
         self._check()

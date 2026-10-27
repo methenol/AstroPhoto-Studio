@@ -846,10 +846,12 @@ def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> 
             "region": list(region) if region else None, "scale": scale, "flip": bool(flip)}
 
 
-def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None, local=None) -> dict:
+def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None, local=None, include: list[int] | None = None,
+        out_dir: str | None = None) -> dict:
     """Restore the included frames of a stacked session with VeraLux ImageMM -> ``imagemm.fits`` and
     ``imagemm_meta.json`` (returned).  Raises on failure: the restore job then fails with the reason (no BlurXTerminator in its place).
-    ``local``: see ``siril_preprocess``."""
+    ``local``: see ``siril_preprocess``.  ``include``: restore only these frames (frames.json row indices; the experiments' held-out
+    validation restores the frames it does not hold out); ``out_dir``: write imagemm.fits / imagemm_meta.json and the frame store there."""
     av = available()
     if not av["ok"]:
         raise RuntimeError(av["reason"])
@@ -877,11 +879,14 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
         region, off = (rx, ry, rw, rh), (rx, ry)
     rows = included_rows(session_dir)
     inc = [i for i, row in enumerate(rows) if row.get("included")]
+    if include is not None:
+        inc = [i for i in inc if i in set(include)]
     if not inc:
         raise RuntimeError("no included frames")
+    dest = out_dir or session_dir
     process = os.path.join(session_dir, "process")
     # (development: imagemm_work names another folder, so a production run never deletes a kept store)
-    work = os.path.join(session_dir, "process", str(sp["imagemm_work"])) if sp.get("imagemm_work") else os.path.join(session_dir, WORK)
+    work = os.path.join(session_dir, "process", str(sp["imagemm_work"])) if sp.get("imagemm_work") else os.path.join(dest, WORK)
     keep = _flag(sp.get("imagemm_keep_prepared", False))
     state = read_json(os.path.join(process, "state.json"), {}) or {}
     seq = state.get("seq") or "pp_light"
@@ -976,7 +981,7 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
         hdr["HISTORY"] = f"VeraLux ImageMM {V.VERSION} (Sukurdeep et al. 2025, AJ 170:233) of the registered frames"
         if r > 1:
             hdr["HISTORY"] = f"VeraLux ImageMM SR x{r:g}"
-        fitsio.write_rgb(os.path.join(session_dir, OUT_FITS), out, hdr)
+        fitsio.write_rgb(os.path.join(dest, OUT_FITS), out, hdr)
         kern = [k for k in (info.pop("kernels", None) or []) if k is not None]
         meta_out = {
             "ok": True, "method": f"VeraLux ImageMM {V.VERSION} ({'formal' if formal else 'practical'} mode)",
@@ -1005,7 +1010,7 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
             "seconds_per_frame_iteration": round(t_rest / max(1, info.get("iters_done") or 1) / max(1, len(store)), 4),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        write_json(os.path.join(session_dir, OUT_META), clean_json(meta_out))
+        write_json(os.path.join(dest, OUT_META), clean_json(meta_out))
         return clean_json(meta_out)
     finally:
         if not keep:

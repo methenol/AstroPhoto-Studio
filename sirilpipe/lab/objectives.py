@@ -808,3 +808,25 @@ class HeldOutRGB:
         L = self.L
         kern = L.fit_kernels(_ho_highpass(lum(img), L.sigma_hp), L.w, L.B)
         return np.mean([self._resid(Bc, _ho_highpass(np.ascontiguousarray(img[..., c]), L.sigma_hp), kern) for c, Bc in enumerate(self.Bc)], axis=0)
+
+
+def off_locus_linear(img: np.ndarray, yard: "Yardstick", snr: float = 60.0, tol: float = 0.05) -> float | None:
+    """The share of the yardstick's stars whose linear flux colour (aperture over the local annulus, each channel) is measured at S/N >= ``snr`` and
+    lies off the blackbody locus - green above both red and blue, or below both, by more than ``tol`` (the finishing gate stars_physical, in the
+    linear data): a colour calibration that mis-scales a channel moves stars off it."""
+    a = np.ascontiguousarray(img, dtype=np.float32)
+    if a.ndim != 3 or a.shape[-1] != 3:
+        return None
+    xs, ys = np.asarray(yard.sx, np.float64), np.asarray(yard.sy, np.float64)
+    if len(xs) < 20:
+        return None
+    r = float(yard.r_total)
+    noise = float(nmad((lum(a) - cv2.GaussianBlur(lum(a), (0, 0), 2.0))[::7, ::7])) or 1e-9
+    f = np.stack([sep.sum_circle(np.ascontiguousarray(a[..., c]), xs, ys, r, bkgann=(2.5 * r, 4 * r))[0] for c in range(3)])
+    err = noise * np.sqrt(np.pi) * r
+    ok = (f.min(0) > 0) & ((f / err).min(0) >= snr)
+    if ok.sum() < 20:
+        return None
+    rr, gg, bb = f[:, ok]
+    off = ~((np.minimum(rr, bb) * (1 - tol) <= gg) & (gg <= np.maximum(rr, bb) * (1 + tol)))
+    return float(off.mean())

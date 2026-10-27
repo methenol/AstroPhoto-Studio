@@ -235,7 +235,9 @@ class Task:
     display_ready = False
 
     def describe(self) -> dict:
-        return {"name": self.name, "label": self.label, "description": self.description, "params": self.params,
+        # the Experiments tab's studies search every parameter the hyper-tune searches unless the user unticks one: a broad space by default
+        params = [{**p, "tune": bool(p.get("tune") or p.get("hypertune"))} for p in self.params]
+        return {"name": self.name, "label": self.label, "description": self.description, "params": params,
                 "metrics": self.metrics, "options": self.options, "default_objective": self.default_objective or self.score,
                 "score": self.score, "min_gain": self.min_gain, "min_gain_rel": self.min_gain_rel, "objective_note": self.objective_note,
                 "constraints": {k: list(v) for k, v in self.static_limits().items()}, "sampler": getattr(self, "ht_sampler", "tpe")}
@@ -361,6 +363,16 @@ def _gate_distance(g: dict) -> float:
 
 
 # ----------------------------------------------------------------------------- registration & integration
+CALIB_KEYS = ("enabled", "dark", "flat", "bias")
+
+
+def apply_calibration(s, settings: dict) -> None:
+    """The calibration choices ``calib_<key>`` of ``settings`` into the session's calibration preferences (only those given)."""
+    prefs = {k: settings[f"calib_{k}"] for k in CALIB_KEYS if f"calib_{k}" in settings}
+    if prefs and any(s.calib_prefs.get(k) != v for k, v in prefs.items()):
+        s.set_calib_prefs(prefs)
+
+
 class StackTask(Task):
     name = "stack"
     label = "Registration & integration"
@@ -382,7 +394,7 @@ class StackTask(Task):
                       "at least 90 % of the baseline's field (a synthetic stack without banding correction came out cropped to a third of it).")
     params = [
         {"name": "rejection", "label": "Rejection algorithm (auto: winsorized, MAD for drizzle > 1x)", "type": "categorical",
-         "choices": ["auto", "winsorized", "sigma", "mad", "linear", "median", "none"], "ht_choices": ["auto", "winsorized", "sigma", "mad", "linear"],
+         "choices": ["auto", "winsorized", "sigma", "mad", "linear", "median", "none"],
          "default": "auto", "tune": False, "hypertune": True, "pipeline": "rejection"},
         {"name": "sigma_low", "label": "Rejection σ low", "type": "float", "low": 1.5, "high": 8.0, "default": 4.0, "tune": True, "hypertune": True, "pipeline": "sigma_low",
          "when": {"rejection": ["auto", "winsorized", "sigma", "mad", "linear"]}},
@@ -391,15 +403,25 @@ class StackTask(Task):
         {"name": "stack_weighting", "label": "Frame weighting (stack -weight)", "type": "categorical", "choices": ["wfwhm", "nbstars", "noise", "nbstack", "none"],
          "default": "wfwhm", "tune": False, "hypertune": True, "pipeline": "stack_weighting"},
         {"name": "sensitivity", "label": "Frame rejection sensitivity", "type": "float", "low": 0.5, "high": 2.0, "default": 1.0, "tune": False, "hypertune": True, "pipeline": "sensitivity"},
-        {"name": "mode", "label": "Resampling", "type": "categorical", "choices": ["auto", "drizzle", "demosaic"], "ht_choices": ["auto", "demosaic"],
+        {"name": "mode", "label": "Resampling", "type": "categorical", "choices": ["auto", "drizzle", "demosaic"],
          "default": "auto", "tune": False, "hypertune": True, "pipeline": "mode"},
         {"name": "drizzle_pixfrac", "label": "Drizzle drop size (pixfrac; 0 = 1 / scale)", "type": "float", "low": 0.5, "high": 1.0, "default": 1.0, "tune": False,
          "hypertune": True, "pipeline": "drizzle_pixfrac", "when": {"mode": ["auto", "drizzle"]}},
         {"name": "drizzle_kernel", "label": "Drizzle kernel", "type": "categorical", "choices": ["square", "point", "turbo", "gaussian", "lanczos2", "lanczos3"],
-         "ht_choices": ["square", "turbo", "gaussian"], "default": "square", "tune": False, "hypertune": True, "pipeline": "drizzle_kernel", "when": {"mode": ["auto", "drizzle"]}},
+         "default": "square", "tune": False, "hypertune": True, "pipeline": "drizzle_kernel", "when": {"mode": ["auto", "drizzle"]}},
         {"name": "scale", "label": "Drizzle scale", "type": "categorical", "choices": [1.0, 1.5, 2.0], "default": 1.0, "tune": False, "pipeline": "scale"},
         {"name": "pattern_correction", "label": "Row banding correction (seqfixbanding)", "type": "bool", "default": True, "tune": False, "hypertune": True, "pipeline": "pattern_correction"},
-        {"name": "crop_threshold", "label": "Crop: minimum frame coverage", "type": "float", "low": 0.1, "high": 1.0, "default": 0.3, "tune": False, "pipeline": "crop_threshold"},
+        {"name": "crop_threshold", "label": "Crop: minimum frame coverage", "type": "float", "low": 0.1, "high": 1.0, "default": 0.3, "tune": False, "hypertune": True,
+         "pipeline": "crop_threshold"},
+        # the calibration choices (Session.calib_prefs): calibration on / off, each master type automatic or none - a change re-calibrates and
+        # re-registers (the masters are part of the registration's signature)
+        {"name": "calib_enabled", "label": "Calibration masters", "type": "bool", "default": True, "tune": False, "hypertune": True, "pipeline": "calib_enabled"},
+        {"name": "calib_dark", "label": "Dark master", "type": "categorical", "choices": ["auto", "none"], "default": "auto", "tune": False, "hypertune": True,
+         "pipeline": "calib_dark", "when": {"calib_enabled": [True]}},
+        {"name": "calib_flat", "label": "Flat master", "type": "categorical", "choices": ["auto", "none"], "default": "auto", "tune": False, "hypertune": True,
+         "pipeline": "calib_flat", "when": {"calib_enabled": [True]}},
+        {"name": "calib_bias", "label": "Bias master", "type": "categorical", "choices": ["auto", "none"], "default": "auto", "tune": False, "hypertune": True,
+         "pipeline": "calib_bias", "when": {"calib_enabled": [True]}},
     ]
     metrics = {
         "stack_score": {"label": "Stack score: fidelity against the held-out frames, 0.5 ln(chi2 baseline / chi2)", "direction": "maximize"},
@@ -475,6 +497,7 @@ class StackTask(Task):
                 raise RuntimeError(f"{len(reg)} registered frames")
             held, trial = reg[0::2], reg[1::2]
             base_sp = dict(ctx["opts"].get("stack_params") or {})
+            apply_calibration(s, base_sp)                                   # the held-out half with the baseline's calibration choices
             H = s.stack_subsets({"held": held}, stack_params=base_sp, place=False)["held"]
             ctx["ref_frame"] = getattr(s, "last_reference", None)          # every trial's stack on this frame's grid
             v = OB.valid_region(OB.lum(_hwc(H)))
@@ -496,6 +519,7 @@ class StackTask(Task):
         sp = {**(ctx["opts"].get("stack_params") or {}),
               **{k: p[k] for k in ("rejection", "sigma_low", "sigma_high", "stack_weighting", "sensitivity", "mode", "drizzle_pixfrac", "drizzle_kernel",
                                    "scale", "pattern_correction", "crop_threshold") if k in p}}
+        apply_calibration(s, {**(ctx["opts"].get("stack_params") or {}), **p})
         t = time.time()
         from .. import post
         if ctx.get("held") is not None:
@@ -874,6 +898,51 @@ _BXT = ["auto", "bxt"]
 _STRENGTH_TOOLS = ["auto", "rl", "graxpert"]          # the Deconvolution slider acts on RL (blend) and GraXpert (-strength); auto falls back to RL without BXT
 
 
+_IMM = [{"deconv_method": ["imagemm"]}, {"deconv_stars_method": ["imagemm"]}]
+_IMM_FORMAL = [{"deconv_method": ["imagemm"], "imagemm_formal": [True]}, {"deconv_stars_method": ["imagemm"], "imagemm_formal": [True]}]
+
+
+def _imm(name, label, typ, default, **kw):
+    return {"name": name, "label": f"ImageMM: {label}", "type": typ, "default": default, "tune": False, "hypertune": True, "pipeline": name,
+            "when": kw.pop("when", _IMM), **kw}
+
+
+# VeraLux ImageMM's settings (imagemm_stage.PARAM_KEYS - every key its mapping reads), searched when ImageMM restores the objects or the stars, over
+# the script's own spin-box ranges (imagemm_stage.LIMITS) and the clamps of imagemm_stage.map_params; defaults webui.server STACK_DEFAULTS.  The
+# super-resolution factor r and its PSF sigma are the user's (super-resolution).
+IMAGEMM_PARAMS = [
+    _imm("imagemm_iterations", "iteration cap", "int", 150, low=1, high=200),
+    _imm("imagemm_huber", "Huber delta", "float", 0.05, low=0.001, high=1.0, log=True),
+    _imm("imagemm_huber_sigma", "Huber sigma (0 = off)", "float", 2.0, low=0.0, high=10.0),
+    _imm("imagemm_kappa", "update clipping kappa", "float", 2.0, low=1.01, high=50.0, log=True),
+    _imm("imagemm_mu", "stopping rule's effective-pixel fraction", "float", 0.1, low=0.0, high=1.0),
+    _imm("imagemm_epsilon", "stopping epsilon", "float", 1e-5, low=1e-8, high=1e-3, log=True),
+    _imm("imagemm_formal", "formal mode", "bool", False),
+    _imm("imagemm_shot_noise", "shot-noise scale (formal)", "float", 1.0, low=0.0, high=10.0, when=_IMM_FORMAL),
+    _imm("imagemm_read_noise", "read noise (formal)", "float", 0.0, low=0.0, high=1.0, when=_IMM_FORMAL),
+    _imm("imagemm_saturation", "saturation level (0 = measured)", "float", 0.0, low=0.0, high=1.0),
+    _imm("imagemm_variance", "variance from", "categorical", "model", choices=["model", "data"]),
+    _imm("imagemm_psf_channels", "one PSF per channel", "bool", True),
+    _imm("imagemm_lower_bound", "lower bound", "categorical", "local", choices=["local", "global", False]),
+    _imm("imagemm_cosmetic", "cosmetic correction of the subs", "bool", True),
+    _imm("imagemm_latent_sigma", "latent sigma", "float", 1.0, low=0.3, high=2.0),
+    _imm("imagemm_bound_sigma", "lower bound's margin (latent sigma)", "float", 1.0, low=0.0, high=3.0),
+    _imm("imagemm_halo", "halo", "bool", False),
+    _imm("imagemm_saturated_points", "saturated cores as points", "bool", False),
+    _imm("imagemm_saturated_photometry", "saturated cores' colour from their wings", "bool", True),
+    _imm("imagemm_psf_wings", "PSF wings", "bool", False),
+    _imm("imagemm_psf_asymmetry", "PSF asymmetry", "bool", True),
+    _imm("imagemm_psf_radial_wings", "PSF radial wings", "bool", True),
+    _imm("imagemm_bloom_grow", "bloom growth (px)", "int", 4, low=0, high=16),
+    _imm("imagemm_point_init", "saturated stars start as points", "bool", True),
+    _imm("imagemm_censor_saturated", "saturated pixels as censored data", "bool", False),
+    _imm("imagemm_reference_psf", "reference PSF", "bool", True),
+    _imm("imagemm_photometry", "photometry", "bool", True),
+    _imm("imagemm_noise_model", "noise model", "categorical", "ptc", choices=["ptc", "script"]),
+    _imm("imagemm_subsky", "per-frame sky subtraction", "bool", False),
+]
+
+
 class RestoreTask(Task):
     name = "restore"
     label = "Linear restoration (restore stage)"
@@ -896,14 +965,17 @@ class RestoreTask(Task):
                       "<= 0.05, faint <= 0.10), no dark rings round the bright stars (moat), the gradient left in the sky <= 3 x the noise, the model's "
                       "structure at 1 - 10 % of the frame <= 15 %, no more satellite trails than Cosmic Clarity's removal leaves.  Without frames to hold "
                       "out (an HDR stack, < 6 frames) the depth gained replaces the fidelity gain (logged).")
-    params = (_processing_params(["bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance",
+    params = (_processing_params(["background", "bg_method", "bg_smoothing", "bg_degree", "bg_correction", "deconvolution", "denoise", "white_balance", "spcc_white_ref",
                                   "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations"],
                                  {"deconvolution", "denoise"},
-                                 hypertune={"bg_method": True, "bg_smoothing": True, "bg_degree": True, "bg_correction": True,
+                                 hypertune={"background": True, "bg_method": True, "bg_smoothing": True, "bg_degree": True, "bg_correction": True,
+                                            "white_balance": True, "spcc_white_ref": True,
                                             "deconvolution": True, "denoise": True, "bxt_auto": True, "bxt_sharpen_stars": True, "bxt_sharpen_nonstellar": True,
                                             "bxt_halos": True, "linear_denoise_auto": True, "linear_denoise_strength": True, "nxt_iterations": True},
-                                 when={"bg_degree": {"bg_method": ["poly"]}, "bg_smoothing": {"bg_method": ["auto", "graxpert", "rbf"]},
-                                       "bg_correction": {"bg_method": ["auto", "graxpert", "poly", "rbf"]},
+                                 when={"bg_method": {"background": [True]}, "bg_degree": {"bg_method": ["poly"], "background": [True]},
+                                       "bg_smoothing": {"bg_method": ["auto", "graxpert", "rbf"], "background": [True]},
+                                       "bg_correction": {"bg_method": ["auto", "graxpert", "poly", "rbf"], "background": [True]},
+                                       "spcc_white_ref": {"white_balance": ["auto"]},
                                        "deconvolution": [{"deconv_method": _STRENGTH_TOOLS}, {"deconv_stars_method": _STRENGTH_TOOLS}],
                                        "bxt_auto": [{"deconv_method": _BXT}, {"deconv_stars_method": _BXT}],
                                        "bxt_sharpen_stars": {"bxt_auto": [False], "deconv_stars_method": _BXT},
@@ -913,26 +985,17 @@ class RestoreTask(Task):
                                        "linear_denoise_auto": {"denoise_method": ["auto", "nxt", "graxpert", "siril"]},
                                        "linear_denoise_strength": {"denoise_method": ["auto", "nxt", "graxpert", "siril"], "linear_denoise_auto": [False]},
                                        "nxt_iterations": {"denoise_method": ["auto", "nxt"], "linear_denoise_auto": [False]}})
-              + [{"name": "deconv_method", "label": "Deconvolution tool (objects)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"],
+              + [{"name": "deconv_method", "label": "Deconvolution tool (objects)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "imagemm", "none"],
                   "default": "auto", "tune": False, "hypertune": True, "pipeline": "deconv_method"},
-                 {"name": "deconv_stars_method", "label": "Deconvolution tool (stars)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "none"],
+                 {"name": "deconv_stars_method", "label": "Deconvolution tool (stars)", "type": "categorical", "choices": ["auto", "bxt", "graxpert", "rl", "imagemm", "none"],
                   "default": "auto", "tune": False, "hypertune": True, "pipeline": "deconv_stars_method"},
                  {"name": "denoise_method", "label": "Noise reduction tool", "type": "categorical", "choices": ["auto", "nxt", "graxpert", "siril", "none"],
                   "default": "auto", "tune": False, "hypertune": True, "pipeline": "denoise_method"},
                  {"name": "graxpert_psfsize", "label": "GraXpert PSF size (px; 0 = measured)", "type": "float", "low": 0.0, "high": 14.0, "default": 0.0, "tune": False,
-                  "pipeline": "graxpert_psfsize", "when": [{"deconv_method": ["graxpert"]}, {"deconv_stars_method": ["graxpert"]}]},
+                  "hypertune": True, "pipeline": "graxpert_psfsize", "when": [{"deconv_method": ["graxpert"]}, {"deconv_stars_method": ["graxpert"]}]},
                  {"name": "satellite_removal", "label": "Cosmic Clarity satellite-trail removal (before the gradient)", "type": "bool", "default": False, "tune": False,
-                  "hypertune": True, "pipeline": "satellite_removal"}])
-    # reference = auto without its fallback: the same model wherever auto uses the survey
-    next(q for q in params if q["name"] == "bg_method")["ht_choices"] = ["auto", "graxpert", "poly", "rbf"]
-    # the hyper-tune searches the tools that run on the GPU: Siril's Richardson-Lucy deconvolution and its denoiser have no GPU implementation
-    # (a Siril RL trial took 10-25 min of CPU on M 31 against about a minute for BlurXTerminator / GraXpert); both stay the user's to choose
-    for _q in params:
-        if _q["name"] in ("deconv_method", "deconv_stars_method"):
-            _q["ht_choices"] = ["auto", "bxt", "graxpert", "none"]
-        elif _q["name"] == "denoise_method":
-            _q["ht_choices"] = ["auto", "nxt", "graxpert", "none"]
-    del _q
+                  "hypertune": True, "pipeline": "satellite_removal"}]
+              + IMAGEMM_PARAMS)
     metrics = {
         "restore_score": {"label": "Restore score: fidelity gained against the held-out frames + ln(1 - emission changed by the gradient model)", "direction": "maximize"},
         "fidelity_gain": {"label": "Fidelity gained against the held-out sharpest frames: 0.5 ln(chi2 unrestored / chi2)", "direction": "maximize"},
@@ -950,6 +1013,7 @@ class RestoreTask(Task):
         "sky_flatness": {"label": "Gradient left in the sky (x pixel noise)", "direction": "minimize"},
         "model_structure": {"label": "Structure the gradient model removed at 1-10 % of the frame (fraction)", "direction": "minimize"},
         "trails": {"label": "Satellite / aircraft trail pixels per million left", "direction": "minimize"},
+        "stars_off_locus": {"label": "Stars (colour S/N >= 60) off the blackbody locus, linear (fraction)", "direction": "minimize"},
         "bg_noise": {"label": "Background noise", "direction": "minimize"},
         "sharpness": {"label": "Sharpness S_F (Krotkov; rewards noise - reported only)", "direction": "maximize"},
         "seconds": {"label": "Run time (s)", "direction": "minimize"},
@@ -965,6 +1029,9 @@ class RestoreTask(Task):
         # the held-out fidelity judges the image's structure (stars masked); the constraints cover what it does not see: the stars' photometry
         # and dark rings, the gradient model's flatness and structure, the satellite trails
         out = {"dm_bright_abs": ("max", 0.05), "dm_faint_abs": ("max", 0.10), "sky_flatness": ("max", 3.0), "model_structure": ("max", 0.15)}
+        b = ctx.get("base_off_locus")
+        if b is not None:
+            out["stars_off_locus"] = ("max", b + 0.02)                    # no colour calibration that puts more stars off the locus than the baseline
         out["moat"] = ("max", (ctx.get("ref_moat") or 0.0) + 1.0)
         if ctx.get("trails_min") is not None:
             # no trial may leave more satellite trails than Cosmic Clarity's removal takes out of this stack (the depth's robust noise does not see them)
@@ -978,11 +1045,12 @@ class RestoreTask(Task):
         tools = available_tools()
         auto_dc = "bxt" if tools.get("bxt") else "rl"
         auto_dn = next((t for t, k in (("nxt", "nxt"), ("graxpert", "graxpert_denoise")) if tools.get(k)), "siril")
+        self._rest_rows = None
         src, sharp = self._held_out(s, study_dir, log, cancel)
         g = gradient_context(s, study_dir, device, log, cancel, src_dir=src)
         return {"ds": ds, "session": s, "study_dir": study_dir, "n": 0, "device": device, "opts": opts, "refs": {}, "pre": {},
                 "auto_deconv": auto_dc, "auto_denoise": auto_dn, "cc_satellite": bool(tools.get("cc_satellite")), "grad": g, "skyref": g["skyref"],
-                "src_dir": src, "sharp_dir": sharp}
+                "src_dir": src, "sharp_dir": sharp, "restore_rows": self._rest_rows}
 
     HELD_OUT = 1.0 / 3.0          # the sharpest third of the frames is held out
 
@@ -1007,6 +1075,7 @@ class RestoreTask(Task):
                 dirs[name] = d
             fw = lambda ix: float(np.median([rows[i]["fwhm"] for i in ix if rows[i].get("fwhm")]))
             log(f"Held out: the {k} sharpest frames (median FWHM {fw(inc[:k]):.2f} px); the trials restore the other {len(inc) - k} ({fw(inc[k:]):.2f} px)")
+            self._rest_rows = inc[k:]
             return dirs["rest"], dirs["sharp"]
         except Exception as e:                         # noqa: BLE001
             log(f"No held-out frames ({type(e).__name__}: {e}): the trials restore the stack and are scored on the depth gained")
@@ -1042,7 +1111,7 @@ class RestoreTask(Task):
 
     def _settings(self, ctx, p):
         from .. import post
-        tool_keys = ("deconv_method", "deconv_stars_method", "denoise_method", "graxpert_psfsize", "satellite_removal")
+        tool_keys = ("deconv_method", "deconv_stars_method", "denoise_method", "graxpert_psfsize", "satellite_removal") + tuple(q["name"] for q in IMAGEMM_PARAMS)
         prm = {**post.DEFAULTS, **{k: v for k, v in p.items() if k not in tool_keys}}
         s = ctx["session"]
         sp = {**(s.meta.get("params") or {}), **(ctx["opts"].get("stack_params") or {}),
@@ -1061,11 +1130,26 @@ class RestoreTask(Task):
         s = ctx["session"]
         wd = os.path.join(ctx["study_dir"], "work", tag)
         _copy_products(src or ctx.get("src_dir") or s.dir, wd, ("stack.fits", "stack_meta.json", "skyref.npz"))
+        meta_r = s.meta
+        if "imagemm" in post.deconv_choice(sp):
+            # VeraLux ImageMM restores the frames this trial restores (the held-out frames excluded) into the trial's folder; the linear stage then
+            # works on its result, as session.run_denoise has post.restore work on imagemm.fits
+            from .. import imagemm_stage
+            imm_key = json.dumps({k: sp.get(k) for k in sorted(sp) if k.startswith("imagemm_")}, sort_keys=True, default=str)
+            cache = ctx.setdefault("imagemm_cache", {})
+            if imm_key not in cache:
+                d_imm = os.path.join(ctx["study_dir"], "work", f"imagemm_{len(cache)}")
+                os.makedirs(d_imm, exist_ok=True)
+                imagemm_stage.run(s.dir, s.meta, sp, checkpoint=_checkpoint(cancel), include=ctx.get("restore_rows"), out_dir=d_imm)
+                cache[imm_key] = d_imm
+            shutil.copy(os.path.join(cache[imm_key], imagemm_stage.OUT_FITS), os.path.join(wd, imagemm_stage.OUT_FITS))
+            meta_r = {**s.meta, "restore_source": imagemm_stage.OUT_FITS}
         try:
-            r = post.Restorer(wd, s.meta, sp, {**post.DEFAULTS, **prm}, None, _checkpoint(cancel))
+            r = post.Restorer(wd, meta_r, sp, {**post.DEFAULTS, **prm}, None, _checkpoint(cancel))
             psf = (r.source != "imagemm.fits" and float(r.p["deconvolution"]) > 0 and r.deconv != ("none", "none") and bool({"auto", "bxt"} & set(r.deconv)))
             key = json.dumps([{k: r.p.get(k) for k in ("background", "bg_method", "bg_correction", "bg_degree", "bg_smoothing", "white_balance", "spcc_sensor",
-                                                        "spcc_filter", "spcc_white_ref")}, bool(sp.get("satellite_removal")), psf], sort_keys=True, default=str)
+                                                        "spcc_filter", "spcc_white_ref")}, bool(sp.get("satellite_removal")), psf, r.source,
+                              {k: sp.get(k) for k in sorted(sp) if k.startswith("imagemm_")} if r.source != "stack.fits" else None], sort_keys=True, default=str)
             pre = ctx.setdefault("pre", {}) if src is None else {}
             t0 = time.time()
             if key in pre:
@@ -1163,6 +1247,11 @@ class RestoreTask(Task):
         out["depth_gain"] = (out["depth"] - pre["depth0"]) if out.get("depth") is not None and pre["depth0"] is not None else None
         g = pre["grad"]
         out.update({k: g.get(k) for k in ("emission_change", "signal_removed", "sky_flatness", "model_structure", "gradient_tool")})
+        # the colour calibration (white balance, white reference): the share of the stars measured at colour S/N >= 60 whose colour is off the
+        # blackbody locus - the held-out chi2 fits each channel's gain, so it does not see a colour balance
+        if "colour_ref" not in ctx:
+            ctx["colour_ref"] = OB.Yardstick(est, keep_image=False)
+        out["stars_off_locus"] = OB.off_locus_linear(est, ctx["colour_ref"])
         keep = math.log(max(1.0 - float(g.get("emission_change") or 0.0), 1e-3))
         if ctx.get("heldout") is not None:
             h = ctx["heldout"]
@@ -1176,6 +1265,8 @@ class RestoreTask(Task):
         out.update(bg_noise=MX.background_noise(est), sharpness=float(np.mean([MX.sharpness(est[..., c]) for c in range(3)])), seconds=dt,
                    trails=trail_pixels(est), tools=" + ".join(meta.get("tools") or []) or "none",
                    failed=[f"{r['tool']}: {r['status']}" for r in meta.get("steps", []) if r.get("status") in ("failed", "unavailable")])
+        if "base_off_locus" not in ctx and out.get("stars_off_locus") is not None:
+            ctx["base_off_locus"] = out["stars_off_locus"]                # the baseline (trial 0)
         if ds.synthetic:
             out.update(_truth_scores(ds, s, lin, float(ctx["opts"].get("sigma_eval", 1.0))))
         return out, est
@@ -1193,8 +1284,7 @@ class StarsTask(Task):
                       "away from the stars within 1 × the noise there (the nebula and the sky are not the remover's to touch), and holes (a star's aperture "
                       "more than 3 σ below its surroundings) at most 5 % of the stars.")
     params = [
-        # the hyper-tune searches the GPU tools: StarNet2's build is CPU-only (tools.py) - it stays the user's to choose
-        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"], "ht_choices": ["sxt", "darkstar"],
+        {"name": "star_removal", "label": "Tool", "type": "categorical", "choices": ["auto", "sxt", "starnet", "darkstar"],
          "default": "auto", "tune": True, "hypertune": True, "processing": "star_removal"},
         {"name": "starnet_stride", "label": "StarNet2 stride", "type": "categorical", "choices": [64, 128, 256], "default": 256, "tune": False, "hypertune": True,
          "processing": "starnet_stride", "when": {"star_removal": ["starnet"]}},
@@ -1344,12 +1434,13 @@ class FinishTask(Task):
          "halo_suppress", "scnr", "black_point", "brightness", "sky_levelling", "sky_level",
          "grade_amount", "grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat", "grade_contrast"],
         {"stretch", "contrast", "hdr", "saturation", "local_contrast", "star_reduction"},
-        hypertune={**{k: True for k in ("stretch_method", "stretch", "stretch_boost", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise",
+        hypertune={**{k: True for k in ("stretch_method", "stretch", "auto_stretch", "stretch_boost", "contrast", "hdr", "hdr_method", "color_preservation", "luminance_denoise",
                                        "chroma_denoise", "cc_denoise", "cc_denoise_model", "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "saturation",
                                        "local_contrast", "sharpen", "star_reduction", "star_intensity", "star_saturation", "star_color_preservation", "halo_suppress",
                                        "scnr", "black_point", "brightness", "sky_levelling", "sky_level")},
-                   # the palette, its formula / OIII boost and the colour grade are matters of style: the user's, never searched
-                   "oiii_unmix": "dual", "synthetic_luminance": "dual"},
+                   "palette": True, "hubble_formula": True, "oiii_boost": True, "oiii_unmix": "dual", "synthetic_luminance": "dual",
+                   **{k: True for k in ("grade_amount", "grade_temperature", "grade_tint", "grade_warm_hue", "grade_warm_sat", "grade_cool_hue", "grade_cool_sat",
+                                        "grade_contrast")}},
         when={"stretch_boost": {"stretch_method": ["statstretch"]}, "contrast": {"stretch_method": _GHS}, "color_preservation": {"stretch_method": _GHS},
               "cc_denoise_model": {"cc_denoise": [True]}, "cc_stellar_amount": {"cc_sharpen": ["both", "stellar"]},
               "cc_nonstellar_amount": {"cc_sharpen": ["both", "nonstellar"]}, "hubble_formula": {"palette": _HUBBLE}, "oiii_boost": {"palette": ["nbn"]},

@@ -143,18 +143,18 @@ def _study(values, cons, baseline=0, direction="maximize"):
     return st
 
 
-def test_best_trial_feasible_and_min_gain():
-    task = TASKS["restore"]                                               # score restore_score (maximize), min_gain 0.01
+def test_best_trial_feasible_wins():
+    task = TASKS["restore"]
     cfg = {"objectives": [{"metric": "restore_score", "direction": "maximize"}], "task": "restore"}
     st = _study([3.0, 3.5, 3.2], [[0.0], [0.4], [-0.1]])                  # trial 1 is best but breaks a constraint
     t, _ = labrun.best_trial(st, cfg, task)
     assert t.number == 2
-    st = _study([3.0, 3.003], [[0.0], [0.0]])                             # better by less than the resolution: the baseline stays
+    st = _study([3.0, 3.003], [[0.0], [0.0]])                             # the better trial wins, however small the gain
     t, why = labrun.best_trial(st, cfg, task)
-    assert t.number == 0 and "baseline kept" in why
-    st = _study([0.300, 0.297], [[0.0], [0.0]], direction="minimize")   # 1 - H: the gain must exceed half a percent of the structure
+    assert t.number == 1
+    st = _study([0.300, 0.297], [[0.0], [0.0]], direction="minimize")
     t, why = labrun.best_trial(st, {"objectives": [{"metric": "finish_score", "direction": "minimize"}]}, TASKS["finish"])
-    assert t.number == 0 and "baseline kept" in why
+    assert t.number == 1
     st = _study([3.0, 3.1], [[0.5], [0.2]])                               # none feasible: the least infeasible
     t, why = labrun.best_trial(st, cfg, task)
     assert t.number == 1 and "least infeasible" in why
@@ -168,8 +168,8 @@ def test_build_space_prunes_tools_and_keeps_style_choices():
     assert "bxt" not in sp["deconv_method"]["choices"] and sp["deconv_method"]["value"] != "bxt"
     assert "nxt" not in sp["denoise_method"]["choices"] and notes
     fin, _ = hypertune.build_space(TASKS["finish"], {}, {"palette": "hoo"}, dual=True, tools=tools)
-    assert not fin["palette"]["tune"] and fin["palette"]["value"] == "hoo"        # style: the user's, never searched
-    assert not fin["grade_amount"]["tune"] and not fin["hubble_formula"]["tune"]
+    assert fin["palette"]["tune"] and fin["palette"]["value"] == "hoo"            # every finishing setting searched, the user's value the baseline
+    assert fin["grade_amount"]["tune"] and fin["hubble_formula"]["tune"]
     assert fin["synthetic_luminance"]["tune"] and fin["cc_sharpen"]["tune"]
     st, _ = hypertune.build_space(TASKS["stack"], {"scale": 2.0, "drizzle_pixfrac": 0.0}, {}, dual=False, tools=tools)
     assert st["drizzle_pixfrac"]["value"] == 0.5 and not st["scale"]["tune"]
@@ -276,7 +276,7 @@ def test_registration_grid_space():
                                   only=("mode", "pattern_correction"))
     assert [k for k, v in sp.items() if v.get("tune")] == ["mode", "pattern_correction"]
     grid = labrun.grid_space(labrun.baseline_space(sp, TASKS["stack"]), TASKS["stack"])
-    assert grid == {"mode": ["auto", "demosaic"], "pattern_correction": [True, False]}
+    assert grid == {"mode": ["auto", "drizzle", "demosaic"], "pattern_correction": [True, False]}
     st, _ = hypertune.build_space(TASKS["stack"], {}, {}, dual=False, tools={}, exclude=("mode", "pattern_correction"))
     assert not st["mode"]["tune"] and st["sigma_low"]["tune"] and st["rejection"]["tune"]
 

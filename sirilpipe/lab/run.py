@@ -175,28 +175,15 @@ def best_trial(study, cfg: dict, task=None):
         best = min(pool, key=lambda q: sgn * q.values[0])
         why = f"best {objs[0]['metric']} ({objs[0].get('direction', 'minimize')})"
         base = next((t for t in pool if t.user_attrs.get("baseline")), None)
-        gain = 0.0
-        if task is not None and objs[0]["metric"] == getattr(task, "score", None) and base is not None:
-            # the measurement's resolution: absolute (log-scale scores), or relative to the baseline's score (a distance)
-            gain = max(float(getattr(task, "min_gain", 0.0) or 0.0), float(getattr(task, "min_gain_rel", 0.0) or 0.0) * abs(base.values[0]))
-        if base is not None and best.number != base.number and gain > 0 and sgn * (base.values[0] - best.values[0]) < gain:
-            why = (f"baseline kept: the best {objs[0]['metric']} ({best.values[0]:.4g}, trial {best.number}) improves it by less than {gain:g} "
-                   f"(the measurement's resolution)")
-            best = base
-        elif base is not None and best.number != base.number and task is not None and objs[0]["metric"] == getattr(task, "score", None):
-            # a held-out score: the two trials were compared with the same held-out pixels, so the gain is tested tile by tile (a paired test):
-            # it must exceed two standard errors of the per-tile gains
+        if base is not None and best.number != base.number and task is not None and objs[0]["metric"] == getattr(task, "score", None):
+            # how sure the gain over the baseline is (information only: the best trial wins) - a held-out score is tested tile by tile, the two
+            # trials compared with the same held-out pixels
             tb = (base.user_attrs.get("metrics") or {}).get("heldout_tiles")
             tt = (best.user_attrs.get("metrics") or {}).get("heldout_tiles")
             if tb and tt and len(tb) == len(tt) and len(tb) >= 4:
                 d = 0.5 * np.log(np.asarray(tb, float) / np.maximum(np.asarray(tt, float), 1e-12))
                 mu, se = float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d)))
-                if mu <= 2.0 * se:
-                    why = (f"baseline kept: the best {objs[0]['metric']} ({best.values[0]:.4g}, trial {best.number}) gains {mu:.4g} over the held-out "
-                           f"tiles, within two standard errors ({2 * se:.3g}) of no gain")
-                    best = base
-                else:
-                    why += f"; held-out gain {mu:.4g} over {len(d)} tiles, {mu / max(se, 1e-12):.1f} standard errors"
+                why += f"; held-out gain {mu:.4g} over {len(d)} tiles, {mu / max(se, 1e-12):.1f} standard errors"
         return best, why + note
 
     def dominates(a, b):
@@ -224,6 +211,18 @@ def best_record(study, cfg: dict, task) -> dict:
             "metrics": t.user_attrs.get("metrics"), "feasible": _violation(t) <= 0, "baseline_trial": base.number if base else None,
             "baseline_values": base.values if base else None, "baseline_metrics": base.user_attrs.get("metrics") if base else None,
             "is_baseline": bool(t.user_attrs.get("baseline")), "n_complete": sum(1 for q in study.trials if q.values)}
+
+
+def discard_work(study_dir: str):
+    """Remove what a study only needs while it runs: the calibrated / registered session, held-out stacks and caches under
+    work/, and the measured reference (reference.pkl).  A finished study keeps its record only - config, status, log,
+    Optuna storage, best.json and the trial previews; continuing it prepares again."""
+    shutil.rmtree(os.path.join(study_dir, "work"), ignore_errors=True)
+    for name in ("reference.pkl", "reference.pkl.tmp"):
+        try:
+            os.remove(os.path.join(study_dir, name))
+        except OSError:
+            pass
 
 
 def run_study(study_dir: str, cancel: threading.Event | None = None, on_log=None, session=None, install_signals: bool = False) -> dict:
@@ -456,6 +455,7 @@ def run_study(study_dir: str, cancel: threading.Event | None = None, on_log=None
     finally:
         status["ended"] = time.time()
         _write_json(status_path, status)
+        discard_work(study_dir)
     if outer["error"] is not None:
         raise outer["error"]
     return status

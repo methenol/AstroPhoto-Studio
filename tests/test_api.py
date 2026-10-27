@@ -771,6 +771,61 @@ def test_lab_routes(env):
     assert r.status_code == 400
 
 
+def test_lab_delete_study_and_synthetic(env):
+    """A finished study and a synthetic dataset can be deleted (the routes had lacked their shutil import: every delete answered 500)."""
+    import json as _json
+    from webui import server
+    c = env.client
+    for kind, name, state in (("studies", "20260101-000000_old", "done"), ("synthetic", "old-set", "done")):
+        d = server._lab(kind, name)
+        os.makedirs(d, exist_ok=True)
+        _json.dump({"state": state}, open(os.path.join(d, "status.json"), "w"))
+        _json.dump({"name": name, "task": "stars", "dataset": {"kind": "real", "name": "x"}, "objectives": [], "n_trials": 1}, open(os.path.join(d, "config.json"), "w"))
+    root = os.path.join(server.CONFIG["workdir"], "lab")                     # (_lab() creates the folder it names)
+    assert c.delete("/api/lab/studies/20260101-000000_old").json() == {"ok": True}
+    assert not os.path.exists(os.path.join(root, "studies", "20260101-000000_old"))
+    assert "20260101-000000_old" not in [x["id"] for x in c.get("/api/lab/studies").json()["studies"]]
+    assert c.delete("/api/lab/synthetic/old-set").json() == {"ok": True}
+    assert not os.path.exists(os.path.join(root, "synthetic", "old-set"))
+
+
+def test_lab_delete_many_is_immediate_and_skips_running(env):
+    """Several studies are deleted in one call: moved out of the list at once (their folders removed in the background); a running
+    study is skipped with the reason.  The list summary is cached against the study's storage."""
+    import json as _json
+    from webui import server
+    c = env.client
+    for name, state in (("20260102-000000_a", "done"), ("20260102-000001_b", "stopped"), ("20260102-000002_run", "running")):
+        d = server._lab("studies", name)
+        os.makedirs(os.path.join(d, "work", "stack"), exist_ok=True)
+        open(os.path.join(d, "work", "stack", "big.fits"), "wb").write(b"0" * 1024)
+        _json.dump({"state": state, "pid": os.getpid()}, open(os.path.join(d, "status.json"), "w"))
+        _json.dump({"name": name, "task": "stars", "dataset": {"kind": "real", "name": "x"}, "objectives": [], "n_trials": 1}, open(os.path.join(d, "config.json"), "w"))
+    listed = {x["id"]: x for x in c.get("/api/lab/studies").json()["studies"]}
+    assert listed["20260102-000000_a"]["n_total"] == 0 and "pick" not in listed["20260102-000000_a"]
+    r = c.post("/api/lab/studies/delete", json={"ids": ["20260102-000000_a", "20260102-000001_b", "20260102-000002_run", "nope"]}).json()
+    assert r["deleted"] == ["20260102-000000_a", "20260102-000001_b"]
+    assert [x["id"] for x in r["skipped"]] == ["20260102-000002_run", "nope"]
+    ids = [x["id"] for x in c.get("/api/lab/studies").json()["studies"]]
+    assert "20260102-000000_a" not in ids and "20260102-000001_b" not in ids and "20260102-000002_run" in ids
+    t = server._LAB_PURGE["thread"]
+    if t is not None:
+        t.join(10)
+    assert not os.listdir(os.path.join(server.CONFIG["workdir"], "lab", "trash"))
+
+
+def test_study_end_discards_work(tmp_path):
+    """A study that ends keeps its record only: the registered session, held-out stacks and the measured reference are removed."""
+    from sirilpipe.lab.run import discard_work
+    d = tmp_path / "study"
+    (d / "work" / "stack").mkdir(parents=True)
+    (d / "work" / "stack" / "r_0001.fit").write_bytes(b"0" * 64)
+    for n in ("reference.pkl", "study.db", "config.json", "log.txt", "best.json"):
+        (d / n).write_text("x")
+    discard_work(str(d))
+    assert sorted(os.listdir(d)) == ["best.json", "config.json", "log.txt", "study.db"]
+
+
 class FakeAstrometry:
     """Stands in for astrophoto.astrometry: no network, no solver."""
     solved: set = set()

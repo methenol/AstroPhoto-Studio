@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -1464,7 +1465,7 @@ def _study_dir(sid: str) -> str:
     return d
 
 
-def _load_trials(d: str, cfg: dict):
+def _load_trials(d: str, cfg: dict, images: bool = True):
     try:
         import optuna
     except ImportError:                                   # an image built without optuna: the studies are listed without their trials
@@ -1486,34 +1487,77 @@ def _load_trials(d: str, cfg: dict):
                      "baseline": bool(t.user_attrs.get("baseline") or t.system_attrs.get("fixed_params")),
                      "seconds": (t.datetime_complete - t.datetime_start).total_seconds()
                      if t.datetime_complete and t.datetime_start else None,
-                     "image": os.path.exists(os.path.join(d, "trials", f"{t.number}.jpg"))})
+                     "image": images and os.path.exists(os.path.join(d, "trials", f"{t.number}.jpg"))})
     return study, rows
+
+
+_LAB_SUMMARY: dict[str, tuple] = {}     # study dir -> (signature, summary)
+_LAB_PURGE = {"thread": None}
+
+
+def _study_signature(d: str) -> list:
+    """What a study's listed summary depends on: its config and its Optuna storage (size and modification time)."""
+    sig = []
+    for f in ("config.json", "study.db", "study.db-wal"):
+        try:
+            st = os.stat(os.path.join(d, f))
+            sig.append([st.st_mtime_ns, st.st_size])
+        except OSError:
+            sig.append(None)
+    return sig
+
+
+def _study_summary(d: str, cfg: dict) -> dict:
+    """The trial counts and best value of a study for the list, recomputed only when its storage changed: cached in
+    memory and in the study's summary.json, so a restarted server lists its studies without reloading every one."""
+    sig = _study_signature(d)
+    hit = _LAB_SUMMARY.get(d)
+    if hit and hit[0] == sig:
+        return hit[1]
+    p = os.path.join(d, "summary.json")
+    try:
+        disk = json.load(open(p))
+        if disk.get("signature") == sig:
+            _LAB_SUMMARY[d] = (sig, disk["summary"])
+            return disk["summary"]
+    except Exception:
+        pass
+    study, rows = _load_trials(d, cfg, images=False)
+    done = [r for r in rows if r["state"] == "COMPLETE"]
+    best = None
+    if done and len(cfg["objectives"]) == 1 and study is not None:
+        try:
+            best = _best_trial(study, cfg)[0].values[0]
+        except Exception:
+            best = None
+    summary = clean_json({"n_complete": len(done), "n_total": len(rows), "best": best,
+                          "pick": _best_settings(study, cfg) if done and study is not None else None})
+    _LAB_SUMMARY[d] = (sig, summary)
+    try:
+        tmp = p + ".tmp"
+        json.dump({"signature": sig, "summary": summary}, open(tmp, "w"))
+        os.replace(tmp, p)
+    except Exception:
+        pass
+    return summary
 
 
 @app.get("/api/lab/studies")
 def lab_list():
-    import json as _json
     out = []
     root = _lab("studies")
     for sid in sorted(os.listdir(root), reverse=True):
         d = os.path.join(root, sid)
         try:
-            cfg = _json.load(open(os.path.join(d, "config.json")))
+            cfg = json.load(open(os.path.join(d, "config.json")))
         except Exception:
             continue
         st = _read_status(d)
-        study, rows = _load_trials(d, cfg)
-        done = [r for r in rows if r["state"] == "COMPLETE"]
-        best = None
-        if done and len(cfg["objectives"]) == 1 and study is not None:
-            try:
-                best = _best_trial(study, cfg)[0].values[0]
-            except Exception:
-                best = None
         out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "dataset": cfg["dataset"].get("name"),
                     "state": st.get("state"), "message": st.get("message"), "n_trials": cfg.get("n_trials"),
-                    "n_complete": len(done), "n_total": len(rows), "best": best, "hypertune": bool(cfg.get("hypertune")),
+                    **{k: v for k, v in _study_summary(d, cfg).items() if k != "pick"}, "hypertune": bool(cfg.get("hypertune")),
                     "objectives": cfg["objectives"], "created": cfg.get("created")})
+    _purge_trash()
     return clean_json({"studies": out})
 
 
@@ -1526,43 +1570,47 @@ def _best_trial(study, cfg):
     return best_trial(study, cfg, TASKS.get(cfg.get("task")))
 
 
+def _best_settings(study, cfg: dict) -> dict | None:
+    """A study's best trial and the pipeline settings it maps to (None for a task the Siril backend does not have:
+    imagemm, network, ...; its settings cannot be applied)."""
+    from sirilpipe.lab.tasks import TASKS
+    try:
+        t, why = _best_trial(study, cfg)
+    except Exception:
+        return None
+    task = TASKS.get(cfg["task"])
+    if task is None:
+        return None
+    allp = t.user_attrs.get("params_all") or {**task.defaults(), **t.params}
+    settings, processing, other = {}, {}, {}
+    for p in task.params:
+        if p["name"] in allp:
+            if p.get("pipeline"):
+                settings[p["pipeline"]] = allp[p["name"]]
+            elif p.get("processing"):
+                processing[p["processing"]] = allp[p["name"]]
+            else:
+                other[p["name"]] = allp[p["name"]]
+    return {"task_label": task.label, "trial": t.number, "values": t.values, "criterion": why,
+            "settings": settings, "processing": processing, "not_pipeline": other}
+
+
 @app.get("/api/lab/best")
 def lab_best():
     """Every study with a completed trial and the pipeline settings of its best trial."""
-    import json as _json
-    from sirilpipe.lab.tasks import TASKS
     out = []
     root = _lab("studies")
     for sid in sorted(os.listdir(root), reverse=True):
         d = os.path.join(root, sid)
         try:
-            cfg = _json.load(open(os.path.join(d, "config.json")))
+            cfg = json.load(open(os.path.join(d, "config.json")))
         except Exception:
             continue
-        study, rows = _load_trials(d, cfg)
-        if study is None or not any(r["state"] == "COMPLETE" for r in rows):
+        pick = _study_summary(d, cfg).get("pick")
+        if not pick:
             continue
-        try:
-            t, why = _best_trial(study, cfg)
-        except Exception:
-            continue
-        task = TASKS.get(cfg["task"])
-        if task is None:                                         # a study of a task the Siril backend does not have (imagemm, network, ...): its settings cannot be applied
-            continue
-        allp = t.user_attrs.get("params_all") or {**task.defaults(), **t.params}
-        settings, processing, other = {}, {}, {}
-        for p in task.params:
-            if p["name"] in allp:
-                if p.get("pipeline"):
-                    settings[p["pipeline"]] = allp[p["name"]]
-                elif p.get("processing"):
-                    processing[p["processing"]] = allp[p["name"]]
-                else:
-                    other[p["name"]] = allp[p["name"]]
-        out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "task_label": task.label,
-                    "dataset": cfg["dataset"].get("name"), "state": _read_status(d).get("state"),
-                    "trial": t.number, "values": t.values, "objectives": cfg["objectives"], "criterion": why,
-                    "settings": settings, "processing": processing, "not_pipeline": other})
+        out.append({"id": sid, "name": cfg["name"], "task": cfg["task"], "dataset": cfg["dataset"].get("name"),
+                    "state": _read_status(d).get("state"), "objectives": cfg["objectives"], **pick})
     return clean_json({"studies": out})
 
 
@@ -1656,15 +1704,51 @@ def lab_continue(sid: str, body: dict = Body(...)):
     return {"ok": True, "n_trials": cfg["n_trials"]}
 
 
-@app.delete("/api/lab/studies/{sid}")
-def lab_delete(sid: str):
+def _purge_trash():
+    """Remove deleted studies' folders (moved to lab/trash by a delete) in the background: tens of GB take minutes."""
+    t = _LAB_PURGE["thread"]
+    if t is not None and t.is_alive():
+        return
+    trash = os.path.join(CONFIG["workdir"], "lab", "trash")
+    if not os.path.isdir(trash) or not os.listdir(trash):
+        return
+
+    def purge():
+        for name in os.listdir(trash):
+            shutil.rmtree(os.path.join(trash, name), ignore_errors=True)
+
+    _LAB_PURGE["thread"] = threading.Thread(target=purge, daemon=True, name="lab-trash")
+    _LAB_PURGE["thread"].start()
+
+
+def _trash_study(sid: str):
+    """Delete a study at once: its folder is moved out of the list (a rename) and removed in the background."""
     d = _study_dir(sid)
     if _read_status(d).get("state") in ("starting", "preparing", "running"):
         raise HTTPException(409, "Stop the study first")
-    shutil.rmtree(d)
+    os.replace(d, os.path.join(_lab("trash"), f"{os.path.basename(d)}.{uuid.uuid4().hex[:8]}"))
+    _LAB_SUMMARY.pop(d, None)
+
+
+@app.delete("/api/lab/studies/{sid}")
+def lab_delete(sid: str):
+    _trash_study(sid)
+    _purge_trash()
     return {"ok": True}
 
 
+@app.post("/api/lab/studies/delete")
+def lab_delete_many(body: dict = Body(...)):
+    """Delete several studies; running ones (and unknown ids) are skipped with the reason."""
+    deleted, skipped = [], []
+    for sid in body.get("ids") or []:
+        try:
+            _trash_study(str(sid))
+            deleted.append(sid)
+        except HTTPException as e:
+            skipped.append({"id": sid, "reason": e.detail or "not found"})
+    _purge_trash()
+    return {"deleted": deleted, "skipped": skipped}
 
 
 # ------------------------------------------------------------------ explore (plate solve + Gaia / SIMBAD annotation)

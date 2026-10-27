@@ -1,6 +1,6 @@
 /* Experiments tab: configure, dispatch, monitor and review Optuna studies (vanilla JS) */
 const Lab = (() => {
-  const L = { tasks: null, byName: {}, data: null, space: {}, sel: null, detail: null, trialSel: null, timer: 0, synthDefaults: null, sep: ":", combine: null };
+  const L = { tasks: null, byName: {}, data: null, space: {}, sel: null, detail: null, studies: null, picked: new Set(), gone: new Set(), trialSel: null, timer: 0, synthDefaults: null, sep: ":", combine: null };
   const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const f4 = v => v === null || v === undefined || Number.isNaN(v) ? "–" : (typeof v === "number" ? (Math.abs(v) >= 1000 || (Math.abs(v) < 1e-3 && v !== 0) ? v.toExponential(2) : +v.toPrecision(4)) : String(v));
   const RUNNING = ["starting", "preparing", "running"];
@@ -215,15 +215,49 @@ const Lab = (() => {
 
   /* ---------------------------------------------------------------- studies */
   async function loadStudies() {
+    if (!L.studies) $("#lbStudies").innerHTML = `<p class="muted small">Loading studies…</p>`;
     const r = await api("/api/lab/studies");
-    L.studies = r.studies;
-    $("#lbStudies").innerHTML = r.studies.length ? r.studies.map(s => `<div class="lbst ${s.id === L.sel ? "sel" : ""}" data-id="${esc(s.id)}">
-      <b>${esc(s.name)}</b>${s.hypertune ? '<span class="ht">hyper-tune</span>' : ""}<span class="state ${esc(s.state)}">${esc(s.state)}</span>
+    L.studies = r.studies.filter(s => !L.gone.has(s.id));
+    renderStudies();
+    if (!L.sel && L.studies.length) { L.sel = L.studies[0].id; loadDetail(); }
+  }
+
+  function renderStudies() {
+    const ids = new Set(L.studies.map(s => s.id));
+    [...L.picked].forEach(id => { if (!ids.has(id)) L.picked.delete(id); });
+    const ended = L.studies.filter(s => !RUNNING.includes(s.state));
+    const bar = L.studies.length ? `<div class="lbbulk small"><label><input type="checkbox" id="lbPickAll" ${ended.length && ended.every(s => L.picked.has(s.id)) ? "checked" : ""}> all not running</label>
+      <button class="btn tiny ghost" id="lbDelPicked" ${L.picked.size ? "" : "disabled"}>Delete selected${L.picked.size ? ` (${L.picked.size})` : ""}</button></div>` : "";
+    $("#lbStudies").innerHTML = bar + (L.studies.length ? L.studies.map(s => `<div class="lbst ${s.id === L.sel ? "sel" : ""}" data-id="${esc(s.id)}">
+      <span class="lbname"><input type="checkbox" class="lbpick" data-id="${esc(s.id)}" ${L.picked.has(s.id) ? "checked" : ""} ${RUNNING.includes(s.state) ? 'disabled title="Stop the study first"' : ""}>
+      <b>${esc(s.name)}</b>${s.hypertune ? '<span class="ht">hyper-tune</span>' : ""}</span><span class="state ${esc(s.state)}">${esc(s.state)}</span>
       <span class="meta">${esc(L.byName[s.task]?.label || s.task)} · ${esc(s.dataset)} · ${s.n_complete}/${s.n_trials} trials</span>
       <span class="meta">${s.best !== null && s.best !== undefined ? `best ${esc(s.objectives[0].metric)} ${f4(s.best)}` : s.objectives.map(o => o.metric).join(" × ")}</span></div>`).join("")
-      : `<p class="muted small">No studies yet. Configure one on the left.</p>`;
-    $$("#lbStudies .lbst").forEach(el => el.onclick = () => { L.sel = el.dataset.id; L.trialSel = null; loadStudies(); loadDetail(); });
-    if (!L.sel && r.studies.length) { L.sel = r.studies[0].id; loadDetail(); }
+      : `<p class="muted small">No studies yet. Configure one on the left.</p>`);
+    $$("#lbStudies .lbst").forEach(el => el.onclick = () => { L.sel = el.dataset.id; L.trialSel = null; renderStudies(); loadDetail(); });
+    $$("#lbStudies .lbpick").forEach(el => {
+      el.onclick = e => e.stopPropagation();
+      el.onchange = () => { el.checked ? L.picked.add(el.dataset.id) : L.picked.delete(el.dataset.id); renderStudies(); };
+    });
+    $("#lbPickAll")?.addEventListener("change", e => { ended.forEach(s => e.target.checked ? L.picked.add(s.id) : L.picked.delete(s.id)); renderStudies(); });
+    $("#lbDelPicked")?.addEventListener("click", () => {
+      const n = L.picked.size;
+      if (n && confirm(`Delete ${n} stud${n === 1 ? "y" : "ies"} and all their trials? This cannot be undone.`)) deleteStudies([...L.picked]);
+    });
+  }
+
+  /* delete at once in the list; the server moves the folders out and removes them in the background */
+  async function deleteStudies(ids) {
+    ids.forEach(id => { L.gone.add(id); L.picked.delete(id); });
+    L.studies = L.studies.filter(s => !ids.includes(s.id));
+    if (ids.includes(L.sel)) { L.sel = null; L.detail = null; L.trialSel = null; $("#lbDetail").innerHTML = ""; }
+    renderStudies();
+    try {
+      const r = await api("/api/lab/studies/delete", { method: "POST", body: { ids } });
+      if (r.skipped.length) toast(`Not deleted: ${r.skipped.map(x => `${x.id} (${x.reason})`).join(", ")}`, true);
+      r.skipped.forEach(x => L.gone.delete(x.id));
+      if (r.skipped.length) loadStudies();
+    } catch (e) { ids.forEach(id => L.gone.delete(id)); toast(e.message, true); loadStudies(); }
   }
 
   async function loadDetail() {
@@ -353,7 +387,7 @@ const Lab = (() => {
     $("#lbCont")?.addEventListener("click", async () => { try { await api(`/api/lab/studies/${encodeURIComponent(D.id)}/continue`, { method: "POST", body: { extra: parseInt($("#lbMore").value) || 10 } }); toast("Continuing"); await loadStudies(); loadDetail(); tick(); } catch (e) { toast(e.message, true); } });
     $("#lbDel")?.addEventListener("click", async () => {
       if (!confirm(`Delete the study “${cfg.name}” and all its trials? This cannot be undone.`)) return;
-      try { await api(`/api/lab/studies/${encodeURIComponent(D.id)}`, { method: "DELETE" }); L.sel = null; L.detail = null; $("#lbDetail").innerHTML = ""; loadStudies(); } catch (e) { toast(e.message, true); }
+      deleteStudies([D.id]);
     });
     $("#lbApply")?.addEventListener("click", () => applyToPipeline(D, shown));
     $$("#lbDetail tbody tr").forEach(tr => {
