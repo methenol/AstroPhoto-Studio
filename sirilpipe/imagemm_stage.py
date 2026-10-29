@@ -241,9 +241,11 @@ def write_registration(path: str, nums: list[int], reg: dict[int, dict[int, str]
         f.write("\n".join(head + body) + "\n")
 
 
-def sequence_placements(seq_file: str, canvas: tuple[int, int]) -> dict[int, tuple[int, int, int, int]]:
+def sequence_placements(seq_file: str, canvas: tuple[int, int], origin: tuple[int, int] = (0, 0)) -> dict[int, tuple[int, int, int, int]]:
     """Where each frame of a Siril registered sequence (``r_<seq>_.seq``) sits on the stack's canvas:
     {file number: (ox, oy, w, h)}, the frame's pixel (row, col) being the canvas pixel (oy + row, ox + col).
+    ``origin``: a whole-pixel correction (dx, dy) added to every placement, measured by ``run`` where the canvas is
+    not Siril's bounding box of the frames (an HDR stack's: the union of its exposure groups' stacks).
 
     ``seqapplyreg -framing=max`` writes every frame at its own size (a variable-size sequence) and records the
     translation of each in the registration matrix H (``R`` lines: [1 0 tx; 0 1 ty; 0 0 1], Siril's y up); the
@@ -267,17 +269,30 @@ def sequence_placements(seq_file: str, canvas: tuple[int, int]) -> dict[int, tup
     cw, ch = canvas
     if hs is None:
         if all((w, h) == (cw, ch) for _, w, h in sizes):
-            return {num: (0, 0, w, h) for num, w, h in sizes}
+            return {num: (origin[0], origin[1], w, h) for num, w, h in sizes}
         raise RuntimeError(f"{os.path.basename(seq_file)}: no registration data to place the frames of different sizes")
     tx = np.array([m[2] for m in hs])
     ty = np.array([m[5] for m in hs])
     out = {}
     for (num, w, h), x, y in zip(sizes, tx, ty):
-        out[num] = (int(round(x - tx.min())), int(round(ch - h - (y - ty.min()))), w, h)
+        out[num] = (int(round(x - tx.min())) + origin[0], int(round(ch - h - (y - ty.min()))) + origin[1], w, h)
     return out
 
 
 # --------------------------------------------------------------------------- frames
+def siril_units(hdr) -> tuple[float, float]:
+    """(a, b) with a x stored + b = the value in Siril's [0, 1] units.  A 16-bit frame (Siril's `convert` of the raw
+    subs when the stack ran without calibration, or set16bits: BITPIX 16, BZERO 32768) stores counts 0..65535, which
+    Siril reads divided by 65535; astropy cannot memory-map such scaled data, so it is read unscaled
+    (do_not_scale_image_data) and the pixels taken are converted here."""
+    a, b = float(hdr.get("BSCALE", 1.0)), float(hdr.get("BZERO", 0.0))
+    bitpix = int(hdr.get("BITPIX", -32))
+    if bitpix > 0:
+        top = 255.0 if bitpix == 8 else 65535.0
+        a, b = a / top, b / top
+    return a, b
+
+
 def read_frame(path: str, box: tuple[int, int, int, int], place: tuple[int, int, int, int] | None = None) -> np.ndarray:
     """The box (x, y, w, h) of the stack's canvas, as seen by a registered frame, float32 (h, w, 3): the frame
     sits on the canvas at ``place`` = (ox, oy, w, h) (``sequence_placements``); canvas pixels it does not cover are
@@ -290,17 +305,79 @@ def read_frame(path: str, box: tuple[int, int, int, int], place: tuple[int, int,
     y0, y1 = max(y, oy), min(y + h, oy + fh)
     if x1 <= x0 or y1 <= y0:
         return out
-    with fits.open(path, memmap=True) as hdul:
+    with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
         d = hdul[0].data
+        sa, sb = siril_units(hdul[0].header)
         if d.ndim == 2:
             d = d[None]
         if d.shape[1] != fh or d.shape[2] != fw:
             raise RuntimeError(f"{os.path.basename(path)}: {d.shape[2]} x {d.shape[1]}, the sequence says {fw} x {fh}")
         a = np.array(d[:, y0 - oy:y1 - oy, x0 - ox:x1 - ox], dtype=np.float32)
+        if (sa, sb) != (1.0, 0.0):
+            a = a * np.float32(sa) + np.float32(sb)
         if a.shape[0] == 1:
             a = np.repeat(a, 3, 0)
     out[y0 - y:y1 - y, x0 - x:x1 - x] = np.moveaxis(a, 0, -1)
     return out
+
+
+def canvas_origin(seq_file: str, frame_path: str, num: int, stack: np.ndarray, crop: tuple[int, int, int, int],
+                  canvas: tuple[int, int]) -> tuple[tuple[int, int], tuple[int, int], bool, dict, list[float]]:
+    """Where the registered frames sit on stack.fits' canvas: (origin for ``sequence_placements``, Siril's bounding box
+    of the frames, stack flipped, flip info, residual shift), from frame ``num`` against ``stack`` (3, h, w, the crop).
+
+    The placements anchor Siril's box at the canvas' left and bottom; the canvas can differ from it: Siril rounds the
+    -framing=max box of interpolated and drizzled frames differently by up to 1 px (IC 1805: 4062 vs 4063), and an HDR
+    stack's canvas is the union of its exposure groups' own stacks, each with its own box, placed by rounded outline
+    offsets (Sh2-131 2026-10-27: 4139 vs 4136).  The frames share the stack's pixel grid, so the box sits on the canvas
+    at a whole-pixel origin: the one where the frame's g channel correlates best with the stack's (normalised
+    cross-correlation over the frame's pixels, every origin within the size difference + 1 px for the rounding; an
+    exhaustive search, as for the HDR groups (stackpost.refine_shift) - unwindowed phase correlation peaks at zero
+    shift on the arrays' own borders).  The best origin on the edge of a search one pixel wider means the frames are
+    further off than the sizes allow: an error.  The frame is then placed with it and the sub-pixel alignment measured
+    - the residual must be under half a pixel."""
+    places = sequence_placements(seq_file, canvas)
+    ext = (max(p[0] + p[2] for p in places.values()), canvas[1] - min(p[1] for p in places.values()))
+    ref_img = np.moveaxis(stack, 0, -1)
+    probe = read_frame(frame_path, crop, places[num])
+    flip, flip_info = stack_is_flipped(ref_img, probe)
+    room = (abs(ext[0] - canvas[0]) + 1, abs(ext[1] - canvas[1]) + 1)
+    origin, ncc = _best_origin(np.ascontiguousarray((ref_img[::-1] if flip else ref_img)[..., 1], np.float32),
+                               np.ascontiguousarray(probe[..., 1], np.float32), (room[0] + 1, room[1] + 1))
+    if abs(origin[0]) > room[0] or abs(origin[1]) > room[1]:
+        raise RuntimeError(f"the registered frames are {list(origin)} px off stack.fits (they span {ext[0]} x {ext[1]}, "
+                           f"its canvas is {canvas[0]} x {canvas[1]})")
+    flip_info = {**flip_info, "origin_correlation": round(ncc, 4)}
+    if origin != (0, 0):
+        probe = read_frame(frame_path, crop, sequence_placements(seq_file, canvas, origin)[num])
+    shift = alignment_shift(ref_img, probe[::-1] if flip else probe)
+    if max(abs(v) for v in shift) > 0.5:
+        raise RuntimeError(f"the registered frames are {shift} px off stack.fits (canvas origin {list(origin)})")
+    return origin, ext, flip, flip_info, shift
+
+
+def _best_origin(ref: np.ndarray, frame: np.ndarray, room: tuple[int, int]) -> tuple[tuple[int, int], float]:
+    """The whole-pixel shift (dx, dy), |dx| <= room[0], |dy| <= room[1], that moves ``frame`` (canvas coordinates, 0 =
+    no data) onto ``ref`` best: normalised cross-correlation over the frame's pixels inside the margin the shifts can
+    reach."""
+    mx, my = room
+    H, W = ref.shape
+    have = frame != 0
+    r = ref[my:H - my, mx:W - mx].astype(np.float64)
+    best, at = -2.0, (0, 0)
+    for dy in range(-my, my + 1):
+        for dx in range(-mx, mx + 1):
+            f = frame[my - dy:H - my - dy, mx - dx:W - mx - dx]
+            m = have[my - dy:H - my - dy, mx - dx:W - mx - dx]
+            if m.sum() < 100:
+                continue
+            a_, b_ = f[m].astype(np.float64), r[m]
+            a_, b_ = a_ - a_.mean(), b_ - b_.mean()
+            d = float(np.sqrt((a_ * a_).sum() * (b_ * b_).sum()))
+            c = float((a_ * b_).sum() / d) if d > 0 else -1.0
+            if c > best:
+                best, at = c, (dx, dy)
+    return at, best
 
 
 def stack_is_flipped(ref: np.ndarray, frame: np.ndarray) -> tuple[bool, dict]:
@@ -403,12 +480,13 @@ def confirm_on_calibrated(sat: dict[int, np.ndarray], calibrated: dict[int, str]
         p = calibrated.get(num)
         if p is None or not len(rc):
             continue
-        with fits.open(p, memmap=True) as hdul:
+        with fits.open(p, memmap=True, do_not_scale_image_data=True) as hdul:
             d = hdul[0].data
+            sa, sb = siril_units(hdul[0].header)
             H = d.shape[-2]
             for straight in (True, False):
                 rows = rc[:, 0] if straight else H - 1 - rc[:, 0]
-                v = np.asarray(d[..., rows, rc[:, 1]], dtype=np.float32)
+                v = np.asarray(d[..., rows, rc[:, 1]], dtype=np.float32) * np.float32(sa) + np.float32(sb)
                 vals[straight][num] = (v.max(0) if v.ndim == 2 else v, rows % 2, rc[:, 1] % 2)
     kept = {True: {}, False: {}}
     levels = {}
@@ -652,15 +730,15 @@ def siril_preprocess(session_dir: str, meta: dict, inc: list[int], rows: list[di
 
 def build_store(work: str, prep: dict, keys: list[int], names: list[str], box: tuple[int, int, int, int],
                 canvas: tuple[int, int], flip: bool, region: tuple[int, int, int, int] | None, say, checkpoint,
-                consume: bool = False, with_masks: bool = True):
+                consume: bool = False, with_masks: bool = True, origin: tuple[int, int] = (0, 0)):
     """Step 4: the frames ``keys`` (file numbers) cropped to ``box`` (and ``region`` inside it), in stack.fits' row
     order, into a ``FrameStore`` with NaN where there is no data or a saturated pixel; their stars in its pixels.
     ``consume``: each registered frame and mask is deleted once it is in the store (the store and the registered
     frames together need ~2 x the frames' size on disk - M 31's 299 frames: 26 + 36 GB; the registration then failed
     for space, and the run fell back to BlurXTerminator)."""
     from .veralux_imagemm import FrameStore, parse_findstar, siril_to_array
-    places = sequence_placements(prep["seq_file"], canvas)
-    mplaces = sequence_placements(prep["mask_seq_file"], canvas) if (with_masks and prep.get("mask_seq_file")) else {}
+    places = sequence_placements(prep["seq_file"], canvas, origin)
+    mplaces = sequence_placements(prep["mask_seq_file"], canvas, origin) if (with_masks and prep.get("mask_seq_file")) else {}
     bx, by, bw, bh = box
     rx, ry, rw, rh = region if region else (0, 0, bw, bh)
     os.makedirs(work, exist_ok=True)
@@ -716,11 +794,12 @@ def build_store(work: str, prep: dict, keys: list[int], names: list[str], box: t
 
 
 def add_masks(store, stats: dict, prep: dict, keys: list[int], box: tuple[int, int, int, int], canvas: tuple[int, int],
-              flip: bool, region: tuple[int, int, int, int] | None, say, checkpoint, consume: bool = True) -> None:
+              flip: bool, region: tuple[int, int, int, int] | None, say, checkpoint, consume: bool = True,
+              origin: tuple[int, int] = (0, 0)) -> None:
     """The registered saturation masks into a store ``build_store`` made without them (``with_masks=False``): the
     frames are stored and deleted first, then the masks are registered into the space they freed (M 31's 299 frames:
     36 GB of registered frames and 29 GB of registered masks did not fit beside each other)."""
-    mplaces = sequence_placements(prep["mask_seq_file"], canvas)
+    mplaces = sequence_placements(prep["mask_seq_file"], canvas, origin)
     bx, by, bw, bh = box
     rx, ry, rw, rh = region if region else (0, 0, bw, bh)
     for k, num in enumerate(keys):
@@ -919,27 +998,17 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
             prep = siril_preprocess(session_dir, meta, inc, rows, say, checkpoint, defer_masks=True, local=local, cosmetic=_flag(sp.get("imagemm_cosmetic", True)),
                                     subsky=_flag(sp.get("imagemm_subsky", False)))
             best = keys[len(keys) // 2]
-            places = sequence_placements(prep["seq_file"], canvas)
-            ext = (max(p[0] + p[2] for p in places.values()), max(p[1] + p[3] for p in places.values()))
-            # (Siril rounds the -framing=max bounding box of interpolated and drizzled frames differently by up to 1 px
-            # - IC 1805: 4062 vs 4063 - while each frame is placed by its own translation; the alignment decides)
-            if abs(ext[0] - canvas[0]) > 1 or abs(ext[1] - canvas[1]) > 1:
-                raise RuntimeError(f"the registered frames span {ext[0]} x {ext[1]}, stack.fits' canvas is {canvas[0]} x {canvas[1]}")
-            probe = read_frame(prep["frames"][best], tuple(crop), places[best])
-            flip, flip_info = stack_is_flipped(np.moveaxis(stack, 0, -1), probe)
-            shift = alignment_shift(np.moveaxis(stack, 0, -1), probe[::-1] if flip else probe)
-            if max(abs(v) for v in shift) > 0.5:
-                raise RuntimeError(f"the registered frames are {shift} px off stack.fits")
-            del probe
+            origin, ext, flip, flip_info, shift = canvas_origin(prep["seq_file"], prep["frames"][best], best, stack, tuple(crop), canvas)
             # (the frames into the store first, each registered frame deleted as it goes; then the saturation masks are
             # registered into the space that freed and added - side by side they needed ~65 GB for M 31's 299 frames)
             store, st = build_store(work, prep, keys, names, tuple(crop), canvas, flip, region, say, checkpoint, consume=True,
-                                    with_masks=not prep.get("register_masks"))
+                                    with_masks=not prep.get("register_masks"), origin=origin)
             if prep.get("register_masks"):
                 prep["register_masks"]()
-                add_masks(store, st, prep, keys, tuple(crop), canvas, flip, region, say, checkpoint)
+                add_masks(store, st, prep, keys, tuple(crop), canvas, flip, region, say, checkpoint, origin=origin)
             prep_info = {"saturation": prep["saturation"], "frames_flipped": {**flip_info, "flipped": bool(flip)},
-                         "alignment_shift_px": shift, "stars_median": float(np.median(st["stars"])),
+                         "alignment_shift_px": shift, "canvas_origin_px": list(origin), "frames_extent": list(ext),
+                         "stars_median": float(np.median(st["stars"])),
                          "invalid_fraction_median": float(np.median(st["invalid_fraction"])),
                          "saturated_fraction_median": float(np.median(st["saturated_fraction"])),
                          "seconds": round(time.time() - t1, 1)}

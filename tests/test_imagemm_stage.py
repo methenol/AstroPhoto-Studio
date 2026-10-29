@@ -8,6 +8,7 @@ import os
 import sys
 import types
 
+import cv2
 import numpy as np
 import pytest
 from astropy.io import fits
@@ -143,6 +144,35 @@ def test_confirm_on_calibrated_drops_hot_pixels_and_finds_the_row_order(tmp_path
     assert S.confirm_on_calibrated({1: rc[-1:]}, {1: p}, 4095.0)[1] is None
 
 
+def _ushort_fits(path, a):
+    """A frame as Siril's `convert` writes it without calibration: BITPIX 16, BZERO 32768 (unsigned counts)."""
+    hdu = fits.PrimaryHDU(a.astype(np.uint16))                 # astropy stores uint16 as int16 + BZERO 32768
+    hdu.writeto(path, overwrite=True)
+    assert fits.getheader(path)["BITPIX"] == 16 and fits.getheader(path)["BZERO"] == 32768
+    return path
+
+
+def test_confirm_on_calibrated_reads_16bit_frames(tmp_path):
+    """The stack ran without calibration: the sequence is the converted 16-bit subs, which astropy cannot memory-map
+    scaled (Sh2-131 2026-10-27: every ImageMM trial failed with "Cannot load a memory-mapped image").  They are read in
+    Siril's [0, 1] units (counts / 65535), as the float frames are."""
+    cal = np.full((40, 50), 60, np.float64)
+    cal[10:13, 20:23] = 4095                                   # the saturated star (12-bit ceiling)
+    cal[35, 45] = 80                                           # a hot pixel the raw had at the ceiling
+    p = _ushort_fits(str(tmp_path / "light_00001.fit"), cal)
+    rc = np.array([[r, c] for r in range(10, 13) for c in range(20, 23)] + [[35, 45]], np.int32)
+    kept, same, info = S.confirm_on_calibrated({1: rc}, {1: p}, 4095.0)
+    assert same is True and len(kept[1]) == 9 and info["hot_pixels"] == 1
+    assert info["lattice_levels"]["00"] == pytest.approx(4095 / 65535, abs=1e-5)
+
+
+def test_read_frame_16bit_in_siril_units(tmp_path):
+    a = (np.arange(40 * 50).reshape(40, 50) % 4000).astype(np.float64)
+    p = _ushort_fits(str(tmp_path / "r_1.fit"), a)
+    y = S.read_frame(p, (5, 7, 20, 10), (0, 0, 50, 40))
+    np.testing.assert_allclose(y[..., 0], a[7:17, 5:25] / 65535, rtol=0, atol=1e-7)
+
+
 # --------------------------------------------------------------------------- frames
 SEQ = """#Siril sequence file.
 S 'r_pp_light_' 1 3 3 5 1 6 1 0 1
@@ -162,6 +192,41 @@ def test_sequence_placements(tmp_path):
     pl = S.sequence_placements(str(f), (104, 87))
     # ox = tx - min(tx); oy = canvas_h - h - (ty - min(ty)) (row 0 is the bottom row)
     assert pl == {1: (0, 87 - 80 - 0, 100, 80), 3: (4, 87 - 76 - 2, 98, 76), 4: (6, 87 - 72 - 6, 96, 72)}
+
+
+def _offset_canvas(tmp_path, origin, canvas=(105, 88), num=3):
+    """A registered frame of SEQ and a stack whose canvas holds Siril's box of the frames at ``origin`` (an HDR stack's
+    union canvas), both cut from one smooth random sky."""
+    f = tmp_path / "r_pp_light_.seq"
+    f.write_text(SEQ)
+    rng = np.random.default_rng(1)
+    sky = np.stack([cv2.GaussianBlur(rng.random((100, 120)).astype(np.float32), (0, 0), 3.0) for _ in range(3)]) + 1.0
+    ox, oy, w, h = S.sequence_placements(str(f), canvas, origin)[num]
+    frame = str(tmp_path / f"r_pp_light_{num:05d}.fit")
+    fits.PrimaryHDU(sky[:, oy:oy + h, ox:ox + w]).writeto(frame)
+    return str(f), frame, sky[:, :canvas[1], :canvas[0]], canvas
+
+
+@pytest.mark.parametrize("origin", [(0, 0), (3, 0), (2, -1), (0, 1), (-1, 0)])
+def test_canvas_origin_measures_where_the_frames_sit(tmp_path, origin):
+    """Sh2-131 2026-10-27 (HDR): the frames span 4136 px, the union canvas of the exposure groups' stacks 4139 - every
+    ImageMM trial failed on the size check.  The frames' whole-pixel origin on the canvas is measured instead."""
+    seq, frame, stack, canvas = _offset_canvas(tmp_path, origin)
+    got, ext, flip, _, shift = S.canvas_origin(seq, frame, 3, stack, (0, 0, canvas[0], canvas[1]), canvas)
+    assert got == origin and ext[0] == 102 and flip is False and max(abs(v) for v in shift) < 0.1
+
+
+def test_canvas_origin_on_a_flipped_stack(tmp_path):
+    """stack.fits rewritten by the plate solve reads back with its rows reversed: the origin is still the canvas'."""
+    seq, frame, stack, canvas = _offset_canvas(tmp_path, (2, 1))
+    got, _, flip, _, shift = S.canvas_origin(seq, frame, 3, stack[:, ::-1], (0, 0, canvas[0], canvas[1]), canvas)
+    assert flip is True and got == (2, 1) and max(abs(v) for v in shift) < 0.1
+
+
+def test_canvas_origin_beyond_the_size_difference_is_an_error(tmp_path):
+    seq, frame, stack, canvas = _offset_canvas(tmp_path, (6, 0))     # canvas 105 px, frames 102: at most 3 + 1 px apart
+    with pytest.raises(RuntimeError, match="off stack.fits"):
+        S.canvas_origin(seq, frame, 3, stack, (0, 0, canvas[0], canvas[1]), canvas)
 
 
 def test_sequence_placements_without_registration_needs_one_size(tmp_path):
