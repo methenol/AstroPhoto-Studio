@@ -102,6 +102,13 @@ switches (``run_imagemm`` arguments, ``imagemm_*`` settings), on by default.
    are sparse is its restored-image PSF at its wings' colour on a floor fitted 4-20 px outside; in the join the
    restoration's own structure (less its smooth part per ring) is kept, and the PSF's tail fades on beyond.  The
    lower bound takes the 5 x 5 minimum of the image everywhere (a dust lane under the bulge was held flat).
+34. The point a saturated star starts from is its PSF, not a delta (``point_kernel``): ``_point_initial`` deposits the light its wings' photometry
+    measures through the frames' own mean kernel (``keff`` - the mean extended frame kernel convolved with g_sigma, the very basis the wing amplitude was
+    least-squared on, support to 80 px) instead of through a 1 px Gaussian, because a star deposited as a delta has no halo for the restoration to
+    refine against: measured on C 20 (2026-11-01, the 14 rewritten stars of the ImageMM delivery) they carry 68.5 % of their r<12 light inside r<2 where the stack carries 10.7 %,
+    and an eighth of the stack's share at r4-6 - the complaint against the ImageMM renders (hot point with missing halo, colour crowns after
+    finishing).  Off until the fleet's renders say otherwise; the shape each star was deposited with is recorded (the fraction of its light inside
+    r<2), because a change to the starting point of a restoration is only believable by its before/after measurement.
 The lower bound's margin is 1 sigma (``bound_sigma``): 3 sigma let rings of -1.2 sigma form round bright stars in R / B,
 0 sigma clipped the sky noise.  The input frames are the stack's own Bayer drizzle when the stack is one (the stage):
 the script's debayer mixed the colours (ImageMM R/G = 0.32 + 1.28 x the stack's).
@@ -150,6 +157,9 @@ DEFAULTS = {"iterations": 150, "kappa": 2.0, "huber_delta": 0.05, "mu": 0.1, "st
             "bloom_grow": 4,
             # saturated stars start as points (change 30): the starting halo stayed where the censored cores left it free
             "point_init": True,
+            # deposit that point through the frames' own kernel rather than as a 1 px Gaussian (change 34): a delta has no halo to refine against.
+            # Measured on C 20 (its ImageMM delivery, 14 rewritten stars): those stars hold 68.5 % of their r<12 light inside r<2 (the stack: 10.7 %) and 1/8 of its share at r4-6.
+            "point_kernel": False,
             # saturated pixels are missing data (the paper's mask), not censored: next to a full well the detector is
             # non-linear (charge spill to 8-10 px round the brightest stars, M 31), and "at least the clip level" there
             # forced the star's light up until its wings over-predicted 6-18 px - a moat held at the lower bound
@@ -1987,8 +1997,13 @@ class ImageMMEngine:
 
     @staticmethod
     def _point_initial(x, core, sigma: float, noise, grow: int = 2, R: int = 104, bg_ring: tuple = (90, 104), ext_max: float = 0.5, valid=None,
-                       kmean=None, valid_frac=None, fit_w: int = 30):
+                       kmean=None, valid_frac=None, fit_w: int = 30, kernel: bool = False):
         """PIPELINE (change 30): each saturated star in the initial guess as the point it is.
+
+    ``kernel`` (change 34) decides the *shape* the star's measured light is deposited with: a 1 px Gaussian (the latent's resolution element, as
+    change 30 shipped it) or ``keff`` shifted to the star's centre and renormalised to unit sum - the frames' own seeing convolved with that resolution element,
+    which is what a point source actually lands as.  The light is the same either way (both shapes are unit-sum), so this is not a photometry change:
+    it moves the light out of one pixel and into the PSF the file already measured, where the annuli the gates and the star judge measure it.
 
         The initial guess is the frames' mean: a saturated star there is its blurred halo round a clipped core.  With
         the core censored the data say only "at least the clip level" there, so a point and a point + halo explain the
@@ -2092,7 +2107,7 @@ class ImageMMEngine:
             # red-green halo of 6-7 % of the data's to 40 px; calibrating the wing up to explain it made every other
             # star's wing 1.3-1.6 x too heavy - dark moats)
             Ltot = [L_core[c] + L_ext[c] for c in range(C)]
-            Fw = [None] * C
+            Fw, Kcs = [None] * C, [None] * C
             if keff is not None:
                 vg = vfp[g_, iy - R:iy + R + 1, ix - R:ix + R + 1]
                 sp_, _ = label((vg < 0.95) | reg)
@@ -2103,6 +2118,7 @@ class ImageMMEngine:
                 from scipy.ndimage import shift as _nd_shift
                 for c in range(C):
                     Kc = _nd_shift(keff[c], (ccy, ccx), order=3, mode="constant")
+                    Kcs[c] = Kc
                     dense = (vfp[c, iy - R:iy + R + 1, ix - R:ix + R + 1] >= 0.95) & free & ~spz
                     num = den = 0.0
                     for k in range(int(math.ceil(r_d)), int(r_f) + 1):
@@ -2115,10 +2131,19 @@ class ImageMMEngine:
                     if den > 0 and num > 0:
                         Fw[c] = num / den
             Fs = [max(Ltot[c], Fw[c]) if Fw[c] is not None else Ltot[c] for c in range(C)]
-            info.append((ix - R, iy - R, round(r_out, 1), round(ratio, 3), [round(Fs[c] / max(Ltot[c], 1e-30), 3) for c in range(C)]))
+            shapes = list(S for _ in range(C))
+            if kernel and keff is not None:                                          # change 34: the star's light through the PSF it was measured with
+                for c in range(C):
+                    if Kcs[c] is not None:
+                        k = np.maximum(Kcs[c], 0.0)                                  # a spline shift rings slightly negative; a PSF is not negative
+                        ksum = float(k.sum())
+                        if ksum > 1e-9:                                              # unit sum again, so the light Fs stays exactly the light measured
+                            shapes[c] = k / ksum
+            info.append((ix - R, iy - R, round(r_out, 1), round(ratio, 3), [round(Fs[c] / max(Ltot[c], 1e-30), 3) for c in range(C)],
+                         [round(float(shapes[c][rr <= 2.0].sum()), 3) for c in range(C)]))   # the shape's own core fraction: the defect's own metric
             for c in range(C):
-                rest = np.where(rr <= r_in, 0.0, above[c] - Mr[c])            # (inside the censored region: no data)
-                new = plane[c] + rest + Fs[c] * S
+                rest = np.where(rr <= r_in, 0.0, above[c] - Mr[c])                    # (inside the censored region: no data)
+                new = plane[c] + rest + Fs[c] * shapes[c]
                 win[c] = np.where(have & (rr <= r_out + 2), np.maximum(new, 1e-6), win[c])
             done += 1
         xc = xp[:, R:R + H, R:R + W]
@@ -2432,7 +2457,7 @@ class ImageMMEngine:
     def run_imagemm(self, store: FrameStore, iterations=20, upscale_factor=1,
                     huber_delta=0.05, kappa=2.0, mu=0.1, stop_epsilon=1e-5,
                     shot_noise_scale=1.0, read_noise=0.0, saturation_level=None,
-                    psf_sigma=1.0, variance_from="model", per_channel_psf=True, latent_sigma=1.0, lower_bound="local", reference_psf=True, photometry=True, noise_model="ptc", huber_sigma=2.0, halo=False, saturated_points=False, saturated_photometry=True, psf_wings=False, psf_asymmetry=True, psf_radial_wings=True, bound_sigma=1.0, bloom_grow=4, point_init=True, censor_saturated=False, wing_correction=None, callback=None, cancel=None, log=print):
+                    psf_sigma=1.0, variance_from="model", per_channel_psf=True, latent_sigma=1.0, lower_bound="local", reference_psf=True, photometry=True, noise_model="ptc", huber_sigma=2.0, halo=False, saturated_points=False, saturated_photometry=True, psf_wings=False, psf_asymmetry=True, psf_radial_wings=True, bound_sigma=1.0, bloom_grow=4, point_init=True, point_kernel=False, censor_saturated=False, wing_correction=None, callback=None, cancel=None, log=print):
         """The script's ``run_imagemm`` on a ``FrameStore`` (stars from ``store.stars``).  Returns the restored image
         (C, r H, r W) float32 in the frames' units; ``self.last_run_info`` says how it went."""
         torch, _, F, _ = _torch()
@@ -2788,7 +2813,7 @@ class ImageMMEngine:
                 nz = [float(1.4826 * torch.median(torch.abs(hp_[0, c] - torch.median(hp_[0, c])))) / math.sqrt(8.0 / 9.0) for c in range(channels)]
                 km_i = torch.stack([kernel_list_hr[i] for i in active]).mean(0).cpu().numpy()
                 x, pinfo = self._point_initial(x, core_i, latent_sigma, nz, valid=(m_sum[0] > 0).cpu().numpy(), kmean=km_i,
-                                               valid_frac=(m_sum[0] / float(max(1, len(active)))).cpu().numpy())
+                                               valid_frac=(m_sum[0] / float(max(1, len(active)))).cpu().numpy(), kernel=point_kernel)
                 self.last_run_info['point_initial'] = pinfo
         # PIPELINE (change 11, lower_bound): the Lower Bound Constraint Algorithm (Lanteri, Roche & Aime 2002; Roche
         # et al. 2003, A&A 409, 1077): x = b + u, u >= 0, the multiplicative update applied to u.  Richardson-Lucy type

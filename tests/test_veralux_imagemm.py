@@ -3,6 +3,7 @@ conv2d, the forward model's orientation, the findstar parser / coordinates and a
 from __future__ import annotations
 
 import cv2
+import math
 import numpy as np
 import pytest
 
@@ -519,6 +520,49 @@ def test_saturated_star_starts_at_the_light_of_its_unsaturated_wings():
         assert abs(got[c] / (c_ * flux) - 1.0) < 0.15, (c, got[c], c_ * flux)
     clipped = (np.minimum(img[1], clip)[r <= 40] - 0.1).sum()
     assert got[1] > 2.0 * clipped                                     # (the clipped light: far below the star's)
+
+
+def test_the_starting_point_of_a_saturated_star_is_its_psf_not_a_delta():
+    """The complaint against the ImageMM renders is the star's *shape*, not its light - measured on C 20 (2026-11-01)
+    the rewritten stars carry 68.5 % of their r<12 light inside r<2 where the stack carries 10.7 %, and an eighth of the
+    stack's share at r4-6 (hot point, missing halo, colour crowns after finishing).  The cause is the shape the initial
+    guess deposits the measured light with: a 1 px Gaussian leaves nothing for the restoration to refine against, while
+    the same run has already least-squared the wings against the frames' own kernel.  ``point_kernel`` (change 34)
+    deposits through that kernel: the light must be untouched, the shape must move out of the core."""
+    C, N = 3, 260
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    k = (1.0 + (np.mgrid[-40:41, -40:41] ** 2).sum(0) / 2.5 ** 2) ** -2.5
+    k /= k.sum()
+    flux = 4000.0
+    star = cv2.filter2D(np.where(np.hypot(xx - 130, yy - 130) <= 0.5, flux, 0.0), -1, k)
+    img = np.stack([0.1 + c_ * star for c_ in (0.6, 1.0, 0.5)])
+    core = (img[1] >= 1.0)
+    img = np.minimum(img, 1.0)
+    vf = np.ones((C, N, N))
+    vf[:, cv2.dilate(core.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0] = 0.0
+    x = torch.from_numpy(img.astype(np.float32))[None]
+    kmean = np.stack([k] * C).astype(np.float32)
+    r = np.hypot(xx - 130, yy - 130)
+
+    def shapes(kernel):
+        out, info = V.ImageMMEngine._point_initial(x, core, 1.0, [1e-3] * C, kmean=kmean, valid_frac=vf, kernel=kernel)
+        g = out[0].numpy().astype(np.float64)[1] - 0.1                     # green: the channel the star's photometry is anchored on
+        return float(g[r <= 2].sum() / g[r <= 12].sum()), float(g[r <= 12].sum()), info
+
+    delta, tot_delta, info_delta = shapes(False)
+    psf, tot_psf, info_psf = shapes(True)
+    kg = cv2.GaussianBlur(k, (0, 0), 1.0)                                             # the frames' PSF at the latent's resolution - the shape the
+    rr = np.hypot(*np.mgrid[-40:41, -40:41])                                          # deposit is now claimed to reproduce
+    want = float(kg[rr <= 2].sum() / kg[rr <= 12].sum())
+    assert delta - psf > 0.3, (delta, psf)                                            # as shipped, the star's light sat in its core; through the
+    assert abs(psf - want) < 0.08, (psf, want)                                        # kernel it sits where the optics put it
+    assert abs(tot_psf / tot_delta - 1.0) < 0.05, (tot_delta, tot_psf)       # and moving it cost no light
+    # the record says which shape each star got, in the defect's own units: 1 - e^-2 = 0.865 is the fraction of a unit-sum
+    # Gaussian of the latent's own resolution (sigma 1) that lands inside r<2 - the whole star in one resolution element -
+    # where the kernel deposits the fraction the frames' optics measure.  A restoration's starting point is only believable
+    # by the before/after measurement of what it did to the star.
+    assert abs(info_delta["stars"][0][5][1] - (1.0 - math.exp(-2.0))) < 0.02, info_delta["stars"]
+    assert abs(info_psf["stars"][0][5][1] - want) < 0.05, info_psf["stars"]
 
 
 def test_saturated_star_is_centred_on_its_missing_data():

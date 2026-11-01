@@ -800,6 +800,113 @@ def sky_rim(a: np.ndarray) -> tuple[np.ndarray | None, dict]:
     return field.astype(np.float32), {"band_px": band, "depths": list(depths), "sides": table, "taken": taken,
                                       "peak": round(float(np.abs(field).max()), 7), "sky": round(ref, 7)}
 
+SKY_TINT_SAMPLES = 20000      # the fewest sky pixels (subject excluded) a plane may be fitted on: below it the plane is the noise of one part of the frame
+SKY_TINT_BUFFER = 9           # px of sky thrown away around the subject, because the subject's edge is not sky either.  The subject is ``nebula_mask``'s own - the same
+                              # definition ``subject_coverage`` uses to refuse the colour-gradient step - and not a high-pass threshold of mine: my first version excluded
+                              # anything standing 3 sigma above an 8 px high-pass of the *linear* light and dilated it 15 px, which on C 20's starless left 10.9k of 2.3M sky
+                              # pixels - a noise-relative threshold on linear data flags a sprinkling, and 15 px of dilation around a sprinkling is the whole frame
+SKY_TINT_MIN_SPREAD = 1.0     # the gate's own units: below this the quarters already agree (a delivery is failed for 1.5), so the frame is left strictly alone - a tool that
+                              # touched clean frames would be processing, not correcting
+SKY_TINT_CAP = 0.10           # the largest peak-to-peak gain allowed in one channel: past 10 % the colour is the sky's own (dual-band, dust, an unbalanced white) and a plane
+                              # fitted on the sky has no business touching it - that is a calibration question, not a residue
+SKY_TINT_GAIN = 1.2           # the correction ships only when it leaves the gate's own quadrant spread this times smaller - a comparison, not a threshold, in the spirit of
+                              # ``STRETCH_CLIP_GAIN``: what is refused is a fit that does not measurably help the thing the delivery is judged on
+SKY_TINT_CLIP = 3.0           # sigma clips of the plane fit: the sky is the bulk of the frame and the subject must not drag the plane, so the sample is trimmed from both tails
+
+
+def sky_quadrant_spread(a: np.ndarray) -> tuple[float, dict]:
+    """What ``gates.quadrant_spread`` will find, read on the frame's own display transform: the worse of the a* and b* spreads between the four quarters of the sky, with the
+    measurement behind it.  This is the number a delivery is failed for - read here, where it can still be corrected, rather than in the sidecar after the export.  It is taken
+    through ``autostretch_display`` (the transform the chain's own step pictures go through) rather than through the whole downstream chain: the delivered gate is the final
+    judge, and the two numbers this records are what the tool saw.
+    """
+    disp = autostretch_display(a)
+    sm = gates.sky_mask(finish.luminance(disp))
+    if sm.sum() < SKY_TINT_SAMPLES:
+        return 0.0, {"refused": "no sky to measure on the display transform"}
+    qs = gates.quadrant_spread(gates._lab(disp), sm)
+    return max(float(qs["spread_a"]), float(qs["spread_b"])), qs
+
+
+def sky_tint(a: np.ndarray) -> tuple[np.ndarray | None, dict]:
+    """Take out the sky's slowly varying **channel-to-channel** tilt: what the refused ``colour_gradient`` step would have done, fitted on sky alone.
+
+    Why it exists (C 20, 2026-11-01, one fixed display transform, the sky taken with the subject excluded, measured on the session's own checkpoints): the registered stack's
+    quadrant tints are neutral - ``gates.quadrant_spread`` reads b* 0.88 - and they grow through the stages after it: restoration 1.55, linear 1.98, starless 3.41, with the
+    bottom-right quadrant's b* at 4.88 while the other three sit at 1.5-2.0.  The delivery then fails ``sky_chroma_quadrants`` on a cast that was never in the data.  Nothing
+    between the frame and the export reaches it: ``colour_gradient`` is refused above ``SKY_STEPS_MAX_COVERAGE`` (this frame's subject covers 34 %), ``neutralise``'s offsets
+    are per channel but *global*, and ``sky_pedestal``/``sky_rim`` are spatial but *achromatic*.
+
+    Why the fit may only look at sky, and only at degree 1: the refusal it stands in for was written for a real hazard - on C 20 (2026-10-15) Siril's degree-2 model "took the
+    North America Nebula's own red".  Running that step on this frame (``output/.ab12/subsky_probe.py``) takes out a model 10x the size of the sky's actual tilt (2.35 % and
+    1.96 % of the sky in R and G where the sky only tilts 0.25 % and 0.43 %), anti-correlated with it in R (corr -0.23), and the quadrant tints get **worse**: a 1.89 -> 3.44.
+    So the replacement is never shown the subject, and stays linear because degree 2 and 3 are what ate the nebula.
+
+    Three things this measures rather than assumes, each learned from it being wrong on these same pixels:
+
+    * it fits in the **log**, because colour is a channel *ratio* and the stretch carries ratios to the picture; the first version fitted absolute differences, and on the
+      starless that raised the gate's a* spread from 1.89 to 3.59 while its own metric said it had halved the tilt;
+    * it **centres** each channel's field on its own sky, so the frame keeps the colour it arrived with (``neutralise``'s offsets own the overall balance, one step later, on
+      purpose); uncentred, this pulled C 20's registered stack from b* -2.9 to about 0 - the sky's colour removed, not a residue;
+    * it **adopts on the gate's own reading** (``sky_quadrant_spread``) rather than on a proxy of it: measured on the real checkpoints, a metric of percent-of-sky tints said
+      the correction improved the restoration frame 1.4x while the gate's number said the opposite, and only the gate's number agreed with what the export does with it.
+
+    The gain is applied to the whole frame rather than under a sky mask: a plane cannot draw an edge, whereas a smooth field multiplied by a blurred mask does - at the
+    nebula's boundary, where the stretch's slope at the sky is a hundred - which is the artifact class this file's other tools exist to remove.  Returns the field to
+    *multiply* by, or None with the reason it refused.
+    """
+    lum = finish.luminance(a)
+    before, qs0 = sky_quadrant_spread(a)
+    if before <= SKY_TINT_MIN_SPREAD:
+        return None, {"refused": "the quarters' sky tints already agree", "spread": round(before, 2),
+                      "limit": gates.LIMITS["sky_chroma_quadrants"]}
+    sm = finish._sky_mask(lum, edge=finish.EDGE_CROP)
+    if sm.sum() < SKY_TINT_SAMPLES:
+        return None, {"refused": f"the frame has no sky to measure ({int(sm.sum())} pixels)"}
+    subject = nebula_mask(lum, _hist_stats(lum)["mode"])[0]                          # the project's own subject definition - the one ``subject_coverage`` refuses the
+    structure = cv2.dilate(subject.astype(np.uint8), np.ones((SKY_TINT_BUFFER, SKY_TINT_BUFFER), np.uint8)) > 0   # gradient on - buffered, because its edge is not sky
+    samples = sm & ~structure
+    if samples.sum() < SKY_TINT_SAMPLES:
+        return None, {"refused": f"only {int(samples.sum())} sky pixels survive the subject", "sky": round(float(sm.mean()), 3)}
+    ys, xs = np.nonzero(samples)
+    stride = max(1, len(ys) // 60000)                                                # a plane has three parameters; 60 k samples is twenty thousand times over-determined,
+                                                                                     # and this fit's cost is paid by every preview (it measured 7 s a frame at 200 k)
+    yi, xi = ys[::stride], xs[::stride]
+    A = np.stack([np.ones(len(yi)), yi.astype(np.float64), xi.astype(np.float64)], -1)
+    yy, xx = np.arange(lum.shape[0], dtype=np.float64), np.arange(lum.shape[1], dtype=np.float64)   # evaluated by row/column below, not as two full grids
+    loga = np.log(np.maximum(a, 1e-12))                                              # colour is a ratio: fit the channels' log levels, and the difference of those
+    planes = np.empty((3,) + lum.shape, np.float64)
+    for c in range(3):
+        v = loga[c][yi, xi].astype(np.float64)
+        keep = np.ones(v.shape, bool)
+        coef = np.zeros(3)
+        for _ in range(3):
+            coef = np.linalg.lstsq(A[keep], v[keep], rcond=None)[0]
+            r = v - A @ coef
+            keep = np.abs(r - np.median(r)) <= SKY_TINT_CLIP * _sigma(r)
+        planes[c] = coef[0] + coef[1] * yy[:, None] + coef[2] * xx[None, :]
+    field = planes - planes.mean(0)                                                   # the channel-to-channel part: the mean of the three is added back, so the frame's
+    for c in range(3):                                                                # luminance gradient is left exactly where the frames put it
+        field[c] -= float(np.mean(field[c][samples]))                                 # ... and only its SPATIAL part: each channel keeps the sky level it arrived with
+    gain = np.exp(-field).astype(np.float32)
+    ptp = [float(np.ptp(gain[c])) for c in range(3)]
+    if max(ptp) < 1e-4:
+        return None, {"refused": "no tilt to take", "spread": round(before, 2)}
+    if max(ptp) > SKY_TINT_CAP:
+        return None, {"refused": f"a {100.0 * max(ptp):.1f} % tilt in one channel is the sky's own colour, not a residue",
+                      "gain_ptp_pct": [round(100.0 * p, 2) for p in ptp]}
+    after, qs1 = sky_quadrant_spread(a * gain)
+    if after * SKY_TINT_GAIN >= before:
+        return None, {"refused": f"the fit leaves the gate's quadrant spread at {after:.2f} (was {before:.2f})",
+                      "gain_ptp_pct": [round(100.0 * p, 2) for p in ptp],
+                      "spread_before": round(before, 2), "spread_after": round(after, 2)}
+    return gain, {"samples": int(samples.sum()), "sky": round(float(sm.mean()), 3),
+                  "gain_ptp_pct": [round(100.0 * p, 2) for p in ptp],
+                  "spread_before": round(before, 2), "spread_after": round(after, 2),
+                  "medians_b_before": [round(float(v), 2) for v in qs0.get("median_b", [])],
+                  "medians_b_after": [round(float(v), 2) for v in qs1.get("median_b", [])]}
+
+
 def level_stats(arr: np.ndarray) -> dict:
     lum = finish.luminance(arr)
     x = finish.sample(lum)
@@ -1100,14 +1207,17 @@ class Finisher:
         rim, rim_info = sky_rim(base)                                                    # and the band behind the ring's line: what the gradient model left in the outer eighth of
         if rim is not None:                                                              # the frame, 1-2 % of the sky in the linear and a band across the export after the toe
             base = np.maximum(base - rim, 0.0).astype(np.float32)
-        if ped is not None or ring is not None or rim is not None:
+        gain, tint_info = sky_tint(base)                                                       # and the colour half of the same problem: quarters of the sky carrying different
+        if gain is not None:                                      # channel-to-channel levels, which no global offset can reach and the stretch's slope delivers as a cast
+            base = (base * gain).astype(np.float32)
+        if ped is not None or ring is not None or rim is not None or gain is not None:
             lum = finish.luminance(base)
             sm = finish._sky_mask(lum, edge=finish.EDGE_CROP)
         med = [float(np.median(base[c][sm])) for c in range(3)]
         ref = max(med)
         off = [ref - m for m in med]
         t0 = time.time()
-        if max(off) < 1e-7 and ped is None and ring is None and rim is None:
+        if max(off) < 1e-7 and ped is None and ring is None and rim is None and gain is None:
             self.record("background neutralisation (linear)", "none", None, status="skipped", note="the sky is already neutral", params={"sky_median": med})
             return base
         lines = ["split bn_r bn_g bn_b"]
@@ -1120,13 +1230,14 @@ class Finisher:
             if os.path.exists(fp):
                 os.remove(fp)
         self.record("background neutralisation (linear)",
-                    ("provenance sky pedestal + " if ped is not None else "") + ("frame ring + " if ring is not None else "") + ("border sky rim + " if rim is not None else "")
+                    ("sky tint + " if gain is not None else "") + ("provenance sky pedestal + " if ped is not None else "") + ("frame ring + " if ring is not None else "") + ("border sky rim + " if rim is not None else "")
                     + "siril split / pm (offsets) / rgbcomp", out,
                     commands=lines, seconds=time.time() - t0, linear=True,
-                    params={"sky_median_before": [round(m, 7) for m in med], "offsets": [round(o, 8) for o in off], "pedestal": ped_info, "ring": ring_info, "rim": rim_info},
+                    params={"sky_median_before": [round(m, 7) for m in med], "offsets": [round(o, 8) for o in off], "pedestal": ped_info, "ring": ring_info, "rim": rim_info, "tint": tint_info},
                     source="Siril SPCC -bgtol / PixInsight BackgroundNeutralization: per-channel offsets so that the sky has equal levels (no gains), plus one offset per"
                            " low-coverage provenance region for the sky's slowly varying pedestal, a measured profile across the frame's outer ring, and the sky's floor on the"
-                           " border lines levelled against the frame's own where the gradient model left a residue; needed because the stretch's slope at the sky is hundreds")
+                           " border lines levelled against the frame's own where the gradient model left a residue, and a degree-1 per-channel plane fitted on sky alone for the"
+                           " quarters' channel-to-channel tilt the refused colour-gradient step would have taken; needed because the stretch's slope at the sky is hundreds")
         return out
 
     # ---- 0b. banding (second line of defence) --------------------------------------------------------------------------------

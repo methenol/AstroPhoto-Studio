@@ -136,7 +136,15 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    (`process/finish/steps/NN_<step>.png` — shown through a linked autostretch, so they only carry the truth from the stretch onwards) and the
    verbatim commands in the sidecar (`linear_info.chain`, whose per-step `levels` also carry `sky_channels`, the median of each channel over
    `gates.sky_mask` — the numbers a colour cast is traced with, and which a layer holding no sky at all, the star layer, records nothing for):
-   colour-gradient removal (`subsky 2`, mean model added back) and background neutralisation (per-channel offsets) on the linear starless;
+   colour-gradient removal (`subsky 2`, mean model added back) and background neutralisation (per-channel offsets) on the linear starless.  The colour-gradient step is
+   refused above `pro.SKY_STEPS_MAX_COVERAGE` — on a frame-filling subject the polynomial takes the nebula's own colour — and `pro.sky_tint` then supplies what that
+   refusal leaves behind: a **degree-1 per-channel plane fitted on sky alone** (`nebula_mask` excluded and buffered, fitted in the log because colour is a *ratio*),
+   centred on each channel's own sky so the frame keeps the colour it arrived with — the overall balance being the neutralisation's offsets, one step later, on purpose —
+   applied as a smooth gain to the whole frame (a plane cannot draw a seam, a masked field would), and adopted only when it leaves the gate's own `quadrant_spread`
+   `pro.SKY_TINT_GAIN` times smaller; both readings go into the record as `params.tint`.  Measured on C 20 (2026-11-01), whose export failed `sky_chroma_quadrants`: the
+   cast is generated downstream of the data — the gate reads 0.88 on the registered stack, 1.55 on the restoration, 1.98 on the linear and 3.41 on the starless — and
+   running Siril's refused step on that frame made it **worse** (a 1.89 → 3.44) because its model came back 10x the sky's tilt, anti-correlated with it (corr -0.23 in R)
+   and full of the nebula's red;
    **Statistical Stretch** (Seti Astro, `pyscript Statistical_Stretch.py`, median 0.10 for a small subject / 0.25 frame-filling) as the default; or the **GHS two-pass stretch** by `ght` (pass 1 SP at the histogram's left half-maximum, b 10, D raised until the background reaches 0.10; `linstretch -BP` at the histogram toe;
    pass 2 SP on the nebula mask's median, b 4, D 1, LP = background, HP < 1 when `hdr` is on) — alternatives `statstretch` (`pyscript Statistical_Stretch.py -median 0.10|0.25 -sigma 5 -linked`),
    `autoghs`, `modasinh`, `autostretch`, `hms` (each after `linstretch -BP` at the histogram toe, its one parameter raised until the background is 0.10); highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless

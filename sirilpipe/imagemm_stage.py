@@ -75,7 +75,7 @@ PARAM_KEYS = {"imagemm_iterations": "iterations", "imagemm_huber": "huber_delta"
               "imagemm_saturated_points": "saturated_points", "imagemm_bound_sigma": "bound_sigma",
               "imagemm_saturated_photometry": "saturated_photometry", "imagemm_psf_wings": "psf_wings",
               "imagemm_psf_asymmetry": "psf_asymmetry", "imagemm_psf_radial_wings": "psf_radial_wings",
-              "imagemm_bloom_grow": "bloom_grow", "imagemm_point_init": "point_init",
+              "imagemm_bloom_grow": "bloom_grow", "imagemm_point_init": "point_init", "imagemm_point_kernel": "point_kernel",
               "imagemm_censor_saturated": "censor_saturated"}
 LIMITS = {"iterations": (1, 200), "kappa": (1.01, 50.0), "huber_delta": (0.001, 1.0), "mu": (0.0, 1.0),
           "stop_epsilon": (1e-8, 1e-3), "psf_sigma": (0.5, 3.0), "shot_noise_scale": (0.0, 10.0),
@@ -146,6 +146,7 @@ def map_params(stack_params: dict | None) -> dict:
     kw["bound_sigma"] = max(0.0, float(kw["bound_sigma"]))
     kw["bloom_grow"] = int(min(8, max(0, round(float(kw["bloom_grow"] or 0)))))
     kw["point_init"] = _flag(kw["point_init"])
+    kw["point_kernel"] = _flag(kw["point_kernel"])
     kw["censor_saturated"] = _flag(kw["censor_saturated"])
     kw["variance_from"] = "data" if str(kw["variance_from"]) == "data" else "model"
     kw["r"] = int(min(3, max(1, round(float(sp.get("imagemm_r") or 1)))))

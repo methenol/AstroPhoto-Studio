@@ -1231,3 +1231,102 @@ def test_a_stretch_whose_sky_is_already_flat_does_not_pay_for_a_second_run(tmp_p
     assert len(p["tried"]) == 2 and p["tried"][1]["sky_lump"] is None, p["tried"]
     assert 0.0 < p["tried"][0]["sky_lump"] < pro.STAT_CLIP_FLOOR, p["tried"]
     assert p["tried"][1]["skipped"].startswith("the clipped sky already measures"), p["tried"]
+
+
+# --- the sky's channel-to-channel tilt (the sky_chroma_quadrants family) ---------------------------------------------------------------
+
+def _tilted_sky(tilt=0.045, nebula=0.0):
+    """A linear frame whose quarters' sky channels have drifted apart - the C 20 case of 2026-11-01, where the restoration left the
+    bottom-right quarter at b* 4.88 while the other three sat at 1.5-2.0 and the registered stack beneath them was neutral at 0.88.
+    Built as smooth ramps on two channels (a tilt, not a step); ``nebula`` paints a bright block over the right of the frame, which is
+    what Siril's degree-2 model mistook for sky on the real frame."""
+    a = np.random.default_rng(29).normal(0.0125, 2e-4, (3, 240, 320)).astype(np.float32)   # its own generator: with the module's, every later
+                                                                                            # fixture here would depend on how many draws this file has
+    h, w = a.shape[1:]
+    yy, xx = np.mgrid[0:h, 0:w]
+    a[0] *= (1.0 + tilt * (xx / w - 0.5)).astype(np.float32)                       # red rising to the right
+    a[2] *= (1.0 - tilt * (yy / h - 0.5) * 0.6).astype(np.float32)                  # blue falling downward
+    if nebula:
+        a[:, 20:h - 20, int(0.55 * w):] *= (1.0 + nebula)
+    return np.maximum(a, 1e-6).astype(np.float32)
+
+
+def test_the_tint_levens_quarters_whose_sky_channels_have_drifted_apart():
+    """The defect: a frame that fails ``sky_chroma_quadrants`` on a cast nothing between the frame and the export reaches - the colour
+    gradient step is refused above ``SKY_STEPS_MAX_COVERAGE``, the neutralisation's offsets are global, and the pedestal/rim tools are
+    achromatic.  Adoption is judged by the gate's own reading, so that is what the test judges too."""
+    a = _tilted_sky()
+    before, _ = pro.sky_quadrant_spread(a)
+    assert before > float(gates.LIMITS["sky_chroma_quadrants"]), before              # the fixture really is a sky the gate fails
+    gain, info = pro.sky_tint(a)
+    assert gain is not None, info
+    after, _ = pro.sky_quadrant_spread(a * gain)
+    assert after * pro.SKY_TINT_GAIN <= before, info                                 # better, by the margin the tool demands of itself
+    assert info["spread_after"] == pytest.approx(after, abs=0.05)                     # and the record says what was actually measured
+
+
+def test_the_tint_leaves_the_sky_its_own_colour():
+    """Each channel keeps the level it arrived with: the frame's overall balance is ``neutralise``'s offsets, one step later, on purpose.
+    The uncentred version of this field pulled C 20's registered stack from b* -2.9 to about 0 - the sky's colour removed rather than a
+    residue, which is the sky's airglow and dust-reflected starlight the astrophotographer paid for."""
+    a = _tilted_sky()
+    gain, info = pro.sky_tint(a)
+    assert gain is not None, info
+    sm = gates.sky_mask(finish.luminance(pro.autostretch_display(a)))
+    m0 = [float(np.median(a[c][sm])) for c in range(3)]
+    m1 = [float(np.median((a * gain)[c][sm])) for c in range(3)]
+    assert all(abs(m1[c] - m0[c]) / m0[c] < 0.01 for c in range(3)), (m0, m1)
+
+
+def test_the_tint_leaves_a_frame_whose_quarters_already_agree():
+    """A clean frame is left strictly alone: a tool that processed frames that need no processing would be indistinguishable from one
+    that damages them, and every frame in the fleet passes through here."""
+    a = _linear_sky_picture()
+    assert pro.sky_quadrant_spread(a)[0] <= pro.SKY_TINT_MIN_SPREAD
+    gain, info = pro.sky_tint(a)
+    assert gain is None and "refused" in info, info
+
+
+def test_the_tint_takes_nothing_from_a_nebula_sitting_in_one_quarter():
+    """The hazard the colour-gradient refusal was written for (C 20, 2026-10-15: the degree-2 model "took the North America Nebula's own
+    red"), reproduced here as a bright block over a quarter whose sky is level.  Measured on the real frame, running that step took out a
+    model 10x the sky's actual tilt, anti-correlated with it in R (corr -0.23), and left the quarters **further** apart (a 1.89 -> 3.44);
+    the subject is therefore never in the fit.  And the refusal must not cost the tool its edge: the same frame with a real sky tilt
+    underneath the nebula still gets its sky levelled, with the nebula's own colour ratios untouched."""
+    a = _tilted_sky(nebula=6.0)
+    sky_only = _tilted_sky(tilt=0.0)                                                  # level sky, same nebula
+    gain, info = pro.sky_tint(sky_only)
+    assert gain is None, info                                                         # the red is the nebula's, and it stays
+    before, _ = pro.sky_quadrant_spread(a)
+    gain, info = pro.sky_tint(a)
+    assert gain is not None, info                                                     # the cast under it is still corrected
+    after, _ = pro.sky_quadrant_spread(a * gain)
+    assert after * pro.SKY_TINT_GAIN <= before, info
+    neb = slice(20, 220), slice(176, 320)
+    r0 = float(np.median(a[0][neb]) / np.median(a[2][neb]))
+    r1 = float(np.median((a * gain)[0][neb]) / np.median((a * gain)[2][neb]))
+    assert max(info["gain_ptp_pct"]) < 6.0, info                                        # the correction stayed the sky's own size: the 7x-brighter red block never
+                                                                                        # entered the fit (Siril's model, shown that same nebula, came back 10x the sky's
+                                                                                        # tilt and left the quarters further apart)
+    assert abs(r1 - r0) / r0 <= max(info["gain_ptp_pct"]) / 100.0 + 0.005, (r0, r1)      # what the subject's colour may move is the plane's own amplitude, which is
+                                                                                        # capped - applying the field under a blurred sky mask instead would draw the seam
+                                                                                        # this file's other tools exist to remove, at the stretch's slope of a hundred
+
+
+def test_the_tint_refuses_a_tilt_that_is_the_sky_own_colour():
+    """Past ``SKY_TINT_CAP`` the channel-to-channel difference is not a residue a plane should touch but the frame's colour - dual-band,
+    dust, an unbalanced white - and correcting it would be white-balancing the sky without being asked."""
+    gain, info = pro.sky_tint(_tilted_sky(tilt=0.6))
+    assert gain is None and "own colour" in info["refused"], info
+
+
+def test_the_neutralisation_records_the_tint_it_applied(tmp_path, monkeypatch):
+    """Wired into the chain: the gain ships through ``neutralise``, which is where the sky's other spatial models are applied - immediately
+    before the stretch, whose slope at the sky is hundreds and which is the only reason a 1 % tilt reaches the export at all."""
+    monkeypatch.setattr(pro.Finisher, "siril", lambda self, tag, arr, lines, stage, **kw: arr)
+    fin = pro.Finisher(str(tmp_path), {}, post.DEFAULTS, False, external=False)
+    fin.neutralise(_tilted_sky())
+    rec = fin.records[-1]
+    assert rec["tool"].startswith("sky tint + "), rec["tool"]
+    t = rec["params"]["tint"]
+    assert t["spread_before"] > t["spread_after"] >= 0.0 and t["samples"] > pro.SKY_TINT_SAMPLES, t
