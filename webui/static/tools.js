@@ -25,11 +25,11 @@ const Tools = (() => {
     const bge = ok(gx) && (!gx.models || gx.models.bge !== false);
     const ccOk = m => !!(cc.torch && cc.models && cc.models[m]);
     const sel = id => document.getElementById("sp-" + id)?.value;
-    const deconvAuto = live("bxt") ? "BlurXTerminator (licensed)" : "Richardson-Lucy (Siril)";
     const denoiseAuto = live("nxt") ? "NoiseXTerminator (licensed)" : ok(gx) && gx.models?.denoise !== false ? "GraXpert denoising" : "Siril denoising";
     const starsAuto = live("sxt") ? "StarXTerminator (licensed)" : ok(sn) ? "StarNet2" : "none installed: the stars stay in the image";
     const dm = sel("deconv_method"), ds = sel("deconv_stars_method"), nm = sel("denoise_method"), sm = S.params?.star_removal;
     const gxOk = k => ok(gx) && (!gx.models || gx.models[k] !== false);
+    const deconvAuto = live("bxt") ? "BlurXTerminator (licensed)" : ok(gx) ? "GraXpert deconvolution" : "Richardson-Lucy (Siril)";
     const deconvNames = { bxt: "BlurXTerminator" + (live("bxt") ? "" : " (not licensed: nothing runs)"), rl: "Richardson-Lucy (Siril)", imagemm: "ImageMM", none: "off",
       graxpert: "GraXpert deconvolution" + (gxOk("deconv_obj") || gxOk("deconv_stellar") ? "" : " (models not installed)") };
     const dn = v => deconvNames[v] || deconvAuto;

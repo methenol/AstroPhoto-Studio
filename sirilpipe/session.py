@@ -1091,7 +1091,7 @@ class Session:
         """"Restore": linear post-processing -> linear.fits (gradient, colour calibration, deconvolution, denoise).
 
         ImageMM chosen for the objects and / or the stars (``deconv_method`` / ``deconv_stars_method`` "imagemm"; "auto" =
-        BlurXTerminator when licensed, else Siril RL): the registered frames are restored jointly by ``imagemm_stage``
+        BlurXTerminator when licensed, else GraXpert, else Siril RL): the registered frames are restored jointly by ``imagemm_stage``
         first (``imagemm.fits``, same grid as stack.fits) and ``post.restore`` then works on that instead of stack.fits -
         without its own deconvolution of ImageMM's region(s), ImageMM being one; with ImageMM for one region only, the
         other comes from stack.fits through the star mask and is deconvolved by its own tool (post.Restorer).  Without torch, or if ImageMM fails, the job fails with the reason

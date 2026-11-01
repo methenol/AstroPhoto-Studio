@@ -78,7 +78,7 @@ STACK_DEFAULTS = {
     "pattern_correction": True,
     "denoise_iters": 2000,
     "ai_deconvolution": True,
-    "deconv_method": "auto",   # deconvolution of the objects: auto = BlurXTerminator when licensed, else Siril RL; bxt | graxpert | rl (that tool only);
+    "deconv_method": "auto",   # deconvolution of the objects: auto = BlurXTerminator when licensed, else GraXpert, else Siril RL; bxt | graxpert | rl (that tool only);
                                # imagemm = VeraLux ImageMM (needs torch); none.  Cosmic Clarity Sharpen is the finishing setting cc_sharpen (stretched image)
     "deconv_stars_method": "auto",  # deconvolution of the stars, the same choices (post.deconv_choice; a request naming only deconv_method: the stars follow it)
     "denoise_method": "auto",  # linear noise reduction: auto = NXT when licensed, else GraXpert / Siril; nxt | graxpert | siril (that tool only); none.  CC Denoise: cc_denoise
@@ -142,7 +142,7 @@ def default_scale(deconv_method: str) -> float:
 
 # The 1.x profile names are part of the API contract (the telescope controller submits them); their
 # stack_params map onto the Siril backend's restoration choices:
-#   deconv_method  auto    = BlurXTerminator when licensed, else Siril makepsf + Richardson-Lucy
+#   deconv_method  auto    = BlurXTerminator when licensed, else GraXpert deconvolution, else Siril makepsf + Richardson-Lucy
 #                  rl      = Siril Richardson-Lucy even when BlurXTerminator is licensed
 #                  imagemm = VeraLux ImageMM multi-frame restoration of the subs (slow; needs IMAGEMM=cuda)
 #                  none    = no deconvolution
@@ -156,8 +156,8 @@ PROFILES = {
                 "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-imagemm": {"label": "ImageMM multi-frame restoration (same as imagemm with this backend)",
                     "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
-    "n2n-network": {"label": "Fast restoration: BlurXTerminator + NoiseXTerminator when licensed, else Siril "
-                             "deconvolution + GraXpert denoise; 2x drizzle when the data supports it "
+    "n2n-network": {"label": "Fast restoration: BlurXTerminator + NoiseXTerminator when licensed, else GraXpert "
+                             "deconvolution + denoise (Siril RL without GraXpert); 2x drizzle when the data supports it "
                              "(was: Noise2Noise + deconvolution network)",
                     "stack_params": {"deconv_method": "auto", "ai_deconvolution": True,
                                      "scale": default_scale("auto")}},

@@ -1322,7 +1322,8 @@ class Restorer:
 
     def _deconvolve_tools(self) -> None:
         """Deconvolution per region: ``deconv_method`` the objects, ``deconv_stars_method`` the stars (``deconv_choice``).  Each: auto =
-        BlurXTerminator when licensed, else Siril Richardson-Lucy; bxt / graxpert / rl = that tool only; imagemm (session.py, before this);
+        BlurXTerminator when licensed, else GraXpert, else (GraXpert not installed, or it left the image untouched) Siril Richardson-Lucy;
+        bxt / graxpert / rl = that tool only; imagemm (session.py, before this);
         none.  One tool for both regions runs once on the whole image.  Two tools run objects first, then stars (GraXpert's own order):
         BlurXTerminator and GraXpert deconvolve one region by their own controls (BXT Sharpen Nonstellar / Sharpen Stars, the other at 0;
         GraXpert's objects / stars model); Siril RL, which has none, is blended in through the stars' footprint mask (``star_mask``).  A
@@ -1405,6 +1406,11 @@ class Restorer:
                 s.add("deconvolution", "rc-astro bxt", "unavailable", time.time() - t0, region=region, note=str(e))
             if tool == "bxt":
                 return
+            if tools.graxpert.available():                           # auto: GraXpert next, Siril RL only when GraXpert cannot run
+                if self._graxpert_deconvolve(d, region):
+                    return
+            else:
+                s.add("deconvolution", "graxpert", "unavailable", region=region, note="GraXpert is not installed")
         t0 = time.time()
         # DESIGN: rl -iters=10..30 -alpha=3000 -tv.  fftw_timelimit=0 = FFTW "estimate" planning: with Siril's default
         # (measure, 60 s per plan) the first run on every new image size spent 10+ minutes planning FFTs (measured:
@@ -1440,10 +1446,10 @@ class Restorer:
             return None
         return v if np.isfinite(v) and v > 0 else None
 
-    def _graxpert_deconvolve(self, d: float, region: str) -> None:
+    def _graxpert_deconvolve(self, d: float, region: str) -> bool:
         """GraXpert AI deconvolution (``graxpert -cmd deconv-obj`` / ``deconv-stellar``, its models since 3.1) on the linear image: ``-strength`` = the Deconvolution
         slider (GraXpert: 0 none .. 1 maximum), ``-psfsize`` = the image FWHM in px (GraXpert / Siril's GraXpert interface: "Image FWHM (in pixels)").  GraXpert works on
-        each tile through a log transform and its inverse, so it takes linear data as it is."""
+        each tile through a log transform and its inverse, so it takes linear data as it is.  False = GraXpert left the image untouched (auto then runs Siril RL)."""
         s = self.steps
         try:
             fwhm = float(self.sp.get("graxpert_psfsize") or 0) or None       # the user's -psfsize; 0 = measured
@@ -1454,8 +1460,8 @@ class Restorer:
         if fwhm is None:
             s.add("deconvolution", "graxpert", "failed", region=region,
                   note="the image FWHM could not be measured (too few isolated stars): set GraXpert PSF size in the options")
-            return
-        for kind in GRAXPERT_DECONV[region]:
+            return False
+        for i, kind in enumerate(GRAXPERT_DECONV[region]):
             t0 = time.time()
             try:
                 src, dst = self._file(self.arr, f"gxdc_{kind}_in.fits"), self._out(f"gxdc_{kind}_out.fits")
@@ -1468,7 +1474,8 @@ class Restorer:
             except (ToolUnavailable, ToolError) as e:
                 s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})",
                       "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, region=region, note=str(e))
-                return
+                return i > 0
+        return True
 
     def _guard_denoise(self, run, strength: float, label: str, key: str) -> None:
         """The denoiser must not buy the sky with the stars -- and if it does, the frame pays back what it can.

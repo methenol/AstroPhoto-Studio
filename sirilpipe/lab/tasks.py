@@ -1043,7 +1043,7 @@ class RestoreTask(Task):
         s = ds.ensure_stacked(log, cancel)
         from ..hypertune import available_tools
         tools = available_tools()
-        auto_dc = "bxt" if tools.get("bxt") else "rl"
+        auto_dc = next((t for t, k in (("bxt", "bxt"), ("graxpert", "graxpert_deconv")) if tools.get(k)), "rl")
         auto_dn = next((t for t, k in (("nxt", "nxt"), ("graxpert", "graxpert_denoise")) if tools.get(k)), "siril")
         self._rest_rows = None
         src, sharp = self._held_out(s, study_dir, log, cancel)
@@ -1082,7 +1082,7 @@ class RestoreTask(Task):
             return None, None
 
     def canonical(self, active, ctx):
-        """What runs: auto = BlurXTerminator when licensed (else Siril RL), the denoiser auto = the first available of NXT / GraXpert / Siril, the
+        """What runs: auto = BlurXTerminator when licensed (else GraXpert, else Siril RL), the denoiser auto = the first available of NXT / GraXpert / Siril, the
         gradient model auto = the sky-survey reference where it covers the field (its smoothing / correction unused), else GraXpert; the
         Deconvolution slider only switches a BXT-only deconvolution on (> 0) or off; strengths of tools that do not run do not count."""
         a = dict(active)

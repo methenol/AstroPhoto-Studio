@@ -100,10 +100,15 @@ def fakes(monkeypatch):
 class FakeGX:
     """tools.graxpert stand-in: records the deconvolution / denoise calls, returns the image unchanged."""
 
-    def __init__(self):
-        self.calls = []
+    def __init__(self, installed=True, missing=()):
+        self.calls, self.installed, self.missing = [], installed, set(missing)
+
+    def available(self):
+        return self.installed
 
     def deconvolve(self, src, dst, kind="obj", strength=0.5, psfsize=3.0, **kw):
+        if kind in self.missing:
+            raise ToolUnavailable("graxpert", f"no {kind} model")
         self.calls.append(("deconv", kind, strength, psfsize))
         arr, hdr = fitsio.read_rgb(src)
         fitsio.write_rgb(dst, arr, hdr)
@@ -140,6 +145,51 @@ def test_graxpert_deconvolution_needs_the_image_fwhm(tmp_path, monkeypatch, fake
     r = _restorer(tmp_path, {"deconv_method": "graxpert_obj"})
     r.deconvolve()
     assert fake_gx.calls == [] and [x["status"] for x in r.steps.records if x["tool"] == "graxpert"] == ["failed"]
+
+
+def _rl_bodies(monkeypatch):
+    bodies = []
+
+    def fake(work, steps, name, arr, header, body, stage, **kw):
+        bodies.append(body)
+        return arr, header
+
+    monkeypatch.setattr(post, "_siril_image", fake)
+    return bodies
+
+
+@pytest.mark.parametrize("sp,kinds", [({}, ["obj", "stellar"]), ({"deconv_stars_method": "none"}, ["obj"]), ({"deconv_method": "none", "deconv_stars_method": "auto"}, ["stellar"])])
+def test_auto_deconvolution_is_graxpert_without_bxt(tmp_path, monkeypatch, fake_gx, sp, kinds):
+    """Auto, BlurXTerminator not licensed: GraXpert deconvolves (its model of each region), Siril RL does not run."""
+    rc = FakeRC(licensed=())
+    monkeypatch.setattr(post.tools, "rcastro", rc)
+    monkeypatch.setattr(post.Restorer, "image_fwhm", lambda self: 4.5)
+    bodies = _rl_bodies(monkeypatch)
+    r = _restorer(tmp_path, sp, {"deconvolution": 0.6})
+    r.deconvolve()
+    assert [c[1] for c in fake_gx.calls] == kinds and not any("rl -iters=" in b for b in bodies)
+    recs = [(x["tool"], x["status"]) for x in r.steps.records if x["step"] == "deconvolution" and x["tool"] != "none"]
+    assert recs[0] == ("rc-astro bxt", "unavailable") and recs[-1][1] == "done" and all("siril rl" != t for t, _ in recs)
+
+
+def test_auto_deconvolution_with_bxt_licensed_runs_bxt_only(tmp_path, monkeypatch, fakes, fake_gx):
+    cc, rc = fakes
+    r = _restorer(tmp_path, {})
+    r.deconvolve()
+    assert rc.calls == ["bxt"] and fake_gx.calls == []
+
+
+@pytest.mark.parametrize("gx", [FakeGX(installed=False), FakeGX(missing=("obj",))])
+def test_auto_deconvolution_is_rl_only_without_graxpert(tmp_path, monkeypatch, gx):
+    """Auto, neither BlurXTerminator nor GraXpert can run (not installed, or its model unavailable): Siril RL."""
+    monkeypatch.setattr(post.tools, "rcastro", FakeRC(licensed=()))
+    monkeypatch.setattr(post.tools, "graxpert", gx)
+    monkeypatch.setattr(post.Restorer, "image_fwhm", lambda self: 4.5)
+    bodies = _rl_bodies(monkeypatch)
+    r = _restorer(tmp_path, {})
+    r.deconvolve()
+    assert gx.calls == [] and sum("rl -iters=" in b for b in bodies) == 1
+    assert [x["tool"] for x in r.steps.records if x["step"] == "deconvolution"][-1] == "siril rl"
 
 
 # ----------------------------------------------------------------------------- deconvolution per region (objects / stars)
