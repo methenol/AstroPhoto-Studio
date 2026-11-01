@@ -1,68 +1,56 @@
 # AstroPhoto Studio — raw FITS subs → finished astrophoto
 
-An end-to-end pipeline that turns the raw one-shot-colour FITS subs from a smart
-telescope or an astronomy camera into a finished image. It
-handles the whole chain: calibration, frame grading, cloud/tree/obstruction rejection,
-registration with alt-az field rotation, local normalisation, sigma-clipped
-Bayer-drizzle integration, AI denoising, gradient removal, deconvolution,
-star separation, narrowband palettes, stretching and export to a
-full-resolution JPEG + 16-bit TIFF. It includes a web UI and a CLI.
+An end-to-end pipeline that turns the raw one-shot-colour FITS subs from a smart telescope or an
+astronomy camera into a finished image, built on **Siril 1.4** (headless) with **GraXpert**,
+**StarNet2** and the **RC-Astro** tools (BlurXTerminator, NoiseXTerminator, StarXTerminator; licensed
+from the web UI), with SetiAstro's **Cosmic Clarity** models (Sharpen, Denoise, Super-Resolution, DarkStar,
+satellite-trail removal) as an optional path instead of or next to them.  It handles the whole chain: calibration, frame grading, registration with alt-az
+field rotation, Bayer-drizzle integration with rejection, plate solving, gradient removal (GraXpert or
+the NSNS sky survey), spectrophotometric colour calibration (Siril SPCC), deconvolution, noise reduction,
+star separation, the community's finishing workflow (Statistical Stretch or the GHS two-pass stretch, highlight protection,
+HOO and Hubble-like SHO palettes by the Hubble_Palette_from_Dual-Band_OSC.py script on dual-band data, Foraxx, Seti Astro star stretch, screen recombination) and export to a full-resolution
+JPEG + 16-bit TIFF with a sidecar that lists every Siril command and tool call.  Every step is a named
+community tool with its published parameters; the sources are cited in the code.  It includes a web UI,
+a programmatic API (`/api/v1`), an Explore tab (Gaia / SIMBAD annotation), an Experiments tab (Optuna
+studies of every stage) and a CLI.  Everything runs inside the Docker image; nothing is installed on
+the host.
 
-Nothing is tuned for a particular object or telescope. Every decision comes from the
-FITS headers (`BAYERPAT`, `BIAS`, `FILTER`, `EXPTIME`, …), from calibration frames
-when there are any, and from statistics of the data. Where a telescope leaves header
-keys out, a profile of that telescope fills them in (see
-[Supported telescopes and cameras](#supported-telescopes-and-cameras)). A dual-band filter
-(Seestar `LP`, DWARF `Duo-Band`, L-eXtreme, …) automatically gets an Ha/OIII (HOO)
-workflow. A broadband filter (`IRCUT`, `Astro`, `VIS`, none) gets a natural-colour RGB workflow.
+Nothing is tuned for a particular object or telescope. Every decision comes from the FITS headers
+(`BAYERPAT`, `FILTER`, `EXPTIME`, `GAIN`, …), from calibration frames when there are any, and from
+statistics of the data. A dual-band filter (Seestar `LP`, DWARF `Duo-Band`, L-eXtreme, …) gets an
+Ha/OIII (HOO) workflow with SPCC in narrowband mode; a broadband filter gets a natural-colour workflow.
 
 ## Quick start
 
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt          # or: uv pip install -r requirements.txt
-
-# Web UI  →  http://127.0.0.1:8000
-python -m webui.server                   # --images /path/to/sessions  --port 8080  --host 0.0.0.0
-
-# or headless, one command:
-python -m astrophoto run "images/IC 5070_sub"
-python -m astrophoto run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
-python -m astrophoto run NIGHT1 NIGHT2     # several sessions of one target, stacked together
-python -m astrophoto analyse DIR          # just the frame-quality report
-python -m astrophoto calibration DIR      # telescope profile + the bias / dark / flat masters it will use
-python -m astrophoto devices              # show GPUs PyTorch can use
+cp .env.example .env                      # IMAGES_DIR, OUTPUT_DIR, PORT, STARNET_ACCEPT_LICENSE, IMAGEMM
+mkdir -p vendor && cp ~/Downloads/rc-astro-cli-*-linux-x64.sh vendor/   # optional: the RC-Astro CLI installer
+docker compose up -d --build              # NVIDIA GPU (default profile); --profile cpu for CPU only
+# → http://localhost:8000  (or your PORT)
 ```
 
-Point the UI or CLI at any folder of light subs: a Seestar `<Object>_sub` folder, a DWARF
-`DWARF_RAW_…` session folder, or a `lights/` folder from any camera. Only same-size
-light frames with the dominant filter are used. JPG/PNG previews, the telescope's own stacks,
-thumbnails and calibration frames are skipped. Several sessions of the same target (one
-folder per night) can be stacked as one dataset: in the UI, open one of them and tick the others
-under *Stack together with*; on the CLI, give all the folders. A combination has its own cache
-folder (`output/<first folder>+<n more>-<hash>/`), and the calibration masters are searched beside
-every folder. Results are cached in `output/<folder>-<hash>/`:
-`stack.fits`, the two half stacks, `denoised.fits`, the coverage and
-rejection maps, and `exports/`.
+Then open the web UI, choose a session folder and press **Run everything & export**.  The *Tools* card
+shows Siril, GraXpert, StarNet2 and RC-Astro; paste your RC-Astro activation code there once (the
+licence is kept in `OUTPUT_DIR/.home`, bound to the container's fixed hostname).  For development
+without rebuilding: `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d` mounts the
+repository's code into the container.
 
-### NVIDIA GPUs (Windows / Linux)
-
-The AI denoiser runs on NVIDIA CUDA, Apple Metal (MPS) or CPU. The default
-PyTorch wheel on Windows/Linux is often CPU-only, so install the CUDA build:
+Headless, inside the container:
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate      # Windows  (Linux: source .venv/bin/activate)
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
-python -m astrophoto devices          # should list your RTX card
+docker compose exec astrophoto python -m sirilpipe run "/data/images/DWARF_RAW_TELE_M 42_…"   # everything
+docker compose exec astrophoto python -m sirilpipe stack DIR [DIR ...]   # several nights of one target
+docker compose exec astrophoto python -m sirilpipe analyse DIR           # frame-quality report
+docker compose exec astrophoto python -m sirilpipe calibration DIR       # masters it will use
+docker compose exec astrophoto python -m sirilpipe devices               # GPUs and tool status
 ```
 
-On CUDA the denoiser uses mixed precision (bf16 on RTX 30/40/50, fp16 on
-older cards). It sizes the training batch and the inference tiles to the
-card's VRAM: 8 GB cards work fine, and 4–6 GB cards use smaller tiles. Pick a
-specific GPU with `--device cuda:1`, or with `ASTROPHOTO_DEVICE=cuda:1`. The
-UI also has a device selector. Everything outside the denoiser (NumPy,
-OpenCV, SEP) runs on the CPU and is platform-independent.
+### NVIDIA GPUs
+
+The RC-Astro tools and GraXpert run on CUDA inside the container (the image carries the CUDA 12 user-space
+libraries; the host needs only the NVIDIA driver and the NVIDIA Container Toolkit).  The optional ImageMM
+restoration needs PyTorch: build with `IMAGEMM=cuda` (about 4 GB more).  Pick the device per job in
+*Integration & compute options* (auto / a GPU / CPU).
 
 ### Docker (NVIDIA or CPU)
 
@@ -106,13 +94,23 @@ docker compose down                               # stop
   `cpu` profile works there, and the AI stages are much slower than a native run on MPS.
   Docker Desktop must be allowed to share the images folder (*Settings → Resources → File
   sharing*; `/Volumes` covers mounted NAS shares).
+- **Tools:** `STARNET_ACCEPT_LICENSE=yes` downloads the StarNet2 CLI from starnetastro.com at build time
+  (you accept its licence); the RC-Astro CLI installer goes to `vendor/` before the build; GraXpert's
+  AI models are downloaded on first use into `OUTPUT_DIR/.home` (or from the Tools card); Cosmic Clarity's models (2.4 GB) are
+  downloaded from the Tools card and need an image built with `IMAGEMM=cuda` (or `cpu`) for PyTorch. Colour calibration (Siril SPCC) uses Gaia DR3 online;
+  the sky chunk covering a field (1 of 48, 27-626 MB) is fetched on first use and cached in `OUTPUT_DIR/.home` so later fields in that region need
+  no download (the Tools card shows and clears the cache).
+- **ImageMM:** `IMAGEMM=cuda|cpu|off` adds PyTorch for the multi-frame restoration (`deconv_method = imagemm`).
 - **Calibration library elsewhere:** set `ASTROPHOTO_CALIB` to its path *inside* the container
   (under `/data/images`), or set it per dataset in the UI's *Calibration* panel.
-- **Images on a NAS:** `LOCAL_COPY=true` in `.env` makes every job that reads the subs (calibrate,
-  analyse, stack, ImageMM restore, run everything) copy the dataset's light frames to a local folder
-  first and read them from there, so each stage does not read every sub over the network again.
-  The folder (`LOCAL_DIR`, default `/data/output/.local_copy` on the output volume) is cleared
-  before the copy and deleted when the job ends, also when it fails or is cancelled. It needs free
+- **Images on a NAS:** `LOCAL_COPY=true` in `.env` makes jobs copy the dataset's light frames to a
+  local folder and read them from there instead of over the network: the copy is made when a stage
+  first reads the subs (calibration before registering, the ImageMM restore's raw-saturation pass);
+  a job that reuses an existing registration reads no sub and copies nothing.
+  The folder (`LOCAL_DIR`, default `/data/output/.local_copy` on the output volume) is shared by every job on
+  that volume, so each job copies into a folder of its own under it and deletes that when its job ends, also when it
+  fails or is cancelled; what a job that died left behind is reclaimed by the next job to start, never a running
+  job's. It needs free
   space for one dataset's subs. Natively, set `ASTROPHOTO_LOCAL_COPY=true` (and optionally
   `ASTROPHOTO_LOCAL_DIR`).
 - **Memory:** worker pools are sized from the container's memory and CPU limits (`mem_limit`,
@@ -153,8 +151,8 @@ curl -X POST http://server:8000/api/v1/jobs -H 'content-type: application/json' 
 - **kind** defaults to `all` (analyse, stack, restore, star remover, auto-finish, export). The other
   kinds are the UI's pipeline steps. `"stack_params": {"autofinish": false}` exports with the given
   processing settings instead of tuning them.
-- **profile** picks a restoration recipe. The default, `default`, is `STACK_DEFAULTS` (ImageMM with
-  its Noise2Noise pass). `imagemm` is ImageMM on all subs at once, without the pass. `n2n-network`
+- **profile** picks a restoration recipe. The default, `default`, is `STACK_DEFAULTS`. `imagemm`
+  (and `n2n-imagemm`) is VeraLux ImageMM on all subs at once. `n2n-network`
   (Noise2Noise + the deconvolution network) is the fast one, and `n2n-rl` uses Noise2Noise with
   Richardson–Lucy (the UI's *Noise2Noise + Richardson-Lucy*); both stack at 2× drizzle (`"stack_params": {"scale": 1}` for native). `stack_params`, `params` and `preset` override single settings on top of the
   profile. `GET /api/v1/profiles` lists them with their settings.
@@ -178,9 +176,9 @@ curl -X POST http://server:8000/api/v1/jobs -H 'content-type: application/json' 
 | **Crop** | Largest fully covered rectangle, found by an aspect-ratio search on the coverage map and centred on the deepest part of the stack. The minimum coverage is adjustable. |
 | **Colour** | Background neutralisation, then **spectrophotometric colour calibration** (SPCC, as in Siril). Once the stack is plate-solved (done automatically after stacking when online), every Gaia DR3 star in the field gets a predicted colour *in your camera*: a Pickles library spectrum for its Gaia temperature, reddened by its own Gaia extinction (CCM89), integrated through your sensor's R/G/B response and your filter's transmission. The per-channel gains are the robust fit of the measured star colours to those predictions, relative to a white reference (average spiral galaxy, or G2V). Sensor and filter come from the FITS headers (camera name, model number, sensor geometry, `FILTER`), or you pick them from Siril's database. Without a plate solution it falls back to star-based white balance (the average star is white). Aperture photometry uses isolated, unsaturated stars, with the aperture sized to the *widest* colour channel. Pixels clipped in any channel are rendered neutral. |
 | **AI deconvolution** (option) | A second network is trained on the same half-stack pairs to *undo the blur*. This is a Noise2Noise adaptation of ZS-DeconvNet. The network takes the denoised half A. Its output, blurred by **PSFs measured from your own stars (one per colour channel)**, must predict the raw half B (χ² with the measured per-pixel noise). The only way to lower that loss is to recover the true, sharper sky. A Hessian penalty and a physical **sky-floor prior** (no flux below the local sky) prevent the dark rings and noise that classic deconvolution produces. In held-out tests on M 27, IC 5070 and M 31, star FWHM fell by 2–2.5× with no ringing, against 1.1× for the old masked Richardson–Lucy (see `experiments/README.md`). Saturated stars are handed back to the denoised image. Richardson–Lucy with TV regularisation remains as the fallback when too few stars are available. |
-| **Restoration: ImageMM** (default) | **ImageMM** (Sukurdeep et al. 2025, arXiv:2501.03002), as published. One non-negative sky image is fitted to **every individual sub at once**, each sub with its own PSF, photon-transfer variances and masks, by majorization-minimization with Huber-robust weights (removes satellite trails), the paper's update clipping, starting image (the median of the exposures) and stopping rule (Eq. C15; it converges in 24–157 iterations per cutout on M 42, the paper's "under 100"). Biggs–Andrews acceleration and a flux-based stopping rule are options, off by default: run 2000 iterations past the paper's convergence they deepened the dark crescents above saturated stars. The PSFs are measured on the subs themselves: the preparation sums the registered subs into their own coadd and measures the field PSF on it (the pipeline's stack is resampled and combined differently and its stars differ from the subs' by a few per cent in the core, which showed up as a dark ring round every bright star); the brightest unsaturated stars are included, and the wings are smoothed by a low-order angular expansion that keeps their real asymmetry. Each sub's kernel is then G(σ<sub>t</sub>) ∗ Q: a seeing-free PSF Q (the coadd's PSF deconvolved by the mean of the subs' Gaussians) convolved with the sub's own Gaussian seeing σ<sub>t</sub>, fitted on its bright stars — a coadd PSF is a mixture over seeing, and no radial scaling of a mixture fits any single sub. The subs' kernels average to the coadd's PSF by construction. The latent is non-negative, as in the paper (a sky pedestal, 50× the subs' pixel noise, is an option, off by default: it let the latent dig 50σ below the sky beside saturated stars). **Saturated stars** follow Whyte, Sivic & Zisserman, *Deblurring shaken and partially saturated images* (IJCV 2014): ImageMM's masks drop every pixel whose resampling uses a saturated raw sample, and the bright latent pixels behind them, estimated from incomplete data, spread their errors through the blur — on M 42 a flat-topped core and a dark crescent above every saturated star (to −130 ADU). Each iteration the latent is split at 0.9× saturation: the bright pixels are updated from all the data through a smooth saturation response, the rest only from the measurements the bright pixels cannot reach (outside them grown by the PSF's support); pixels with no such data keep the measured image, so a saturated star keeps its recorded glow round a deconvolved core. Without saturated pixels the update is the paper's exactly. Every restoration kernel is scaled to unit sum first: the non-negative Eq. 11 solution of an aberrated PSF carries up to 1–4 % too much flux in the field's corners, which on the pedestal became a different sky level in every cutout (M 42, 2026-10-06: steps of up to 55 ADU). The latent resolution (Gaussian σ, 1.0 at 1×) is checked against the PSFs before the Eq. 11 solve and raised in steps of 0.1 if the PSF core is flatter than that Gaussian allows (the only non-negative Eq. 11 kernel is then ring-shaped and rings every star; the chosen σ is reported in the restoration info). The subs are prepared by linear demosaicing and star-refined registration (RMS at the centroid-noise level), with per-colour photometric scales and background models. Options: 2× super-resolution (the paper's Algorithm 2), Moffat PSFs, seeing groups, and the Noise2Noise pass (on by default: the two halves of the subs are restored separately and combined by a Noise2Noise network trained on the pair; star cores far above its training range are the mean of the two halves, where the network's output was ~35 % too green on M 42). The first run prepares the subs once (about 15 min for 200 subs, 55 min for 565); the full-field restoration time is measured below. |
+| **Restoration: ImageMM** | **VeraLux ImageMM** v1.0.0 by Riccardo Paterniti ([vera-lux-siril-scripts](https://gitlab.com/RikyPate/vera-lux-siril-scripts/-/blob/IMM_update/VeraLux/VeraLux_ImageMM.py), GPL-3.0-or-later), an implementation of ImageMM (Sukurdeep et al. 2025, AJ 170:233), run headless (`sirilpipe/veralux_imagemm.py`). One sky image is fitted to **every sub at once** by the paper's majorize-minimize updates, each sub with its own PSF (measured on its own stars, per colour channel, at the stars' common positions), its transmission, its sky level and gradient (both against the mean of the subs: the target's own light is never modelled away), a measured photon-transfer noise model and Huber-robust weights on the standardised residuals. Subs the model cannot use are dropped and listed (transmission under half the median - cloud, dawn - , no measurable PSF, or a fit far outside the noise; M 31: 33 of 299). The preparation runs as Siril commands on the stack's calibrated subs: cosmetic correction, `calibrate -debayer`, registration with the stack's own transforms (Lanczos-4); saturated pixels are found on the raw subs and left out with a margin that grows with the saturated patch (the light next to a full well exceeds the PSF's); a saturated star starts as a point at the light PSF photometry of its unsaturated wings measures, and where the subs' data are sparse it is drawn as the restored image's own PSF at its wings' colour. The PSF reaches 80 px: an extended wing joined from unsaturated and saturated stars (Infante-Sainz et al. 2020), with its colour and its lobe measured on the saturated stars. Changed from the script, each a defect measured on real data and listed in the module: the forward model is a convolution (the script drew stars rotated by 180°), star positions follow Siril's convention (the script read them mirrored), the PSF fit keeps the wings, frames stream from disk, and the script's per-sub `seqsubsky` is an option, off (it removed part of large targets). Every run is checked against its own subs (every sub fits within its noise). Options: `restored_resolution` (super-resolution r = 2–3), formal mode, and the `imagemm_*` processing settings. |
 | **Star separation** | An **AI star remover trained on your own image** (like StarNet, with no pretrained weights). Its training pairs are made from the dataset: the classic starless image as the background, plus stars rendered with the image's own measured star profile per colour channel (halo and any dark ring included), star colours and brightnesses, up to saturated cores. The network then removes the real stars, including faint ones below the detection limit and stars on nebulosity, where inpainting smears. **Star reduction** at 1 gives the fully starless image. Until the remover is trained, the classic method is used: stars detected on a background mesh scaled to the PSF, with a concentration index that keeps galaxy nuclei and nebula knots out of the star layer, and push-pull inpainting with matched grain. |
-| **Star colour & halos** | Refractors bring blue/violet (and the OIII band) to a slightly different focus, so bright stars get coloured rings. Halo light above the local background is desaturated in linear data. The star layer uses a luminance-only stretch, true linear star colour and an "unscreen" recombination, which gives white cores with no coloured blooming, dark donuts or tints over bright backgrounds. |
+| **Star colour & halos** | Refractors bring blue/violet (and the OIII band) to a slightly different focus, so bright stars get coloured rings. Halo light above the local background is desaturated in linear data. The star layer uses a luminance-only stretch, true linear star colour and an "unscreen" recombination, which gives white cores with no coloured blooming, dark donuts or tints over bright backgrounds. *Star colour preservation* blends in the colour-preserving stretch of Lupton et al. (2004): every pixel's RGB scaled by one factor of its intensity, so the stars keep their linear colour ratios (an L\*a\*b\* composition had pushed 45 % of M 31's well-measured stars off the blackbody locus, green or magenta). |
 | **Stretch** | Four algorithms, as in Siril: **Generalized Hyperbolic Stretch** (default), **arcsinh**, **histogram transformation** (midtones transfer function, as in an autostretch) and **logarithmic**. For each one the strength is solved automatically so that the starless background lands on a target level. The stretch is colour-preserving, with luminance-preserving gamut mapping so that saturated highlights never darken. |
 | **Narrowband (dual-band filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. The palette's colour is used as composed, at full strength everywhere: **nothing is desaturated and no region is treated differently from another**. Colour noise is the job of the *Colour noise reduction* slider, which treats every pixel alike. |
 | **Finishing** | Post-stretch starlet shrinkage on luminance, OKLab chroma noise reduction, wavelet local contrast, perceptual (OKLab) vibrance with background protection, SCNR, curves and masked sharpening. |
@@ -372,69 +370,34 @@ Siril predicts star colours from each star's Gaia XP spectrum. The Gaia archive 
 spectra one star at a time (minutes for a few hundred stars), while temperature and extinction
 come with the catalogue query that plate solving already makes.
 
-## AI star remover
+## Star separation
 
-**Train AI star remover** (Pipeline panel, and part of *Run everything*) takes about 2–3 minutes
-on an Apple-silicon GPU. It trains a U-Net to remove stars from this dataset (details in the
-*Star separation* row above). Once it is trained, *Star removal: auto* uses it for star
-separation. The **Star reduction** slider then works in two ranges:
-
-- up to 0.5 it shrinks the stars;
-- from 0.5 to 1 it also fades them out, and 1 is the starless image.
-
-A new restack or restoration makes the trained remover stale, and it has to be trained again.
+**Remove stars** (Pipeline panel, and part of *Run everything*) separates the stars from the linear
+restored image with **StarXTerminator** when licensed (on linear data, no unscreen, as RC-Astro
+recommends), else **StarNet2**.  The star layer is stretched on its own (Seti Astro Star Stretch, which is
+Siril's `mtf` with m = 1/(3^a+1)), colour-balanced for dual-band data (invert, SCNR, invert), reduced with the
+Deep Space Astro star-reduction formula and screened back onto the starless image (`~(~starless*~stars)`).
+The **Star reduction** slider runs from 0 (as stretched) to 1 (starless).
 
 ## Auto-finish
 
 **Auto-finish** (the last Pipeline step, the ✨ button under the Process sliders, and part of *Run
-everything* unless *Auto-finish before the export* is unticked) works through the sliders on the
-right the way a finisher does: one control at a time, in the professional order, watching one
-measurement per control and stopping where the image says stop. Every step and its reason are
-listed above the sliders afterwards, and the sliders land where it left them, so you can carry on
-by hand.
+everything* unless *Auto-finish before the export* is unticked) sets the processing settings from
+measurements of the image by published rules, and lists every decision with its measurement and its
+source above the sliders:
 
-| In this order | What it watches | Where it stops |
-|---|---|---|
-| Stretch | the object's midtones | where the reference images put them |
-| Black point | the sky's brightness | the references' sky, but never clipping the sky's noise to black |
-| HDR | the brightest extended structure | the least compression that keeps it off the ceiling |
-| Midtones | the object's midtones again | re-checked after the black point and HDR |
-| GHS focus (contrast) | structure against grain on the object | the focus with the most structure, grain bounded |
-| Fine-grain noise reduction | the sky's grain on a **full-resolution crop** (1:1) | the least that brings it to the references' grain |
-| Colour noise reduction | colour mottle of sky and object | the least that removes it |
-| Local contrast | mid-scale noise and mottle on the faint parts | raised until they would show |
-| Sharpening | fine noise and dark halos on the 1:1 crop | raised until they begin to show |
-| Star reduction | the share of the frame the stars cover | no more than in a typical reference |
-| Star brightness | clipped star cores | the brightest stars just below clipping |
-| Halo suppression | blue excess round bright stars | until it is gone |
-| Saturation | the object's colourfulness | the references' colourfulness, unless the colour mottles, clips or tints the field |
-| OIII boost (dual-band) | the warm / cool balance | the references' balance, unless OIII noise tints the sky |
-| SCNR | the share of green hues | only if it exceeds the references' |
-| Colour grade | hue of the red and of the teal / blue sectors, star colour cast, tonal spread | towards the nearest reference's hues; the star field neutral (broadband); the references' tonal spread |
+| Setting | Rule |
+|---|---|
+| Stretch | Seti Astro Statistical Stretch (median 0.10 small subject / 0.25 frame-filling) by default; alternatives: Siril GHS two-pass recipe (background 0.10, second pass D 2.5 small subject / 1.5 above 30 % coverage), `autoghs`, `modasinh`, `autostretch`, VeraLux HMS, each after a black point at the histogram toe |
+| Highlights | GHS HP < 1 at half strength on dual-band nebulae; full when more than 0.05 % of the stretched pixels clip |
+| Noise reduction | NoiseXTerminator 0.6–0.85 on the stretched starless image by the measured SNR (RC-Astro, Brecher), colour denoise 0.95 |
+| Local contrast | Siril `clahe` under a background mask at the lowest published LHE strengths |
+| Palette / SCNR | HOO for dual-band (no SCNR: the green is OIII); natural colour and SCNR only against a measured green cast for broadband |
+| Saturation | Siril `ght -sat` (GHS saturation stretch) under the subject mask, D fitted so the subject's mean HSL saturation reaches 0.45 (HOO) / 0.25 (broadband); the `saturation` setting is the factor 1-3 |
+| Stars | Seti Star Stretch amount 5 (lowered to 4 / 3 against clipping); then the least intervention - colour boost 1 / 1.5 / 2, a gentler star stretch 4 / 3, colour preservation - whose stars, measured in the recombined picture as the finishing gates measure them, are coloured (saturation ≥ 0.10), physically coloured (at most 10 % of the well-measured stars off the blackbody locus: green or magenta stars are chroma noise) and kept (at most 20 % of the linear layer's 5σ stars below visibility); reduction by star density, checked the same way |
 
-The **targets** are not constants in the code. They are the medians of the same measurements over
-reference astrophotographs of the target: 58 freely licensed images on Wikimedia Commons of 16
-targets (M 42, M 31, M 27, M 20, M 76, NGC 281, NGC 6960, NGC 6992, NGC 7000, NGC 7635, NGC 7662,
-IC 405, IC 1318, IC 5070, Sh2-142, LDN 1235), chosen for natural-colour or HOO looks that a one-shot-
-colour camera can reach. Only the statistics and the attributions are kept, in
-`astrophoto/data/autofinish_refs.json`; `python experiments/autofinish_refs.py` rebuilds it. The
-**limits** (where to stop) come from the image itself: its own grain, clipping, colour mottle and
-star coverage, measured on a 1000 px render for the tonal and colour steps and on a 1024 px
-full-resolution crop of the most structured part of the object for noise reduction and sharpening,
-which act below the resolution of a small render. A target without references of its own uses those
-of its class (emission nebulae, supernova remnants, planetary nebulae, galaxies, dark and reflection
-nebulae), found from the `OBJECT` header and a list of common names; without a known class, all the
-dual-band or all the broadband references. For a small object in a wide field (M 27 in a Seestar
-frame) the object's brightness targets count in proportion to the share of the frame it covers.
-
-The finished image is then compared with the nearest reference and that distance is reported,
-before and after. It is a check, not the objective: the earlier Auto-finish searched the sliders to
-minimise this distance and could pay for a match with the wrong trade-offs (desaturating and
-tinting to match a hue histogram, lifting the sky to match a close-up's brightness). The rules of
-thumb it works by (how much grain, clipping and star coverage is acceptable, how strong the grade
-is) are `autofinish.RULES`, tunable in the Experiments tab (task *Auto-finish (finishing look)*).
-`autofinish.json` in the session folder keeps the last result; on the CLI `--no-autofinish` turns the
-step off. About 60 renders, one to two minutes on the CPU.
+Auto-finish uses no reference images: every value comes from the image's own measurements, and no Experiments
+or hyper-tune objective uses reference images either.  `autofinish.json` in the session folder keeps the last result.
 
 ## Gradient removal against a sky survey
 
@@ -454,8 +417,6 @@ onto your plate solution, and are cached with the session (`skyref.npz`).
 - Limits: NSNS's [OIII] and continuum maps are background-filtered above about 3°. On fields wider
   than that, structure larger than 3° is treated as gradient. Outside the survey, offline, or
   without a plate solution, the sample-based *auto* model is used; the processing info says which.
-- The ImageMM restoration subtracts the same sky model from every sub. A restoration made before
-  this was added used a degree-2 polynomial: run *Restore* again to use the survey.
 
 NSNS DR0.2 is © its authors, CC BY-NC-SA 4.0 (non-commercial use; cite
 [doi:10.3847/2515-5172/adfec7](https://doi.org/10.3847/2515-5172/adfec7)). Thanks to CDS
@@ -494,46 +455,85 @@ the session folder (`explore/`).
 
 ## Experiments (Optuna)
 
-The **Experiments** tab tunes the pipeline with [Optuna](https://optuna.org) studies. For
-each study you choose:
+The **Experiments** tab tunes the pipeline with [Optuna](https://optuna.org) studies. For each study you
+choose an experiment, a dataset (a stacked real session, several nights of one target, or a **synthetic**
+one generated in the tab), which parameters to tune and over what ranges, one or two objectives, and a
+sampler (multivariate TPE, NSGA-II, random or grid).  Each study runs as its own background process.
+While it runs you see the optimisation history, Pareto front, fANOVA importances, slice plots, a trials
+table with a preview of every result, and the log.  Trial 0 is the pipeline's current settings.  Stop a
+study, continue it, or apply its best trial to the pipeline (from the study, or with **From experiment** in
+*Integration & compute options*).
 
-- an experiment: ImageMM restoration, the Noise2Noise denoiser, the N2N restoration
-  network, registration & integration, star detection & separation (classic), the AI star
-  remover, or gradient removal
-- a dataset: a stacked real session, or a **synthetic** one generated in the tab
-- which parameters to tune, and over what ranges
-- one or two objectives
-- a sampler: multivariate TPE, NSGA-II, random or grid
+Experiments, in pipeline order, each with a score and constraints (shown under the experiment in the tab;
+a trial that breaks a constraint is marked ✗, the samplers steer away from such regions, and the best trial
+is the best one that meets them - the baseline stays unless a trial beats it by more than the measurement's
+resolution).  The measurements are paired: the same stars and the same empty-sky apertures, chosen once on a
+reference image, are measured in every trial, so the differences between trials are not lost in the
+scatter of a new detection.
 
-Each study runs as its own background process, so several can run at once on different
-GPUs. While it runs you see the optimisation history, Pareto front, fANOVA parameter
-importances, slice plots, a trials table with a preview of every result in one shared
-stretch, and the log. Trial 0 is the pipeline's current settings, so every result is shown
-as a change from the baseline. Stop a study, continue it with more trials, or apply its
-best trial to the pipeline: from the study itself, or with **From experiment** in
-*Integration & compute options*. That sets integration & compute options and processing
-settings. Some tuned values are constants of the code instead, such as the star detection
-thresholds and mask radii (`postprocess.STAR_DETECT`, `STAR_MASK`), the gradient model's
-sampling (`postprocess.BACKGROUND`) and the star remover's training (`starnet.train`). The
-study names these, and a better value becomes the default for every dataset when it is
-changed there.
+| Experiment | Searches | Score | Constraints |
+|---|---|---|---|
+| **Registration & integration** | rejection algorithm and sigmas, frame weighting, frame selection, Bayer drizzle / demosaic, drizzle drop size and kernel, banding correction | fidelity against held-out frames: every second frame (in time) stacked with your settings and held out, the trial stacks the others; matched to the held-out stack's PSF per tile, noise-weighted χ² (depth, the matched-aperture S/N, reported) | star ellipticity, single-pixel outliers (hot pixels a lax rejection lets through) and satellite / aircraft trails no worse than the baseline; the auto-crop keeps 90 % of the field |
+| **Satellite trails (Cosmic Clarity)** | Cosmic Clarity trail removal on the stack | trail pixels left (Hough transform on the sky) | nothing else changed above the PSF scale |
+| **Gradient removal** | sky-survey reference, GraXpert, Siril polynomial / RBF, subtract / divide, degree, smoothing | emission changed by the model (validated on a synthetic sky: ρ +0.99 with the error against the truth; the flatness of the "sky" was ρ −0.19, since a model that eats faint nebula flattens it best) | gradient left in the sky ≤ 3 × the pixel noise, the model's own structure at 1-10 % of the frame ≤ 15 % of the image's |
+| **Linear restoration** | satellite-trail removal (Cosmic Clarity), gradient model (sky-survey reference, GraXpert, polynomial / RBF, subtract / divide), deconvolution tool of the objects and of the stars (BXT, GraXpert, RL) and strengths (BXT Sharpen Stars / Nonstellar / Halos), noise-reduction tool and strength (NXT with iterations, GraXpert, Siril) | fidelity against held-out frames (the sharpest third stacked on its own; restoration matched to its PSF per tile, noise-weighted χ², stars masked) + ln(1 − emission changed by the gradient model) | star flux conserved (\|Δmag\| ≤ 0.05 bright / 0.10 faint), no dark rings round bright stars, gradient left ≤ 3 × noise, model structure ≤ 15 %, trails no more than Cosmic Clarity's removal leaves |
+| **Star separation** | StarXTerminator, StarNet2 (stride), Cosmic Clarity DarkStar | star light left + holes dug at the reference stars | nebula / sky untouched above the PSF scale, holes ≤ 5 % of the stars |
+| **Stretch & finish** | stretch tool and settings, highlights, NXT / Cosmic Clarity Denoise, Cosmic Clarity Sharpen, saturation, local contrast, stars, black point, final sky level (or midtones); palette and colour grade in the lab only (the hyper-tune keeps yours) | failed finishing gates first, then 1 − *H*: the structural fidelity of the finished image to its linear data (TMQI, Yeganeh & Wang 2013, with the significance set by the data's noise) - how much of the structure the data holds above its noise is made visible | every finishing gate no worse than in the baseline, gate by gate |
+| **Super-resolution (Cosmic Clarity)** | Cosmic Clarity Super-Resolution vs Lanczos, 2-4× | star FWHM in original pixels | binned back, the enlargement reproduces the original (PSNR ≥ 32 dB, flux within 2 %) |
 
-How results are scored:
+A parameter that has no effect under the other settings (the RBF smoothing of a polynomial model, the Cosmic
+Clarity amounts with Sharpen off) is not sampled, and a trial that repeats an earlier trial's settings reuses its
+result.  Synthetic datasets (Seestar-format subs of an analytic sky with stars, nebulae, galaxies, dither, field
+rotation, Moffat seeing, noise, hot pixels, satellite trails) are also scored against their exact truth,
+registered onto the stack's grid.
 
-- **Real data** is scored on held-out data only, never on data the method saw:
-  - restorations: the odd subs, predicted through each one's own PSF
-  - the denoiser: the independent half-stack, on held-out bands
-  - star separation and the star remover: the stars the default detector finds in a window
-    (flux left behind and the fraction still detected), and the change away from every star
-  - gradient removal: the flatness of the star-free sky tiles, and how much of the brightest
-    tiles' emission the model took away
-- **Synthetic datasets** are raw subs of an analytic sky in the Seestar S50's format (stars, nebulae,
-  galaxies) with the same held-out scores, plus comparison against the exact truth: error,
-  SSIM, faint-emission error and star photometry. Each sub has its own dither, field
-  rotation, Moffat seeing, transparency, sky gradient, shot and read noise, hot pixels,
-  satellite trails and cosmic rays.
+### Hyper-tune each stage
 
-Details: [experiments/README.md](experiments/README.md#experiment-lab-optuna).
+The **Hyper-tune each stage** checkbox under *Run everything & export* (off by default; *Trials per stage*
+appears when it is ticked) makes Run everything search the best configuration this framework offers for the
+target.  Before each of the four stages it runs that stage's experiment on this dataset with exactly the number
+of trials you set (a normal study in the Experiments tab, named *Hyper-tune <target>: <stage>*; the first trial is
+your current settings), runs the stage with the best trial and moves on; the export renders the best finishing
+trial.  Registration, restoration and star removal are searched by multivariate TPE (Falkner et al. 2018) with the
+constraints; the finish - some 28 settings against a dozen gates whose feasible region lies round your settings - by
+the (1+1)-CMA-ES for constrained optimisation (Arnold & Hansen, GECCO 2012), a local search from your (Auto-finish's)
+settings that adapts its step size by the success rule and learns from every trial that breaks a gate to step away
+from that direction (constrained TPE over the full ranges left 50 of 60 trials outside the gates on M 31).  A trial
+whose settings repeat an earlier one's (TPE re-proposes; on a plate-solved field the gradient's
+"auto" is the sky survey whatever its smoothing) returns that result at no cost and still counts as a trial.
+
+| Stage | Searched | Objective (no ground truth, no reference image) |
+|---|---|---|
+| Register & integrate | rejection algorithm and sigmas, frame weighting, frame selection, resampling, drizzle drop size / kernel, banding correction | **held-out fidelity**: the frames go alternately (in time) to two halves; one is held out and stacked with your settings, each trial stacks the other half with its own; the trial's stack, matched to the held-out stack's PSF by a kernel fitted per tile on luminance (difference imaging: Alard & Lupton 1998, Bramich 2008) and applied to R, G and B, is compared with it in noise-weighted χ² per channel - the halves' noise is independent, so this measures the trial's error against the true sky in every channel (on luminance alone a Bayer-drizzled stack won and its R / B band networks failed the finish's colour gates); a trial must beat your settings by two standard errors of the per-tile gains; trails the trial lets through are looked for in the residual; constraints: at least 3 frames, ≥ 90 % of the field kept, star ellipticity at most 0.02 worse, single-pixel outliers and trails no more than in your stack (+50 % / +25 %); depth (matched-aperture S/N) is reported |
+| Restore | satellite-trail removal (Cosmic Clarity), gradient model (sky survey, GraXpert, polynomial, RBF; subtract / divide), deconvolution tool of objects and of stars with strengths and BlurXTerminator's settings, noise reduction tool, strength and NXT iterations | **held-out fidelity + ln(1 − emission changed by the gradient model)**: the sharpest third of the frames is stacked on its own and held out, the trials restore the other frames, and the restoration matched to the held-out stack's PSF is compared with it in noise-weighted χ² (stars masked) - a deconvolution that recovers real structure and a denoiser that removes noise lower it, invented, smeared or misplaced structure raises it; a gradient model that takes a fraction *f* of the nebula's signal costs ln(1 − *f*); constraints: star flux conserved (bright ≤ 0.05 mag, faint ≤ 0.10), no dark rings, the gradient left in the sky ≤ 3 × the noise, the model's own structure at 1-10 % of the frame ≤ 15 %, no more trails than Cosmic Clarity's removal leaves |
+| Remove stars | the remover (StarXTerminator, StarNet2 and its stride, DarkStar) | **star light left** at the reference stars (left-over cores and dug holes both count); constraints: nebula and sky untouched within the noise, holes at ≤ 5 % of the stars |
+| Finish | stretch tool and settings, highlights, noise reduction of the stretched image (NXT / Cosmic Clarity Denoise), Cosmic Clarity Sharpen, dual-band unmixing, local contrast, saturation, star layer, black point / final sky level | **structural fidelity H**: the share of the structure your linear data holds above its noise that the finished image makes visible, in its shape - TMQI's multi-scale structural fidelity (Yeganeh & Wang, IEEE TIP 2013, the authors' code: 5 scales, CSF visibility thresholds) with the significance set by the data's own noise (Immerkaer 1996); the score counts failed finishing gates and their distance outside the limits first (a direction towards passing), then 1 − H; constraints: every gate your settings pass still passes, gate by gate, so that none is traded for another - the gates bound what H alone would reward (the sky's noise stretched into view, clipping, a sky off its level); the sky gates measure the sky with the stars excluded |
+
+How the objectives were checked: on a synthetic sky with exact truth, the gradient objective ranked 12 models at
+Spearman ρ +0.99 against the error to the truth (the flattest sky ρ −0.19: it is the model that ate the faint
+nebula).  Depth (matched-aperture S/N) was the stack and restore score first and was replaced: on M 31 it rose 5.5×
+in point-source S/N when BlurXTerminator shrank the stars from 4.5 to 2.0 px and as much again for a heavy
+GraXpert denoise - star reshaping and smoothing add no information, and depth cannot see structure; the held-out
+χ² on the same restorations is 1.02 unrestored (noise alone), 1.006 with NXT, 1.08-1.10 with BlurXTerminator's
+default processing; the finishing fidelity *H* measured on the data tracked *H* measured against the true sky (at the data's
+noise) at ρ +0.85 over 60 random finishes of the restored synthetic set, +0.90 over the 29 whose sky lay in the gate's
+band; on M 31 and on Sh2-131 it fell under every damage done to a finish (M 31 / Sh2-131: blur 0.81 → 0.76 / 0.65
+and 0.72 → 0.69 / 0.57, contrast flattened 0.76 / 0.66, over-sharpening 0.78 / 0.70 and 0.69 / 0.61, a brighter
+midtone 0.79 / 0.69, added noise 0.805 / 0.712).  Darkening the image raises it slightly (more contrast in the
+bright structure while the faint large-scale light, its coarsest scale, falls), and clipping the highlights leaves it
+level: the sky and clipping gates bound those directions, so a finish chosen by *H* sits towards the dark end of the
+sky band.  A trial replaces your settings only by more than the measurement's measured
+resolution: identical restorations scatter by 0.0023 in depth (BlurXTerminator and NoiseXTerminator on the GPU are
+not bit-reproducible), so restoration needs a gain of 0.01; Siril's stacking is deterministic (0.005); the
+finishing chain is deterministic too and needs 0.005 in H.  Restoration trials share the state before the
+deconvolution (trail removal, gradient, plate solve, colour calibration) per such settings.  Every stage's
+experiment runs before the stage (the calibration and registration inside the stack experiment); with Auto-finish
+on, its proposal is one trial of the finishing experiment, adopted only if it scores best.  The tools offered are those that can run here (a tool that is not
+licensed or installed is not searched).  Super-resolution, the output scale, the crop, the palette and the colour
+grade are yours and run as chosen; an ImageMM restoration (hours per run) is not searched.  Expect hours: a stack
+trial re-stacks the subs.  The report (every stage's study, its score yours → best and what changed) appears above
+the sliders and in `hypertune.json` in the session folder.
+CLI: `python -m sirilpipe run DIR --hypertune 25`; API: `"stack_params": {"hypertune": true, "hypertune_trials": 25}`.  25 trials a stage is the default; 20-30 is the target.
 
 ## Research & benchmarks
 

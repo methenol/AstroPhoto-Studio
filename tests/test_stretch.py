@@ -1,0 +1,86 @@
+"""The alternative community stretches (stretch.py) and the numpy mirror of Siril's ght; the tests marked ``docker`` run the real tools (siril-cli, the siril-scripts Python
+scripts in the pyscript virtualenv) and are part of the image's integration run."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from sirilpipe import finish, stretch
+
+
+def _scene(seed=3, h=240, w=320):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w]
+    neb = 0.35 * np.exp(-(((xx - 160) / 40.0) ** 2 + ((yy - 120) / 30.0) ** 2))
+    return np.clip(0.02 + 0.5 * neb * 0.1 + rng.normal(0, 0.0005, (h, w)), 0, 1).astype(np.float32)
+
+
+def test_ghs_slope_family_is_the_ghs_harmonic_family():
+    # slope (1 + b D t)^(-1 - 1/b) from SP: monotone decreasing both sides, normalised 0 -> 0 and 1 -> 1, LP / HP linear continuations
+    x = np.linspace(0, 1, 2001)
+    y = finish.ghs(x, 6.0, 20.0, 0.1, lp=0.02, hp=0.8)
+    assert y[0] == pytest.approx(0.0, abs=1e-6) and y[-1] == pytest.approx(1.0, abs=1e-6) and (np.diff(y) > 0).all()
+    s = np.diff(y) / np.diff(x)
+    assert s[int(0.1 * 2000)] > s[int(0.5 * 2000)] > 0 and s[int(0.02 * 2000)] > s[int(0.01 * 2000)] - 1e-3    # slope peaks at SP, falls on both sides, constant below LP
+    assert np.allclose(s[: int(0.019 * 2000)], s[0], rtol=1e-3) and np.allclose(s[int(0.81 * 2000):], s[-1], rtol=1e-3)
+
+
+@pytest.mark.docker
+def test_numpy_ghs_mirror_equals_siril_ght(tmp_path):
+    if not stretch.siril_available():
+        pytest.skip("no siril-cli")
+    x = np.concatenate([np.linspace(0, 0.1, 500), np.linspace(0.1, 1, 500)]).astype(np.float32)
+    plane = np.tile(x[None, :], (4, 1))
+    st = stretch.SirilStretcher(str(tmp_path))
+    for D, b, sp, lp, hp in ((2.0, 6.0, 0.1, 0.0, 1.0), (3.0, 10.0, 0.05, 0.02, 1.0), (4.0, 3.0, 0.3, 0.1, 0.8), (1.5, 0.0, 0.2, 0.0, 1.0)):
+        line = f"ght -D={D} -B={b:g} -SP={sp} -LP={lp} -HP={hp} -clipmode=clip -independent"
+        out = st._run([plane], [[line]], "mirror")[0][0]
+        assert np.abs(out - finish.ghs(plane, b, float(np.expm1(D)), sp, lp, hp)).max() < 2e-6
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize("method", ["autoghs", "modasinh", "autostretch", "hms"])
+def test_every_alternative_tool_runs_headless_and_lands_the_sky(tmp_path, method):
+    if not stretch.siril_available():
+        pytest.skip("no siril-cli")
+    if method == "hms" and not (stretch.community_python() and stretch.community_script(stretch.HMS_SCRIPT)):
+        pytest.skip("pyscript virtualenv / siril-scripts clone missing")
+    img = _scene()
+    u = np.clip((img - 0.0195) / 0.01 + 0.02, 0, 1).astype(np.float32)
+    ctx = {"sky": float(np.median(u)), "noise": 0.01, "lum": u, "sky_aim": 0.10}
+    st = stretch.SirilStretcher(str(tmp_path))
+    out, rec = st.stretch_to_sky([u, u, u], ctx, method)
+    assert rec["method"] == method and rec["commands"]
+    assert 0.0 <= out[0].min() and out[0].max() <= 1.0
+    assert float(np.median(out[0])) == pytest.approx(0.10, abs=0.02)
+
+
+def test_a_failing_trial_is_left_out_of_the_fit_not_the_whole_run(tmp_path, monkeypatch):
+    """One trial value Siril cannot complete (autoghs at high D x 3 passes: the trial copy clipped flat, "stats failed") failed the script of all
+    9 trials and the preview with it.  The batch is retried one trial per script; the failing values get no level."""
+    from sirilpipe.siril import SirilError
+    st = stretch.SirilStretcher(str(tmp_path), allow=False)
+    plane = np.full((8, 8), 0.1, np.float32)
+
+    def fake_run(planes, blocks, tag, must_log=None):
+        if len(blocks) > 1 or "BAD" in blocks[0][0]:
+            raise SirilError("stretch failed: stats failed")
+        return [[planes[0] * float(blocks[0][0].split()[1])]]
+    monkeypatch.setattr(st, "_run", fake_run)
+    outs = st._run_trials([plane], [["x 1"], ["x 2"], ["BAD 3"]], "fit0_p1")
+    assert outs[2] is None and float(outs[1][0].mean()) == pytest.approx(0.2)
+    with pytest.raises(SirilError):                                   # every trial failing still fails
+        st._run_trials([plane], [["BAD 1"], ["BAD 2"]], "fit0_p1")
+
+
+def test_autoghs_shadowsclip_puts_sirils_symmetry_point_left_of_the_sky_peak():
+    """Siril's autoghs: SP = median + shadowsclip x std of the image.  A nebula inflates the std far above the sky noise (M 42: 160 x), so a fixed
+    -1.2 put SP below 0 (the sky mapped negative, a black render); the shadowsclip is derived so SP = sky - 1.2 noise sigma."""
+    rng = np.random.default_rng(1)
+    lum = (2e-4 + rng.normal(0, 4e-5, (400, 600))).astype(np.float32)
+    lum[100:300, 150:450] += 0.02                                      # a bright nebula: std >> noise
+    k = stretch.autoghs_shadowsclip(lum, 2e-4, 4e-5)
+    x = lum[::2, ::2]
+    sp = float(np.median(x)) + k * float(np.std(x))
+    assert sp == pytest.approx(2e-4 - 1.2 * 4e-5, abs=1e-7) and sp > 0
+    assert -0.05 < k < 0                                               # nothing like the old -1.2

@@ -8,3 +8,10 @@ experiments
 **/*.pyc
 .DS_Store
 .env
+*.log
+tests/fixtures/**/*.fit
+tests/fixtures/**/*.fits
+tests/data
+!vendor
+!vendor/**
+output_backend/

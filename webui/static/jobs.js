@@ -37,8 +37,7 @@ const Jobs = (() => {
       : `<p class="muted small">Nothing is running. Jobs started from the Pipeline card appear here, and wait their turn when the server is busy.</p>`;
     $("#jobsExternalCard").hidden = !r.external.length;
     $("#jobsExternal").innerHTML = r.external.map(x => `<div class="jobcard"><div class="jobhead"><b>${esc(x.kind)}</b><span class="muted">${esc(x.name || x.id)}${x.device ? " · device " + esc(x.device) : ""}</span>
-      <span class="state running">${esc(x.state)}</span></div><div class="small jobmsg">${esc(x.message || "")}${x.trial !== undefined && x.trial !== null ? ` · trial ${x.trial + 1}${x.n_trials ? "/" + x.n_trials : ""}` : ""}${x.started ? ` · since ${when(x.started)}` : ""}
-      — runs in its own process alongside the queue (manage it in the Experiments tab)</div></div>`).join("");
+      <span class="state running">${esc(x.state)}</span></div><div class="small jobmsg">${esc(x.message || "")}${x.trial !== undefined && x.trial !== null ? ` · trial ${x.trial + 1}${x.n_trials ? "/" + x.n_trials : ""}` : ""}${x.started ? ` · since ${when(x.started)}` : ""}</div></div>`).join("");
     $("#jobsHistory").innerHTML = r.history.length ? r.history.map(j => card(j, true)).join("") : `<p class="muted small">No finished jobs yet.</p>`;
     $$("#tab-jobs [data-act]").forEach(b => b.onclick = async () => {
       try {

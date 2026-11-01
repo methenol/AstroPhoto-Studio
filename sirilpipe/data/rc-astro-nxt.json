@@ -1,0 +1,209 @@
+{
+ "schemaVersion": 6,
+ "cliVersion": "2.6.10",
+ "key": "nxt",
+ "name": "RC-Astro NoiseXTerminator",
+ "displayName": "NoiseXTerminator",
+ "mlVersion": 3.1,
+ "license": {
+  "status": "required",
+  "valid": false,
+  "message": "A license is required to use this software"
+ },
+ "activationUrl": "https://www.rc-astro.com/account",
+ "parameters": [
+  {
+   "label": "Tile Overlap",
+   "name": "overlap",
+   "flag": "--overlap",
+   "description": "Fractional overlap between adjacent tiles",
+   "type": "float",
+   "precision": 2,
+   "default": 0.2,
+   "max": 0.5,
+   "min": 0.0
+  },
+  {
+   "label": "Denoise",
+   "name": "dn",
+   "flag": "--dn",
+   "description": "Denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "!csep && !fsep"
+  },
+  {
+   "label": "Intensity/Color Separation",
+   "name": "csep",
+   "guiOnly": true,
+   "description": "Process luminance and color independently",
+   "type": "bool",
+   "default": false
+  },
+  {
+   "label": "Denoise Intensity",
+   "name": "di",
+   "flag": "--di",
+   "description": "Intensity denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "csep && !fsep"
+  },
+  {
+   "label": "Denoise Color",
+   "name": "dc",
+   "flag": "--dc",
+   "description": "Chrominance denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "csep && !fsep"
+  },
+  {
+   "label": "Frequency Separation",
+   "name": "fsep",
+   "guiOnly": true,
+   "description": "Apply denoising in a frequency-separated manner",
+   "type": "bool",
+   "default": false
+  },
+  {
+   "label": "Denoise HF",
+   "name": "dhf",
+   "flag": "--dhf",
+   "description": "High-frequency (small scale) denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "!csep && fsep"
+  },
+  {
+   "label": "Denoise LF",
+   "name": "dlf",
+   "flag": "--dlf",
+   "description": "Low-frequency (large scale) denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "!csep && fsep"
+  },
+  {
+   "label": "Denoise HF Intensity",
+   "name": "dihf",
+   "flag": "--dihf",
+   "description": "High-frequency (small scale) intensity denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "csep && fsep"
+  },
+  {
+   "label": "Denoise LF Intensity",
+   "name": "dilf",
+   "flag": "--dilf",
+   "description": "Low-frequency (large scale) intensity denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "csep && fsep"
+  },
+  {
+   "label": "Denoise HF Color",
+   "name": "dchf",
+   "flag": "--dchf",
+   "description": "High-frequency (small scale) color denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "csep && fsep"
+  },
+  {
+   "label": "Denoise LF Color",
+   "name": "dclf",
+   "flag": "--dclf",
+   "description": "Low-frequency (large scale) color denoise strength",
+   "type": "float",
+   "precision": 2,
+   "default": 0.9,
+   "max": 1.0,
+   "min": 0.0,
+   "visibleIf": "csep && fsep"
+  },
+  {
+   "label": "HF/LF Scale",
+   "name": "fs",
+   "flag": "--fs",
+   "description": "Pixel scale of the low/high frequency transition band",
+   "type": "float",
+   "precision": 1,
+   "logarithmic": true,
+   "default": 5.0,
+   "max": 100.0,
+   "min": 1.0,
+   "visibleIf": "fsep",
+   "unit": "pixels"
+  },
+  {
+   "label": "Iterations",
+   "name": "it",
+   "flag": "--it",
+   "description": "Number of denoising iterations to perform",
+   "type": "int",
+   "default": 2,
+   "max": 5,
+   "min": 1
+  }
+ ],
+ "groups": [
+  {
+   "name": "optionsGroup",
+   "label": "Options",
+   "params": [
+    "csep",
+    "fsep"
+   ]
+  },
+  {
+   "name": "denoiseGroup",
+   "label": "Denoise",
+   "params": [
+    "dn",
+    "di",
+    "dc",
+    "dhf",
+    "dlf",
+    "dihf",
+    "dchf",
+    "dilf",
+    "dclf",
+    "fs",
+    "it"
+   ]
+  },
+  {
+   "name": "engineGroup",
+   "label": "Engine",
+   "params": [
+    "overlap"
+   ]
+  }
+ ]
+}

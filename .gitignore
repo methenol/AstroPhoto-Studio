@@ -11,3 +11,5 @@ experiments/cache/
 
 # docker compose settings
 .env
+vendor/
+output_backend/

@@ -1,0 +1,112 @@
+{
+ "bias_gain_2_bin_1.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "dark_exp_15.000000_gain_60_bin_1_27C_stack_3.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "dark_exp_15.000000_gain_60_bin_1_38C_stack_20.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "dark_exp_30.000000_gain_60_bin_1_28C_stack_1.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "dark_exp_30.000000_gain_60_bin_1_39C_stack_20.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "dark_exp_60.000000_gain_60_bin_1_28C_stack_1.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "dark_exp_60.000000_gain_60_bin_1_40C_stack_20.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "flat_gain_2_bin_1_ir_0.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "flat_gain_2_bin_1_ir_1.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ },
+ "flat_gain_2_bin_1_ir_2.fits": {
+  "SIMPLE": true,
+  "BITPIX": 16,
+  "NAXIS": 2,
+  "NAXIS1": 3840,
+  "NAXIS2": 2160,
+  "EXTEND": true,
+  "BZERO": 32768,
+  "BSCALE": 1,
+  "BAYERPAT": "RGGB"
+ }
+}

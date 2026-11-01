@@ -1,0 +1,62 @@
+{
+ "schemaVersion": 6,
+ "cliVersion": "2.6.10",
+ "key": "sxt",
+ "name": "RC-Astro StarXTerminator",
+ "displayName": "StarXTerminator",
+ "mlVersion": 11,
+ "license": {
+  "status": "required",
+  "valid": false,
+  "message": "A license is required to use this software"
+ },
+ "activationUrl": "https://www.rc-astro.com/account",
+ "parameters": [
+  {
+   "label": "Tile Overlap",
+   "name": "overlap",
+   "flag": "--overlap",
+   "description": "Fractional overlap between adjacent tiles",
+   "type": "float",
+   "precision": 2,
+   "default": 0.2,
+   "max": 0.5,
+   "min": 0.0
+  },
+  {
+   "label": "Generate Star Image",
+   "name": "stars",
+   "flag": "--stars",
+   "description": "Also write a stars-only image (original minus starless) beside the starless output",
+   "type": "bool",
+   "default": false
+  },
+  {
+   "label": "Unscreen Stars",
+   "name": "unscreen",
+   "flag": "--unscreen",
+   "description": "Unscreen stars; requires Generate Star Image",
+   "type": "bool",
+   "default": false,
+   "disabledIf": "!stars",
+   "disabledValue": false
+  }
+ ],
+ "groups": [
+  {
+   "name": "optionsGroup",
+   "label": "Options",
+   "params": [
+    "stars",
+    "unscreen"
+   ]
+  },
+  {
+   "name": "engineGroup",
+   "label": "Engine",
+   "params": [
+    "overlap"
+   ]
+  }
+ ]
+}

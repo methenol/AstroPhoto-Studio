@@ -11,9 +11,39 @@ OUT=/data/output
 # getpass.getuser() (PyTorch's compile cache, among others) otherwise fails with
 # "getpwuid(): uid not found"
 export USER="${USER:-astrophoto}" LOGNAME="${LOGNAME:-astrophoto}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/torchinductor}"
+# Siril keeps every frame of a sequence open (2000+ subs): raise the open-files limit as far as allowed
+ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+
+# per-user directories of the tools (HOME is on the output volume): Siril, GraXpert, RC-Astro, StarNet
+prepare_home() {
+    mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/tools"
+    # siril-scripts / siril-spcc-database must sit at their XDG location (canonical clones from the image)
+    for d in /opt/siril-data/*; do
+        [ -d "$d" ] || continue
+        [ -e "$HOME/.local/share/$(basename "$d")" ] || cp -a "$d" "$HOME/.local/share/"
+    done
+}
+
+# one line per tool in the container log (no licence is touched: read-only queries)
+report_tools() {
+    echo "[tools] siril:    $(siril-cli -v 2>/dev/null | tail -n 1 || echo missing)"
+    echo "[tools] graxpert: $(/opt/graxpert/bin/python /opt/graxpert/gx_run.py -v 2>/dev/null | tail -n 1 || echo missing)"
+    if [ -x "$STARNET_DIR/starnet2" ]; then
+        echo "[tools] starnet2: $("$STARNET_DIR/starnet2" --version 2>&1 | grep -v "^$" | head -n 1)"
+    else
+        echo "[tools] starnet2: not installed (download in the Tools panel)"
+    fi
+    if [ -x "$RCASTRO_BIN" ]; then
+        echo "[tools] rc-astro: schemaVersion $(LD_LIBRARY_PATH="$TOOL_LD_LIBRARY_PATH" "$RCASTRO_BIN" --json --no-banner 2>/dev/null \
+            | python -c 'import json,sys; print(json.load(sys.stdin).get("schemaVersion"))' 2>/dev/null || echo '?')"
+    else
+        echo "[tools] rc-astro: installer not provided (vendor/ at build time)"
+    fi
+}
 
 if [ "$(id -u)" != "0" ]; then
+    prepare_home 2>/dev/null || true
+    report_tools
     exec "$@"                       # started with --user: nothing to fix, run as given
 fi
 
@@ -29,6 +59,8 @@ fi
 
 if [ "$PUID" = "0" ]; then
     mkdir -p "$HOME"
+    prepare_home
+    report_tools
     exec "$@"
 fi
 
@@ -48,4 +80,12 @@ if ! as_user sh -c "test -w '$OUT' && mkdir -p '$HOME'"; then
     exit 1
 fi
 
+# prepare the tool directories as the user (so everything is owned by it), then report and start
+as_user sh -c '
+    mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/tools"
+    for d in /opt/siril-data/*; do
+        [ -d "$d" ] || continue
+        [ -e "$HOME/.local/share/$(basename "$d")" ] || cp -a "$d" "$HOME/.local/share/"
+    done' || true
+report_tools
 exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"

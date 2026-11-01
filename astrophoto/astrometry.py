@@ -401,7 +401,12 @@ def _explore_dir(sess) -> str:
 
 
 def _stack_created(sess) -> str:
-    return str(sess.meta.get("created", ""))
+    """Identifies the stack the cached solution belongs to (a new stack invalidates it)."""
+    meta = sess.meta
+    if meta.get("created"):
+        return str(meta["created"])
+    p = sess._p("stack.fits")
+    return str(int(os.path.getmtime(p))) if os.path.exists(p) else ""
 
 
 def load_solution(sess) -> dict | None:
@@ -418,36 +423,92 @@ def load_solution(sess) -> dict | None:
     return sol
 
 
+def header_wcs(header, shape):
+    """The celestial WCS Siril's plate solve left in a stack header (TAN, usually with SIP) in the
+    array's own pixel coordinates (0-based, x = column, y = row as stored), or None."""
+    from astropy.wcs import WCS
+    try:
+        w = WCS(header, naxis=2, relax=True)
+    except Exception:
+        return None
+    if not w.has_celestial or "TAN" not in str(w.wcs.ctype[0]).upper():
+        return None
+    w.pixel_shape = (shape[1], shape[0])
+    return w
+
+
+def solve_from_wcs(det: dict, gaia: dict, wcs, shape) -> dict:
+    """Residual statistics of an existing WCS against the detected stars (same fields as ``solve``)."""
+    from scipy.spatial import cKDTree
+    h, w = shape
+    px = np.stack(wcs.all_world2pix(gaia["ra"], gaia["dec"], 0), 1)
+    inside = np.flatnonzero((px[:, 0] > 0) & (px[:, 0] < w) & (px[:, 1] > 0) & (px[:, 1] < h))
+    dxy = np.stack([det["x"], det["y"]], 1)
+    d, j = cKDTree(dxy).query(px[inside])
+    tol = max(2.0, 1.5 * det["fwhm"])
+    ok = d < tol
+    order = np.argsort(d[ok])
+    jj, first = np.unique(j[ok][order], return_index=True)     # one catalogue star per detection
+    sel = inside[ok][order][first]
+    if len(sel) < 8:
+        raise RuntimeError(f"the plate solution matches only {len(sel)} Gaia stars")
+    res = np.hypot(*(px[sel] - dxy[j[ok][order][first]]).T)
+    keep = res < max(3 * float(np.sqrt(np.mean(res ** 2))), 0.5)
+    res, sel = res[keep], sel[keep]
+    rms = float(np.sqrt(np.mean(res ** 2)))
+    scales = np.abs(np.linalg.svd(wcs.pixel_scale_matrix, compute_uv=False)) * 3600
+    return {"n_matched": int(len(sel)), "rms_px": rms, "rms_arcsec": rms * float(np.mean(scales)),
+            "scale_arcsec": float(np.mean(scales)), "parity": int(np.sign(np.linalg.det(wcs.pixel_scale_matrix))),
+            "initial_inliers": int(len(sel)), "source": "siril"}
+
+
 def solve_session(sess, gmax: float = 16.0, progress=None) -> dict:
-    """Plate-solve the session's stack and cache the solution with the Gaia and SIMBAD
-    catalogues of the field."""
-    from .pipeline import _load_fits
+    """Identify the session's stack and cache the solution with the Gaia and SIMBAD catalogues of
+    the field.  The WCS Siril's plate solve wrote into the stack header is used when there is one;
+    otherwise the stars are matched to Gaia here (astroalign triangles + an astropy SIP fit)."""
+    from astropy.coordinates import SkyCoord
+    from sirilpipe import fitsio
     say = progress or (lambda i, n, m: None)
     if not os.path.exists(sess._p("stack.fits")):
         raise RuntimeError("stack the dataset first")
-    info0 = sess.infos[0]
-    if info0.ra is None or info0.dec is None:
-        raise RuntimeError("the FITS headers have no RA/DEC to start from")
     d = _explore_dir(sess)
-    st = _load_fits(sess._p("stack.fits"))
-    cov = _load_fits(sess._p("coverage.fits")) if os.path.exists(sess._p("coverage.fits")) else None
-    h, w = st.shape[:2]
+    arr, hdr = fitsio.read_fits(sess._p("stack.fits"))
+    st = arr.mean(0) if arr.ndim == 3 else arr             # (H, W), rows as stored
+    h, w = st.shape
+    hw = header_wcs(hdr, (h, w))
+    f0 = sess.fs.first if getattr(sess, "fs", None) else None
     say(0, 5, "Detecting stars")
-    det = detect_stars(st, cov)
-    scale = pixel_scale_guess(info0.focallen, info0.pixsize, float(sess.meta.get("scale", 1.0)))
+    det = detect_stars(st)
+    drizzle = float((sess.meta.get("drizzle") or {}).get("scale", 1.0) or 1.0) if sess.meta.get("drizzle") else 1.0
+    if hw is not None:
+        ra0, dec0 = (float(v) for v in hw.all_pix2world([[w / 2 - 0.5, h / 2 - 0.5]], 0)[0])
+        scale = float(np.mean(np.abs(np.linalg.svd(hw.pixel_scale_matrix, compute_uv=False)))) * 3600
+    else:
+        if f0 is None or f0.ra is None or f0.dec is None or not (f0.focallen and f0.pixsize):
+            raise RuntimeError("the FITS headers have no RA/DEC and optics to start from")
+        ra0, dec0 = f0.ra, f0.dec
+        scale = pixel_scale_guess(f0.focallen, f0.pixsize, drizzle)
     radius = 0.5 * math.hypot(h, w) * scale / 3600 * 1.15 + 0.1
-    epoch = decimal_year(info0.date_obs) if info0.date_obs else GAIA_EPOCH
+    epoch = decimal_year(f0.date_obs) if f0 is not None and getattr(f0, "date_obs", None) else GAIA_EPOCH
     say(1, 5, f"Querying Gaia DR3 (G < {gmax:g}, {radius:.2f} deg)")
-    gaia = gaia_cone(info0.ra, info0.dec, radius, gmax, epoch)
+    gaia = gaia_cone(ra0, dec0, radius, gmax, epoch)
     say(2, 5, f"Matching {len(det['x'])} stars to {len(gaia['g'])} Gaia sources")
-    sol = solve(det, gaia, info0.ra, info0.dec, scale, (h, w))
+    sol = None
+    if hw is not None:
+        try:
+            sol = solve_from_wcs(det, gaia, hw, (h, w))
+            sol["wcs"] = hw
+        except RuntimeError:
+            sol = None                                       # a poor header solution: solve it here
+    if sol is None:
+        sol = solve(det, gaia, ra0, dec0, scale, (h, w))
+        sol["source"] = "astroalign"
     wcs = sol["wcs"]
     wcs.pixel_shape = (w, h)
     lim = completeness_limit(det, gaia, wcs, (h, w))
     # the field actually covered, for the SIMBAD query and for trimming the Gaia list
     cra, cdec = (float(v) for v in wcs.all_pix2world([[w / 2 - 0.5, h / 2 - 0.5]], 0)[0])
     corners = wcs.all_pix2world([[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1]], 0)
-    from astropy.coordinates import SkyCoord
     c0 = SkyCoord(cra, cdec, unit="deg")
     rad_field = float(max(c0.separation(SkyCoord(corners[:, 0], corners[:, 1], unit="deg")).deg)) + 0.02
     say(3, 5, "Querying SIMBAD")
@@ -464,9 +525,18 @@ def solve_session(sess, gmax: float = 16.0, progress=None) -> dict:
     out.update({"wcs_header": wcs.to_header(relax=True).tostring(sep="\n"), "stack_created": _stack_created(sess),
                 "shape": [h, w], "center": [cra, cdec], "depth_g": lim, "gmax": gmax, "epoch": epoch,
                 "n_detected": int(len(det["x"])), "fwhm_px": det["fwhm"],
+                "bottom_up": bool(bottom_up(hdr)),
                 "solved": datetime.now().isoformat(timespec="seconds")})
     json.dump(out, open(os.path.join(d, "solution.json"), "w"), indent=1)
     return load_solution(sess)
+
+
+def bottom_up(header) -> bool:
+    """True unless the header says ROWORDER = TOP-DOWN (Siril writes the bottom row first)."""
+    try:
+        return str(header.get("ROWORDER", "BOTTOM-UP")).strip().upper() != "TOP-DOWN"
+    except Exception:
+        return True
 
 
 def _nice_step(span_deg: float, steps_deg: list[float], n: int = 6) -> float:
@@ -505,12 +575,17 @@ def annotate(sess, lin_info: dict, lin_shape) -> dict:
     up = float(lin_info.get("upscaled", 1.0))
     y0, y1, x0, x1 = lin_info.get("crop") or [0, lin_shape[0], 0, lin_shape[1]]
     W, H = x1 - x0, y1 - y0
+    # the WCS is in the stored array's pixels; Siril stores the bottom row first and the view is top-down
+    flip = bool(sol.get("bottom_up", True))
+    Hs = float(lin_shape[0])                              # stored rows (before any crop)
 
     def to_disp(px, py):
+        py = Hs - 1 - np.asarray(py, float) if flip else py
         return (px + 0.5) * up - 0.5 - x0, (py + 0.5) * up - 0.5 - y0
 
     def to_stack(dx, dy):
-        return (dx + x0 + 0.5) / up - 0.5, (dy + y0 + 0.5) / up - 0.5
+        px, py = (dx + x0 + 0.5) / up - 0.5, (dy + y0 + 0.5) / up - 0.5
+        return px, (Hs - 1 - py if flip else py)
 
     def inside(x, y, m=0):
         return (x >= -m) & (x < W + m) & (y >= -m) & (y < H + m)

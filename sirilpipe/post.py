@@ -1,0 +1,2165 @@
+"""The post-stack stages of the Siril backend: Restore, Star removal, Auto-finish, Export, preview.
+
+``session.py`` calls the five functions below with the session folder (the layout of DESIGN section 3):
+
+    restore(dir, stack_meta, stack_params, params, progress, checkpoint)       -> restore_meta   (linear.fits)
+    remove_stars(dir, stack_meta, params, stack_params, progress, checkpoint)  -> starnet_meta   (starless.fits, stars.fits)
+    autofinish(dir, stack_meta, params, progress, checkpoint)                  -> {"params", "report"}
+    export(dir, stack_meta, params, export_opts, progress, checkpoint)         -> {"jpg", "tif", "json", "size"}
+    preview_jpeg(dir, stack_meta, params, max_side=1600)                       -> bytes
+
+Every step has a chain of alternatives and records which one ran (``restore_meta.json``): a tool that is
+missing, unlicensed (RC-Astro exit 77) or failing raises :class:`tools.ToolUnavailable` / ``ToolError`` and the
+next one takes over; nothing is ever inpainted or synthesised (project rule): photons resolve to star or sky.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import threading
+import time
+from datetime import datetime
+
+import cv2
+import numpy as np
+
+from . import skyref as skyref_mod, export as export_mod
+from . import finish, fitsio, gates, pro, tools
+from .siril import SirilError, SirilRunner
+from .tools import ToolError, ToolUnavailable
+from .util import Cancelled
+
+PLATESOLVE_PAUSE = float(os.environ.get("PLATESOLVE_PAUSE", 20))   # seconds between catalogue retries
+SPCC_ATTEMPTS = 2                                                      # SPCC once more after a failed / crashed catalogue download (Siril resumes from its spcc-cache)
+SPCC_RETRY_PAUSE = float(os.environ.get("SPCC_RETRY_PAUSE", 5))
+# Deconvolution is chosen per region: ``deconv_method`` = the objects (nonstellar structure), ``deconv_stars_method`` = the stars; each one of
+DECONV_TOOLS = ("auto", "bxt", "graxpert", "rl", "imagemm", "none")
+# the single choice before the split, still accepted: GraXpert's models named in deconv_method -> (objects, stars)
+LEGACY_DECONV = {"graxpert_obj": ("graxpert", "none"), "graxpert_stellar": ("none", "graxpert"), "graxpert_both": ("graxpert", "graxpert")}
+GRAXPERT_DECONV = {"both": ("obj", "stellar"), "objects": ("obj",), "stars": ("stellar",)}   # region -> GraXpert models, in order (objects then stars)
+STAR_MASK_K = 1.0        # a star's footprint ends where its fitted Moffat profile falls to STAR_MASK_K x the sky noise
+CC_SUPERRES_SCALES = (2, 3, 4)   # the scales the Cosmic Clarity super-resolution models exist for
+RL_TIMEOUT = float(os.environ.get("RL_TIMEOUT", 1800))      # Siril's Richardson-Lucy: ~40 s / iteration on a loaded 8 MP frame
+
+# Siril failing = a failed script, or the binary not being startable at all (no Siril on a dev machine)
+SIRIL_FAILS = (SirilError, OSError)
+
+try:
+    from . import __version__
+except Exception:                                     # pragma: no cover
+    __version__ = "2.0.0"
+
+
+# =========================================================================== parameters
+
+# Processing parameters (api-contract section 3).  Same keys and defaults as the old backend so older
+# clients keep working; keys that have no effect any more stay accepted and are listed in the sidecar's
+# ``ignored_params`` (see IGNORED_KEYS).
+DEFAULTS: dict = {
+    # linear stage
+    "crop": True, "crop_threshold": 0.3,
+    "background": True, "bg_method": "auto", "bg_correction": "subtract", "bg_degree": 2, "bg_smoothing": 0.5,
+    "white_balance": "auto", "spcc_sensor": "auto", "spcc_filter": "auto", "spcc_white_ref": "average_spiral_galaxy",
+    "denoise": 0.95, "deconvolution": 0.7, "restored_resolution": 1.0,
+    # non-linear stage (the professional chain of pro.py; the published values, source at each use there)
+    "palette": "auto", "oiii_boost": 1.0, "synthetic_luminance": 0.0,
+    "stretch_method": "statstretch", "stretch": 0.10, "auto_stretch": True, "hdr": 0.5, "contrast": 4.0,
+    "color_preservation": 0.2,
+    "star_separation": True, "star_removal": "auto", "star_reduction": 0.4, "star_intensity": 1.0,
+    "star_saturation": 1.2, "halo_suppress": 0.6, "star_color_preservation": 0.0,
+    "saturation": 1.45, "chroma_denoise": 0.95, "luminance_denoise": 0.8, "oiii_unmix": False,
+    "local_contrast": 0.8, "scnr": 0.0, "black_point": 0.0, "brightness": 0.0, "sharpen": 0.0,
+    # colour grade (finish.color_grade): neutral by default
+    "grade_amount": 1.0, "grade_temperature": 0.0, "grade_tint": 0.0, "grade_warm_hue": 0.0, "grade_warm_sat": 1.0,
+    "grade_cool_hue": 0.0, "grade_cool_sat": 1.0, "grade_contrast": 0.0,
+}
+
+# Every key of DEFAULTS has an effect: crop / crop_threshold reach the stack job through stack_params (webui.server copies them), restored_resolution is the ImageMM
+# super-resolution factor (session.run_denoise), the others are steps of pro.Finisher.  Nothing is silently ignored.
+IGNORED_KEYS: tuple = ()
+
+
+# Honoured but not part of the 47-key API contract (DEFAULTS): ``star_stretch`` is the Seti Astro Star Stretch amount (5 when absent), ``stretch_boost`` the
+# Statistical_Stretch.py curves boost (0 when absent), ``hdr_method`` the highlight tool (auto: the stretch's own, GHS HP / Statistical Stretch -hdr; wavescale: Seti Wavescale
+# HDR), ``ghs_d2`` the D of the second GHS pass (Siril -D scale, "small": 1), ``hubble_formula`` the formula preset of Hubble_Palette_from_Dual-Band_OSC.py (auto: Classic,
+# Improved with oiii_unmix / hoo_improved).
+EXTRA_KEYS = ("star_stretch", "stretch_boost", "hdr_method", "ghs_d2", "starnet_stride", "hubble_formula",
+              "cc_sharpen", "cc_stellar_amount", "cc_nonstellar_amount", "cc_denoise", "cc_denoise_model",
+              "bxt_auto", "bxt_sharpen_stars", "bxt_sharpen_nonstellar", "bxt_halos", "linear_denoise_auto", "linear_denoise_strength", "nxt_iterations",
+              "sky_levelling", "sky_level", "sky_median_guard")
+# Cosmic Clarity (siril-scripts CosmicClarity_Native.py) on the stretched image: off by default (an optional path); the amounts and the model are the script's defaults
+EXTRA_DEFAULTS = {"stretch_boost": 0.0, "hubble_formula": "auto", "cc_sharpen": "off", "cc_stellar_amount": 0.5, "cc_nonstellar_amount": 0.5,
+                  "cc_denoise": False, "cc_denoise_model": "full",
+                  # BlurXTerminator / the linear denoiser: auto = the strengths from the measured signal-to-noise (finish.bxt_ss / bxt_sn / nxt_dn /
+                  # graxpert_strength, the published ranges); off = the values below (BXT Sharpen Stars / Sharpen Nonstellar / Adjust Star Halos; the
+                  # denoiser's own strength: NXT --dn, GraXpert -strength, Siril denoise -mod; NXT --it iterations, its default 2)
+                  "bxt_auto": True, "bxt_sharpen_stars": 0.3, "bxt_sharpen_nonstellar": 0.55, "bxt_halos": 0.0,
+                  "linear_denoise_auto": True, "linear_denoise_strength": 0.7, "nxt_iterations": 2,
+                  # the final sky level: off = the Midtones slider; on = the midtones that put the sky at sky_level after the black point.
+                  # sky_median_guard (on) is the floor under the slider: the midtones are solved to the edge of the sky_median gate's window
+                  # when the brightness would leave the sky above it, so a render is never delivered failing that gate
+                  "sky_levelling": False, "sky_level": 0.10, "sky_median_guard": True}        # extra keys with a control in the web UI (PARAM_SPEC) need a default the UI can show
+
+
+def _R(group, key, label, lo, hi, step):
+    return {"group": group, "key": key, "label": label, "type": "range", "min": lo, "max": hi, "step": step}
+
+
+def _B(group, key, label):
+    return {"group": group, "key": key, "label": label, "type": "bool"}
+
+
+def _S(group, key, label, options):
+    return {"group": group, "key": key, "label": label, "type": "select", "options": options}
+
+
+# UI metadata: only the keys that have an effect now (labels and ranges as in webui/server.py where the
+# meaning is unchanged).  spcc_sensor / spcc_filter options are completed by the server from the SPCC database.
+PARAM_SPEC: list[dict] = [
+    _B("Linear", "background", "Gradient removal (GraXpert AI background extraction)"),
+    _S("Linear", "bg_method", "Gradient model (auto: the NSNS sky survey when the stack is plate-solved and the field is covered, else GraXpert AI; reference: the survey only; graxpert: GraXpert AI only; poly / rbf: Siril subsky)", ["auto", "reference", "graxpert", "poly", "rbf"]),
+    _S("Linear", "bg_correction", "Gradient correction", ["subtract", "divide"]),
+    _R("Linear", "bg_degree", "Polynomial degree (poly model)", 1, 4, 1),
+    _R("Linear", "bg_smoothing", "Gradient smoothing", 0, 1, 0.05),
+    _S("Linear", "white_balance", "Colour calibration (auto: Siril SPCC with Gaia)", ["auto", "stars", "background", "none"]),
+    _S("Linear", "spcc_sensor", "Colour calibration: camera sensor", ["auto"]),
+    _S("Linear", "spcc_filter", "Colour calibration: filter", ["auto"]),
+    _S("Linear", "spcc_white_ref", "Colour calibration: white reference", ["average_spiral_galaxy", "g2v"]),
+    _R("Linear", "denoise", "Light denoise before stretch (the tool: Integration & options > Noise reduction; NoiseXTerminator, GraXpert or Siril)", 0, 1, 0.05),
+    _R("Linear", "deconvolution", "Deconvolution strength (the tool: Integration & options > Deconvolution; BlurXTerminator on/off, Richardson-Lucy blend, GraXpert -strength)", 0, 1, 0.05),
+    _B("Linear", "bxt_auto", "BlurXTerminator strengths from the signal-to-noise (off: the three values below)"),
+    _R("Linear", "bxt_sharpen_stars", "BlurXTerminator Sharpen Stars (when not from the signal-to-noise)", 0, 0.7, 0.01),
+    _R("Linear", "bxt_sharpen_nonstellar", "BlurXTerminator Sharpen Nonstellar (when not from the signal-to-noise)", 0, 1, 0.01),
+    _R("Linear", "bxt_halos", "BlurXTerminator Adjust Star Halos (when not from the signal-to-noise)", -0.5, 0.5, 0.01),
+    _B("Linear", "linear_denoise_auto", "Linear denoise strength from the signal-to-noise x the Light denoise slider (off: the strength below)"),
+    _R("Linear", "linear_denoise_strength", "Linear denoise: the tool's own strength (NXT --dn, GraXpert -strength, Siril -mod; when not from the signal-to-noise)", 0, 1, 0.01),
+    _R("Linear", "nxt_iterations", "NoiseXTerminator iterations (--it, when not from the signal-to-noise; NXT's default 2)", 1, 5, 1),
+    _S("Stretch", "stretch_method", "Stretch tool (statstretch: Seti Astro Statistical Stretch, the default; ghs2: Siril ght, the GHS two-pass recipe; autoghs, modasinh, autostretch: Siril commands; hms: VeraLux HyperMetric Stretch)",
+       ["statstretch", "ghs2", "autoghs", "modasinh", "autostretch", "hms"]),
+    _R("Stretch", "stretch", "Background level after the stretch (Brecher 0.09-0.11) / Statistical Stretch median target for a small target", 0.04, 0.35, 0.01),
+    _R("Stretch", "stretch_boost", "Statistical Stretch curves boost (the script's 0-1): lifts the midtones above the median; auto-finish raises it until the subject stands 2.5 x the sky above it", 0, 1, 0.05),
+    _R("Stretch", "hdr", "Highlights (bright cores): 0 = off, 1 = the published values (GHS HP < 1, Statistical Stretch -hdr 0.15, Wavescale HDR 1.5)", 0, 1.5, 0.05),
+    _R("Stretch", "contrast", "GHS second pass: local intensity b (3-5, ghsastro)", 0.25, 13, 0.25),
+    _B("Stretch", "auto_stretch", "Adapt the background to the object's size (frame-filling object: top of Brecher's band)"),
+    _R("Stretch", "color_preservation", "Colour model of the GHS stretch (Siril ght: <0.33 independent channels, <0.66 even luminance, else human-weighted luminance = colour preserving)", 0, 1, 0.05),
+    _S("Colour", "palette", "Palette (dual-band; hoo, hoo_improved and the Hubble-like sho / hso / osh / ohs / hos with a synthetic SII are made by the Hubble_Palette_from_Dual-Band_OSC.py "
+              "script; foraxx; hoo_warm; nbn: narrowband normalisation)", ["auto", "natural", "hoo", "hoo_improved", "sho", "hso", "osh", "ohs", "hos", "foraxx", "hoo_warm", "nbn"]),
+    _S("Colour", "hubble_formula", "Hubble palette formulas (the script's presets; auto: Classic, Improved with the Ha-leak removal): classic OIII = (G+B)/2, SII = (Ha+OIII)/2; "
+              "improved OIII = (G+B-0.3R)/2, SII = 0.3R; advanced; nonlinear_s2 SII = 0.3 R^1.4", ["auto", "classic", "improved", "advanced", "nonlinear_s2"]),
+    _R("Colour", "oiii_boost", "OIII boost of the narrowband normalisation (palette NBN)", 0.5, 3, 0.05),
+    _R("Colour", "synthetic_luminance", "Ha as luminance (dual-band): share of the lightness taken from the Ha plane (Siril rgbcomp -lum)", 0, 1, 0.05),
+    _B("Colour", "oiii_unmix", "Remove the Ha leak from OIII (palette auto: Improved OIII = (G + B - 0.3 R) / 2 instead of Classic)"),
+    _R("Colour", "saturation", "Colour strength: the subject's mean saturation x this (Siril ght -sat, the GHS saturation stretch, under the subject mask)", 1, 4, 0.05),
+    _R("Colour", "chroma_denoise", "Colour noise reduction (NoiseXTerminator --dc, 0.9-1.0; Cosmic Clarity's colour strength)", 0, 1, 0.05),
+    _R("Colour", "scnr", "SCNR (Siril rmgreen; broadband, and the dual-band palettes with Ha in green: sho, ohs)", 0, 1, 0.05),
+    _B("Stars", "star_separation", "Process stars separately"),
+    _S("Stars", "star_removal", "Star removal (auto: StarXTerminator, else StarNet2; darkstar: Cosmic Clarity DarkStar)", ["auto", "sxt", "starnet", "darkstar", "none"]),
+    _R("Stars", "star_reduction", "Star reduction strength (DSA star reduction value = 0.5 x (1 - this); published 0.4-0.6; 1 = starless)", 0, 1, 0.05),
+    _R("Stars", "star_intensity", "Star brightness (1 = as stretched)", 0, 1.5, 0.05),
+    _R("Stars", "star_saturation", "Star colour (Siril satu on the stars, 1 = none)", 0, 2.5, 0.05),
+    _R("Stars", "star_color_preservation", "Colour-preserving star stretch (LRGB: stretched lightness with the linear colour ratios, blended by this)", 0, 1, 0.05),
+    _R("Stars", "halo_suppress", "Halo suppression (Siril unpurple with a star mask: blue / purple halos)", 0, 1, 0.05),
+    _R("Detail", "luminance_denoise", "Noise reduction of the stretched starless image (NoiseXTerminator --dn, 0.6-0.85, or Cosmic Clarity's luminance strength; GraXpert denoise as the fallback). This is the floor, not the ceiling: if the sky the tool leaves is still noisier than the sky_pixel_noise gate, the same tool is re-run harder - up to its own maximum, at most three extra passes - and a harder pass that breaks another gate is refused", 0, 1, 0.05),
+    # Cosmic Clarity Sharpen / Denoise: shown in the Integration & options panel beside the linear Deconvolution / Noise reduction tools ("host": "options")
+    {**_S("Detail", "cc_sharpen", "Cosmic Clarity Sharpen (on the stretched image; in addition to or, with Deconvolution off, instead of the linear deconvolution)",
+          ["off", "both", "stellar", "nonstellar"]), "host": "options"},
+    {**_R("Detail", "cc_stellar_amount", "Cosmic Clarity Sharpen: stellar amount (script default 0.5)", 0, 1, 0.05), "host": "options"},
+    {**_R("Detail", "cc_nonstellar_amount", "Cosmic Clarity Sharpen: non-stellar amount (script default 0.5)", 0, 1, 0.05), "host": "options"},
+    {**_B("Detail", "cc_denoise", "Cosmic Clarity Denoise instead of NoiseXTerminator on the stretched starless image (strengths: the two noise sliders)"), "host": "options"},
+    {**_S("Detail", "cc_denoise_model", "Cosmic Clarity Denoise model (the script's Full / Lite / Walking Noise)", ["full", "lite", "walking"]), "host": "options"},
+    _R("Detail", "local_contrast", "Local contrast (Siril clahe under a background mask; blend 0.4 x this, 0.5 = the lowest published strength)", 0, 2, 0.05),
+    _R("Detail", "sharpen", "Final sharpening (Siril unsharp under the subject mask, after the noise reduction)", 0, 1.5, 0.05),
+    _R("Finish", "black_point", "Black point", 0, 0.2, 0.005),
+    _R("Finish", "brightness", "Midtones", -1, 1, 0.05),
+    _B("Finish", "sky_levelling", "Final sky level: set the midtones so that the sky ends at the level below (instead of the Midtones slider)"),
+    _R("Finish", "sky_level", "Final sky level (with the option above; the sky gate is 0.08-0.12)", 0.05, 0.15, 0.005),
+    _B("Finish", "sky_median_guard", "Keep the sky inside its own gate: when the Midtones slider would leave the sky above the 0.08-0.12 gate, solve the midtones to the edge of the gate instead (off ships the slider exactly as set)"),
+    _R("Grade", "grade_amount", "Grade strength", 0, 1, 0.05),
+    _R("Grade", "grade_temperature", "Temperature (cool - warm)", -1, 1, 0.05),
+    _R("Grade", "grade_tint", "Tint (green - magenta)", -1, 1, 0.05),
+    _R("Grade", "grade_warm_hue", "Warm hues: shift (magenta - yellow)", -1, 1, 0.05),
+    _R("Grade", "grade_warm_sat", "Warm hues: saturation", 0, 2, 0.05),
+    _R("Grade", "grade_cool_hue", "Cool hues: shift (green - blue)", -1, 1, 0.05),
+    _R("Grade", "grade_cool_sat", "Cool hues: saturation", 0, 2, 0.05),
+    _R("Grade", "grade_contrast", "Object contrast (S-curve)", -1, 1, 0.05),
+    _B("Linear", "crop", "Auto-crop the stacking edges (stack job)"),
+    _R("Linear", "crop_threshold", "Crop: minimum frame coverage (stack job)", 0.1, 1.0, 0.05),
+    _R("Linear", "restored_resolution", "ImageMM super-resolution factor r (deconvolution imagemm)", 1, 3, 1),
+]
+
+# Same presets as before ("Balanced" = DEFAULTS); only keys that are still honoured matter.
+PRESETS: dict = {
+    "Balanced": {},
+    "Vivid nebula": {"saturation": 1.5, "local_contrast": 0.8, "stretch": 0.10, "contrast": 4.0, "oiii_boost": 1.0,
+                     "star_reduction": 0.6, "star_intensity": 0.8},
+    "Starless-ish": {"star_reduction": 0.8, "star_intensity": 0.45, "local_contrast": 1.0},
+    "Galaxy / broadband": {"palette": "natural", "stretch": 0.10, "contrast": 4.0, "saturation": 1.4,
+                           "local_contrast": 0.8, "star_reduction": 0.4, "bg_degree": 2},
+    "Natural colour": {"palette": "natural", "saturation": 1.3, "scnr": 0.6},
+    "Deep & dark": {"stretch": 0.06, "black_point": 0.0, "contrast": 5.0, "local_contrast": 0.8},
+}
+
+# Sensor / filter mapping for Siril's SPCC database (workflows.md 7.3, Naztronomy FILTER_COMMANDS_MAP).
+# Narrowband wavelengths for the DWARF Duo-Band filter: Naztronomy 2.0.7 (Ha 656.28 nm / 18 nm, OIII 500.70 nm / 30 nm
+# for both G and B; an approximation, as siril.md 11 notes).
+SPCC_NARROWBAND = ["-narrowband", "-rwl=656.28", "-rbw=18", "-gwl=500.70", "-gbw=30", "-bwl=500.70", "-bbw=30"]
+SPCC_WHITE_REF = {"average_spiral_galaxy": "Average Spiral Galaxy", "g2v": "Star, type G2(v)"}
+
+
+# =========================================================================== helpers
+
+def _p(session: str, *parts: str) -> str:
+    return os.path.join(session, *parts)
+
+
+def _load_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_json(path: str, doc: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=1, default=export_mod._json_default)
+    os.replace(tmp, path)
+
+
+def _flag(v) -> bool:
+    """A boolean setting that may arrive as a string ("false", "0", "off": an API client, a lab study's categorical)."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "off", "no", "none")
+    return bool(v)
+
+
+def _sanitize(arr: np.ndarray) -> np.ndarray:
+    """Finite and within [0, 1] (the tools rescale anything else and the inverse would be lost).  A tiny
+    negative excess (background subtraction) is clipped; values above 1 (SPCC gains) are scaled in by the maximum."""
+    arr = np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=1.0, neginf=0.0)
+    mx = float(arr.max())
+    if 1.0 < mx <= 4.0:
+        arr = arr / np.float32(mx)
+    return np.clip(arr, 0.0, 1.0)
+
+
+def normalise_scale(arr: np.ndarray) -> tuple[np.ndarray, float]:
+    """Bring a stack to a known scale: peak = 1.0.  DWARF 3 data is 12-bit (the stack peaks near 0.0625), Seestar and
+    ASI585 are 16-bit.  Done explicitly, once, in the restore (and for a stack-only export) so that no tool's implicit
+    rescale (GraXpert / RC-Astro rescale out-of-range input) can change the linear relation between files.
+    The factor is recorded in restore_meta.json (``scale``)."""
+    peak = float(np.percentile(arr[:, ::7, ::7], 99.999)) if arr.size else 1.0
+    peak = max(peak, float(arr.max()) * 0.5, 1e-6)
+    if peak < 0.5:
+        k = float(min(1.0 / float(arr.max()), 64.0)) if arr.max() > 0 else 1.0
+        return (arr * np.float32(k)).astype(np.float32), k
+    return arr, 1.0
+
+
+def cc_superres_factor(stack_params: dict | None) -> float:
+    """The Cosmic Clarity super-resolution factor asked for (``superres_method`` = cosmic_clarity, ``scale`` > 1), else 0.  Its models exist for 2, 3 and 4 only:
+    another scale is returned as it is and the export records that it cannot run (no rounding to a scale nobody chose)."""
+    sp = stack_params or {}
+    if str(sp.get("superres_method") or "drizzle") != "cosmic_clarity":
+        return 0
+    try:
+        want = float(sp.get("scale", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return 0
+    if want <= 1.0:
+        return 0
+    return int(want) if want in CC_SUPERRES_SCALES else want
+
+
+def _has_wcs(header) -> bool:
+    return all(k in header for k in ("CTYPE1", "CRVAL1", "CRPIX1")) and any(k in header for k in ("CD1_1", "PC1_1", "CDELT1"))
+
+
+def _dual_band(meta: dict, header=None) -> bool:
+    if "is_dualband" in meta and meta["is_dualband"] is not None:
+        return bool(meta["is_dualband"])
+    return finish.is_narrowband(meta.get("filter") or (header.get("FILTER") if header is not None else None))
+
+
+def _write_like(path: str, arr: np.ndarray, header) -> None:
+    fitsio.write_rgb(path, arr, header)
+
+
+def _read_like(path: str, ref_header) -> np.ndarray:
+    """Read a Siril output; rows are put back in the reference image's row order (Siril writes its own
+    bottom-up order; a TOP-DOWN input would otherwise come back upside down)."""
+    arr, hdr = fitsio.read_rgb(path)
+    if export_mod.bottom_up(hdr) != export_mod.bottom_up(ref_header):
+        arr = np.ascontiguousarray(arr[:, ::-1])
+    return arr
+
+
+class _Steps:
+    """Step recorder + progress reporter shared by the stages."""
+
+    def __init__(self, n: int, progress, checkpoint):
+        self.n, self.i = n, 0
+        self.progress, self.checkpoint = progress, checkpoint
+        self.records: list[dict] = []
+
+    def begin(self, msg: str) -> None:
+        self.i += 1
+        self.check()
+        if self.progress:
+            self.progress(min(self.i, self.n), self.n, msg)
+
+    def sub(self, _i=None, _n=None, msg: str = "") -> None:
+        """Sub-progress from a tool: keep our step counters, show the tool's message."""
+        if self.progress and msg:
+            self.progress(min(self.i, self.n), self.n, msg)
+
+    def check(self) -> None:
+        if self.checkpoint:
+            self.checkpoint()
+
+    def add(self, step: str, tool: str, status: str = "done", seconds: float = 0.0, note: str = "", **params) -> dict:
+        rec = {"step": step, "tool": tool, "status": status, "seconds": round(seconds, 1), "params": params}
+        if note:
+            rec["note"] = note
+        self.records.append(rec)
+        return rec
+
+
+def _siril_run(work: str, steps: _Steps, script: str, stage: str, expect=(), timeout: float | None = None) -> object:
+    runner = SirilRunner(work, progress=steps.sub, checkpoint=steps.checkpoint, timeout=timeout)
+    return runner.run(script, stage, expect=list(expect))
+
+
+def _siril_image(work: str, steps: _Steps, name: str, arr: np.ndarray, header, body: str, stage: str,
+                 with_log: bool = False, timeout: float | None = None):
+    """Write ``arr``, run ``load name_in; <body>; save name_out`` in Siril, read the result back.
+
+    Returns ``(array, header_out)``, plus the interesting lines of Siril's log when ``with_log`` (SPCC prints
+    its fitted factors there).  The caller's arrays are bottom-up (Siril's own order), so the rows come back
+    in the same order."""
+    fin, fout = os.path.join(work, f"{name}_in.fit"), os.path.join(work, f"{name}_out.fit")
+    if os.path.exists(fout):
+        os.remove(fout)
+    _write_like(fin, arr, header)
+    try:
+        res = _siril_run(work, steps, f"load {name}_in\n{body}\nsave {name}_out\n", stage, expect=[f"{name}_out.fit"],
+                         timeout=timeout)
+        out, hdr = fitsio.read_rgb(fout)
+        if export_mod.bottom_up(hdr) != export_mod.bottom_up(header):
+            out = np.ascontiguousarray(out[:, ::-1])
+        if with_log:
+            keep = [ln for ln in res.tail if re.search(r"spcc|gaia|white|factor|K[012]|catalog|stars", ln, re.I)][-8:]
+            return out, hdr, keep
+        return out, hdr
+    finally:
+        for f in (fin, fout):
+            if os.path.exists(f):
+                os.remove(f)
+
+
+def _device_gpu(stack_params: dict | None) -> str:
+    return str((stack_params or {}).get("device") or "auto")
+
+
+# =========================================================================== restore (linear)
+
+def spcc_arguments(header, meta: dict, p: dict) -> tuple[list[str], str]:
+    """Siril ``spcc`` arguments for this camera and filter (workflows.md 7.3) and a description.
+
+    Explicit ``spcc_sensor`` / ``spcc_filter`` win.  Raises ``ValueError`` when the camera cannot be told
+    (the caller then falls back to background neutralisation)."""
+    ident = " ".join(str(x) for x in (header.get("TELESCOP"), header.get("INSTRUME"), header.get("CREATOR"),
+                                      header.get("CAMERA"), meta.get("instrument"), meta.get("telescope"),
+                                      meta.get("kind"), meta.get("sensor")) if x).lower()
+    filt = str(header.get("FILTER") or meta.get("filter") or "")
+    fnorm = re.sub(r"[^a-z0-9]", "", filt.lower())
+    sensor = None
+    if "seestar" in ident or re.search(r"\bs(30|50)\b", ident):
+        pro = "pro" in ident
+        sensor = "Sony IMX585" if pro else ("ZWO Seestar S30" if "s30" in ident else "ZWO Seestar S50")
+    elif "dwarf" in ident:
+        sensor = "Sony IMX662" if "mini" in ident else ("Sony IMX415" if re.search(r"dwarf ?(2|ii)\b", ident) else "Sony IMX678")
+    else:
+        m = re.search(r"imx ?(\d{3})", ident)
+        if m:
+            sensor = f"Sony IMX{m.group(1)}"
+        elif "585" in ident:
+            sensor = "Sony IMX585"
+        elif "294" in ident:
+            sensor = "Sony IMX294"
+        elif "533" in ident:
+            sensor = "Sony IMX533"
+        elif "2600" in ident or "571" in ident:
+            sensor = "Sony IMX571"
+    if meta.get("sensor") and not sensor:
+        sensor = str(meta["sensor"])                    # stack_meta.sensor is already an SPCC oscsensor name
+    if p.get("spcc_sensor") not in (None, "", "auto"):
+        sensor = str(p["spcc_sensor"])
+    if not sensor:
+        raise ValueError("camera sensor unknown (no SPCC database entry guessed from the headers)")
+    args = [f"-oscsensor={sensor}", "-catalog=gaia", f"-whiteref={SPCC_WHITE_REF.get(p.get('spcc_white_ref'), 'Average Spiral Galaxy')}"]
+    desc = sensor
+    if p.get("spcc_filter") not in (None, "", "auto"):
+        args.append(f"-oscfilter={p['spcc_filter']}")
+        desc += f" + {p['spcc_filter']}"
+    elif fnorm in ("duoband", "dualband", "duo"):
+        args += SPCC_NARROWBAND
+        desc += " + dual-band (narrowband mode)"
+    elif fnorm == "lp" and "seestar" in ident:
+        args.append("-oscfilter=ZWO Seestar LP")
+        desc += " + ZWO Seestar LP"
+    else:
+        args.append("-oscfilter=UV/IR Block")
+        desc += " + UV/IR Block"
+    return args, desc
+
+
+def field_circle(header, shape_hw) -> tuple[float, float, float]:
+    """(RA, Dec, radius) in degrees of the plate-solved field: the WCS reference point and half the diagonal from the CD / CDELT scale."""
+    ra, dec = float(header["CRVAL1"]), float(header["CRVAL2"])
+    if "CD1_1" in header:
+        scale = float(np.sqrt(abs(float(header["CD1_1"]) * float(header.get("CD2_2", header["CD1_1"])) - float(header.get("CD1_2", 0.0)) * float(header.get("CD2_1", 0.0)))))
+    else:
+        scale = float(abs(float(header["CDELT1"])))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("no pixel scale in the WCS")
+    h, w = shape_hw
+    return ra, dec, 0.5 * scale * float(np.hypot(h, w))
+
+
+def _spcc_database_present() -> bool:
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return os.path.isdir(os.path.join(home, ".local", "share", "siril-spcc-database"))
+
+
+def deconv_choice(stack_params: dict | None) -> tuple[str, str]:
+    """(objects, stars): the deconvolution tool of each region, each one of DECONV_TOOLS.  ``deconv_method`` is the objects' tool and
+    ``deconv_stars_method`` the stars'; without the latter (or "") the stars follow ``deconv_method``, the single choice before the split.
+    The former GraXpert values of deconv_method (graxpert_obj / graxpert_stellar / graxpert_both) name both regions."""
+    sp = stack_params or {}
+    obj = str(sp.get("deconv_method") or "auto")
+    stars = str(sp.get("deconv_stars_method") or "")
+    if obj in LEGACY_DECONV:
+        obj, follow = LEGACY_DECONV[obj]
+    else:
+        follow = obj
+    if stars in LEGACY_DECONV:
+        stars = LEGACY_DECONV[stars][1]
+    return obj, stars or follow
+
+
+def star_footprint_mask(work: str, steps: _Steps, arr: np.ndarray, header) -> tuple[np.ndarray, dict]:
+    """(H, W) float32 mask in [0, 1] of the stars' footprints on the linear image ``arr`` (Siril's row order), for confining a whole-image
+    deconvolution (Siril RL, ImageMM) to the objects or to the stars.
+
+    Siril ``findstar`` with Moffat profiles (``setfindstar -moffat``; the default detection otherwise) fits every star; a star covers the
+    pixels where its fitted profile A (1 + (r / alpha)^2)^-beta is above STAR_MASK_K x the sky noise (per pixel, of the green plane,
+    the plane findstar measures): r = alpha sqrt((A / k sigma)^(1 / beta) - 1), alpha = FWHM / (2 sqrt(2^(1 / beta) - 1)), at
+    least the FWHM.  The discs are softened by the median star's own Gaussian sigma (FWHM / 2.355), like a star mask's smoothing."""
+    from .veralux_imagemm import siril_to_array
+    H, W = arr.shape[-2:]
+    lst = os.path.join(work, "starmask.lst")
+    if os.path.exists(lst):
+        os.remove(lst)
+    fin = os.path.join(work, "starmask_in.fit")
+    _write_like(fin, arr, header)
+    try:
+        _siril_run(work, steps, "load starmask_in\nsetfindstar reset\nsetfindstar -moffat\nfindstar -out=starmask.lst\nsetfindstar reset\n",
+                   "Star mask", expect=["starmask.lst"])
+    finally:
+        if os.path.exists(fin):
+            os.remove(fin)
+    cols, rows = None, []
+    with open(lst, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.split()
+            if line.startswith("#"):
+                head = line.lstrip("#").replace("[px]", "").replace('["]', "").split()
+                if "X" in head and "beta" in head:
+                    cols = {k: head.index(k) for k in ("A", "beta", "X", "Y", "FWHMx", "FWHMy")}
+                continue
+            if cols and len(parts) > max(cols.values()):
+                try:
+                    rows.append({k: float(parts[i]) for k, i in cols.items()})
+                except ValueError:
+                    continue
+    # the sky's per-pixel noise: MAD of the 5 px high-pass of the green plane (the plane findstar measures), over the high-pass's own factor for white noise,
+    # sqrt(1 - 2 g(0) + sum g^2) = sqrt(1 - 3 / (4 pi s^2)); finish.lower_half_sigma reads 0.6 sigma on pure Gaussian noise (a relative estimate)
+    g = arr[1 if arr.shape[0] > 1 else 0].astype(np.float32)
+    sigma = finish.mad_sigma((g - cv2.GaussianBlur(g, (0, 0), 5.0))[::2, ::2]) / float(np.sqrt(1.0 - 3.0 / (4.0 * np.pi * 25.0)))
+    mask = np.zeros((H, W), np.uint8)
+    fwhms, radii = [], []
+    for st in rows:
+        fwhm = max(st["FWHMx"], st["FWHMy"])
+        beta = max(st["beta"], 1.0 + 1e-3)
+        if not (np.isfinite(fwhm) and fwhm > 0 and np.isfinite(st["A"])):
+            continue
+        alpha = fwhm / (2.0 * np.sqrt(2.0 ** (1.0 / beta) - 1.0))
+        ratio = st["A"] / max(STAR_MASK_K * sigma, 1e-12)
+        r = alpha * np.sqrt(ratio ** (1.0 / beta) - 1.0) if ratio > 1 else 0.0
+        r = max(r, fwhm)
+        c, y = siril_to_array(st["X"], st["Y"], H)
+        cv2.circle(mask, (int(round(c * 16)), int(round(y * 16))), int(round(r * 16)), 1, -1, lineType=cv2.LINE_8, shift=4)
+        fwhms.append(fwhm)
+        radii.append(r)
+    m = mask.astype(np.float32)
+    if fwhms:
+        m = np.clip(cv2.GaussianBlur(m, (0, 0), float(np.median(fwhms)) / 2.3548), 0.0, 1.0)
+    info = {"stars": len(fwhms), "sky_sigma": round(float(sigma), 7), "k": STAR_MASK_K, "coverage": round(float(m.mean()), 4),
+            "fwhm_median": round(float(np.median(fwhms)), 2) if fwhms else None,
+            "radius_median": round(float(np.median(radii)), 2) if radii else None, "radius_max": round(float(max(radii)), 1) if radii else None}
+    return m, info
+
+BORDER_DEBT_MIN = 0.0005          # what the step has to have added at the border, as a fraction of the sky, to be worth giving back: the stretch's slope at the sky is 75-120,
+                                   # so this is already 4-6 % of the display sky, which is the frame the user sees
+BORDER_DEBT_SIGMA = 3.0           # ... and it has to stand this many standard errors of the line's own median clear of what the input carried at that depth
+BORDER_DEBT_CAP = 0.04            # the absolute ceiling on what may be handed back.  NGC 1499 (2026-10-30) had a right border at +2.25 % of the sky here that the export showed as
+                                  # -59 % of the display sky, and the 2 % this used to be refused at was only ever a guess at the question BORDER_DEBT_CELL now asks directly; the
+                                  # ceiling stays as the last resort for a profile that test cannot read
+BORDER_DEBT_CELL = 0.25           # and the question is this: an extrapolated lattice cell misfits its own cell and nothing beyond it, so the inner quarter of the band has to be
+                                  # clear of the deviation.  What stands there did not come from the model - it came in with the sky, and the sky stays
+BORDER_DEBT_STANDING = 1.0 / 3.0  # ... and "standing" means a third or more of the lines there carry it, because a single line is the noise's and not the model's: NGC 1499's
+                                  # bottom border was refused for one line at 243 px of 251 with every neighbour back at zero
+
+
+def border_debt(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray | None, dict]:
+    """What a background model left at the frame's border that its own input did not carry, and not one pixel more.
+
+    GraXpert lays its background grid on a lattice that stops half a cell inside the frame (spacing = the width over ``tools.GX_MESH_POINTS``) and interpolates those samples
+    with a thin-plate RBF, which across the frame's outer cell has nothing left to interpolate through: it is extrapolated there, and a subtraction correction keeps the
+    error.  Measured on LBN 429 (2026-10-30) a top border flat to +-0.05 % of the sky left that step at +0.20 to +0.28 % across the outer 128 px and a left edge 0.6 % off
+    where its input had been - and at the stretch's slope at the sky, half a percent of the sky is a third of the display.  ``tools.GraXpert.run`` hands the model reflected
+    image one cell wide to take most of it out; what remains (0.2-0.4 % on one side or another on IC 434 and M 31, measured the same way) cannot be dealt with by
+    ``pro.edge_ring``, which refuses every one of these borders for the right reason: **a deviation still standing 48 px in is indistinguishable, from the output alone,
+    from a nebula's edge**, and flattening a nebula's edge is the one error this pipeline does not recover from.
+
+    This tool is not working from the output alone.  The step's own input is here, so the border is held to what the frames made it: the correction is only the part of the
+    output's deviation that stands above the input's own at the same depth, and never more than the input carried there.  Three consequences, all of them the point:
+    nebulosity, a gradient or any other structure the frames really do carry at the border is left exactly where the frames put it; a gradient step that *improved* a border
+    (``|out| <= |in|`` everywhere) is left completely alone; and the result cannot end up with a border more deviant than the one that went in, which is the invariant the
+    test asserts.  What is left is what the model added, taken back at the depth it has, tapered over the band's inner quarter so the correction cannot leave a step of its
+    own behind.  Three more conditions decide whether a side is taken at all.  **The deviation has to die inside the cell**: an extrapolated lattice cell misfits its own cell
+    and nothing beyond it, so a deviation still standing, on a third or more of its lines, in the inner quarter of the band came in with the sky and is left there - which is
+    what ``BORDER_DEBT_CAP`` used to stand in for, bluntly enough to refuse NGC 1499's right border at +2.25 % of the sky, dead by 71 px of a 251 px cell, in the export -59 %
+    of the display sky.  **It has to run the length of the border**: the step's change is sampled near both ends and in the middle of its deepest line, and all three have to
+    clear 3 SE in one direction.  They need not be the same size - the misfit grows toward the corner where two extrapolated borders meet, and NGC 1499's right border ran
+    +1.01 %, +2.46 %, +5.55 % of the sky on its way there - but structure the frames themselves carry leaves the step *nothing to change* where it sits, and that is the
+    deviation that dies: M 31's left border measured +0.15 % at one end against its 0.31 % 3 SE.  And a side is taken in **all its channels or none**: the cell is one object
+    measured three times, and handing back the channels that passed while leaving the one that did not paints the border in the colour that was left out.
+
+
+    Returns the field to subtract from ``dst``, or None; with it, what each side and channel was measured at and what was refused, for the record."""
+    src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
+    if src.ndim != 3 or src.shape != dst.shape:
+        return None, {"note": "not a pair of images on one grid"}
+    ch, h, w = dst.shape
+    band = int(min(math.ceil(max(h, w) / tools.GX_MESH_POINTS), h // 4, w // 4))        # how far the extrapolation reaches: one lattice cell
+    if band < 16:
+        return None, {"note": "frame too small for a band"}
+    keep = np.ones((h, w), bool)
+    keep[:band, :] = keep[h - band:, :] = keep[:, :band] = keep[:, w - band:] = False
+    if int(keep.sum()) < 4096:
+        return None, {"note": "too little interior to measure the sky on"}
+    din = np.array([float(np.median(src[c][keep])) for c in range(ch)])                  # each side is read against its own array's interior: the step takes sky out globally,
+    dout = np.array([float(np.median(dst[c][keep])) for c in range(ch)])                 # and only a deviation measured against the same array's own sky is the step's doing
+
+    def sample(arr, side, d, lo, hi):                                                     # the line d px in from that border, between two fractions of its length
+        n = w if side < 2 else h
+        a0, a1 = int(lo * n), max(int(lo * n) + 1, int(hi * n))
+        if side == 0:
+            return arr[:, d:d + 1, a0:a1]
+        if side == 1:
+            return arr[:, h - 1 - d:h - d, a0:a1]
+        if side == 2:
+            return arr[:, a0:a1, d:d + 1]
+        return arr[:, a0:a1, w - 1 - d:w - d]
+
+    def debt(v_in, v_out, base_in, base_out):                                             # what the step added beyond what the input carried, 0 where it did not
+        a_in, a_out = float(np.median(v_in)) - base_in, float(np.median(v_out)) - base_out
+        if not a_out:
+            return 0.0
+        return a_out - math.copysign(min(abs(a_out), abs(a_in)), a_out)                   # allowed to be as deviant as its input, no further
+
+    num, den, table = np.zeros((ch, h, w)), np.zeros((ch, h, w)), []
+    tail = max(1, band // 4)
+    ramp = np.ones(band)
+    ramp[-tail:] = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, tail)))                 # the correction's own inner edge is a slope, never a step
+    for side in range(4):
+        taken, why = [], None
+        for c in range(ch):
+            ex, ses = np.zeros(band), np.zeros(band)
+            for d in range(band):
+                v_in, v_out = sample(src, side, d, 0.25, 0.75)[c], sample(dst, side, d, 0.25, 0.75)[c]
+                if v_in.size < 256:
+                    continue
+                e = debt(v_in, v_out, din[c], dout[c])
+                se = 1.253 * pro._sigma(v_out) / math.sqrt(v_out.size)
+                ses[d] = se
+                ex[d] = e if abs(e) > BORDER_DEBT_SIGMA * se else 0.0
+            emax = float(np.abs(ex).max())
+            ref = abs(dout[c]) or 1e-12
+            if emax < BORDER_DEBT_MIN * ref:
+                continue                                                               # this channel left its border as the frames had it
+            if emax > BORDER_DEBT_CAP * ref:
+                why = "more sky than a model can have added"
+            else:
+                inner = slice(int(band * (1.0 - BORDER_DEBT_CELL)), band)          # the model's own cell, the depths its interpolation cannot have reached
+                # ex is already zeroed below significance, so a nonzero line here is a significant one; counting them rather than taking "any" keeps one noisy line from
+                # condemning a side whose deviation is otherwise dead
+                if float(np.mean(ex[inner] != 0.0)) >= BORDER_DEBT_STANDING:
+                    why = "the deviation runs past the model's cell"
+                else:
+                    d0 = int(np.argmax(np.abs(ex)))
+                    # the step's own change to its deepest line, at both ends of the border and in its middle, before any clipping
+                    samples = [float(np.median(sample(dst, side, d0, lo, hi)[c])) - float(np.median(sample(src, side, d0, lo, hi)[c])) - (dout[c] - din[c])
+                               for lo, hi in ((0.06, 0.30), (0.40, 0.60), (0.70, 0.94))]
+                    se_typ = float(np.median(ses[ses > 0])) if (ses > 0).any() else 0.0
+                    if min(samples) < 0.0 < max(samples) or min(abs(s) for s in samples) < BORDER_DEBT_SIGMA * se_typ:
+                        why = "the deviation is not along the whole border"
+            if why:
+                table.append((side, c, round(emax / ref, 5), why))
+                # the side goes with the channel: the cell is one object measured in three channels, and handing back the ones that passed while leaving the one that did not
+                # paints the border in the colour that was left out
+                break
+            taken.append((c, ex))
+        if why:
+            continue                                                               # nothing at all is taken from this side
+        for c, ex in taken:
+            for d in range(band):
+                if ex[d] == 0.0:
+                    continue
+                sl = ((slice(d, d + 1), slice(None)) if side == 0 else (slice(h - 1 - d, h - d), slice(None)) if side == 1
+                      else (slice(None), slice(d, d + 1)) if side == 2 else (slice(None), slice(w - 1 - d, w - d)))
+                num[c][sl] += ex[d] * ramp[d]
+                den[c][sl] += ramp[d]
+    if not den.any():
+        return None, {"band_px": band, "sides": table, "note": "the step left nothing at the border that its input did not carry"}
+    total = np.where(den > 0, num / np.maximum(den, 1e-9), 0.0)
+    peak = float(np.abs(total).max())
+    if peak < BORDER_DEBT_MIN * (abs(float(np.median(dout))) or 1e-12):
+        return None, {"band_px": band, "sides": table, "note": "under what the export can show"}
+    return total.astype(np.float32), {"band_px": band, "peak": round(peak, 7), "cap": round(BORDER_DEBT_CAP * abs(float(np.median(dout))), 7), "sides": table}
+
+
+# A repainting step's matte patches.  ``border_debt`` above deals with a model that *subtracts*; this deals with a
+# model that paints over, which no border tool can see because the patch it leaves need not touch the frame at all.
+PAINT_CELL = 8                # px: the smallest area that can honestly say "nothing in here varies" -- a satellite
+                              # trail is a few pixels across, so a finer grid reads the trail's own edge as texture
+PAINT_FLAT = 0.9              # ... and "nothing varies" means this fraction of the cell sits on one value: a fill,
+                              # not a smoothed sky.  IC 1848 (2026-11-01), the satellite remover run alone on the
+                              # session's own stack.fits: the stripe it painted was 0.94 single-valued, its input 0.00
+PAINT_QUIET = 0.25            # ... or the cell's own scatter having fallen to this share of the frame's typical cell
+PAINT_MIN = 0.0005            # ... and the sky has to have MOVED under the patch by at least this much, as a fraction
+                              # of the sky, for the pixels to be worth giving back.  A repaint that leaves the sky
+                              # where it was is invisible after the stretch however flat it is, and the trail it
+                              # removed was worth more than the texture it cost; BORDER_DEBT_MIN's reasoning holds
+                              # here too -- the stretch's slope at the sky is 75-120, so 0.05 % of the sky is already
+                              # 4-6 % of the display sky the owner sees
+PAINT_SE = 3.0                # ... and clear of its own measurement noise by this many standard errors: a cell median
+                              # carries 1.25 sigma over root(cell), so without this a fill at the right level trips the
+                              # guard on the noise's own scatter, which is how a harmless trail fill failed the test
+PAINT_GROW = 0.34             # a neighbouring cell joins the patch while its own step is at least this share of the
+                              # seeded fill's, and in the same direction: the fill thins at its edges and leaves the
+                              # sky's noise behind, so those cells fail the matte test on their own -- IC 1848's bar
+                              # kept 80 of its 150 rows painted until the verdict was allowed to grow along it
+PAINT_MAX = 0.25              # ... and no more than this share of the frame may be taken this way.  A verdict that
+                              # wide is a gradient, a background model or the sky itself, not paint, and that
+                              # disagreement belongs to the owner's settings rather than to a weight map
+
+
+def painted_patch(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray | None, dict]:
+    """Where a repainting step left a matte patch and moved the sky under it, the weight map that gives those pixels
+    back to the frames.
+
+    A satellite-trail remover does not model the sky, it fills over it, and a fill differs from the sky in two ways
+    that can be measured rather than looked for.  Nothing in a painted patch varies -- the noise the frames took into
+    those pixels has been replaced by a value.  And the fill need not sit at the level of the sky it covers.  Measured
+    on IC 1848 (2026-11-01), ``--sat-mode full --sensitivity 0.1`` run alone on the session's own ``stack.fits``: a
+    7 x 150 px stripe went from level with its surroundings (+1.4 % of the sky) to 8.3 % below them, 94 % of it at one
+    value.  The stretch's slope at the sky (~120) delivers that matte pedestal as a black bar, and the bar is what the
+    owner reported as a rectangle in the export.
+
+    A cell is taken when the tool made it matte (``PAINT_FLAT`` of it on one value, or its scatter down to
+    ``PAINT_QUIET`` of the frame's own) while its input was not, *and* the sky moved under it by ``PAINT_MIN``.  The
+    two exclusions carry as much of the rule as the test: a patch repainted at the right level stays exactly as the
+    tool made it, and an area that was already matte in the input -- a saturated core, a masked corner, a frame the
+    telescope itself left blank -- is the frames' own and stays.  A cell is taken in all channels or none, for the
+    same reason ``border_debt`` takes a side that way: half a patch given back paints it in the colour left out.
+
+    Returns a float32 weight map (1.0 where the input is to be restored, grown by a cell so the trail's antialiased
+    edge goes back with its body) or None; with it, what was measured, for the record."""
+    src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
+    if src.ndim != 3 or src.shape != dst.shape:
+        return None, {"note": "not a pair of images on one grid"}
+    ch, h, w = dst.shape
+    ny, nx = h // PAINT_CELL, w // PAINT_CELL
+    if ny < 4 or nx < 4:
+        return None, {"note": "frame too small for a cell grid"}
+
+    def cells(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        a = arr[:, :ny * PAINT_CELL, :nx * PAINT_CELL].reshape(ch, ny, PAINT_CELL, nx, PAINT_CELL)
+        med = np.median(a, axis=(2, 4))
+        sd = a.std(axis=(2, 4))
+        return med, sd, (np.abs(a - med[:, :, None, :, None]) <= 0.01 * sd_ref).mean(axis=(2, 4))
+
+    e = PAINT_CELL
+    interior = np.zeros((h, w), bool)
+    interior[e:h - e, e:w - e] = True
+    sky = np.array([float(np.median(src[c][interior])) for c in range(ch)])
+    sd_ref = float(np.median(dst[:, :ny * PAINT_CELL, :nx * PAINT_CELL].reshape(ch, ny, PAINT_CELL, nx, PAINT_CELL)
+                             .std(axis=(2, 4))))
+    if not sd_ref > 0.0:
+        return None, {"note": "no noise anywhere to judge the patch against"}
+    med_in, sd_in, flat_in = cells(src)
+    med_out, sd_out, flat_out = cells(dst)
+
+    matte_out = (flat_out >= PAINT_FLAT) | (sd_out < PAINT_QUIET * sd_ref)
+    matte_in = (flat_in >= PAINT_FLAT) | (sd_in < PAINT_QUIET * sd_ref)
+    # The level has to clear the cell's own measurement noise as well as the visible floor.  A cell median carries
+    # about 1.25 sigma over root(cell): sky noise of 3.5e-4 across a 64-px cell is 5.5e-5 of scatter in the median
+    # alone, a fiftieth of the sky, so PAINT_MIN on its own would have a harmless level fill trip the guard on noise.
+    se = PAINT_SE * 1.25 * sd_ref / math.sqrt(PAINT_CELL * PAINT_CELL)
+    moved = np.abs(med_out - med_in) >= np.maximum(PAINT_MIN * np.abs(np.where(sky == 0.0, 1.0, sky)[:, None, None]), se)
+    take = (matte_out & ~matte_in & moved).any(axis=0)
+    if not take.any():
+        return None, {"cell_px": PAINT_CELL, "cells": 0,
+                      "note": "the step left no matte patch with the sky moved under it"}
+    found = int(take.sum())
+    # The fill is one object, and only its middle reads as matte: where it came in thin it left the sky's noise behind
+    # while still sitting at the fill's level, so those cells fail the matte test on their own and would be left
+    # painted in the middle of the patch.  Grow the verdict along the step it made -- same direction, at least
+    # PAINT_GROW of the seed's own size -- and it stops by itself where the fill stops and the sky's own scatter
+    # begins, which is the only boundary the pixels can be asked to draw.
+    seed = take.copy()
+    band = np.abs(med_out - med_in).max(axis=0)
+    speak = np.argmax(np.abs(med_out - med_in), axis=0)
+    yy, xx = np.indices(seed.shape)
+    step = np.sign(med_out - med_in)[speak, yy, xx]
+    ref = float(np.median(band[seed])) or 1e-12
+    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], np.uint8)
+    while True:
+        nb = cv2.dilate(take.astype(np.uint8), cross) > 0
+        cand = nb & ~take & (band >= PAINT_GROW * ref) & (step * np.sign(med_out - med_in)[speak, yy, xx] > 0)
+        if not cand.any():
+            break
+        take |= cand
+    if take.mean() > PAINT_MAX:
+        return None, {"cell_px": PAINT_CELL, "cells": int(take.sum()), "cells_found": found,
+                      "note": "the step moved the sky over the frame; that is not a patch"}
+    # A cell ring each way as well: a fill's antialiased edge lies in the cells it only half-covered, and those still
+    # carry enough of the sky's own noise to read as untouched -- precisely the pixels a bare-cell verdict would leave
+    # painted, one cell deep, framing the patch it was meant to give back.
+    take = cv2.dilate(take.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    mask = np.kron(take, np.ones((PAINT_CELL, PAINT_CELL), bool))
+    if mask.shape != (h, w):
+        full = np.zeros((h, w), bool)
+        full[:mask.shape[0], :mask.shape[1]] = mask
+        mask = full
+    off = float(np.abs(med_out - med_in)[matte_out & ~matte_in & moved].max())
+    return mask.astype(np.float32), {"cell_px": PAINT_CELL, "cells": int(take.sum()), "cells_found": found,
+                                     "area_pct": round(100.0 * float(mask.mean()), 4),
+                                     "offset_sky_pct": round(100.0 * off / max(float(np.median(np.abs(sky))), 1e-12), 3),
+                                     "flat_frac": round(float(flat_out[matte_out & ~matte_in].max()), 3),
+                                     "quiet_frac": round(float((sd_out[matte_out & ~matte_in] / sd_ref).min()), 4)}
+
+
+# The star pass' photometric gate.  A deconvolution may move a star's light inward -- that is its whole job -- but it
+# may not delete it.  The PSF of these frames is compact (C 49, 2026-11-01, measured on the stack's own isolated
+# unsaturated stars: Gaussian sigma 1.37 px, Moffat beta 12, 82 % of a star's light inside r=2 and 99 % inside r=6),
+# so every star sits inside r=12 and the aperture out there *is* the star.  What the shipped renders delivered against
+# their own stack.fits, summed excess light over 60 isolated stars each (1.00 = the light the frames measured): C 49
+# on the stars 0.72, M 31 (ImageMM objects, BlurXTerminator stars) 0.72, C 20 EXP_15 (ImageMM) 1.10 with the core at
+# 1.35, NGC 1499 (BlurXTerminator) 1.13 with the core at 1.36 -- while the same sessions rendered without a star pass
+# kept 0.91-0.95.  The configurations that left the stars alone are the ones that kept their photometry, which is why
+# the answer here is to refuse a star rather than to tune a tool: the reference pixels are the light the frames took.
+#
+# ``align`` is why the reference has to be chosen with care, and it is the whole difference between a defect and an
+# artefact.  A star's light is an excess over its local sky, so a per-channel PEDESTAL (background subtraction,
+# ``finish.neutralize_background``) cancels in it while a per-channel GAIN (white balance, SPCC) does not -- and a
+# scale inferred from the two images' sky medians cannot tell those apart.  Measured on C 20 2026-11-01: after the
+# colour fallback (gains 1.777/1.0/1.733 then offsets 0.034/0/0.033) a sky-median alignment reported every star as
+# carrying 1.39 of the light the frames took and the gate refused 752 of 752, which would have handed the whole frame
+# back un-white-balanced.  So the reference is only ever an array that shares the image's photometric units by
+# construction -- the stack window against ImageMM's output (``imagemm_stage.match_to_stack`` fitted them to each
+# other, and both then carry the same ``normalise_scale`` k: ``align=False``), or the image as the star pass found it
+# (same array lineage, where the only legitimate global change is a tool's ``_sanitize`` rescale: ``align=True``).
+GUARD_R_APER = 12                               # a star's light: the disc above its own sky
+GUARD_SKY = (40, 70)                            # the star's own neighbourhood sky, where no telescope has a star
+GUARD_TOL = 0.10                                # a tenth of the star's light, in either direction
+GUARD_NSIG = 30.0                               # only stars the sky could not be mistaken for
+GUARD_SWAP = 16                                 # px handed back: the aperture, with a 4 px taper
+DENOISE_DESCALATION = 3                           # extra runs of the linear denoiser, at most, when the stars it leaves are
+                                                  # dimmer than GUARD_TOL allows: the ladder from the requested strength to 0
+                                                  # in this many steps, so a frame that cannot be denoised without eating its
+                                                  # stars costs a bounded amount of time and is then left alone, every attempt recorded
+
+
+def star_flux_guard(arr: np.ndarray, ref: np.ndarray, tol: float = GUARD_TOL, nsig: float = GUARD_NSIG,
+                    align: bool = True) -> tuple[np.ndarray, dict]:
+    """``arr`` with the stars whose light its restoration broke handed back from ``ref``, and what was refused.
+
+    Each star's light is its aperture sum (r <= 12) above its *own* neighbourhood sky (the median of the 40-70 px
+    annulus), measured in both images -- a sum, not annulus medians: a deconvolution that moves light inward -- its
+    whole job -- must read 1.00, and medians read it as a gain.  Requiring an empty 30 px around each star is what
+    makes the sum safe from a neighbour's light.  A star is refused when its light has moved by more than ``tol``, or
+    when one channel alone has moved by twice that (the coloured crown: one channel's core erased, the other two
+    intact).  When the *population* median is itself outside ``tol`` the step's star photometry is refused for every
+    star checked, because that is a tool destroying light on every star rather than a few hard ones; ``mode`` says
+    which happened, and the numbers are recorded either way.
+
+    ``align`` scales the reference by the two images' sky medians first, which is legitimate only when nothing between
+    them added a pedestal -- a sky median cannot tell a pedestal from a gain (see above).  With ``align=False`` the
+    two arrays must already share photometric units, and are compared exactly as they are.  Each image is always
+    measured above its own local sky, never the other's: an image whose whole frame sits a little lower than the
+    reference is a sky-level matter, not a theft of star light, and weighing its discs against the reference's sky
+    would report a 0.012 pedestal as half of every star's light and refuse stars that are perfectly intact.
+    """
+    from scipy.ndimage import maximum_filter
+
+    C, H, W = arr.shape
+    if ref.shape != arr.shape:
+        raise RuntimeError(f"star flux guard: reference {ref.shape} does not match the image {arr.shape}")
+    a = np.asarray(arr, np.float32)
+    b = np.asarray(ref, np.float32)
+    kb = (np.array([float(np.median(a[c])) / v if v > 1e-9 else 1.0
+                    for c, v in enumerate(np.median(b, axis=(1, 2)))], np.float32) if align else np.ones(C, np.float32))
+    b = (b * kb[:, None, None]).astype(np.float32)
+    lum = finish.luminance(b)
+    sigma = max(finish.lower_half_sigma(finish.sample(lum)), 1e-9)
+    pad = GUARD_SKY[1] + 4                                      # the sky annulus plus the swap's taper must fit
+    peaks = (lum == maximum_filter(lum, size=11)) & (lum > np.median(lum) + nsig * sigma)
+    yy, xx = np.mgrid[0:H, 0:W]
+    stars = []
+    for y, x in zip(*np.nonzero(peaks)):
+        y, x = int(y), int(x)
+        if not (pad < x < W - pad and pad < y < H - pad):
+            continue
+        y0, y1, x0, x1 = y - GUARD_SKY[1] - 1, y + GUARD_SKY[1] + 2, x - GUARD_SKY[1] - 1, x + GUARD_SKY[1] + 2
+        r = np.hypot(xx[y0:y1, x0:x1] - x, yy[y0:y1, x0:x1] - y)
+        if (peaks[y - 30:y + 31, x - 30:x + 31] & (np.hypot(xx[y - 30:y + 31, x - 30:x + 31] - x,
+                                                            yy[y - 30:y + 31, x - 30:x + 31] - y) >= 12)).sum():
+            continue                                             # a neighbour's light would fill the aperture
+        disc = r <= GUARD_R_APER
+        f_a = f_b = 0.0
+        per = []
+        for c in range(C):
+            base_a = float(np.median(a[c][y0:y1, x0:x1][r >= GUARD_SKY[0]]))
+            base_b = float(np.median(b[c][y0:y1, x0:x1][r >= GUARD_SKY[0]]))
+            # Each image above its own local sky (see the docstring).  What this records is therefore the state the
+            # step is judged on, before the pixels are handed back: on C 49 (ImageMM on both regions) the restoration
+            # had also darkened the sky around the stars, so a frame whose every star had just been handed back from
+            # stack.fits still measured 1.39 when re-weighed against the image's own annulus.  The correction is in
+            # the pixels -- see test_a_refused_star_comes_back_as_the_frames_carried_it -- not in a rerun of this
+            # measurement, which would need the sky to travel with them.
+            va = float((a[c][y0:y1, x0:x1][disc] - base_a).sum())
+            vb = float((b[c][y0:y1, x0:x1][disc] - base_b).sum())
+            if not (np.isfinite(va) and np.isfinite(vb)) or vb <= 0.0:
+                per.append(None)
+                continue
+            per.append(va / vb)
+            f_a, f_b = f_a + va, f_b + vb
+        if f_b <= 0.0 or any(v is None for v in per):
+            continue
+        worst = max(abs(v - 1.0) for v in per)
+        stars.append((x, y, f_a / f_b, worst))
+    info: dict = {"aperture": GUARD_R_APER, "sky_annulus": list(GUARD_SKY), "tolerance": tol,
+                  "align": bool(align), "scale": [round(float(v), 4) for v in kb], "stars": len(stars)}
+    if len(stars) < 8:
+        info["note"] = "too few isolated stars to judge the restoration's photometry"
+        return arr, info
+    ratios = np.array([s[2] for s in stars], np.float32)
+    info.update(median=round(float(np.median(ratios)), 4), p10=round(float(np.percentile(ratios, 10)), 4),
+                p90=round(float(np.percentile(ratios, 90)), 4))
+    pop = abs(float(np.median(ratios)) - 1.0) > tol              # the tool is doing this to every star
+    keep = [s for s in stars if pop or abs(s[2] - 1.0) > tol or s[3] > 2 * tol]
+    info["refused"] = len(keep)
+    info["mode"] = "population" if pop else "individual"
+    info["worst"] = [[s[0], s[1], round(s[2], 3)] for s in sorted(keep, key=lambda s: abs(s[2] - 1.0))[-5:]]
+    if not keep:
+        return arr, info
+    out = a.copy()
+    for x, y, _ratio, _worst in keep:
+        y0, y1, x0, x1 = y - GUARD_SWAP - 1, y + GUARD_SWAP + 2, x - GUARD_SWAP - 1, x + GUARD_SWAP + 2
+        r = np.hypot(xx[y0:y1, x0:x1] - x, yy[y0:y1, x0:x1] - y)
+        w = np.clip((GUARD_SWAP - r) / 4.0, 0.0, 1.0)            # the patch in, on a taper, no seam
+        out[:, y0:y1, x0:x1] = (b[:, y0:y1, x0:x1] * w + a[:, y0:y1, x0:x1] * (1.0 - w)).astype(np.float32)
+    return out, info
+
+
+class Restorer:
+    """The linear post-processing chain on ``stack.fits`` -> ``linear.fits`` (DESIGN section 4 "Restore")."""
+
+    def __init__(self, session: str, meta: dict, stack_params: dict, p: dict, progress, checkpoint):
+        self.session, self.meta, self.sp, self.p = session, meta, stack_params or {}, p
+        self.steps = _Steps(7, progress, checkpoint)
+        self.work = _p(session, "process", "restore")
+        os.makedirs(self.work, exist_ok=True)
+        # session.py may point the restore at another file with stack.fits' grid (ImageMM's imagemm.fits)
+        self.source = str((meta or {}).get("restore_source") or "stack.fits")
+        if not os.path.exists(_p(session, self.source)):
+            self.source = "stack.fits"
+        self.arr, self.header = fitsio.read_rgb(_p(session, self.source))
+        flip = not export_mod.bottom_up(self.header)
+        if flip:                                                     # one row order for everything downstream (Siril's)
+            self.arr = np.ascontiguousarray(self.arr[:, ::-1])
+            self.header["ROWORDER"] = "BOTTOM-UP"
+        self.deconv = deconv_choice(self.sp)                         # (objects, stars)
+        self._mask: np.ndarray | None = None
+        self._psf_image: np.ndarray | None = None                     # the image whose blur the deconvolution undoes, when not self.arr
+        self._flip = flip                                          # the row order the delivered image is in (Siril's)
+        self._pre_deconv: np.ndarray | None = None                 # the image before the star pass touched it
+        self._pre_denoise: np.ndarray | None = None                # the image before the denoiser touched it
+        self._phot_scale = 1.0                                     # what the source was multiplied by to get here
+        if self.source == "imagemm.fits" and self.deconv.count("imagemm") == 1:
+            self._imagemm_region(flip)
+        raw = float(np.nanmax(self.arr))                                # the peak before anything rescales it away
+        self.arr, self.scale = normalise_scale(_sanitize(self.arr))
+        self._phot_scale = float(self.arr.max()) / raw if raw > 0 else 1.0   # _sanitize and normalise_scale together,
+        # measured rather than assumed: the stack window the star gate hands pixels back from has to be multiplied by
+        # exactly this to share the delivered image's units (an HDR stack peaks above 1 and _sanitize divides it out)
+        self.gpu = _device_gpu(self.sp)
+        self.dual = _dual_band(meta, self.header)
+        self.psf_corrected = False
+        self.info: dict = {"spcc": None}
+        self._snr: float | None = None
+        self._guard_star_flux("restore")          # what ImageMM did to the stars, judged while the frames' units still hold
+
+    def _stack_window(self, scale: float = 1.0) -> np.ndarray:
+        """``stack.fits`` on the delivered image's grid: the window ImageMM was fed (its ``r`` and offset, Lanczos-resampled
+        to the delivered size) in the delivered row order, finite.  Both the join and the star photometry gate read the
+        frames' light through here, so they cannot disagree about what the stack carried.  ``scale`` is ``self.scale``
+        (``normalise_scale``'s single factor) when the window has to be in the delivered image's units to be compared
+        with it pixel for pixel; the join leaves it alone, as it sanitises the joined array as a whole."""
+        stack, _ = fitsio.read_rgb(_p(self.session, "stack.fits"))
+        r = int(self.meta.get("imagemm_r") or 1)
+        ox, oy = (int(v) for v in (self.meta.get("imagemm_offset") or (0, 0)))
+        C, H, W = self.arr.shape
+        win = stack[:, oy:oy + H // r, ox:ox + W // r]
+        if r > 1:
+            win = np.stack([cv2.resize(win[c], (W, H), interpolation=cv2.INTER_LANCZOS4) for c in range(C)])
+        if self._flip:
+            win = win[:, ::-1]
+        return np.nan_to_num((win * scale).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _imagemm_region(self, flip: bool) -> None:
+        """ImageMM restores one region only: the other region is taken from stack.fits (the same window, Lanczos-resampled to ImageMM's r x grid;
+        ImageMM's output is on the stack's per-pixel photometric scale, imagemm_stage.match_to_stack), joined through the stars' footprint mask
+        measured on the stack.  The other region's tool then deconvolves it in ``deconvolve``."""
+        s = self.steps
+        t0 = time.time()
+        region = "objects" if self.deconv[0] == "imagemm" else "stars"
+        win = self._stack_window()                                    # stack.fits on this image's grid, sanitised
+        # joined on their own values and sanitised once as a whole (by the caller): _sanitize rescales an image whose maximum is
+        # in (1, 4] by that maximum, so sanitising each part on its own put them on different scales - an HDR stack peaks
+        # above 1 (Sh2-131: 2.13; ImageMM's output <= 1) and every star came from a 2.13 x darker stack, a black disc in the sky
+        if win.shape != self.arr.shape:
+            raise RuntimeError(f"ImageMM ({region} only): stack.fits window {win.shape} does not match imagemm.fits {self.arr.shape}")
+        img = np.nan_to_num(self.arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        m, info = star_footprint_mask(self.work, s, np.clip(win / max(float(win.max()), 1.0), 0.0, 1.0), self.header)
+        self._mask = m
+        self._psf_image = win                                        # the other region's tool deconvolves the stack's blur
+        w = m if region == "stars" else 1.0 - m                      # where ImageMM's pixels are kept
+        self.arr = (win + w[None] * (img - win)).astype(np.float32)
+        s.add("deconvolution", "imagemm", seconds=time.time() - t0, region=region,
+              note=f"ImageMM's {region}; the {'objects' if region == 'stars' else 'stars'} from stack.fits through the star mask", star_mask=info)
+
+    def star_mask(self) -> np.ndarray:
+        """The stars' footprint mask (``star_footprint_mask``), measured once, on the image before the deconvolution."""
+        if self._mask is None:
+            t0 = time.time()
+            self._mask, info = star_footprint_mask(self.work, self.steps, self.arr, self.header)
+            self.steps.add("deconvolution", "siril findstar (star mask)", seconds=time.time() - t0, **info)
+        return self._mask
+
+    # ---- plumbing
+    def _file(self, arr: np.ndarray, name: str) -> str:
+        path = os.path.join(self.work, name)
+        _write_like(path, arr, self.header)
+        return path
+
+    def _out(self, name: str) -> str:
+        return os.path.join(self.work, name)
+
+    def _rc(self, product: str, arr: np.ndarray, tag: str, **params) -> tuple[np.ndarray, dict]:
+        """One RC-Astro run on ``arr``; raises ToolUnavailable / ToolError for the caller's fallback."""
+        s = self.steps
+        src, dst = self._file(arr, f"{tag}_in.fits"), self._out(f"{tag}_out.fits")
+        meta = tools.rcastro.run(product, src, dst, device=_device_gpu(self.sp), progress=s.sub,
+                                 checkpoint=s.checkpoint, **params)
+        return _sanitize(fitsio.read_rgb(dst)[0]), meta
+
+    def _cc(self, mode: str, arr: np.ndarray, cli: list[str]) -> tuple[np.ndarray, dict]:
+        """One Cosmic Clarity run on ``arr`` (siril-scripts' CosmicClarity_Native.py, ``tools.CosmicClarity``); raises ToolUnavailable / ToolError for the caller's fallback."""
+        s = self.steps
+        out, meta = tools.cosmic_clarity.run(mode, arr, cli, work=self.work, device=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+        return _sanitize(out), meta
+
+    def snr(self) -> float:
+        """Per-pixel signal-to-noise of the object (``finish.object_snr``), measured once on the background-corrected stack: the strengths of BXT and the
+        denoiser follow it (RC-Astro: sharpen less and denoise more on noisy data)."""
+        if self._snr is None:
+            e = finish.EDGE_CROP
+            lum = finish.luminance(self.arr)
+            self._snr = finish.object_snr(lum[e:-e, e:-e] if min(lum.shape) > 8 * e else lum)
+            self.info["snr"] = round(self._snr, 2)
+        return self._snr
+
+    # ---- steps
+    def satellite(self) -> None:
+        """Cosmic Clarity satellite-trail removal on the stack (``satellite_removal``, off by default: the stack's sigma rejection removes trails when there are enough
+        frames; the remover is for the trails that survive it).  The script's defaults: full colour, trail clipping on, sensitivity 0.1.
+        The remover paints over the sky rather than modelling it, so its output is judged against its own input by ``painted_patch``: a patch whose noise the fill killed
+        and whose sky the fill moved goes back to the frames, because the stretch turns that matte pedestal into a black bar (IC 1848, 2026-11-01)."""
+        s = self.steps
+        if not self.sp.get("satellite_removal"):
+            return
+        s.begin("Satellite trails")
+        t0 = time.time()
+        cli = ["--sat-mode", "full", "--sensitivity", "0.1"]
+        try:
+            before = self.arr
+            self.arr, meta = self._cc("satellite", self.arr, cli)
+            weight, paint = painted_patch(before, self.arr)
+            if weight is not None:
+                self.arr = np.where(weight[None] > 0.5, before, self.arr).astype(np.float32)
+            s.add("satellite", "cosmic clarity satellite", seconds=time.time() - t0, command=meta["command"], trails_detected=meta.get("trails_detected"),
+                  backend=meta.get("backend"), device=meta.get("device"), painted_patch=paint)
+        except Cancelled:
+            raise
+        except (ToolUnavailable, ToolError) as e:
+            s.add("satellite", "cosmic clarity satellite", "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, note=str(e))
+
+    def background(self) -> None:
+        s, p = self.steps, self.p
+        s.begin("Removing gradient")
+        if not p["background"]:
+            s.add("gradient", "none", "skipped", note="background=false")
+            return
+        method = p["bg_method"] if p["bg_method"] in ("poly", "rbf", "reference", "graxpert") else "auto"
+        smoothing = float(p["bg_smoothing"])
+        t0 = time.time()
+        if method in ("auto", "reference"):
+            # the calibrated sky survey (NSNS DR0.2, skyref.py): the gradient is what the survey's maps cannot explain, so emission that fills the field is kept
+            try:
+                if not _has_wcs(self.header):
+                    raise ValueError("the stack has no plate solution")
+                bg, info = self._survey_gradient()
+                bgm = np.moveaxis(bg, -1, 0).astype(np.float32)
+                # the model's shape is removed and its mean - the sky pedestal - stays (GraXpert "subtract" and Siril subsky keep it too).  Subtracting
+                # the whole model put the sky on 0 and _sanitize clipped its lower half (M 42 2026-10-24: 44 % of the values zeroed, the pixel noise
+                # 1.72e-4 -> 1.01e-4); NXT then shifted every area by how much of it was clipped (blocks) and the stretch blew the nebula out
+                flat = self.arr - bgm + bgm.mean(axis=(1, 2), keepdims=True)
+                zero = skyref_mod.sky_zero_mask(info, flat.shape[1:])
+                level = None
+                if zero is not None and zero.sum() > 100:
+                    off = np.array([float(np.median(flat[c][zero])) for c in range(3)], np.float32)
+                    level = float(off.mean())
+                    flat = flat - off[:, None, None] + np.float32(level)    # the sky's zero point where the survey sees the least emission, one level for the 3 channels
+                clipped = float((flat < 0).mean())
+                self.arr = _sanitize(flat)
+                s.add("gradient", "sky survey reference (skyref)", seconds=time.time() - t0, method=info["method"], degree=info["degree"], coverage=info["coverage"],
+                      gradient_range=round(info["gradient_range"], 2), survey_coefficients=info["survey_coefficients"], credit=info["credit"],
+                      sky_level=None if level is None else round(level, 6), clipped_fraction=round(clipped, 6))
+                return
+            except Cancelled:
+                raise
+            except Exception as e:                                    # noqa: BLE001  offline, outside the survey, no plate solution: the sample-based models follow
+                s.add("gradient", "sky survey reference (skyref)", "failed" if method == "reference" else "skipped", time.time() - t0, note=f"{type(e).__name__}: {str(e)[:160]}")
+                method = "auto"
+        if method in ("auto", "graxpert"):
+            try:
+                src, dst = self._file(self.arr, "bge_in.fits"), self._out("bge_out.fits")
+                inp = self.arr
+                meta = tools.graxpert.background_extraction(src, dst, smoothing=smoothing, correction=p["bg_correction"],
+                                                            gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+                self.arr = _sanitize(fitsio.read_rgb(dst)[0])
+                debt, debt_info = border_debt(inp, self.arr)          # the border the model invented is owed back; what the frames carried is not: see border_debt
+                if debt is not None:
+                    self.arr = _sanitize(np.maximum(self.arr - debt, 0.0))
+                    self._file(self.arr, "bge_out.fits")              # the persisted step product is the one the chain actually carried on
+                s.add("gradient", "graxpert", seconds=time.time() - t0, smoothing=smoothing,
+                      correction=meta["correction"], model=meta.get("model"), providers=meta.get("providers"),
+                      border_debt=debt_info)
+                return
+            except Cancelled:
+                raise
+            except (ToolUnavailable, ToolError) as e:
+                s.add("gradient", "graxpert", "failed", time.time() - t0, note=str(e))
+                if method == "graxpert":                                 # chosen explicitly: recorded, nothing else runs in its place
+                    return
+        # Siril: polynomial or RBF subtraction (also the fallback when the AI model is missing)
+        if method == "poly":
+            cmd = f"subsky {int(np.clip(p['bg_degree'], 1, 4))} -samples=20 -tolerance=1.0"
+        else:
+            cmd = f"subsky -rbf -samples=20 -tolerance=1.0 -smooth={smoothing:.2f}"
+        t0 = time.time()
+        try:
+            out, _ = _siril_image(self.work, s, "bg", self.arr, self.header, cmd, "Removing gradient")
+            self.arr = _sanitize(out)
+            s.add("gradient", "siril subsky", seconds=time.time() - t0, command=cmd)
+        except SIRIL_FAILS as e:
+            s.add("gradient", "siril subsky", "failed", time.time() - t0, note=str(e).splitlines()[0])
+
+    def _survey_gradient(self):
+        """The NSNS maps on the stack's grid (cached in ``skyref.npz``) fitted beside a degree-3 polynomial (skyref.fit); returns (model (H, W, 3), info)."""
+        from astropy.wcs import WCS
+        # the celestial axes only: the RGB file's header has NAXIS = 3, and astropy refuses SIP distortions with a
+        # third axis ("SIP distortions only work in 2 dimensions") - the survey gradient was then skipped on every
+        # plate-solved image (IC 1805, 2026-10-16)
+        wcs = WCS(self.header, naxis=2)
+        shape = self.arr.shape[1:]
+        key = json.dumps([wcs.to_header_string()[:4000], list(shape), skyref_mod.SURVEYS, skyref_mod.FACTOR, skyref_mod.FETCH_VERSION])
+        path = _p(self.session, "skyref.npz")
+        refs = None
+        if os.path.exists(path):
+            try:
+                z = np.load(path)
+                if str(z["key"]) == key:
+                    refs = z["refs"].astype(np.float32)
+            except Exception:                                         # noqa: BLE001
+                refs = None
+        if refs is None:
+            refs = skyref_mod.fetch(wcs, shape)
+            np.savez_compressed(path, key=key, refs=refs)
+        img = np.ascontiguousarray(np.moveaxis(self.arr, 0, -1), np.float32)
+        bg, info = skyref_mod.fit(img, refs, float(skyref_mod.FACTOR), degree=3, smooth=1.5, clip_high=2.5)
+        return bg.astype(np.float32), info
+
+    def plate_solve(self) -> bool:
+        """WCS for SPCC.  The stack job normally solved it already; solve again only when it is missing."""
+        s = self.steps
+        s.begin("Plate solving")
+        if _has_wcs(self.header):
+            s.add("platesolve", "none", "skipped", note="the stack is already plate-solved")
+            return True
+        hints = ""
+        if self.header.get("FOCALLEN") and self.header.get("XPIXSZ"):
+            scale = float(self.meta.get("scale") or 1.0) or 1.0
+            hints = f" -focal={float(self.header['FOCALLEN']):g} -pixelsize={float(self.header['XPIXSZ']) / scale:g}"
+        # Why a solve fails on a good frame (IC 1805 / NGC 1499, 2026-10-15): Siril's catalogue is fetched online (NOMAD, and Gaia DR3, from CDS VizieR's TAP
+        # service) and the service answers "503 No server is available" now and then; the log said "Server unreachable ... unable to retrieve the remote
+        # catalogue", the same frame solved a few minutes later (3 degree field, 1800 stars, 4 s).  So: try NOMAD, then Gaia DR3 (another VizieR table, another
+        # query), then both again after a pause; a solve is only reported failed when all of those did.
+        attempts = [("nomad", 0.0), ("gaia", 0.0), ("nomad", PLATESOLVE_PAUSE), ("gaia", PLATESOLVE_PAUSE)]
+        last = ""
+        for n, (cat, pause) in enumerate(attempts):
+            if pause:
+                end = time.time() + pause
+                while time.time() < end:
+                    s.check()
+                    time.sleep(min(1.0, max(0.0, end - time.time())))
+            t0 = time.time()
+            try:
+                out, hdr = _siril_image(self.work, s, "solve", self.arr, self.header, f"platesolve -force{hints} -catalog={cat}", "Plate solving")
+                if not _has_wcs(hdr):
+                    raise SirilError("Siril reported success but wrote no WCS")
+                self.arr = _sanitize(out)
+                for card in hdr.cards:                                   # take over the astrometric solution (WCS + SIP)
+                    if re.match(r"(CTYPE|CRVAL|CRPIX|CD\d|PC\d|CDELT|CUNIT|CROTA|LONPOLE|LATPOLE|EQUINOX|RADESYS|[AB]P?_|PLTSOLVD|"
+                                r"OBJCTRA|OBJCTDEC|RA$|DEC$)", card.keyword):
+                        self.header[card.keyword] = (card.value, card.comment)
+                s.add("platesolve", "siril", seconds=time.time() - t0, catalog=cat, attempt=n + 1)
+                return True
+            except Cancelled:
+                raise
+            except SIRIL_FAILS as e:
+                last = str(e).splitlines()[0]
+                s.add("platesolve", "siril", "failed", time.time() - t0, note=last, catalog=cat, attempt=n + 1)
+        return False
+
+    def psf_correction(self) -> None:
+        """BlurXTerminator "Correct Only" before colour calibration (RC-Astro's manual: it makes SPCC more
+        consistent).  Only when BXT is licensed and deconvolution is wanted; otherwise nothing runs here."""
+        s, p = self.steps, self.p
+        s.begin("PSF correction")
+        if self.source == "imagemm.fits":
+            # (also with ImageMM for one region: correcting the whole image would reshape ImageMM's restored region)
+            s.add("psf-correction", "none", "skipped",
+                  note="deconvolution by ImageMM" if self.deconv.count("imagemm") == 2 else "ImageMM restored the {} of the image".format(
+                      "objects" if self.deconv[0] == "imagemm" else "stars"))
+            return
+        if float(p["deconvolution"]) <= 0 or self.deconv == ("none", "none"):
+            s.add("psf-correction", "none", "skipped", note="deconvolution off")
+            return
+        if not {"auto", "bxt"} & set(self.deconv):
+            s.add("psf-correction", "none", "skipped", note="deconvolution (objects / stars) = {} / {}: no BlurXTerminator".format(*self.deconv))
+            return
+        t0 = time.time()
+        try:
+            tools.rcastro.require("bxt")
+            self.arr, meta = self._rc("bxt", self.arr, "bxtc", correct_only=True)
+            self.psf_corrected = True
+            s.add("psf-correction", "rc-astro bxt", seconds=time.time() - t0, correct_only=True, flags=meta.get("flags"))
+        except Cancelled:
+            raise
+        except (ToolUnavailable, ToolError) as e:
+            s.add("psf-correction", "rc-astro bxt", "unavailable", time.time() - t0, note=str(e))
+
+    def colour(self, solved: bool) -> None:
+        s, p = self.steps, self.p
+        s.begin("Colour calibration (SPCC)")
+        mode = p["white_balance"]
+        if mode == "none":
+            s.add("colour", "none", "skipped", note="white_balance=none")
+            return
+        if mode == "auto":
+            t0 = time.time()
+            try:
+                if not solved:
+                    raise SirilError("the image is not plate-solved")
+                if not _spcc_database_present():
+                    raise SirilError("the SPCC sensor/filter database is not installed")
+                args, desc = spcc_arguments(self.header, self.meta, p)
+                cache = self._gaia_cache(s)
+                if cache:                                            # the field's chunk of the Gaia catalogue is cached: SPCC reads it, no Zenodo range requests
+                    args = [a if not a.startswith("-catalog=") else "-catalog=localgaia" for a in args]
+                    desc += " (cached Gaia chunk)"
+                body = "spcc " + " ".join(f'"{a}"' for a in args)
+                if cache:
+                    body = f'set "core.catalogue_gaia_photo={tools.gaia.dir()}"\n' + body
+                for attempt in range(SPCC_ATTEMPTS):
+                    try:
+                        out, _, log = _siril_image(self.work, s, "spcc", self.arr, self.header, body,
+                                                   "Colour calibration (SPCC)", with_log=True)
+                        break
+                    except SIRIL_FAILS as e:
+                        # the Gaia DR3 xp_sampled catalogue is fetched from Zenodo chunk by chunk; a dropped connection fails (or crashes) the command once,
+                        # and the next attempt continues from Siril's cache (spcc-cache)
+                        if attempt + 1 >= SPCC_ATTEMPTS:
+                            raise
+                        s.add("colour", "siril spcc", "retry", time.time() - t0, note=str(e).splitlines()[0], attempt=attempt + 1)
+                        time.sleep(SPCC_RETRY_PAUSE)
+                self.arr = _sanitize(out)
+                self.info["spcc"] = {"args": args, "description": desc, "log": log}
+                s.add("colour", "siril spcc", seconds=time.time() - t0, sensor=desc, catalog="gaia")
+                return
+            except Cancelled:
+                raise
+            except (*SIRIL_FAILS, ValueError) as e:
+                note = str(e).splitlines()[0]
+                s.add("colour", "siril spcc", "failed", time.time() - t0, note=note)
+                self.info["spcc"] = {"failed": note}
+                mode = "fallback"
+        t0 = time.time()
+        if mode in ("stars", "fallback"):
+            # the fallback after a failed SPCC is the "stars" calibration, not neutralisation alone: without the channel gains a dual-band OSC stack keeps its raw
+            # Bayer balance (G strongest) and every star turns green (M 42 2026-10-15, SPCC crashed on the catalogue download)
+            self.arr, det = finish.star_white_balance(self.arr)
+            self.arr, det2 = finish.neutralize_background(self.arr)
+            s.add("colour", "stars + background neutralisation", seconds=time.time() - t0,
+                  note="SPCC failed: white balance from the stars' mean colour (gains normalised to G)" if mode == "fallback" else "", **det, **det2)
+        else:                                                        # "background"
+            self.arr, det = finish.neutralize_background(self.arr)
+            s.add("colour", "background neutralisation", seconds=time.time() - t0, **det)
+        self.arr = _sanitize(self.arr)
+
+    def _gaia_cache(self, s) -> dict | None:
+        """Fetch (once) and keep the chunks of the Gaia DR3 SPCC catalogue that cover this field (tools.GaiaCatalog); None when the field cannot be placed or the
+        download fails: SPCC then reads Zenodo directly as before."""
+        t0 = time.time()
+        try:
+            ra, dec, radius = field_circle(self.header, self.arr.shape[-2:])
+        except (KeyError, ValueError, TypeError) as e:
+            s.add("colour", "gaia cache", "skipped", note=f"field centre unknown: {e}")
+            return None
+        try:
+            info = tools.gaia.ensure_field(ra, dec, radius, progress=s.sub, checkpoint=s.checkpoint)
+        except Cancelled:
+            raise
+        except (ToolError, OSError) as e:
+            s.add("colour", "gaia cache", "failed", time.time() - t0, note=str(e)[:200])
+            return None
+        s.add("colour", "gaia cache", seconds=time.time() - t0, pixels=info["pixels"], fetched=info["fetched"], ra=round(ra, 3), dec=round(dec, 3), radius_deg=round(radius, 2))
+        return info
+
+    def deconvolve(self) -> None:
+        """The deconvolution tools, then the gate on what they did to the stars -- judged against the image as the star
+        pass found it, the only array whose photometric units the tools share by construction."""
+        self._pre_deconv = self.arr.copy()                                # as the star pass found it
+        try:
+            self._deconvolve_tools()
+        finally:
+            self._guard_star_flux("deconvolution")
+
+    def _guard_star_flux(self, stage: str) -> None:
+        """``star_flux_guard`` at one of the two points where a reference genuinely shares the image's units.
+
+        ``restore`` judges the frame the session handed the chain, when ImageMM restored it, against ``stack.fits`` on
+        the same grid -- no alignment, because ``imagemm_stage.match_to_stack`` fitted ImageMM's output to that window
+        per channel and both then carry ``normalise_scale``'s single factor.  It runs here, at adoption, because
+        everything downstream (white balance, background neutralisation, the star pass) is entitled to move a star's
+        light, and after them the frames' units can no longer be read off the image.
+        ``deconvolution`` judges the image against what the star pass found, so the verdict names the tools.
+
+        The verdict is a measurement, not a tool, so it lands in the restore record as ``star_photometry`` (the step's
+        records stay the list of tools that ran, which ``save`` writes into the FITS HISTORY and the lab prints)."""
+        if self.sp.get("star_photometry_guard") is False:
+            self.info["star_photometry"] = {**(self.info.get("star_photometry") or {}),
+                                            stage: {"skipped": "star_photometry_guard=false"}}
+            return
+        if stage == "restore":
+            if not self.source.endswith("imagemm.fits"):
+                return                                                    # the stack is its own reference
+            ref, align = self._stack_window(self._phot_scale), False
+        else:
+            ran = [r for r in self.steps.records if r.get("step") == "deconvolution" and r.get("status") == "done"
+                   and r.get("tool") not in (None, "none")]
+            if self._pre_deconv is None or not ran:
+                return                                                    # no tool reshaped the image
+            ref, align = self._pre_deconv, True
+        t0 = time.time()
+        try:
+            self.arr, info = star_flux_guard(self.arr, ref, align=align)
+        except Exception as e:                                             # a gate that cannot measure must not cost the frame
+            verdict = {"error": str(e).splitlines()[0][:200]}
+        else:
+            verdict = {**info, "seconds": round(time.time() - t0, 2)}
+        self.info["star_photometry"] = {**(self.info.get("star_photometry") or {}), stage: verdict}
+
+    def _deconvolve_tools(self) -> None:
+        """Deconvolution per region: ``deconv_method`` the objects, ``deconv_stars_method`` the stars (``deconv_choice``).  Each: auto =
+        BlurXTerminator when licensed, else Siril Richardson-Lucy; bxt / graxpert / rl = that tool only; imagemm (session.py, before this);
+        none.  One tool for both regions runs once on the whole image.  Two tools run objects first, then stars (GraXpert's own order):
+        BlurXTerminator and GraXpert deconvolve one region by their own controls (BXT Sharpen Nonstellar / Sharpen Stars, the other at 0;
+        GraXpert's objects / stars model); Siril RL, which has none, is blended in through the stars' footprint mask (``star_mask``).  A
+        tool chosen explicitly that cannot run is recorded and its region left as it is - nothing else runs in its place (the user
+        chooses what runs)."""
+        s, p = self.steps, self.p
+        s.begin("Deconvolution")
+        d = float(np.clip(p["deconvolution"], 0, 1))
+        obj, stars = self.deconv
+        if d <= 0 or (obj, stars) == ("none", "none"):
+            s.add("deconvolution", "none", "skipped", note="deconvolution=0" if d <= 0 else "deconvolution (objects / stars) = none")
+            return
+        if self.source == "imagemm.fits":
+            done = [rg for rg, t in (("objects", obj), ("stars", stars)) if t == "imagemm"]
+            if len(done) == 2:
+                # The image IS deconvolved: ImageMM restored it in the session's restore, on the registered subs, before
+                # this step ever saw a stack.  Recording that as "skipped" told the reader nothing had sharpened the data
+                # when the session's own metadata says the restoration ran 147 of 150 iterations to convergence on 87 of
+                # 108 frames - which is how a correct run comes to be reported as a missing step.  Say what ran, with the
+                # run's own numbers, taken from the metadata it wrote.
+                mm = _load_json(_p(self.session, "imagemm_meta.json"))
+                it, psf = mm.get("iterations") or {}, mm.get("psf") or {}
+                s.add("deconvolution", "imagemm", seconds=float(mm.get("seconds_restore") or 0.0),
+                      note="done upstream: ImageMM restored the whole image on the registered subs during the session's "
+                           "restore, so this step had nothing left to undo",
+                      frames_used=mm.get("frames_used"), frames_total=mm.get("frames_total"),
+                      iterations=it.get("done"), iterations_max=it.get("max"), converged=it.get("converged"),
+                      psf_kernel_fwhm_px=psf.get("kernel_fwhm_px_median"))
+                return
+        if obj == stars:
+            self._deconvolve_region(obj, "both", d)
+            return
+        for region, tool in (("objects", obj), ("stars", stars)):
+            if tool == "none":
+                s.add("deconvolution", "none", "skipped", region=region, note=f"deconvolution ({region}) = none")
+            elif tool == "imagemm" and self.source == "imagemm.fits":
+                continue                                             # recorded by _imagemm_region
+            else:
+                self._deconvolve_region(tool, region, d)
+
+    def _deconvolve_region(self, tool: str, region: str, d: float) -> None:
+        """``tool`` on ``region`` ("both", "objects" or "stars") at strength ``d``."""
+        s = self.steps
+        if tool == "imagemm":
+            s.add("deconvolution", "imagemm", "unavailable", region=region,
+                  note="ImageMM runs in the session's restore on the registered subs (Session.run_denoise), not on a stack")
+            return
+        if tool == "graxpert":
+            self._graxpert_deconvolve(d, region)
+            return
+        if tool in ("auto", "bxt"):
+            t0 = time.time()
+            try:                                                     # BlurXTerminator sharpening (auto PSF)
+                tools.rcastro.require("bxt")
+                # BXT sharpen with the 1-2 h smart-scope values (research/pro-workflow.md A5/B3: Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; Brecher's 0.5/0.9 are
+                # for 15-19 h stacks, AstroPipe's 0.25/0.60/0 for smart-scope data); the lower end on the noisiest data (finish.bxt_ss / bxt_sn).  One region only:
+                # the other's sharpening at 0 (RC-Astro: Sharpen Stars / Sharpen Nonstellar act on the stars / the nonstellar structure).
+                snr = self.snr()
+                ss, sn = round(finish.bxt_ss(snr), 3), round(finish.bxt_sn(snr), 3)     # research/pro-workflow.md A5: 1-2 h stacks ss 0.25-0.35, sn 0.5-0.6
+                ash = 0.0
+                if not _flag(self.p.get("bxt_auto", True)):                # the user's (or a study's) own BXT values
+                    ss = round(float(np.clip(self.p.get("bxt_sharpen_stars", ss), 0.0, 0.7)), 3)
+                    sn = round(float(np.clip(self.p.get("bxt_sharpen_nonstellar", sn), 0.0, 1.0)), 3)
+                    ash = round(float(np.clip(self.p.get("bxt_halos", 0.0), -0.5, 0.5)), 3)
+                if region == "objects":
+                    ss = 0.0
+                elif region == "stars":
+                    sn = 0.0
+                extra: dict = {}
+                fwhm = float(self.meta.get("fwhm_px") or 0)
+                if self.p.get("bxt_manual_psf") and 1.0 < fwhm:        # RC-Astro manual: PSF diameter = the measured star FWHM in px (max 8)
+                    extra = {"ansp": False, "nsd": min(8.0, fwhm)}
+                self.arr, meta = self._rc("bxt", self.arr, "bxt", ss=ss, sn=sn, ash=ash, **extra)
+                s.add("deconvolution", "rc-astro bxt", seconds=time.time() - t0, region=region, ss=round(ss, 3), sn=round(sn, 3), ash=ash, snr=round(snr, 2),
+                      strengths="signal-to-noise" if _flag(self.p.get("bxt_auto", True)) else "manual", flags=meta.get("flags"), **extra)
+                return
+            except Cancelled:
+                raise
+            except (ToolUnavailable, ToolError) as e:
+                s.add("deconvolution", "rc-astro bxt", "unavailable", time.time() - t0, region=region, note=str(e))
+            if tool == "bxt":
+                return
+        t0 = time.time()
+        # DESIGN: rl -iters=10..30 -alpha=3000 -tv.  fftw_timelimit=0 = FFTW "estimate" planning: with Siril's default
+        # (measure, 60 s per plan) the first run on every new image size spent 10+ minutes planning FFTs (measured:
+        # 1200 px crop 101 s -> 6 s once the wisdom existed; with the limit at 0 a 1800 px crop takes 13 s from scratch).
+        iters = int(round(10 + 20 * d))
+        try:
+            w = 1.0
+            if region != "both":                                     # Siril's rl has no star / nonstellar control: blended in through the star mask
+                m = self.star_mask()
+                w = (m if region == "stars" else 1.0 - m)[None]
+            out, _ = _siril_image(self.work, s, "rl", self.arr, self.header,
+                                  f"set core.fftw_timelimit=0\nmakepsf stars\nrl -iters={iters} -alpha=3000 -tv\n"
+                                  "set core.fftw_timelimit=60", "Deconvolution",
+                                  timeout=RL_TIMEOUT)
+            res = _sanitize(out)
+            self.arr = (self.arr + np.float32(d) * w * (res - self.arr)).astype(np.float32)     # strength = linear blend
+            s.add("deconvolution", "siril rl", seconds=time.time() - t0, region=region, iterations=iters, alpha=3000, tv=True,
+                  blend=round(d, 2), **({"through": "star mask" if region == "stars" else "inverted star mask"} if region != "both" else {}))
+        except SIRIL_FAILS as e:
+            s.add("deconvolution", "siril rl", "failed", time.time() - t0, region=region, note=str(e).splitlines()[0])
+
+    def image_fwhm(self) -> float | None:
+        """The image's star FWHM in px, measured on the linear image itself (lab.metrics.star_fwhm: twice the half-light radius of isolated, unsaturated stars) -
+        GraXpert's "Image FWHM (in pixels)".  The registration's per-sub FWHM in stack_meta is not used: it is measured on the subs by Siril's PSF fit and need not
+        match the stack (Sh2-131 two nights: 8.9 px recorded, 4.5 px on the stack).  With ImageMM for one region the image is ImageMM's restoration joined
+        with the stack, and the other region - the one GraXpert deconvolves - is the stack's: its FWHM is measured on the stack (``_psf_image``); on the
+        joined image the isolated faint stars measured are ImageMM's restored ones (Sh2-131: 2.3 px for the stack's ~7 px stars)."""
+        from .lab import metrics as MX
+        src = self.arr if self._psf_image is None else self._psf_image
+        try:
+            v = float(MX.star_fwhm(np.ascontiguousarray(np.moveaxis(src, 0, -1)), float(src.max())))
+        except Exception:                                             # noqa: BLE001
+            return None
+        return v if np.isfinite(v) and v > 0 else None
+
+    def _graxpert_deconvolve(self, d: float, region: str) -> None:
+        """GraXpert AI deconvolution (``graxpert -cmd deconv-obj`` / ``deconv-stellar``, its models since 3.1) on the linear image: ``-strength`` = the Deconvolution
+        slider (GraXpert: 0 none .. 1 maximum), ``-psfsize`` = the image FWHM in px (GraXpert / Siril's GraXpert interface: "Image FWHM (in pixels)").  GraXpert works on
+        each tile through a log transform and its inverse, so it takes linear data as it is."""
+        s = self.steps
+        try:
+            fwhm = float(self.sp.get("graxpert_psfsize") or 0) or None       # the user's -psfsize; 0 = measured
+        except (TypeError, ValueError):
+            fwhm = None
+        if fwhm is None:
+            fwhm = self.image_fwhm()
+        if fwhm is None:
+            s.add("deconvolution", "graxpert", "failed", region=region,
+                  note="the image FWHM could not be measured (too few isolated stars): set GraXpert PSF size in the options")
+            return
+        for kind in GRAXPERT_DECONV[region]:
+            t0 = time.time()
+            try:
+                src, dst = self._file(self.arr, f"gxdc_{kind}_in.fits"), self._out(f"gxdc_{kind}_out.fits")
+                meta = tools.graxpert.deconvolve(src, dst, kind=kind, strength=d, psfsize=fwhm, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+                self.arr = _sanitize(fitsio.read_rgb(dst)[0])
+                s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})", seconds=time.time() - t0, region=region, strength=round(d, 3),
+                      psfsize=round(fwhm, 2), model=meta.get("model"), providers=meta.get("providers"))
+            except Cancelled:
+                raise
+            except (ToolUnavailable, ToolError) as e:
+                s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})",
+                      "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, region=region, note=str(e))
+                return
+
+    def _guard_denoise(self, run, strength: float, label: str, key: str) -> None:
+        """The denoiser must not buy the sky with the stars -- and if it does, the frame pays back what it can.
+
+        A denoiser has no reason to touch a star's light: the stack already averaged that noise out.  Measured against
+        the image as it was handed to the step, C 49's linear went from 1.03 to 0.87 of the frames' light through the
+        denoise step alone (GraXpert), C 20 EXP_15 from 1.05 to 0.96.  So once the tool has run, the star population is
+        measured; when the *median* star has lost more than ``GUARD_TOL`` the same tool is asked again, weaker, on the
+        same input -- ``pro.Finisher._close_sky_noise``'s ladder run in the other direction, bounded by the same kind of
+        cap -- and the first candidate inside tolerance is what ships.  At strength 0 the tool does nothing, so the
+        ladder always ends with the light the frames took; what that gives up is sky smoothness, and every attempt is
+        recorded so the frame says which of the two it chose.  No pixel swapping here: a patch of unsmoothed stack in
+        the middle of a denoised sky is its own artifact.
+        """
+        ref, s = self._pre_denoise, self.steps
+        if ref is None or self.sp.get("star_photometry_guard") is False or strength <= 0.0:
+            return
+        t0 = time.time()
+        try:
+            _o, i = star_flux_guard(self.arr, ref, align=True)
+            med = i.get("median")
+            if med is None or abs(med - 1.0) <= GUARD_TOL:
+                verdict = {"strength": strength, "median": med, "stars": i.get("stars"), "kept": strength}
+            else:
+                attempts = [{"strength": strength, "median": med}]
+                best, best_arr, kept = None, None, strength
+                ladder = [round(float(v), 3) for v in np.linspace(strength, 0.0, DENOISE_DESCALATION + 1)][1:]
+                for a in ladder:
+                    try:
+                        cand = ref.copy() if a <= 0.0 else run(ref.copy(), a)
+                        _o, ci = star_flux_guard(cand, ref, align=True)
+                    except Cancelled:
+                        raise
+                    except (ToolUnavailable, ToolError) as e:                 # the tool refuses to go weaker: keep what is good
+                        attempts.append({"strength": a, "error": str(e).splitlines()[0][:120]})
+                        continue
+                    cm = ci.get("median")
+                    attempts.append({"strength": a, "median": cm})
+                    if cm is not None and abs(cm - 1.0) <= GUARD_TOL:
+                        best, best_arr, kept = a, cand, a
+                        break
+                if best is not None:
+                    self.arr = best_arr
+                    for r in reversed(s.records):                              # the step's record describes the picture that shipped
+                        if r.get("tool") == label and key in (r.get("params") or {}):
+                            r["params"][key] = best                           # the tool's kwargs live under ``params``
+                            break
+                verdict = {"strength": strength, "median": med, "stars": i.get("stars"),
+                           "kept": kept, "attempts": attempts, "tolerance": GUARD_TOL}
+        except Exception as e:                                                 # a gate that cannot measure must not cost the frame
+            verdict = {"error": str(e).splitlines()[0][:200]}
+        self.info["star_photometry"] = {**(self.info.get("star_photometry") or {}), "denoise": verdict}
+        self.info["star_photometry"]["denoise"]["seconds"] = round(time.time() - t0, 2)
+
+    def denoise(self) -> None:
+        """``denoise_method`` (the linear image): auto = NoiseXTerminator when licensed, else GraXpert, else Siril; nxt / graxpert / siril = that tool only (recorded
+        and left out when it cannot run); none.  Cosmic Clarity Denoise is a finishing setting (``cc_denoise``) on the stretched image."""
+        s, p = self.steps, self.p
+        s.begin("Noise reduction")
+        d = float(np.clip(p["denoise"], 0, 1))
+        method = self.sp.get("denoise_method") or "auto"
+        if d <= 0 or method == "none":
+            s.add("denoise", "none", "skipped", note="denoise=0" if d <= 0 else "denoise_method=none")
+            return
+        # THE noise reduction of the picture (the render's wavelet pass only removes the grain this leaves): an AI denoiser on the linear data, strength by
+        # the measured signal-to-noise (NXT --dn 0.9 .. 0.6, GraXpert 1.0 .. 0.6; finish.nxt_dn / graxpert_strength), scaled by the ``denoise`` setting (1 at its
+        # default 0.95).  On IC 1805 (SNR 2) a light pass (NXT 0.28) left a pixel noise 20 x the nebula's signal, which the stretch then turned into blotches;
+        # GraXpert 1.0 on the same linear data resolves the Heart's filaments.
+        snr = self.snr()
+        scale = min(1.0, d / 0.95)
+        manual = not _flag(p.get("linear_denoise_auto", True))      # the tool's own strength, not the signal-to-noise ladder x the slider
+        mstrength = float(np.clip(p.get("linear_denoise_strength", 0.7), 0.0, 1.0))
+        order = {"nxt": ["nxt"], "graxpert": ["graxpert"], "siril": ["siril"]}.get(method, ["nxt", "graxpert", "siril"])
+        self._pre_denoise = self.arr.copy()                             # what the step was handed, for the star gate below
+        for tool in order:
+            t0 = time.time()
+            if tool == "nxt":
+                try:
+                    tools.rcastro.require("nxt")
+                    dn = round(mstrength if manual else finish.nxt_dn(snr) * scale, 3)
+                    extra = {"it": int(np.clip(int(p.get("nxt_iterations", 2) or 2), 1, 5))} if manual else {}
+                    self.arr, meta = self._rc("nxt", self.arr, "nxt", dn=dn, **extra)
+                    s.add("denoise", "rc-astro nxt", seconds=time.time() - t0, dn=dn, snr=round(snr, 2), strengths="manual" if manual else "signal-to-noise",
+                          flags=meta.get("flags"), **extra)
+                    self._guard_denoise(lambda a, st: self._rc("nxt", a, "nxt", dn=st, **extra)[0], dn, "rc-astro nxt", "dn")
+                    return
+                except Cancelled:
+                    raise
+                except (ToolUnavailable, ToolError) as e:
+                    s.add("denoise", "rc-astro nxt", "unavailable", time.time() - t0, note=str(e))
+            elif tool == "graxpert":
+                def run(a: np.ndarray, st: float):                      # the same call, on any input at any strength
+                    src, dst = self._file(a, "gxd_in.fits"), self._out("gxd_out.fits")
+                    meta = tools.graxpert.denoise(src, dst, strength=st, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
+                    return _sanitize(fitsio.read_rgb(dst)[0]), meta
+                try:
+                    strength = round(mstrength if manual else finish.graxpert_strength(snr) * scale, 3)
+                    self.arr, meta = run(self.arr, strength)
+                    s.add("denoise", "graxpert", seconds=time.time() - t0, strength=strength, snr=round(snr, 2), model=meta.get("model"),
+                          providers=meta.get("providers"))
+                    self._guard_denoise(lambda a, st: run(a, st)[0], strength, "graxpert", "strength")
+                    return
+                except Cancelled:
+                    raise
+                except (ToolUnavailable, ToolError) as e:
+                    s.add("denoise", "graxpert", "unavailable", time.time() - t0, note=str(e))
+            else:
+                mod = round(mstrength if manual else min(1.0, 0.85 * d), 2)
+                def run(a: np.ndarray, m: float):
+                    out, _ = _siril_image(self.work, s, "dn", a, self.header, f"denoise -mod={m}", "Noise reduction")
+                    return _sanitize(out)
+                try:
+                    self.arr = run(self.arr, mod)
+                    s.add("denoise", "siril denoise", seconds=time.time() - t0, mod=mod)
+                    self._guard_denoise(run, mod, "siril denoise", "mod")
+                    return
+                except SIRIL_FAILS as e:
+                    s.add("denoise", "siril denoise", "failed", time.time() - t0, note=str(e).splitlines()[0])
+
+    def save(self) -> dict:
+        s = self.steps
+        hdr = self.header.copy()
+        for r in s.records:
+            if r["status"] == "done" and r["tool"] != "none":
+                hdr.add_history(f"AstroPhoto Studio {__version__}: {r['step']} with {r['tool']}")
+        fitsio.write_rgb(_p(self.session, "linear.fits"), self.arr, hdr)
+        lum = finish.luminance(self.arr)
+        ran = [r["tool"] for r in s.records if r["status"] == "done" and r["tool"] != "none"]
+        return {"created": datetime.now().isoformat(timespec="seconds"), "steps": s.records, "tools": ran,
+                "scale": self.scale, "wcs": _has_wcs(self.header), "dual_band": self.dual, "spcc": self.info["spcc"], "snr": self.info.get("snr"),
+                "star_photometry": self.info.get("star_photometry"),
+                "deconv_method": self.deconv[0], "deconv_stars_method": self.deconv[1], "denoise_method": str(self.sp.get("denoise_method") or "auto"),
+                "stats": {"median": round(float(np.median(finish.sample(lum))), 6),
+                          "noise_sigma": round(finish.lower_half_sigma(finish.sample(lum)), 6),
+                          "max": round(float(self.arr.max()), 4)},
+                "name": " + ".join(ran) or "none",
+                "params": {k: self.p[k] for k in ("background", "bg_method", "bg_correction", "bg_smoothing",
+                                                  "white_balance", "denoise", "deconvolution")}}
+
+
+def restore(session_dir: str, stack_meta: dict, stack_params: dict, params: dict, progress=None, checkpoint=None) -> dict:
+    """Linear restoration: [satellite trails] -> gradient -> plate solve -> [BXT correct only] -> colour calibration -> deconvolution
+    -> light denoise, ``stack.fits`` -> ``linear.fits`` (+ ``restore_meta.json``).
+
+    Each step tries its best tool and falls back (GraXpert -> Siril RBF; SPCC -> background neutralisation +
+    rmgreen; auto: BXT -> Siril Richardson-Lucy; NXT -> GraXpert -> Siril denoise) and records what ran; a deconvolution / denoise tool chosen explicitly
+    (``deconv_method`` / ``deconv_stars_method`` bxt / rl / graxpert for the objects / the stars, ``denoise_method`` nxt / graxpert / siril) runs alone.  Cosmic Clarity (SetiAstro, through siril-scripts'
+    CosmicClarity_Native.py) is the optional path: here ``satellite_removal`` (on the stack) and, in remove_stars, DarkStar; its Sharpen / Denoise (``cc_sharpen``,
+    ``cc_denoise``) and Super-Resolution (``superres_method``) run on the stretched image (pro.Finisher / export), where they keep the flux - on this pipeline's
+    linear data they did not (6.2 x / 2.2 x / 0.75 x the flux, Sh2-131 2026-10-24).  RC-Astro's
+    BlurXTerminator manual puts "Correct Only" before colour calibration (it makes SPCC more consistent), so
+    that half of BXT runs before SPCC and the sharpening half after it."""
+    p = {**DEFAULTS, **(params or {})}
+    r = Restorer(session_dir, stack_meta or {}, stack_params or {}, p, progress, checkpoint)
+    t0 = time.time()
+    r.satellite()
+    r.background()
+    solved = r.plate_solve()
+    r.psf_correction()
+    r.colour(solved)
+    r.deconvolve()
+    r.denoise()
+    r.steps.begin("Saving linear image")
+    meta = r.save()
+    meta["seconds"] = round(time.time() - t0, 1)
+    _save_json(_p(session_dir, "restore_meta.json"), meta)
+    return meta
+
+
+# =========================================================================== star removal
+
+STAR_FILES = ("starless.fits", "stars.fits")
+
+
+def _linear_source(session: str) -> str:
+    for name in ("linear.fits", "stack.fits"):
+        if os.path.exists(_p(session, name)):
+            return _p(session, name)
+    raise RuntimeError("Nothing to process: stack the dataset first")
+
+
+def _imagemm_sigma(session: str) -> float | None:
+    """The latent resolution (Gaussian sigma, px) of a 1.x ImageMM restoration the linear image comes from, or None.
+    VeraLux ImageMM's stars are partially deconvolved PSFs, not Gaussians of a latent sigma: restricting its star layer to
+    such footprints (``_compact_star_layer``) gave the bright stars a cyan glow and a dark ring (IC 1805, 2026-10-21),
+    so it has no Eq. 11 sigma and the step stays off for it."""
+    rm = _read_json_quiet(_p(session, "restore_meta.json"))
+    if not rm or rm.get("deconvolution_by") != "imagemm":
+        return None
+    try:
+        sig = float(((rm.get("imagemm_info") or {}).get("psf") or {}).get("eq11", {}).get("sigma") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return sig if sig > 0 else None
+
+
+def _restored_by_imagemm(session: str) -> bool:
+    rm = _read_json_quiet(_p(session, "restore_meta.json"))
+    return bool(rm) and rm.get("deconvolution_by") == "imagemm"
+
+
+def _fill_starless_under_stars(lin: np.ndarray, starless: np.ndarray, stars: np.ndarray, nsig: float = 20.0,
+                               r_max: int = 24, sky_in: int = 25, sky_out: int = 35):
+    """The star remover's starless layer raised back to the sky where it was dug out round a star; the star layer gives
+    that light up (starless + stars stays the linear image, nothing is added).
+
+    StarXTerminator is trained on stars with halos: round the compact stars of an ImageMM restoration it still removes a
+    halo-sized disc (M 31 2026-10-22: out to 10-12 px round the bright stars, while the restored star itself ends at
+    4 px and the linear image is at the sky there within 1 sigma) - after the finish's denoise and stretch a dark disc
+    round every bright star.  For each star of the star layer peaking above ``nsig`` x the starless noise (brightest
+    first): the sky is the median of the starless layer in the ``sky_in``-``sky_out`` px annulus; the deficit radius is
+    where the starless layer's ring medians are back within one standard error of that sky (at most ``r_max``); inside
+    it every ring is offset up to the sky (an offset: the texture stays), never above the linear image."""
+    noise = finish.lower_half_sigma(finish.sample(finish.luminance(starless)))
+    lum = np.ascontiguousarray(stars.max(0), np.float32)
+    pk = (lum == cv2.dilate(lum, np.ones((9, 9), np.uint8))) & (lum > nsig * max(noise, 1e-12))
+    ys, xs = np.nonzero(pk)
+    order = np.argsort(-lum[ys, xs])
+    C, H, W = starless.shape
+    R = sky_out
+    yy, xx = np.mgrid[-R:R + 1, -R:R + 1]
+    rb = np.rint(np.hypot(yy, xx)).astype(int)
+    ann = (rb >= sky_in) & (rb <= sky_out)
+    out = starless.copy()
+    filled, radii, raised = 0, [], 0.0
+    for j in order:
+        y, x = int(ys[j]), int(xs[j])
+        if not (R <= y < H - R and R <= x < W - R):
+            continue
+        hit = False
+        for c in range(C):
+            win = out[c, y - R:y + R + 1, x - R:x + R + 1]
+            lw = lin[c, y - R:y + R + 1, x - R:x + R + 1]
+            sky = float(np.median(win[ann]))
+            sd = 1.4826 * float(np.median(np.abs(win[ann] - sky)))
+            prof = np.array([float(np.median(win[rb == k])) for k in range(r_max + 3)])
+            se = np.array([1.2533 * sd / np.sqrt(max(1, int((rb == k).sum()))) for k in range(r_max + 3)])
+            back = [k for k in range(1, r_max + 1) if (prof[k:k + 3] >= sky - se[k:k + 3]).all()]
+            rd = back[0] if back else r_max
+            if rd <= 1:
+                continue
+            new = win.copy()
+            for k in range(rd):
+                d = sky - prof[k]
+                if d > 0:
+                    m = rb == k
+                    new[m] = np.minimum(win[m] + d, lw[m])
+            raised += float((new - win).sum())
+            out[c, y - R:y + R + 1, x - R:x + R + 1] = new
+            hit = True
+            if c == (1 if C > 1 else 0):
+                radii.append(rd)
+        filled += int(hit)
+    stars_out = np.maximum(lin - out, 0.0).astype(np.float32)
+    return out.astype(np.float32), stars_out, {"stars": int(len(order)), "filled": filled,
+                                               "radius_px_median": float(np.median(radii)) if radii else None,
+                                               "raised_flux_fraction": round(raised / max(float(stars.sum()), 1e-12), 4)}
+
+
+def _read_json_quiet(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:                                                 # noqa: BLE001
+        return None
+
+
+def _compact_star_layer(lin: np.ndarray, stars: np.ndarray, sigma: float, k_sigma: float = 4.0, nsig: float = 3.0):
+    """The star layer of an ImageMM restoration restricted to its stars' footprints.  A restored star is the
+    latent's Gaussian of ``sigma`` px (Eq. 11: the PSF is in the kernels, not in the image), so its light lies within
+    ``k_sigma`` sigma of its peak; what the star remover put in the star layer beyond that is sky - StarXTerminator,
+    trained on stars with halos, takes a disc of sky out round the compact restored stars (IC 1805: -1.2 % of the
+    sky to 20 px), and the star layer's own processing then turned it into a dark disc round every bright star.
+    That light goes back to the starless layer; starless + stars stays the linear image.  A footprint is kept
+    round every star-layer peak above ``nsig`` x the sky noise (3: the faint stars the restoration resolved
+    stay stars; at 5 they would go back to the starless layer, whose noise reduction removes them).  Peaks are
+    local maxima over the star's own width (2 sigma), so a fainter star within the footprint radius of a
+    brighter one keeps its own footprint.
+
+    Inside a footprint the remover's starless may still sit below the sky round it (the same trained-halo
+    depression, now under the star): the star layer then carries that deficit, and the star reduction of the
+    recombination (pro.recombine, DSA) shrinks it with the star - a dark disc of the footprint's size.  There the
+    starless layer is offset up until its median matches the local sky, the median of the starless layer in
+    the ring 1-4 px outside the footprints (the sky annulus of aperture photometry), never above the image.  Returns (starless, stars, info)."""
+    from scipy.ndimage import maximum_filter
+    R = max(2, int(math.ceil(k_sigma * float(sigma))))
+    lum = np.ascontiguousarray(stars.max(0), np.float32)
+    noise = finish.lower_half_sigma(finish.sample(finish.luminance(np.maximum(lin - stars, 0))))
+    w_pk = 2 * max(1, int(math.ceil(2 * float(sigma)))) + 1
+    thr = nsig * max(noise, 1e-12)
+    peaks = (lum == maximum_filter(lum, size=w_pk)) & (lum > thr)
+    # each star's footprint to where its Gaussian falls to the detection level, sigma sqrt(2 ln(peak / thr)), and
+    # at least k_sigma sigma: a fixed 4 sigma left the outskirts of the brightest restored stars (peaks 1e4 x the
+    # noise: 3 sigma at 4 sigma radius) in the starless layer as faint dots
+    foot_u8 = np.zeros(lum.shape, np.uint8)
+    py_, px_ = np.nonzero(peaks)
+    rad = np.maximum(R, np.ceil(float(sigma) * np.sqrt(2.0 * np.log(np.maximum(lum[py_, px_] / thr, 1.0))))).astype(int)
+    for yq, xq, rq in zip(py_.tolist(), px_.tolist(), rad.tolist()):
+        cv2.circle(foot_u8, (xq, yq), int(rq), 1, -1)
+    foot = foot_u8 > 0
+    stars_c = np.where(foot[None], stars, 0.0).astype(np.float32)
+    moved = float((stars - stars_c).sum())
+    starless = (lin - stars_c).astype(np.float32)
+    # the local sky under each footprint: the median of the starless pixels in the 4 px ring round it that lie
+    # outside every footprint (a median: a neighbour's light or the restored star's own residual wing in the ring
+    # must not lift the sky - with a sky above the star's edge the star would lose its footprint's light)
+    from scipy.ndimage import find_objects, label
+    lab, nlab = label(foot)
+    ring_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    H, W = foot.shape
+    raised = 0.0
+    for q, sl in enumerate(find_objects(lab), start=1):
+        if sl is None:
+            continue
+        y0, y1 = max(0, sl[0].start - 5), min(H, sl[0].stop + 5)
+        x0, x1 = max(0, sl[1].start - 5), min(W, sl[1].stop + 5)
+        comp = lab[y0:y1, x0:x1] == q
+        ring = (cv2.dilate(comp.astype(np.uint8), ring_k) > 0) & ~foot[y0:y1, x0:x1]
+        if ring.sum() < 8:
+            continue
+        for c in range(starless.shape[0]):
+            win = starless[c, y0:y1, x0:x1]
+            # an offset (the footprint's median up to the ring's), not a clip at the sky: the starless texture stays
+            d = float(np.median(win[ring])) - float(np.median(win[comp]))
+            if not d > 0:
+                continue
+            new = np.where(comp, np.minimum(win + d, lin[c, y0:y1, x0:x1]), win)
+            raised += float((new - win).sum())
+            starless[c, y0:y1, x0:x1] = new
+    stars_c = np.where(foot[None], np.maximum(lin - starless, 0.0), 0.0).astype(np.float32)
+    return starless, stars_c, {"radius_px": R, "radius_px_max": int(rad.max()) if len(rad) else R, "stars": int(peaks.sum()),
+                               "moved_flux_fraction": round(moved / max(float(stars.sum()), 1e-12), 4),
+                               "sky_raised_flux_fraction": round(raised / max(float(stars.sum()), 1e-12), 4)}
+
+
+def remove_stars(session_dir: str, stack_meta: dict, params: dict, stack_params: dict, progress=None, checkpoint=None) -> dict:
+    """Separate the stars: ``linear.fits`` -> ``starless.fits`` + ``stars.fits`` (+ ``starnet_meta.json``).
+
+    Order: StarXTerminator (licensed; RC-Astro: best on linear data) -> StarNet2 ``--linear`` -> none; ``star_removal`` darkstar puts Cosmic Clarity DarkStar
+    alone.  The
+    star layer is ``linear - starless`` clipped at 0, exact for linear data (RC-Astro: unscreen is for stretched
+    images only).  When StarNet2 cannot run on linear data the meta says ``stage: stretched`` and the export
+    removes the stars after the stretch instead."""
+    p = {**DEFAULTS, **(params or {})}
+    sp = stack_params or {}
+    steps = _Steps(3, progress, checkpoint)
+    t_all = time.time()
+    for f in STAR_FILES:
+        if os.path.exists(_p(session_dir, f)):
+            os.remove(_p(session_dir, f))
+    meta: dict = {"tool": "none", "stage": "none", "attempts": [], "created": datetime.now().isoformat(timespec="seconds")}
+    wanted = str(p["star_removal"]).lower()
+    if not p["star_separation"] or wanted in ("none", "classic"):
+        meta["reason"] = "star_separation=false" if not p["star_separation"] else f"star_removal={wanted}"
+        _save_json(_p(session_dir, "starnet_meta.json"), meta)
+        return meta
+    order = {"sxt": ["sxt"], "starnet": ["starnet"], "darkstar": ["darkstar"]}.get(wanted, ["sxt", "starnet"])
+    work = _p(session_dir, "process", "stars")
+    os.makedirs(work, exist_ok=True)
+    src = _linear_source(session_dir)
+    lin, header = fitsio.read_rgb(src)
+    starless_path = _p(session_dir, "starless.fits")
+    ok = False
+    for tool in order:
+        steps.begin("Star removal")
+        t0 = time.time()
+        try:
+            if tool == "sxt":
+                tools.rcastro.require("sxt")
+                m = tools.rcastro.run("sxt", src, starless_path, device=_device_gpu(sp), progress=steps.sub,
+                                      checkpoint=steps.checkpoint, stars=True)
+                side = m.get("stars_path")
+                if side and os.path.exists(side):
+                    os.remove(side)                                   # recomputed below, the same way for every tool
+                meta.update(tool="sxt", stage="linear", flags=m.get("flags"))
+            elif tool == "darkstar":
+                # Cosmic Clarity DarkStar (siril-scripts CosmicClarity_Native.py) on the linear image: the script stretches it itself and undoes the stretch; additive
+                # mode, the star layer is linear - starless below as for every remover (unscreen is for stretched images)
+                sl, m = tools.cosmic_clarity.run("darkstar", lin, ["--darkstar-mode", "additive"], work=work, device=_device_gpu(sp), progress=steps.sub,
+                                                 checkpoint=steps.checkpoint)
+                fitsio.write_rgb(starless_path, np.clip(sl, 0, 1).astype(np.float32), header)
+                meta.update(tool="darkstar", stage="linear", command=m["command"], backend=m.get("backend"), device=m.get("device"))
+            else:
+                try:
+                    m = tools.starnet.run(src, starless_path, linear=True, stride=int(p.get("starnet_stride", 256) or 256), progress=steps.sub, checkpoint=steps.checkpoint)
+                    meta.update(tool="starnet2", stage="linear", version=m.get("version"), gpu=m.get("gpu"))
+                except ToolError as e:
+                    meta["attempts"].append({"tool": "starnet2 --linear", "status": "failed", "note": str(e)})
+                    if "linear" not in (e.log or str(e)).lower():     # a real failure, not an old CLI without --linear
+                        raise
+                    # a StarNet2 without --linear (< 2.5): remove the stars after the stretch, in the export
+                    meta.update(tool="starnet2", stage="stretched")
+                    _save_json(_p(session_dir, "starnet_meta.json"), meta)
+                    meta["seconds"] = round(time.time() - t_all, 1)
+                    return meta
+            ok = True
+            meta["attempts"].append({"tool": meta["tool"], "status": "done", "seconds": round(time.time() - t0, 1)})
+            break
+        except Cancelled:
+            raise
+        except (ToolUnavailable, ToolError) as e:
+            meta["attempts"].append({"tool": tool, "status": "unavailable" if isinstance(e, ToolUnavailable) else "failed",
+                                     "note": str(e)})
+    if ok:
+        steps.begin("Star removal")
+        starless, _ = fitsio.read_rgb(starless_path)
+        starless = np.clip(np.nan_to_num(starless), 0, 1).astype(np.float32)
+        stars = np.maximum(lin - starless, 0).astype(np.float32)
+        # the two layers must add up to the linear image exactly (linear data: starless + stars = linear): where the
+        # remover's starless came out above the image (its inpainting under a removed star), that light was in
+        # neither layer's account and the recombination added it twice
+        starless = np.minimum(starless, lin).astype(np.float32)
+        if meta["tool"] == "starnet2":              # StarNet leaves the scattered-light wings of bright stars in the starless layer
+            t_w = time.time()
+            starless, winfo, stars = finish.subtract_star_wings(lin, starless, stars)
+            meta["wing_subtraction"] = {**winfo, "seconds": round(time.time() - t_w, 1)}
+        sig_mm = _imagemm_sigma(session_dir)
+        if sig_mm:
+            starless, stars, cinfo = _compact_star_layer(lin, stars, sig_mm)
+            meta["imagemm_star_footprint"] = cinfo
+        elif _restored_by_imagemm(session_dir):
+            starless, stars, finfo = _fill_starless_under_stars(lin, starless, stars)
+            meta["imagemm_starless_fill"] = finfo
+        fitsio.write_rgb(starless_path, starless, header)
+        fitsio.write_rgb(_p(session_dir, "stars.fits"), stars, header)
+        sky_noise = finish.lower_half_sigma(finish.sample(finish.luminance(starless)))
+        n, per_mp = finish.count_stars(stars, sky_noise)
+        meta["stars"] = {"count": n, "per_megapixel": round(per_mp, 1), "min_sigma": 5.0, "sky_noise": round(sky_noise, 6),
+                         "flux_fraction": round(float(stars.sum() / max(float(lin.sum()), 1e-9)), 4)}
+    meta["seconds"] = round(time.time() - t_all, 1)
+    _save_json(_p(session_dir, "starnet_meta.json"), meta)
+    return meta
+
+
+# =========================================================================== export / preview
+
+class _Layers:
+    """The images the render needs, loaded once (and reduced for a preview)."""
+
+    def __init__(self, session: str, p: dict, max_side: int | None = None):
+        self.session = session
+        self.src = _linear_source(session)
+        self.base, self.header = fitsio.read_rgb(self.src)
+        if os.path.basename(self.src) == "stack.fits":
+            self.base, _ = normalise_scale(self.base)
+        self.starnet = _load_json(_p(session, "starnet_meta.json"))
+        self.stars = None
+        self.separate = False
+        self.stage = "linear"
+        sl, st = _p(session, "starless.fits"), _p(session, "stars.fits")
+        if p["star_separation"] and self.starnet.get("tool") not in (None, "none"):
+            if self.starnet.get("stage") == "stretched":
+                self.stage = "stretched"
+            elif os.path.exists(sl) and os.path.exists(st) and os.path.getmtime(sl) >= os.path.getmtime(self.src):
+                self.base = fitsio.read_rgb(sl)[0]
+                self.stars = fitsio.read_rgb(st)[0]
+                self.separate = True
+        e = finish.EDGE_CROP
+        if min(self.base.shape[1:]) > 8 * e:                  # the stack's outer rim: fewer dithered frames contribute, so it is noisier (and a wavelet / GraXpert artefact lives there)
+            self.base = np.ascontiguousarray(self.base[:, e:-e, e:-e])
+            if self.stars is not None:
+                self.stars = np.ascontiguousarray(self.stars[:, e:-e, e:-e])
+        self.fwhm_px = float(_load_json(_p(session, "stack_meta.json")).get("fwhm_px") or 3.0)
+        # the linear data went through a denoiser in the restore stage (NXT, GraXpert or Siril): the render's wavelet pass then only cleans the grain
+        rm = _load_json(_p(session, "restore_meta.json"))
+        self.denoised = os.path.basename(self.src) == "linear.fits" and any(
+            r.get("step") == "denoise" and r.get("status") == "done" and r.get("tool") != "none" for r in rm.get("steps", []))
+        if max_side:
+            self.fwhm_px *= min(1.0, max_side / max(self.base.shape[1:]))
+            self.base = _reduce(self.base, max_side)
+            if self.stars is not None:
+                self.stars = _reduce(self.stars, max_side)
+        self.coverage = _coverage(session, self.base.shape, e)             # frames per pixel: the provenance the sky pedestal is stratified by (pro.sky_pedestal)
+
+
+def _reduce(arr: np.ndarray, max_side: int) -> np.ndarray:
+    h, w = arr.shape[1:]
+    if max(h, w) <= max_side:
+        return arr
+    s = max_side / max(h, w)
+    size = (max(1, int(round(w * s))), max(1, int(round(h * s))))
+    return np.stack([cv2.resize(arr[c], size, interpolation=cv2.INTER_AREA) for c in range(3)])
+
+
+def _coverage(session: str, shape: tuple, edge: int) -> np.ndarray | None:
+    """``coverage.fits``: how many registered frames each pixel of the stack is built from, aligned to the layers the render actually uses (the same
+    ``EDGE_CROP`` trim and, for a preview, the same reduction).  None when the stack wrote no map."""
+    path = _p(session, "coverage.fits")
+    if not os.path.exists(path):
+        return None
+    try:
+        c = np.asarray(fitsio.read_rgb(path)[0], np.float64)
+    except Exception:                                                       # noqa: BLE001  a render must never fail over a diagnostic map
+        return None
+    if c.ndim == 3:
+        c = c[0]
+    h, w = shape[1:]
+    if c.shape != (h, w):
+        if c.shape[0] > h + 2 * edge and c.shape[1] > w + 2 * edge:
+            c = c[edge:c.shape[0] - edge, edge:c.shape[1] - edge]
+        if c.shape != (h, w):
+            c = cv2.resize(c, (w, h), interpolation=cv2.INTER_AREA)
+    return c
+
+
+_PREVIEW_CACHE: dict[tuple, _Layers] = {}
+_PREVIEW_CACHE_LOCK = threading.Lock()                    # previews of two datasets may render at once (each dataset's own are serialised by the Session)
+
+
+
+def preview_jpeg(session_dir: str, stack_meta: dict, params: dict, max_side: int = 1600) -> bytes:
+    """The preview of the best state on disk (starless + stars, else linear, else the stack) as JPEG bytes: the SAME finishing chain as the export (``pro.Finisher``, the
+    professional workflow of research/pro-workflow.md: Siril ``ght`` two-pass stretch, palette, ``clahe`` under a mask, ``satu``, Seti Star Stretch as ``mtf``, screen
+    recombination) on the same data with the same parameters, at the export's resolution (reduced to ``max_side`` only at the end).  Only the external AI steps are left
+    out: the preview is "without the AI noise reduction of the stretched image (NoiseXTerminator / GraXpert)", which the export runs at step 3."""
+    p = {**DEFAULTS, **(params or {})}
+    key = (session_dir, p["star_separation"]) + tuple(
+        os.path.getmtime(_p(session_dir, f)) if os.path.exists(_p(session_dir, f)) else 0
+        for f in ("stack.fits", "linear.fits", "starless.fits", "stars.fits", "starnet_meta.json"))
+    with _PREVIEW_CACHE_LOCK:
+        layers = _PREVIEW_CACHE.get(key)
+    if layers is None:
+        layers = _Layers(session_dir, p, None)           # full resolution: the noise statistics and the colour resolution are those of the export
+        with _PREVIEW_CACHE_LOCK:
+            _PREVIEW_CACHE.clear()                         # one dataset's layers at a time (memory)
+            _PREVIEW_CACHE[key] = layers
+    work = _p(session_dir, "process", "preview")
+    os.makedirs(work, exist_ok=True)
+    img, _ = _render(layers, p, _dual_band(stack_meta or {}, layers.header), external=False, work=work)
+    return export_mod.jpeg_bytes(export_mod.display_image(img, export_mod.bottom_up(layers.header)), 88, max_side)
+
+
+def _render(layers: _Layers, p: dict, dual: bool, external: bool, work: str, sp: dict | None = None, steps: _Steps | None = None,
+            tick=None, pictures: bool = False) -> tuple[np.ndarray, dict]:
+    """The finishing chain on the loaded layers: ``pro.Finisher`` (``external``: with the AI noise reduction of the stretched image)."""
+    base, stars = layers.base, layers.stars
+    if str(p.get("stretch_method")) in ("mtf", "asinh", "log"):      # the old numpy statistical stretches are gone: the default recipe runs
+        p = {**p, "stretch_method": "statstretch"}
+    fin = pro.Finisher(work, layers.header, p, dual, external=external, progress=(steps.sub if steps else None), checkpoint=(steps.checkpoint if steps else None), tick=tick,
+                       device=_device_gpu(sp), steps=steps, keep_pictures=pictures, coverage=layers.coverage)
+    img, info = fin.run(base, stars)
+    info["star_layer"] = "separate" if stars is not None else "none"
+    info["palette"] = fin.palette_name() if dual else "natural"
+    return img, info
+
+
+def _superres_final(img: np.ndarray, sp: dict | None, work: str, steps, info: dict) -> np.ndarray | None:
+    """Cosmic Clarity Super-Resolution 2 / 3 / 4x (``superres_method`` cosmic_clarity at stack time, factor from ``scale``) on the finished image: its models keep the
+    flux on a stretched image (1.00 on Sh2-131), while on this pipeline's linear data the script's own stretch / unstretch round trip lost a quarter of it (0.75).  The
+    stack was integrated at 1x (workflow.decide_resampling).  None when not asked or when it cannot run (recorded)."""
+    f = cc_superres_factor(sp)
+    if not f:
+        return None
+    t0 = time.time()
+    if f not in CC_SUPERRES_SCALES:
+        note = f"Cosmic Clarity has 2x / 3x / 4x super-resolution models; scale {f:g} was chosen: not enlarged"
+        steps.add("super-resolution", "cosmic clarity superres", "unavailable", note=note)
+        info["superres"] = {"tool": "cosmic clarity superres", "factor": f, "status": "unavailable", "note": note}
+        return None
+    h0, w0 = img.shape[1:]
+    try:
+        out, m = tools.cosmic_clarity.run("superres", img, ["--scale", str(f)], work=work, device=_device_gpu(sp), progress=steps.sub, checkpoint=steps.checkpoint)
+        if out.shape[1:] != (h0 * f, w0 * f):
+            raise ToolError("cosmic clarity superres", f"output {out.shape[2]}x{out.shape[1]} is not {f} x {w0}x{h0}")
+        info["superres"] = {"tool": "cosmic clarity superres", "factor": f, "from": [w0, h0], "to": [w0 * f, h0 * f], "command": m["command"],
+                            "backend": m.get("backend"), "device": m.get("device"), "seconds": round(time.time() - t0, 1)}
+        steps.add("super-resolution", "cosmic clarity superres", seconds=time.time() - t0, factor=f, size=f"{w0 * f}x{h0 * f}", command=m["command"])
+        return np.clip(out, 0, 1).astype(np.float32)
+    except Cancelled:
+        raise
+    except (ToolUnavailable, ToolError) as e:
+        steps.add("super-resolution", "cosmic clarity superres", "unavailable" if isinstance(e, ToolUnavailable) else "failed", time.time() - t0, note=str(e))
+        info["superres"] = {"tool": "cosmic clarity superres", "factor": f, "status": "failed", "note": str(e)[:300]}
+        return None
+
+
+def _chain_record(info: dict) -> list[dict]:
+    """The chain's steps for the sidecar: command lines verbatim, parameters, levels after the step, the picture saved for it."""
+    out = []
+    for r in info.get("chain") or []:
+        out.append({k: v for k, v in r.items() if k in ("n", "step", "tool", "status", "seconds", "commands", "params", "levels", "picture", "note", "source",
+                                                         "ratio_before", "ratio_after", "needed", "command")})
+    return out
+
+
+def export(session_dir: str, stack_meta: dict, params: dict, export_opts: dict | None = None, progress=None,
+           checkpoint=None) -> dict:
+    """The final render and the files: ``{"jpg", "tif", "json", "size"}`` (api-contract "Outputs")."""
+    opts = {"quality": 95, "upscale": 1.0, "tiff": True}
+    opts.update({k: v for k, v in (export_opts or {}).items() if v is not None})
+    given = params or {}
+    p = {**DEFAULTS, **given}
+    meta = stack_meta or _load_json(_p(session_dir, "stack_meta.json"))
+    steps = _Steps(2, progress, checkpoint)
+    t_all = time.time()
+    steps.begin("Stretching")
+    layers = _Layers(session_dir, p)
+    dual = _dual_band(meta, layers.header)
+    work = _p(session_dir, "process", "finish")
+    os.makedirs(work, exist_ok=True)
+    sp = (meta.get("params") or {}) if isinstance(meta, dict) else {}
+
+    def tick(name):
+        steps.sub(msg=f"Finishing ({name.lower()})")
+
+    t0 = time.time()
+    img, info = _render(layers, p, dual, external=True, work=work, sp=sp, steps=steps, tick=tick, pictures=True)
+    info["render_seconds"] = round(time.time() - t0, 1)
+    steps.begin("Exporting")
+    gate_report = None
+    if True:
+        try:
+            sm = layers.starnet.get("stars") or {}
+            level = float(pro.mtf_balance(pro.star_stretch_m(float(p.get("star_stretch", pro.STAR_STRETCH))), 5.0 * float(sm["sky_noise"]))) if sm.get("sky_noise") else None
+            lin_n = finish.count_stars(layers.stars, float(sm["sky_noise"]))[0] if layers.stars is not None and sm.get("sky_noise") else sm.get("count")
+            gate_report = gates.compute(img, starless=info.get("starless") if layers.stars is not None and p["star_reduction"] < 1.0 else None,
+                                        linear_star_count=lin_n, star_level=level, linear_stars=layers.stars, linear_noise=sm.get("sky_noise"),
+                                        linear_base=layers.base)
+            print(gates.format_gates(gate_report), flush=True)
+            fitsio.write_rgb(_p(work, "finish.fits"), img, layers.header)
+        except Exception as e:                                           # noqa: BLE001  the gates never stop an export
+            gate_report = {"error": str(e)}
+    superres = _superres_final(img, sp, work, steps, info)
+    if superres is not None:
+        img = superres
+    disp = export_mod.display_image(img, export_mod.bottom_up(layers.header))
+    lum = finish.sample(finish.luminance(layers.base))
+    restore_meta = _load_json(_p(session_dir, "restore_meta.json"))
+    chain = _chain_record(info)
+    linear_info = {
+        "source": os.path.basename(layers.src), "star_layer": info.get("star_layer"), "star_removal": layers.starnet.get("tool", "none"),
+        "star_removal_stage": layers.starnet.get("stage", "none"), "restoration": restore_meta.get("name", "none (stack only)"),
+        "palette": info.get("palette"), "dual_band": dual, "stretch": info.get("stretch"), "highlights": info.get("highlights"),
+        "chain": chain, "gates": gate_report, "pictures": _p(work, "steps"),
+        "noise_ref": round(finish.lower_half_sigma(lum), 6), "crop": meta.get("crop"),
+        "steps": steps.records, "render_seconds": info["render_seconds"], "seconds": round(time.time() - t_all, 1),
+        "siril_tools": sorted({r["tool"] for r in steps.records if r["status"] == "done"}),
+    }
+    if info.get("superres"):
+        linear_info["superres"] = info["superres"]
+    ignored = sorted(k for k in given if k in IGNORED_KEYS or (k not in DEFAULTS and k not in EXTRA_KEYS))
+    files = export_mod.write_outputs(session_dir, disp, meta=meta, params_full=p, linear_info=linear_info,
+                                     quality=int(opts["quality"]), upscale=float(opts["upscale"] or 1.0),
+                                     tiff=bool(opts["tiff"]), ignored=ignored)
+    return files
+
+
+# =========================================================================== auto-finish
+
+def autofinish(session_dir: str, stack_meta: dict, params: dict, progress=None, checkpoint=None) -> dict:
+    """Tune the processing settings from measurements of the image (autofinish.py): ``{"params", "report"}``,
+    also written to ``autofinish.json``."""
+    from . import autofinish as af
+    return af.run(session_dir, stack_meta or {}, params or {}, progress, checkpoint)
+
+
+# =========================================================================== dev entry point
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m sirilpipe.post --session DIR [--steps restore,stars,autofinish,export] [--device cpu]``"""
+    import argparse
+    ap = argparse.ArgumentParser(description="Run the post-stack stages on a session folder")
+    ap.add_argument("--session", required=True)
+    ap.add_argument("--steps", default="restore,stars,autofinish,export")
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--params", default="{}", help="JSON object of processing params")
+    args = ap.parse_args(argv)
+    d = os.path.abspath(args.session)
+    meta = _load_json(_p(d, "stack_meta.json"))
+    sp = {**(meta.get("params") or {}), "device": args.device}
+    params = json.loads(args.params)
+    t_start = time.time()
+
+    def progress(i, n, msg):
+        print(f"[{time.time() - t_start:7.1f}s] {i}/{n} {msg}", flush=True)
+
+    steps = args.steps.split(",")
+    out: dict = {}
+    if "restore" in steps:
+        out["restore"] = restore(d, meta, sp, params, progress)
+    if "stars" in steps:
+        out["stars"] = remove_stars(d, meta, params, sp, progress)
+    if "autofinish" in steps:
+        af = autofinish(d, meta, params, progress)
+        params = af["params"]
+        out["autofinish"] = af["report"].get("summary", "ok")
+    if "export" in steps:
+        out["export"] = export(d, meta, params, {}, progress)
+    print(json.dumps(out, indent=1, default=export_mod._json_default)[:6000])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

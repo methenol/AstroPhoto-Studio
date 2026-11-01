@@ -27,8 +27,15 @@ x-astrophoto: &astrophoto
       target: /data/output
       bind:
         create_host_path: true
-  # the stacking / preparation worker pools and PyTorch share memory through /dev/shm
+  # Siril and the tool subprocesses share memory through /dev/shm
   shm_size: "${SHM_SIZE:-8gb}"
+  # stable RC-Astro machine identity: the licence activation is tied to it (licence lives in the volume)
+  hostname: astrophoto-studio
+  # Siril keeps every frame of a sequence open: thousands of subs need a high open-files limit
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
   restart: unless-stopped
 
 # environment of both services:
@@ -53,7 +60,9 @@ services:
       # network.host entitlement)
       network: ${BUILD_NETWORK:-host}
       args:
-        TORCH_INDEX: "${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
+        GRAXPERT_EXTRA: cuda
+        STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
+        IMAGEMM: "${IMAGEMM:-off}"       # off | cuda | cpu: torch for the optional ImageMM restoration
     environment:
       ASTROPHOTO_DEVICE: "${ASTROPHOTO_DEVICE:-auto}"
       PUID: "${PUID:-}"
@@ -64,6 +73,7 @@ services:
       ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
       ASTROPHOTO_LOCAL_COPY: "${LOCAL_COPY:-false}"
       ASTROPHOTO_LOCAL_DIR: "${LOCAL_DIR:-}"
+      STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
     deploy:
       resources:
         reservations:
@@ -80,7 +90,9 @@ services:
       context: .
       network: ${BUILD_NETWORK:-host}   # see the GPU service
       args:
-        TORCH_INDEX: https://download.pytorch.org/whl/cpu
+        GRAXPERT_EXTRA: cpuonly
+        STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"
+        IMAGEMM: "${IMAGEMM:-off}"
     environment:
       ASTROPHOTO_DEVICE: cpu
       PUID: "${PUID:-}"
@@ -91,3 +103,4 @@ services:
       ASTROPHOTO_RAW_CACHE_GB: "${ASTROPHOTO_RAW_CACHE_GB:-}"
       ASTROPHOTO_LOCAL_COPY: "${LOCAL_COPY:-false}"
       ASTROPHOTO_LOCAL_DIR: "${LOCAL_DIR:-}"
+      STARNET_ACCEPT_LICENSE: "${STARNET_ACCEPT_LICENSE:-}"

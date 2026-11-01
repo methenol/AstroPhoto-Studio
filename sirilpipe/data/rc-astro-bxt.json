@@ -1,0 +1,148 @@
+{
+ "schemaVersion": 6,
+ "cliVersion": "2.6.10",
+ "key": "bxt",
+ "name": "RC-Astro BlurXTerminator",
+ "displayName": "BlurXTerminator",
+ "mlVersion": 5,
+ "license": {
+  "status": "required",
+  "valid": false,
+  "message": "A license is required to use this software"
+ },
+ "activationUrl": "https://www.rc-astro.com/account",
+ "parameters": [
+  {
+   "label": "Tile Overlap",
+   "name": "overlap",
+   "flag": "--overlap",
+   "description": "Fractional overlap between adjacent tiles",
+   "type": "float",
+   "precision": 2,
+   "default": 0.2,
+   "max": 0.5,
+   "min": 0.0
+  },
+  {
+   "label": "Sharpen Stars",
+   "name": "ss",
+   "flag": "--ss",
+   "description": "Amount of stellar sharpening",
+   "type": "float",
+   "precision": 2,
+   "default": 0.5,
+   "max": 0.7,
+   "min": 0.0,
+   "disabledIf": "lp",
+   "disabledValue": 0.0
+  },
+  {
+   "label": "Adjust Star Halos",
+   "name": "ash",
+   "flag": "--ash",
+   "description": "Reduce or enlarge star halos",
+   "type": "float",
+   "precision": 2,
+   "default": 0.0,
+   "max": 0.5,
+   "min": -0.5,
+   "disabledIf": "lp",
+   "disabledValue": 0.0
+  },
+  {
+   "label": "PSF Diameter",
+   "name": "nsd",
+   "flag": "--nsd",
+   "description": "Manual nonstellar PSF diameter (must be 0.0 when auto-nonstellar-psf is true)",
+   "type": "float",
+   "precision": 1,
+   "default": 0.0,
+   "max": 8.0,
+   "min": 0.0,
+   "disabledIf": "ansp && !lp",
+   "disabledValue": 0.0,
+   "unit": "pixels"
+  },
+  {
+   "label": "Automatic PSF",
+   "name": "ansp",
+   "flag": "--ansp",
+   "description": "Estimate the nonstellar PSF automatically from stars in the image",
+   "type": "bool",
+   "default": true,
+   "disabledIf": "lp",
+   "disabledValue": false
+  },
+  {
+   "label": "Sharpen Nonstellar",
+   "name": "sn",
+   "flag": "--sn",
+   "description": "Amount of nonstellar sharpening",
+   "type": "float",
+   "precision": 2,
+   "default": 0.5,
+   "max": 1.0,
+   "min": 0.0
+  },
+  {
+   "label": "Lunar/Planetary Mode",
+   "name": "lp",
+   "flag": "--lp",
+   "description": "Enable lunar/planetary mode",
+   "type": "bool",
+   "default": false
+  }
+ ],
+ "groups": [
+  {
+   "name": "stellarGroup",
+   "label": "Stellar Adjustments",
+   "params": [
+    "ss",
+    "ash"
+   ]
+  },
+  {
+   "name": "nonstellarGroup",
+   "label": "Nonstellar Adjustments",
+   "params": [
+    "ansp",
+    "nsd",
+    "sn"
+   ]
+  },
+  {
+   "name": "optionsGroup",
+   "label": "Options",
+   "params": [
+    "lp"
+   ],
+   "modes": [
+    "correctOnlyMode"
+   ]
+  },
+  {
+   "name": "engineGroup",
+   "label": "Engine",
+   "params": [
+    "overlap"
+   ]
+  }
+ ],
+ "modes": [
+  {
+   "flag": "--correct-only",
+   "name": "correctOnlyMode",
+   "label": "Correct Only",
+   "description": "Correct PSF aberrations without sharpening",
+   "pins": {
+    "ansp": true,
+    "ash": 0.0,
+    "lp": false,
+    "nsd": 0.0,
+    "sn": 0.0,
+    "ss": 0.0
+   }
+  }
+ ]
+}

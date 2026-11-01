@@ -36,16 +36,20 @@ const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "
 /* ------------------------------------------------------------ init */
 async function init() {
   S.system = await api("/api/system");
-  $("#versionBadge").textContent = "v" + S.system.version;
+  $("#versionBadge").textContent = "v" + S.system.version + (S.system.backend ? " · " + S.system.backend : "");
+  S.tools = S.system.tools || {};
   const dev = S.system.devices;
   const gpu = (dev.gpus || [])[0];
   $("#deviceBadge").textContent = gpu ? `⚡ ${gpu.name}${gpu.vram_gb ? " · " + gpu.vram_gb + " GB" : ""}` : "CPU only";
   const ds = $("#sp-device");
-  ds.innerHTML = `<option value="auto">auto (${dev.default})</option>` +
-    (dev.gpus || []).map(g => `<option value="${g.id}">${g.name}</option>`).join("") + `<option value="cpu">CPU</option>`;
+  if (ds) ds.innerHTML = `<option value="auto">auto (${(dev.gpus || []).length ? "GPU" : "CPU"})</option>` +
+    (dev.gpus || []).map(g => `<option value="gpu${g.id}">${esc(g.name)}</option>`).join("") + `<option value="cpu">CPU</option>`;
   buildParamUI();
   buildPresets();
   bindUI();
+  loadExperimentChoices();
+  const adv = $(".sidebar details.adv"); if (adv) adv.addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
+  Tools.init();
   await loadDatasets();
   const last = splitFolders(store.get("lastFolder"));
   if (last.length && last.every(p => S.datasets.some(d => d.path === p))) {
@@ -73,9 +77,23 @@ function currentDefaults() { return { ...S.system.defaults }; }
 
 function buildParamUI() {
   const groups = {};
-  for (const p of S.system.param_spec) (groups[p.group] ||= []).push(p);
+  for (const p of S.system.param_spec) if (p.host !== "options") (groups[p.group] ||= []).push(p);
   const host = $("#paramGroups");
   host.innerHTML = "";
+  // settings shown in the Integration & options panel (Cosmic Clarity Sharpen / Denoise beside the linear tools): same data-key binding as the Process tab's
+  const opt = $("#optParams");
+  if (opt) {
+    opt.innerHTML = "";
+    for (const p of S.system.param_spec.filter(q => q.host === "options")) {
+      const el = document.createElement("label");
+      el.title = p.label;
+      const short = p.label.split(" (")[0];
+      if (p.type === "range") el.innerHTML = `${short} <input type="range" min="${p.min}" max="${p.max}" step="${p.step}" data-key="${p.key}"><output></output>`;
+      else if (p.type === "bool") { el.className = "check"; el.innerHTML = `<input type="checkbox" data-key="${p.key}"> ${short}`; }
+      else el.innerHTML = `${short} <select data-key="${p.key}">${p.options.map(o => `<option>${o}</option>`).join("")}</select>`;
+      opt.appendChild(el);
+    }
+  }
   Object.entries(groups).forEach(([g, items], gi) => {
     const det = document.createElement("details");
     det.className = "pgroup"; det.open = gi < 4;
@@ -94,9 +112,11 @@ function buildParamUI() {
       }
       body.appendChild(el);
     }
+    if (g === "Linear") body.insertAdjacentHTML("afterbegin", `<div id="toolPlan" class="toolplan"></div>`);
     host.appendChild(det);
   });
-  $$("#paramGroups [data-key]").forEach(inp => {
+  if (typeof Tools !== "undefined") Tools.renderPlan();
+  $$("#paramGroups [data-key], #optParams [data-key]").forEach(inp => {
     const ev = inp.type === "range" ? "input" : "change";
     inp.addEventListener(ev, () => {
       const k = inp.dataset.key;
@@ -109,16 +129,29 @@ function buildParamUI() {
 }
 
 function applyParamsToUI() {
-  $$("#paramGroups [data-key]").forEach(inp => {
+  $$("#paramGroups [data-key], #optParams [data-key]").forEach(inp => {
     const v = S.params[inp.dataset.key];
     if (inp.type === "checkbox") inp.checked = !!v; else inp.value = v;
   });
   syncParamOutputs();
 }
 function syncParamOutputs() {
-  $$("#paramGroups input[type=range]").forEach(inp => { inp.parentElement.querySelector("output").textContent = (+inp.value).toFixed(inp.step < 0.05 ? 3 : 2); });
+  $$("#paramGroups input[type=range], #optParams input[type=range]").forEach(inp => { inp.parentElement.querySelector("output").textContent = (+inp.value).toFixed(inp.step < 0.05 ? 3 : 2); });
 }
-function saveParams() { if (S.folder) store.set("params:" + S.folder, S.params); }
+/* Per-dataset settings are stored as the values the user changed away from the defaults of the day ({changed, base}); on load only the changes are kept over the
+   current defaults.  A plain object from an older build is discarded: it froze that build's defaults (asinh, synthetic luminance 0.8, colour preservation 0.7 ...)
+   as if the user had chosen them. */
+function saveParams() {
+  if (!S.folder) return;
+  const base = currentDefaults(), changed = {};
+  for (const [k, v] of Object.entries(S.params)) if (JSON.stringify(base[k]) !== JSON.stringify(v)) changed[k] = v;
+  store.set("params:" + S.folder, { changed, base });
+}
+function storedParams(folder) {
+  const rec = store.get("params:" + folder, null);
+  if (!rec || typeof rec !== "object" || !rec.changed || !rec.base) { if (rec) store.set("params:" + folder, null); return {}; }
+  return rec.changed;
+}
 
 function buildPresets() {
   const bar = $("#presets");
@@ -139,7 +172,7 @@ async function openDataset(folder) {
     S.folder = folder; store.set("lastFolder", folder);
     if (typeof Explore !== "undefined") Explore.reset();
     S.status = r.status; S.frames = r.frames;
-    S.params = { ...currentDefaults(), ...store.get("params:" + folder, {}) };
+    S.params = { ...currentDefaults(), ...storedParams(folder) };
     applyParamsToUI();
     const parts = r.status.folders || [folder];
     $("#datasetTitle").textContent = `${r.status.object || ""} · ${parts.length > 1 ? `${parts.length} sessions stacked together` : folder}`;
@@ -260,18 +293,20 @@ const AF_LABELS = { sky_L: "Sky brightness", sky_C: "Sky colour cast", sig_L50: 
 function renderAutofinish(res) {
   const box = $("#afReport");
   if (!res || !res.report) { box.hidden = true; box.innerHTML = ""; return; }
-  const r = res.report, f = v => v === undefined || v === null ? "–" : (+v).toFixed(3);
+  const r = res.report;
   const fv = v => typeof v === "number" ? (+v).toFixed(Math.abs(v) < 0.1 && v !== 0 ? 3 : 2) : esc(v ?? "–");
-  const steps = (r.steps || []).map(st => `<tr><td>${esc(st.step)}</td><td class="mono">${fv(st.from)} → <b>${fv(st.to)}</b></td>` +
-    `<td>${esc(AF_LABELS[st.measured] || st.measured)}: ${f(st.before)} → ${f(st.after)}${st.target !== null && st.target !== undefined ? ` <span class="muted">(aim ${f(st.target)})</span>` : ""}</td>` +
-    `<td class="muted">${esc(st.why)}</td></tr>`).join("");
-  const rows = Object.keys(AF_LABELS).filter(k => k in (r.stats_after || {}))
-    .map(k => `<tr><td>${AF_LABELS[k]}</td><td>${f((r.stats_before || {})[k])}</td><td>${f(r.stats_after[k])}</td><td>${f((r.stats_reference || {})[k])}</td></tr>`).join("");
-  const near = r.nearest ? ` · nearest: <a href="${esc(r.nearest.url)}" target="_blank" rel="noopener">${esc(r.nearest.title)}</a>` : "";
-  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b> · ${esc(r.reference)}${r.class ? " · " + esc(r.class) : ""}</span></div>
-    <div class="afrow muted"><span>distance to the references ${(+r.score_before).toFixed(1)} → <b>${(+r.score_after).toFixed(1)}</b>${near}</span><span>${r.renders} renders · ${fmtDur(r.seconds)}</span></div>
-    <details open><summary>What it did (${(r.steps || []).length} steps)</summary><table class="afsteps"><tr class="muted"><td>step</td><td>setting</td><td>measured</td><td>why it stopped there</td></tr>${steps}</table></details>
-    <details><summary>Measured look</summary><table><tr class="muted"><td></td><td>before</td><td>after</td><td>references</td></tr>${rows}</table></details>`;
+  const head = [r.reference, r.class].filter(Boolean).map(esc).join(" · ");
+  const steps = Array.isArray(r.steps) ? r.steps : (Array.isArray(r.decisions) ? r.decisions : []);
+  // one row per decision: what was set, from what measured value, and why
+  const rows = steps.map(st => `<tr><td>${esc(st.step ?? st.param ?? st.name ?? "")}</td>` +
+    `<td class="mono">${st.from !== undefined ? fv(st.from) + " → " : ""}<b>${fv(st.to ?? st.value)}</b></td>` +
+    `<td>${st.measured !== undefined ? esc(AF_LABELS[st.measured] || st.measured) + (st.before !== undefined ? ": " + fv(st.before) + " → " + fv(st.after) : "") : ""}` +
+    `${st.target !== null && st.target !== undefined ? ` <span class="muted">(aim ${fv(st.target)})</span>` : ""}</td>` +
+    `<td class="muted">${esc(st.why ?? st.reason ?? "")}</td></tr>`).join("");
+  const sec = r.seconds !== undefined ? `<span>${fmtDur(r.seconds)}</span>` : "";
+  box.innerHTML = `<div class="afrow"><span>✨ <b>Auto-finish</b>${head ? " · " + head : ""}</span>${sec}</div>` +
+    (rows ? `<details open><summary>What it did (${steps.length} settings)</summary><table class="afsteps"><tr class="muted"><td>setting</td><td>value</td><td>measured</td><td>why</td></tr>${rows}</table></details>` : "") +
+    `<details><summary>Report</summary><pre class="small" style="white-space:pre-wrap">${esc(JSON.stringify(r, null, 1))}</pre></details>`;
   box.hidden = false;
 }
 function applyAutofinish(res) {
@@ -283,6 +318,55 @@ function applyAutofinish(res) {
 async function loadAutofinish() {
   if (!S.folder) return;
   try { renderAutofinish((await api(`/api/autofinish?folder=${encodeURIComponent(S.folder)}`)).result); } catch { renderAutofinish(null); }
+}
+
+/* ------------------------------------------------------------ hyper-tune */
+function syncHypertune() { $("#hypertuneTrials").hidden = !$("#sp-hypertune").checked; }
+// the stack / restore options the hyper-tune chose, shown in Integration & options (the processing settings come back as the Auto-finish params)
+function applyHypertune(rep) {
+  const set = [];
+  for (const [k, v] of Object.entries(rep.stack_params || {})) {
+    const el = $("#sp-" + k); if (!el || ["hypertune", "hypertune_trials", "autofinish", "star_remover", "device"].includes(k)) continue;
+    if (el.type === "checkbox") { if (el.checked !== !!v) { el.checked = !!v; set.push(k); } }
+    else if (String(el.value) !== String(v) && (el.tagName !== "SELECT" || [...el.options].some(o => o.value === String(v)))) { el.value = String(v); set.push(k); }
+    if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
+  }
+  return set;
+}
+function renderHypertune(rep) {
+  const box = $("#afReport");
+  const f = v => typeof v === "number" ? +v.toPrecision(4) : esc(v ?? "–");
+  // one block per stage (the panel is narrow): the stage and its score, yours -> best; then what changed, wrapped
+  const rows = (rep.stages || []).map(st => {
+    const ch = Object.entries(st.changed || {}).map(([k, [a, b]]) => `${esc(k)} ${f(a)} → <b>${f(b)}</b>`).join(" · ");
+    const res = st.state === "done"
+      ? `${esc(st.score)} ${f(st.baseline)} → <b>${f(st.best)}</b>${st.is_baseline ? " · yours kept" : ""}${st.feasible === false ? ' · <span style="color:var(--bad)">no trial met every constraint</span>' : ""}`
+      : `<span class="muted">${esc(st.state)}${st.reason ? ": " + esc(st.reason) : ""}</span>`;
+    return `<div class="htstage"><div class="htrow"><b>${esc(st.label || st.stage)}</b>${st.study ? ` <a href="#" data-study="${esc(st.study)}">study</a>` : ""}</div>` +
+      `<div class="mono small">${res}</div>${ch ? `<div class="small muted htch">${ch}</div>` : ""}</div>`;
+  }).join("");
+  const g = rep.export_gates;
+  const html = `<div class="afrow"><span>🔬 <b>Hyper-tune</b> · ${rep.trials_per_stage} trials per stage</span><span>${fmtDur(rep.seconds)}</span></div>` +
+    `<details open><summary>Best of every stage</summary>${rows}` +
+    (g ? `<p class="small muted">Export gates: ${g.passed ? "all pass" : "failed: " + esc((g.failed || []).join(", "))}</p>` : "") + `</details>`;
+  $("#htReport")?.remove();
+  box.insertAdjacentHTML("afterbegin", `<div id="htReport">${html}</div>`);
+  box.hidden = false;
+  $$("#afReport [data-study]").forEach(a => a.onclick = e => { e.preventDefault(); switchTab("lab"); if (typeof Lab !== "undefined" && Lab.open) Lab.open(a.dataset.study); });
+}
+
+function resetStackParams() {
+  // every option back to the pipeline's STACK_DEFAULTS (served by /api/system)
+  const D = S.system.stack_defaults;
+  for (const [k, v] of Object.entries(D)) {
+    const el = $("#sp-" + k); if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!v;
+    else if (el.tagName === "SELECT" && ![...el.options].some(o => o.value === String(v))) continue;
+    else el.value = String(v);
+    if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
+  }
+  syncHypertune();
+  toast("Integration & compute options reset to defaults");
 }
 
 /* ------------------------------------------------------------ settings from an experiment */
@@ -299,10 +383,13 @@ function applyExperiment(id) {
   const e = EXPERIMENTS.find(x => x.id === id);
   if (!e) { $("#sp-experiment-info").textContent = ""; return; }
   const set = [];
+  // the single GraXpert deconvolution choice before the objects / stars split (studies run before it)
+  const legacy = { graxpert_obj: ["graxpert", "none"], graxpert_stellar: ["none", "graxpert"], graxpert_both: ["graxpert", "graxpert"] };
   for (const [k, v] of Object.entries(e.settings)) {
     const el = $("#sp-" + k); if (!el) continue;
-    if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
-    if (k === "deconv_method") el.dispatchEvent(new Event("change", { bubbles: true }));
+    if (k === "deconv_method" && legacy[v]) [el.value, $("#sp-deconv_stars_method").value] = legacy[v];
+    else if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
+    if (k === "deconv_method" || k === "deconv_stars_method") el.dispatchEvent(new Event("change", { bubbles: true }));
     set.push(`${k} = ${v}`);
   }
   const proc = Object.entries(e.processing || {});
@@ -315,50 +402,26 @@ function applyExperiment(id) {
 }
 document.addEventListener("change", e => { if (e.target.id === "sp-experiment") applyExperiment(e.target.value); });
 
-function resetStackParams() {
-  // every option back to the pipeline's STACK_DEFAULTS (served by /api/system)
-  const D = S.system.stack_defaults;
-  for (const [k, v] of Object.entries(D)) {
-    const el = $("#sp-" + k); if (!el) continue;
-    if (el.type === "checkbox") el.checked = !!v;
-    else el.value = String(v);
-    if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
-  }
-  $("#sp-experiment").value = ""; $("#sp-experiment-info").textContent = "";
-  $("#sp-deconv_method").dispatchEvent(new Event("change", { bubbles: true }));
-  toast("Integration & compute options reset to defaults");
-}
-
 /* ------------------------------------------------------------ jobs */
-// ImageMM options only matter for the ImageMM restoration.  Choosing a restoration also sets its
-// default stack scale (pipeline.default_scale: 2x drizzle for the Noise2Noise restorations, native for
-// ImageMM); only on the user's own choice, so a reset or an applied experiment keeps the scale it set.
-document.addEventListener("change", e => {
-  if (e.target.id !== "sp-deconv_method") return;
-  $("#imagemm-opts").hidden = e.target.value !== "imagemm";
-  if (e.isTrusted) $("#sp-scale").value = e.target.value === "imagemm" ? "1" : "2";
-});
+// Only the options the Siril backend honours are in the page; the others (the old ImageMM /
+// Noise2Noise ones) are still accepted by the API and ignored, so they are not sent.
 function stackParams() {
   const g = id => $("#sp-" + id);
+  const on = g("deconv_method").value !== "none" || g("deconv_stars_method").value !== "none";
   return {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
-    local_norm: g("local_norm").checked, denoise_iters: parseInt(g("denoise_iters").value), device: g("device").value,
-    deconv_method: g("deconv_method").value, ai_deconvolution: g("deconv_method").value !== "none",
-    imagemm_r: parseInt(g("imagemm_r").value), imagemm_sigma: parseFloat(g("imagemm_sigma").value) || 0,
-    imagemm_robust: g("imagemm_robust").checked, imagemm_epsilon: parseFloat(g("imagemm_epsilon").value) || 1e-6,
-    imagemm_stop: g("imagemm_stop").value,
-    imagemm_delta: parseFloat(g("imagemm_delta").value) || 2, imagemm_kappa: parseFloat(g("imagemm_kappa").value) || 2,
-    imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 2000, imagemm_psf: g("imagemm_psf").value,
-    imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
-    imagemm_n2n: g("imagemm_n2n").checked, imagemm_background: g("imagemm_background").checked,
-    network_groups: parseInt(g("network_groups").value) || 0,
-    deconv_target_fwhm: parseFloat(g("deconv_target_fwhm").value) || 0,
-    deconv_iters: parseInt(g("deconv_iters").value) || 6000,
-    deconv_sources: Number.isFinite(parseFloat(g("deconv_sources").value)) ? parseFloat(g("deconv_sources").value) : 1,
-    pattern_correction: g("pattern_correction").checked, n2n_split: g("n2n_split").value, n2n_loss: g("n2n_loss").value,
-    star_remover_iters: parseInt(g("star_remover_iters").value) || 3000,
+    rejection: g("rejection").value, stack_weighting: g("stack_weighting").value,
+    drizzle_pixfrac: parseFloat(g("drizzle_pixfrac").value) || 0, drizzle_kernel: g("drizzle_kernel").value,
+    local_norm: g("local_norm").checked, pattern_correction: g("pattern_correction").checked,
+    deconv_method: g("deconv_method").value, deconv_stars_method: g("deconv_stars_method").value, ai_deconvolution: on,
+    denoise_method: g("denoise_method").value, superres_method: g("superres_method").value, satellite_removal: g("satellite_removal").checked,
+    graxpert_psfsize: parseFloat(g("graxpert_psfsize").value) || 0,
+    star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
+    hypertune: g("hypertune").checked,
+    hypertune_trials: Math.max(10, Math.min(500, parseInt(g("hypertune_trials").value) || 25)),
+    device: g("device") ? g("device").value : "auto",
   };
 }
 function exportOpts() {
@@ -418,6 +481,7 @@ async function pollJob() {
   const pb = $("#pauseJob");
   pb.hidden = !(j.state === "running" || j.state === "paused");
   pb.textContent = j.state === "paused" ? "Resume" : "Pause";
+  if (j.kind === "tools") { /* shown in the Tools panel */ }
   const stepEl = { calibrate: "#step-calibrate", analyse: "#step-analyse", stack: "#step-stack", denoise: "#step-denoise", starnet: "#step-starnet", autofinish: "#step-autofinish" }[j.kind];
   $$(".steps li").forEach(li => li.classList.remove("running"));
   if (stepEl && (j.state === "running" || j.state === "paused")) $(stepEl).classList.add("running");
@@ -431,7 +495,9 @@ async function pollJob() {
       const r = await api("/api/open", { method: "POST", body: { folder: S.folder } });
       S.status = r.status; S.frames = r.frames; updateSteps(); renderFrames();
       // the settings Auto-finish tuned (alone, or before the export of Run everything) become the sliders'
-      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(`Auto-finish: ${(j.result.autofinish.report.steps || []).length} settings set from the image, checked against ${j.result.autofinish.report.reference}`); }
+      if (j.result?.hypertune) applyHypertune(j.result.hypertune);
+      if (j.result?.autofinish) { applyAutofinish(j.result.autofinish); toast(j.result?.hypertune ? "Hyper-tune: every stage's best settings applied" : "Auto-finish: settings set from the measurements of the image"); }
+      if (j.result?.hypertune) renderHypertune(j.result.hypertune);
       else if (S.status.stacked) schedulePreview(0);
       if (["calibrate", "analyse", "all"].includes(j.kind)) loadCalibration();
       if (j.kind === "calibrate" && j.result?.changed_analysis) toast("Calibration changed: the frame analysis was dropped — run Analyse frames again");
@@ -461,7 +527,8 @@ async function fetchImage(which) {
   const size = $("#previewSize").value;
   const r = await fetch("/api/preview", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ folder: S.folder, params: S.params, which, size: size === "full" ? null : parseInt(size) }) });
-  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail; } catch { } throw new Error(m); }
+  if (r.status === 204) { const e = new Error("superseded"); e.superseded = true; throw e; }   // a newer preview was asked for: it renders instead
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail; } catch { } const e = new Error(m); e.status = r.status; throw e; }
   return { url: URL.createObjectURL(await r.blob()), t: r.headers.get("X-Render-Time"), w: +r.headers.get("X-Width"), h: +r.headers.get("X-Height") };
 }
 
@@ -482,7 +549,16 @@ async function requestPreview() {
     $("#imgBefore").style.width = S.imgW + "px"; $("#imgBefore").style.height = S.imgH + "px";
     if (first || sizeChanged) fitView();
     layoutSplit();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    if (e.superseded || seq !== S.previewSeq) return;     // an older request: the newest one reports for itself
+    // 409: a job holds the pipeline (one at a time) - say so in the pane instead of a toast that
+    // disappears, and try again when the job is likely done
+    if (e.status === 409 && !$("#imgAfter").src) {
+      $("#placeholder .ph-inner p").innerHTML = "A pipeline job is running.<br>The preview appears when it finishes.";
+      showPlaceholder(true);
+      schedulePreview(8000);
+    } else toast(e.message, true);
+  }
   finally { if (seq === S.previewSeq) $("#spinner").hidden = true; }
 }
 
@@ -625,35 +701,59 @@ function renderCharts() {
 }
 
 /* ------------------------------------------------------------ export & diag */
+function gatesPill(g) {
+  if (!g) return "";                                                          // recorded nothing: say nothing
+  if (g.error || g.passed === null) return `<span class="pill bad" title="the export could not measure its own gates">gates not measured</span>`;
+  if (g.passed) return `<span class="pill">gates ok</span>`;
+  const f = g.failed || [];
+  return `<span class="pill bad" title="${f.join(", ")}">${f.length} gate${f.length === 1 ? "" : "s"} failed</span>`;
+}
 async function refreshExports() {
   if (!S.folder) return;
   const r = await api(`/api/exports?folder=${encodeURIComponent(S.folder)}`);
   $("#exportsList").innerHTML = r.exports.length ? r.exports.map(e => `
     <div class="exp"><a href="/api/download?inline=1&path=${encodeURIComponent(e.jpg)}" target="_blank"><img src="/api/download?inline=1&path=${encodeURIComponent(e.jpg)}" loading="lazy" alt=""></a>
-      <div class="meta"><b>${e.name}</b><span class="muted">${e.created} · ${e.size_mb} MB</span>
+      <div class="meta"><b>${e.name}</b>${gatesPill(e.gates)}<span class="muted">${e.created} · ${e.size_mb} MB</span>
       <span><a href="/api/download?path=${encodeURIComponent(e.jpg)}">JPG</a>${e.tif ? `<a href="/api/download?path=${encodeURIComponent(e.tif)}">16-bit TIFF</a>` : ""}</span></div></div>`).join("")
     : `<p class="muted">No exports yet.</p>`;
 }
 async function refreshDiag() {
   if (!S.folder) return;
   const q = `folder=${encodeURIComponent(S.folder)}&t=${Date.now()}`;
-  $("#diagRef").src = `/api/diagnostic?kind=reference&${q}`;
-  $("#diagCov").src = `/api/diagnostic?kind=coverage&${q}`;
-  $("#diagRej").src = `/api/diagnostic?kind=rejection&${q}`;
+  const ref = $("#diagRef");
+  ref.onload = () => ($("#diagRefBox").hidden = false);
+  ref.onerror = () => ($("#diagRefBox").hidden = true);
+  ref.src = `/api/diagnostic?kind=reference&${q}`;
+  for (const [k, id] of [["coverage", "Cov"], ["rejection", "Rej"]]) {
+    const im = $("#diag" + id), box = $("#diag" + id + "Box");
+    im.onload = () => (box.hidden = false); im.onerror = () => (box.hidden = true);
+    im.src = `/api/diagnostic?kind=${k}&${q}`;
+  }
   let li = {};
   try { li = await api(`/api/linear_info?folder=${encodeURIComponent(S.folder)}`); } catch { }
   $("#diagInfo").textContent = JSON.stringify({ stack: S.status?.stack_meta, processing: li }, null, 1);
+  loadLogs();
+}
+async function loadLogs() {
+  const box = $("#logList");
+  let r = { logs: [] };
+  try { r = await api(`/api/diagnostic?kind=logs&folder=${encodeURIComponent(S.folder)}`); } catch { }
+  box.innerHTML = r.logs.length ? r.logs.map(l => `<div><a data-log="${esc(l.name)}">${esc(l.name)}</a> <span class="muted">${(l.bytes / 1024).toFixed(1)} kB · ${new Date(l.modified * 1000).toLocaleString()}</span></div>`).join("")
+    : `<span class="muted">No stage logs yet: they appear when a Siril stage has run.</span>`;
+  $$("a[data-log]", box).forEach(el => el.onclick = async () => {
+    const t = await (await fetch(`/api/diagnostic?kind=log&name=${encodeURIComponent(el.dataset.log)}&folder=${encodeURIComponent(S.folder)}`)).text();
+    const pre = $("#logText"); pre.textContent = t; pre.hidden = false; pre.scrollTop = 1e9;
+  });
 }
 
 function switchTab(name) {
-  if (typeof Lab !== "undefined") Lab.hidePop();
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "process") setTimeout(fitView, 50);
   if (name === "diag") refreshDiag();
-  if (name === "explore") setTimeout(() => Explore.show(), 30);
-  if (name === "lab") Lab.show();
+  if (name === "lab" && typeof Lab !== "undefined") Lab.show();
   if (name === "jobs") Jobs.show();
+  if (name === "explore") setTimeout(() => Explore.show(), 30);
 }
 
 /* ------------------------------------------------------------ bindings */
@@ -664,6 +764,8 @@ function bindUI() {
     await openDataset(p);
   };
   $$("[data-job]").forEach(b => b.onclick = () => startJob(b.dataset.job));
+  $("#sp-hypertune").onchange = syncHypertune;
+  syncHypertune();
   $("#calSave").onclick = saveCalibration;
   $("#cancelJob").onclick = () => S.job && api(`/api/jobs/${S.job.id}/cancel`, { method: "POST" });
   $("#pauseJob").onclick = async () => {
@@ -690,8 +792,7 @@ function bindUI() {
   sps.nextElementSibling.textContent = "1.0";
   const q = $("#ex-quality"); q.oninput = () => (q.nextElementSibling.textContent = q.value);
   bindViewer();
-  loadExperimentChoices();
-  $(".sidebar details.adv").addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
+  $("#logsRefresh").onclick = loadLogs;
   $("#spReset").onclick = resetStackParams;
 }
 

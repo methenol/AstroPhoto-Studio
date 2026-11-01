@@ -1,6 +1,6 @@
 /* Experiments tab: configure, dispatch, monitor and review Optuna studies (vanilla JS) */
 const Lab = (() => {
-  const L = { tasks: null, byName: {}, data: null, space: {}, sel: null, detail: null, trialSel: null, timer: 0, synthDefaults: null, sep: ":", combine: null };
+  const L = { tasks: null, byName: {}, data: null, space: {}, sel: null, detail: null, studies: null, picked: new Set(), gone: new Set(), trialSel: null, timer: 0, synthDefaults: null, sep: ":", combine: null };
   const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const f4 = v => v === null || v === undefined || Number.isNaN(v) ? "–" : (typeof v === "number" ? (Math.abs(v) >= 1000 || (Math.abs(v) < 1e-3 && v !== 0) ? v.toExponential(2) : +v.toPrecision(4)) : String(v));
   const RUNNING = ["starting", "preparing", "running"];
@@ -17,9 +17,9 @@ const Lab = (() => {
     r.tasks.forEach(t => L.byName[t.name] = t);
     $("#lbTask").innerHTML = r.tasks.map(t => `<option value="${t.name}">${esc(t.label)}</option>`).join("");
     $("#lbSampler").innerHTML = r.samplers.map(s => `<option value="${s.name}">${esc(s.label)}</option>`).join("");
-    const dev = S.system.devices;
-    $("#lbDevice").innerHTML = `<option value="auto">auto (${dev.default})</option>` +
-      (dev.gpus || []).map(g => `<option value="${g.id}">${esc(g.name)}</option>`).join("") + `<option value="cpu">CPU</option>`;
+    const dev = S.system.devices || {};
+    $("#lbDevice").innerHTML = `<option value="auto">auto (${dev.default || "cpu"})</option>` +
+      (dev.gpus || []).map(g => `<option value="gpu${g.id}">${esc(g.name)}</option>`).join("") + `<option value="cpu">CPU</option>`;
     buildSynthForm();
     $("#lbTask").onchange = buildTask;
     $("#lbData").onchange = () => { buildCombine(); buildObjectives(); };
@@ -136,7 +136,10 @@ const Lab = (() => {
   function buildTask() {
     const t = L.byName[$("#lbTask").value];
     $("#lbTaskDesc").textContent = t.description;
-    $("#lbOptions").innerHTML = t.options.map(o => o.type === "categorical"
+    const cons = Object.entries(t.constraints || {}).map(([k, [kind, b]]) => `${k} ${kind === "max" ? "≤" : "≥"} ${b}`);
+    if (t.sampler && [...$("#lbSampler").options].some(o => o.value === t.sampler)) $("#lbSampler").value = t.sampler;
+    $("#lbTaskObj").innerHTML = t.objective_note ? `<b>Objective.</b> ${esc(t.objective_note)}` : (cons.length ? `Constraints: ${esc(cons.join(", "))}` : "");
+    $("#lbOptions").innerHTML = t.options.filter(o => !o.internal).map(o => o.type === "categorical"
       ? `<label>${esc(o.label)}<select data-opt="${o.name}">${o.choices.map(c => `<option ${c === o.default ? "selected" : ""}>${c}</option>`).join("")}</select></label>`
       : `<label>${esc(o.label)}<input data-opt="${o.name}" data-t="${o.type}" type="number" step="any" value="${o.default}"></label>`).join("");
     L.space = {};
@@ -159,8 +162,9 @@ const Lab = (() => {
       const fixed = s.tune ? "" : p.type === "bool" ? `<select class="fixed" data-k="value"><option value="true" ${s.value ? "selected" : ""}>on</option><option value="false" ${!s.value ? "selected" : ""}>off</option></select>`
         : p.type === "categorical" ? `<select class="fixed" data-k="value">${p.choices.map(c => `<option ${String(c) === String(s.value) ? "selected" : ""}>${c}</option>`).join("")}</select>`
         : `<input class="fixed" type="number" step="any" data-k="value" value="${s.value}">`;
+      const cond = p.when ? (Array.isArray(p.when) ? p.when : [p.when]).map(a => Object.entries(a).map(([k, v]) => `${k} ∈ {${v.join(", ")}}`).join(" and ")).join(" or ") : "";
       return `<div class="lbparam" data-p="${p.name}"><div class="hd"><input type="checkbox" data-k="tune" ${s.tune ? "checked" : ""}>
-        <span title="${esc(p.pipeline ? "pipeline setting: " + p.pipeline : p.processing ? "processing setting: " + p.processing : p.code ? "constant in " + p.code + ": " + p.name : "not a pipeline setting")}">${esc(p.label)}</span>${fixed}</div>${body}</div>`;
+        <span title="${esc((p.pipeline ? "pipeline setting: " + p.pipeline : p.processing ? "processing setting: " + p.processing : p.code ? "constant in " + p.code + ": " + p.name : "not a pipeline setting") + (cond ? ". Sampled only when " + cond : ""))}">${esc(p.label)}${cond ? ' <span class="muted">⤷</span>' : ""}</span>${fixed}</div>${body}</div>`;
     }).join("");
     $$("#lbSpace [data-k]").forEach(inp => inp.onchange = () => {
       const name = inp.closest("[data-p]").dataset.p, s = L.space[name], k = inp.dataset.k;
@@ -202,7 +206,7 @@ const Lab = (() => {
     const sampler = $("#lbSampler").value;
     const cfg = { name: $("#lbName").value.trim(), task: t.name, dataset: ds, options, space, objectives, sampler,
       n_trials: parseInt($("#lbTrials").value) || 30, timeout_min: parseFloat($("#lbTimeout").value) || 0,
-      seed: parseInt($("#lbSeed").value) || 0, device: $("#lbDevice").value, baseline: $("#lbBaseline").checked };
+      seed: parseInt($("#lbSeed").value) || 0, device: $("#lbDevice").value, baseline: $("#lbBaseline").checked, constraints: $("#lbConstraints").checked };
     try {
       const r = await api("/api/lab/studies", { method: "POST", body: { config: cfg } });
       toast("Study started"); L.sel = r.id; await loadStudies(); loadDetail(); tick();
@@ -211,15 +215,49 @@ const Lab = (() => {
 
   /* ---------------------------------------------------------------- studies */
   async function loadStudies() {
+    if (!L.studies) $("#lbStudies").innerHTML = `<p class="muted small">Loading studies…</p>`;
     const r = await api("/api/lab/studies");
-    L.studies = r.studies;
-    $("#lbStudies").innerHTML = r.studies.length ? r.studies.map(s => `<div class="lbst ${s.id === L.sel ? "sel" : ""}" data-id="${esc(s.id)}">
-      <b>${esc(s.name)}</b><span class="state ${esc(s.state)}">${esc(s.state)}</span>
+    L.studies = r.studies.filter(s => !L.gone.has(s.id));
+    renderStudies();
+    if (!L.sel && L.studies.length) { L.sel = L.studies[0].id; loadDetail(); }
+  }
+
+  function renderStudies() {
+    const ids = new Set(L.studies.map(s => s.id));
+    [...L.picked].forEach(id => { if (!ids.has(id)) L.picked.delete(id); });
+    const ended = L.studies.filter(s => !RUNNING.includes(s.state));
+    const bar = L.studies.length ? `<div class="lbbulk small"><label><input type="checkbox" id="lbPickAll" ${ended.length && ended.every(s => L.picked.has(s.id)) ? "checked" : ""}> all not running</label>
+      <button class="btn tiny ghost" id="lbDelPicked" ${L.picked.size ? "" : "disabled"}>Delete selected${L.picked.size ? ` (${L.picked.size})` : ""}</button></div>` : "";
+    $("#lbStudies").innerHTML = bar + (L.studies.length ? L.studies.map(s => `<div class="lbst ${s.id === L.sel ? "sel" : ""}" data-id="${esc(s.id)}">
+      <span class="lbname"><input type="checkbox" class="lbpick" data-id="${esc(s.id)}" ${L.picked.has(s.id) ? "checked" : ""} ${RUNNING.includes(s.state) ? 'disabled title="Stop the study first"' : ""}>
+      <b>${esc(s.name)}</b>${s.hypertune ? '<span class="ht">hyper-tune</span>' : ""}</span><span class="state ${esc(s.state)}">${esc(s.state)}</span>
       <span class="meta">${esc(L.byName[s.task]?.label || s.task)} · ${esc(s.dataset)} · ${s.n_complete}/${s.n_trials} trials</span>
       <span class="meta">${s.best !== null && s.best !== undefined ? `best ${esc(s.objectives[0].metric)} ${f4(s.best)}` : s.objectives.map(o => o.metric).join(" × ")}</span></div>`).join("")
-      : `<p class="muted small">No studies yet. Configure one on the left.</p>`;
-    $$("#lbStudies .lbst").forEach(el => el.onclick = () => { L.sel = el.dataset.id; L.trialSel = null; loadStudies(); loadDetail(); });
-    if (!L.sel && r.studies.length) { L.sel = r.studies[0].id; loadDetail(); }
+      : `<p class="muted small">No studies yet. Configure one on the left.</p>`);
+    $$("#lbStudies .lbst").forEach(el => el.onclick = () => { L.sel = el.dataset.id; L.trialSel = null; renderStudies(); loadDetail(); });
+    $$("#lbStudies .lbpick").forEach(el => {
+      el.onclick = e => e.stopPropagation();
+      el.onchange = () => { el.checked ? L.picked.add(el.dataset.id) : L.picked.delete(el.dataset.id); renderStudies(); };
+    });
+    $("#lbPickAll")?.addEventListener("change", e => { ended.forEach(s => e.target.checked ? L.picked.add(s.id) : L.picked.delete(s.id)); renderStudies(); });
+    $("#lbDelPicked")?.addEventListener("click", () => {
+      const n = L.picked.size;
+      if (n && confirm(`Delete ${n} stud${n === 1 ? "y" : "ies"} and all their trials? This cannot be undone.`)) deleteStudies([...L.picked]);
+    });
+  }
+
+  /* delete at once in the list; the server moves the folders out and removes them in the background */
+  async function deleteStudies(ids) {
+    ids.forEach(id => { L.gone.add(id); L.picked.delete(id); });
+    L.studies = L.studies.filter(s => !ids.includes(s.id));
+    if (ids.includes(L.sel)) { L.sel = null; L.detail = null; L.trialSel = null; $("#lbDetail").innerHTML = ""; }
+    renderStudies();
+    try {
+      const r = await api("/api/lab/studies/delete", { method: "POST", body: { ids } });
+      if (r.skipped.length) toast(`Not deleted: ${r.skipped.map(x => `${x.id} (${x.reason})`).join(", ")}`, true);
+      r.skipped.forEach(x => L.gone.delete(x.id));
+      if (r.skipped.length) loadStudies();
+    } catch (e) { ids.forEach(id => L.gone.delete(id)); toast(e.message, true); loadStudies(); }
   }
 
   async function loadDetail() {
@@ -282,6 +320,8 @@ const Lab = (() => {
     const head = `<div class="card"><h3>${esc(cfg.name)} <span class="state ${esc(st.state)}">${esc(st.state)}</span></h3>
       <div class="small">${esc(L.byName[cfg.task]?.label || cfg.task)} on <b>${esc(cfg.dataset.name)}</b> (${esc(cfg.dataset.kind)}) · ${esc(cfg.sampler)} · ${done.length}/${cfg.n_trials} trials complete${D.trials.length - done.length ? `, ${D.trials.length - done.length} other` : ""} · device ${esc(cfg.device)}</div>
       <div class="small muted" style="margin-top:4px">${esc(st.message || "")}</div>
+      ${D.best_criterion ? `<div class="small" style="margin-top:4px">Best: trial #${D.best?.[0]} — ${esc(D.best_criterion)}</div>` : ""}
+      ${D.objective_note ? `<details class="small muted" style="margin-top:4px"><summary>How this experiment is scored</summary>${esc(D.objective_note)}</details>` : ""}
       <div class="row gap" style="margin-top:10px">
         ${running ? `<button class="btn small" id="lbStop">Stop</button>` : `<button class="btn small" id="lbCont">Run more trials</button> <input id="lbMore" type="number" value="10" min="1" style="width:70px">
         <button class="btn small ghost" id="lbDel">Delete study</button>`}
@@ -328,11 +368,13 @@ const Lab = (() => {
     }
     // trials table
     const mcols = Object.keys(D.metrics).filter(k => D.trials.some(t => t.metrics && typeof t.metrics[k] === "number") && !cfg.objectives.some(o => o.metric === k)).slice(0, 5);
-    const table = `<div class="card"><h3>Trials</h3><div class="lbtable"><table><thead><tr><th>#</th><th>State</th>
+    const hasCons = D.trials.some(t => t.feasible !== null && t.feasible !== undefined);
+    const table = `<div class="card"><h3>Trials</h3><div class="lbtable"><table><thead><tr><th>#</th><th>State</th>${hasCons ? "<th title=\"Meets every constraint of the experiment\">OK</th>" : ""}
       ${cfg.objectives.map(o => `<th>${esc(o.metric)} ${o.direction === "minimize" ? "↓" : "↑"}</th>`).join("")}
       ${tuned.map(k => `<th>${esc(k)}</th>`).join("")}${mcols.map(k => `<th>${esc(k)}</th>`).join("")}<th>Time</th></tr></thead><tbody>
-      ${[...D.trials].reverse().map(t => `<tr data-n="${t.number}" ${t.image ? "data-img" : ""} class="${(D.best || []).includes(t.number) ? "best" : ""} ${t.state === "FAIL" ? "fail" : ""}" title="${esc(t.error || "")}">
-        <td>${t.number}${t.baseline ? " ●" : ""}</td><td>${esc(t.state.toLowerCase())}</td>
+      ${[...D.trials].reverse().map(t => `<tr data-n="${t.number}" ${t.image ? "data-img" : ""} class="${(D.best || []).includes(t.number) ? "best" : ""} ${t.state === "FAIL" ? "fail" : ""} ${t.feasible === false ? "infeasible" : ""}" title="${esc(t.error || (t.metrics?.violations ? "constraints: " + Object.entries(t.metrics.violations).map(([k, v]) => `${k} ${v > 0 ? "broken by " + f4(v) : "met"}`).join(", ") : ""))}">
+        <td>${t.number}${t.baseline ? " ●" : ""}${t.duplicate_of !== null && t.duplicate_of !== undefined ? ` <span class="muted" title="same active settings as trial ${t.duplicate_of}: its result reused">=${t.duplicate_of}</span>` : ""}</td><td>${esc(t.state.toLowerCase())}</td>
+        ${hasCons ? `<td>${t.feasible === true ? "✓" : t.feasible === false ? '<span style="color:var(--bad)">✗</span>' : "–"}</td>` : ""}
         ${cfg.objectives.map((o, i) => `<td class="num">${t.values ? f4(t.values[i]) : "–"}</td>`).join("")}
         ${tuned.map(k => `<td class="num">${esc(f4(t.params[k]))}</td>`).join("")}
         ${mcols.map(k => `<td class="num">${f4(t.metrics?.[k])}</td>`).join("")}
@@ -345,7 +387,7 @@ const Lab = (() => {
     $("#lbCont")?.addEventListener("click", async () => { try { await api(`/api/lab/studies/${encodeURIComponent(D.id)}/continue`, { method: "POST", body: { extra: parseInt($("#lbMore").value) || 10 } }); toast("Continuing"); await loadStudies(); loadDetail(); tick(); } catch (e) { toast(e.message, true); } });
     $("#lbDel")?.addEventListener("click", async () => {
       if (!confirm(`Delete the study “${cfg.name}” and all its trials? This cannot be undone.`)) return;
-      try { await api(`/api/lab/studies/${encodeURIComponent(D.id)}`, { method: "DELETE" }); L.sel = null; L.detail = null; $("#lbDetail").innerHTML = ""; loadStudies(); } catch (e) { toast(e.message, true); }
+      deleteStudies([D.id]);
     });
     $("#lbApply")?.addEventListener("click", () => applyToPipeline(D, shown));
     $$("#lbDetail tbody tr").forEach(tr => {
@@ -371,7 +413,6 @@ const Lab = (() => {
     }
     if (proc) { applyParamsToUI(); saveParams(); schedulePreview(0); }
     const task = D.config.task;
-    if (task === "imagemm" || task === "network") { $("#sp-deconv_method").value = task; $("#sp-deconv_method").dispatchEvent(new Event("change", { bubbles: true })); }
     $(".sidebar details.adv").open = true;
     if (typeof loadExperimentChoices === "function") loadExperimentChoices();
     toast(`Applied: ${set.join(", ")}. Re-run the pipeline step to use them.`);
@@ -445,5 +486,6 @@ const Lab = (() => {
     return `<div class="lbchart"><h4>${esc(k)} vs ${esc(o.metric)}</h4><svg viewBox="0 0 ${W} ${H}">${ax}${done.map((t, i) => dot(X(sx, xs[i]), Y(sy, t.values[0]), t)).join("")}</svg></div>`;
   }
 
-  return { show, hidePop };
+  async function open(id) { L.sel = id; L.trialSel = null; await show(); await loadStudies(); loadDetail(); }
+  return { show, hidePop, open };
 })();

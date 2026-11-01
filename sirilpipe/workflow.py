@@ -1,0 +1,609 @@
+"""The recipe: pure functions that turn a classified dataset + calibration + stack_params into
+Siril scripts (``.ssf`` text) and into the frame-selection / drizzle decisions.
+
+Nothing here runs Siril or touches the disk (except ``stage_inputs``, which creates the staging
+symlinks), so the whole recipe is unit-testable.  Every number that comes from the community
+rather than from us carries its source in a comment.
+
+Pipeline (one ``siril-cli`` per stage; commands verified on Siril 1.4.4, see siril.md)::
+
+    link light            symlinks of the selected subs only (``failed_*`` etc. never reach Siril)
+    calibrate light ...   dark/flat when matched, ``-cfa``: keep the Bayer mosaic (Bayer drizzle)
+    [banding]             measured row noise > threshold: seqsplit_cfa, seqfixbanding 1 1 per Bayer plane, seqmerge_cfa (see BANDING_*)
+    [merge]               several nights / exposure groups -> one sequence, one registration
+    register -2pass       transforms + best reference + per-frame fwhm/wfwhm/roundness/nbstars
+    unselect ...          frames our rules (frames.json "included") exclude
+    seqapplyreg -drizzle  Bayer drizzle onto the -framing=max canvas of the included frames
+    stack rej w ...       Winsorized sigma clipping, wFWHM weights, additive+scale normalisation
+"""
+from __future__ import annotations
+
+import math
+import os
+import shutil
+import statistics
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from . import config
+from .dataset import Frame
+from .siril import quote, ranges
+
+# --------------------------------------------------------------------------- constants
+# Registration: official-script defaults + spec-chum's DWARF recipe
+# (https://github.com/spec-chum/dwarf-siril-script: register -2pass -transf=homography -minpairs=10 -maxstars=2000)
+REGISTER_ARGS = "-2pass -transf=homography -minpairs=10 -maxstars=2000"
+# Official Seestar_Preprocessing.ssf v1.3 (siril-scripts): frames more than 2.5 sigma rounder-than-worst are dropped
+ROUNDNESS_K = 2.5
+# Bayer drizzle: Siril docs / OSC_Preprocessing_BayerDrizzle.ssf: scale 1, pixfrac 1, square kernel for OSC
+DRIZZLE_1X = {"scale": 1.0, "pixfrac": 1.0, "kernel": "square"}
+# 2x drizzle only with plenty of data and undersampled stars: PixInsight DrizzleIntegration guidance quoted in
+# workflows.md section 10 (FWHM < ~2 px) and the community minimum of 100 subs (lancepickens: 50+; DESIGN: 100)
+DRIZZLE_2X = {"scale": 2.0, "pixfrac": 0.5, "kernel": "square"}   # pixfrac ~ 1/scale (Siril drizzle docs)
+DRIZZLE_KERNELS = ("square", "point", "turbo", "gaussian", "lanczos2", "lanczos3")   # seqapplyreg -kernel= (Siril 1.4 drizzle)
+# stack rej: Siril's letters; GESDT ("g") is left out (bug #1993, fixed only in 1.4.5); percentile clipping takes fractions, not sigmas
+REJECTIONS = {"winsorized": "w", "sigma": "s", "mad": "a", "linear": "l", "median": "m", "none": "n"}
+WEIGHTINGS = ("wfwhm", "nbstars", "noise", "nbstack", "none")                       # stack -weight= (Siril 1.4); none = no weighting
+DRIZZLE2_MIN_FRAMES = 100
+DRIZZLE2_MAX_FWHM = 2.0
+# Banding (CMOS row noise): Siril's own tool, run on the calibrated CFA subs BEFORE registration, where the pattern still lies along the sensor rows
+# (after the 0-2 degree field rotation of an alt-az mount and the drizzle it is smeared into the stack and cannot be removed any more).  Siril docs
+# (https://siril.readthedocs.io/en/stable/Commands.html#fixbanding): "amount defines the amount of correction, between 0 and 4. sigma defines the
+# highlight protection level of the algorithm ... between 0 and 5. Values of 1 and 1 are often good enough"; `seqfixbanding` is the sequence form
+# (output prefix unband_).  Siril 1.4.4 has no -cfa option: on the raw mosaic the row medians of R/G and G/B rows are equalised (plane medians moved
+# by 40-70 % on IC 1805), so the mosaic is split into its four Bayer planes (seqsplit_cfa), each plane is de-banded, and seqmerge_cfa rebuilds the
+# mosaic (Siril docs: "applying some processing to the individual Bayer subchannels prior to demosaicing").
+BANDING_AMOUNT = 1.0
+BANDING_SIGMA = 1.0
+BANDING_SIGMAS = 5.0         # a stage is only run when the measured row-banding excess is > 5 standard errors of the estimate (see row_banding_ratio)
+BANDING_SAMPLE = 8           # subs measured
+BANDING_PATTERNS = ("RGGB", "BGGR", "GRBG", "GBRG")     # seqmerge_cfa's accepted patterns
+
+# Frames kept by `sensitivity` (DESIGN section 4): 1.0 -> best 90 % by wFWHM, 0.5 -> 97 %, 2.0 -> 75 %
+KEEP_PERCENT = ((0.5, 97.0), (1.0, 90.0), (2.0, 75.0))
+MIN_STARS = 5                    # DESIGN: subs with nbstars < 5 are excluded
+# Narrowest plausible star (Siril's FWHM, px): an optical PSF sampled by the sensor is not narrower than ~1.5 px.
+# Narrower "stars" are single-pixel defects (hot pixels): on a clouded-out night (SNR G180.0-01.7, 2026-10-18) Siril
+# found 12-15 of them at FWHM 1.37 px and "registered" four frames on the sensor (identity transforms), and the stack
+# was of clouds.  Every real DWARF / Seestar session here: median 2.6-9.4 px, single frames >= 2.0 px.
+MIN_STAR_FWHM = 1.6
+FASTNORM_FRAMES = config.FASTNORM_FRAMES   # Siril docs/forums: -fastnorm for > 1000 short subs (siril.md 2.4)
+
+
+# --------------------------------------------------------------------------- data
+@dataclass
+class Unit:
+    """Frames calibrated together: one night folder x one exposure group (own darks/flats)."""
+    index: int
+    dir: str                       # absolute work dir (the process dir itself when there is one unit)
+    frames: list[Frame]
+    calib: dict = field(default_factory=dict)   # calibration report (dark/flat/bias choices)
+    masters: dict = field(default_factory=dict)  # kind -> absolute master path actually passed to Siril
+    group: int = 0                 # exposure group (HDR: one per exposure time; 0 when there is only one)
+
+    @property
+    def calibrated(self) -> bool:
+        return bool(self.masters.get("dark") or self.masters.get("flat") or self.masters.get("bias"))
+
+
+# --------------------------------------------------------------------------- decisions
+def keep_percent(sensitivity: float) -> float:
+    """% of frames kept by weighted FWHM for a ``sensitivity`` (piecewise linear through DESIGN's three points)."""
+    s = float(sensitivity)
+    pts = KEEP_PERCENT
+    if s <= pts[0][0]:
+        return min(100.0, pts[0][1] + (pts[0][0] - s) * 14.0)
+    for (s0, p0), (s1, p1) in zip(pts, pts[1:]):
+        if s <= s1:
+            return p0 + (p1 - p0) * (s - s0) / (s1 - s0)
+    return max(50.0, pts[-1][1] - (s - pts[-1][0]) * 15.0)
+
+
+def decide_resampling(params: dict, n_included: int, median_fwhm: float | None, cfa: bool = True) -> dict:
+    """How the registered frames are resampled: Bayer drizzle 1x (default), 2x only when the rule allows,
+    demosaic + Lanczos when asked (or when the data is not a Bayer mosaic).  ``reason`` is recorded in
+    stack_meta so the user sees why a requested scale was not used.  ``drizzle_pixfrac`` (0 = the rule's: 1 / scale)
+    and ``drizzle_kernel`` set the drop size and kernel of a drizzle explicitly."""
+    out = _decide_resampling(params, n_included, median_fwhm, cfa)
+    if out.get("mode") == "drizzle":
+        try:
+            pf = float(params.get("drizzle_pixfrac") or 0)
+        except (TypeError, ValueError):
+            pf = 0.0
+        kern = str(params.get("drizzle_kernel") or "square").lower()
+        if pf > 0:
+            out["pixfrac"] = round(float(np.clip(pf, 0.1, 1.0)), 3)
+            out["reason"] += f"; pixfrac {out['pixfrac']:g} (chosen)"
+        if kern in DRIZZLE_KERNELS and kern != out.get("kernel"):
+            out["kernel"] = kern
+            out["reason"] += f"; {kern} kernel (chosen)"
+    return out
+
+
+def _decide_resampling(params: dict, n_included: int, median_fwhm: float | None, cfa: bool = True) -> dict:
+    mode = str(params.get("mode", "auto") or "auto").lower()
+    want = float(params.get("scale", 1.0) or 1.0)
+    out: dict = {"mode": "drizzle", "requested_scale": want, "reason": ""}
+    if want > 1.0 and str(params.get("superres_method") or "drizzle") == "cosmic_clarity":
+        # the super-resolution is Cosmic Clarity's, on the finished image (post._superres_final): the stack itself is integrated at 1x
+        out = _decide_resampling({**params, "scale": 1.0, "superres_method": "drizzle"}, n_included, median_fwhm, cfa)
+        out.update(requested_scale=want, superres="cosmic_clarity",
+                   reason=out["reason"] + f"; the {want:g}x super-resolution is Cosmic Clarity's, on the finished image")
+        return out
+    if mode == "demosaic" or not cfa:
+        out.update(mode="demosaic", scale=1.0, pixfrac=None, kernel=None, interp="lanczos4",
+                   reason="demosaic + Lanczos4 registration" if cfa else "not a Bayer mosaic")
+        return out
+    if want > 1.0:
+        if mode == "drizzle":                          # the user chose Bayer drizzle at this scale explicitly: honoured (Siril drizzle docs: pixfrac ~ 1 / scale)
+            out.update(scale=float(want), pixfrac=round(1.0 / float(want), 3), kernel="square")
+            out["reason"] = f"{want:g}x drizzle requested explicitly (pixfrac {1.0 / want:.2f})"
+            return out
+        ok = n_included >= DRIZZLE2_MIN_FRAMES and median_fwhm is not None and median_fwhm < DRIZZLE2_MAX_FWHM
+        if ok:
+            out.update(DRIZZLE_2X)
+            out["reason"] = f"2x drizzle: {n_included} frames, median FWHM {median_fwhm:.2f} px"
+            return out
+        why = (f"only {n_included} frames (< {DRIZZLE2_MIN_FRAMES})" if n_included < DRIZZLE2_MIN_FRAMES
+               else f"median FWHM {median_fwhm:.2f} px is not < {DRIZZLE2_MAX_FWHM} px"
+               if median_fwhm is not None else "no FWHM measurement")
+        out.update(DRIZZLE_1X)
+        out["reason"] = f"requested {want:g}x drizzle, using 1x: {why}"
+        return out
+    out.update(DRIZZLE_1X)
+    out["reason"] = "Bayer drizzle 1x (scale 1, pixfrac 1)"
+    return out
+
+
+def rejection(params: dict, resampling: dict) -> dict:
+    """Rejection type and sigmas: auto = Winsorized (``w``); MAD (``a``) for drizzled data above 1x (the Siril stacking
+    doc calls it the most effective for the sparse R/B coverage); never GESDT (bug #1993 fixed only in 1.4.5).
+    ``rejection`` names one of REJECTIONS explicitly."""
+    lo = float(params.get("sigma_low", 4.0) or 4.0)
+    hi = float(params.get("sigma_high", 3.0) or 3.0)
+    want = str(params.get("rejection") or "auto").lower()
+    if want in REJECTIONS:
+        kind = REJECTIONS[want]
+    else:
+        kind = "a" if (resampling["mode"] == "drizzle" and resampling.get("scale", 1.0) > 1.0) else "w"
+    names = {v: k for k, v in REJECTIONS.items()}
+    return {"type": kind, "name": names[kind], "low": lo, "high": hi}
+
+
+def weighting(params: dict) -> str:
+    """The stack's frame weighting (``-weight=``): ``stack_weighting`` one of WEIGHTINGS; default wfwhm (siril.md 5.6)."""
+    w = str(params.get("stack_weighting") or "wfwhm").lower()
+    if w not in WEIGHTINGS:
+        w = "wfwhm"
+    return "" if w == "none" else w
+
+
+def _shown(low: float, high: float) -> str:
+    """``low < high``, printed at the first precision that still shows the gap.  A C 20 frame measured roundness
+    0.7049 against a cut of 0.7048 and the frames table rendered it as "stars too elongated (roundness 0.70 <
+    0.70)": a filter the user can see working and cannot see the reason for, which is how a legitimate exclusion
+    gets reported as a bug.  Numbers that really are equal say so instead of claiming a gap."""
+    for dp in range(2, 12):
+        x, y = f"{low:.{dp}f}", f"{high:.{dp}f}"
+        if x != y:
+            return f"{x} < {y}"
+    return f"{low:.4f} and the cut are the same number"
+
+
+def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]]:
+    """Reasons to exclude each frame ([] = keep).  ``stats``: per frame dicts with registered (bool), nbstars,
+    roundness, wfwhm (from the .seq).  Rules (same semantics as Siril's -filter-* options, evaluated here so the
+    UI shows exactly what will be stacked and user overrides compose with them):
+      1. registration failed: Siril returned no transform for the frame (its cause is not measured here, so it is
+         not asserted - see the note in the loop; the telescope's own failed_* verdict is stated, because that one
+         is a recorded fact);
+      2. fewer than MIN_STARS stars, or "stars" narrower than MIN_STAR_FWHM (pixel defects: no star field);
+      3. roundness more than ROUNDNESS_K sigma below the mean (``-filter-round=2.5k``);
+      4. worse than the best ``keep_percent(sensitivity)`` % by weighted FWHM (``-filter-wfwhm=N%``)."""
+    n = len(stats)
+    reasons: list[list[str]] = [[] for _ in range(n)]
+    alive = []
+    for i, s in enumerate(stats):
+        if not s.get("registered", True):
+            # The fact we actually have is that Siril returned no transform for this frame.  Why is not measured
+            # here, and asserting one lost data to weather that was never observed: C 20 (2026-10-31) dropped 34 of
+            # 157 subs under "clouds, or too few stars".  Checking the files: 31 of the 34 are the telescope's own
+            # failed_* captures (device_rejected), which is a recorded fact and is stated; for the other 3 nothing
+            # was known, which is exactly why the invented cause is dropped and the measurements are printed instead.
+            got = ", ".join(f"{k} {s[k]:g}" for k in ("nbstars", "fwhm", "roundness")
+                            if isinstance(s.get(k), (int, float)) and s[k])
+            flagged = "; the telescope itself flagged this file as a failed capture" if s.get("device_rejected") else ""
+            reasons[i].append("registration failed: Siril returned no transform for this frame ("
+                              + (f"although it measured {got}" if got else "no FWHM and no star count measured")
+                              + flagged + ")")
+        elif s.get("nbstars") is None or s["nbstars"] < MIN_STARS:
+            reasons[i].append(f"fewer than {MIN_STARS} stars")
+        elif s.get("fwhm") is not None and 0 < s["fwhm"] < MIN_STAR_FWHM:
+            reasons[i].append(f"registered on pixel defects, not stars (FWHM {s['fwhm']:.2f} px < {MIN_STAR_FWHM:g}: "
+                              "hot pixels; clouds, no star field)")
+        else:
+            alive.append(i)
+    rr = [stats[i]["roundness"] for i in alive if stats[i].get("roundness") is not None]
+    if len(rr) >= 10:
+        mu, sd = statistics.fmean(rr), statistics.pstdev(rr)
+        thr = mu - ROUNDNESS_K * sd
+        for i in list(alive):
+            r = stats[i].get("roundness")
+            if r is not None and r < thr:
+                reasons[i].append(f"stars too elongated (roundness {_shown(r, thr)})")
+                alive.remove(i)
+    pct = keep_percent(sensitivity)
+    if len(alive) >= 10 and pct < 100.0:
+        order = sorted(alive, key=lambda i: (stats[i].get("wfwhm") is None, stats[i].get("wfwhm") or 0.0))
+        keep = max(3, int(math.ceil(len(order) * pct / 100.0)))
+        cut = stats[order[keep - 1]].get("wfwhm")
+        for i in order[keep:]:
+            reasons[i].append(f"weighted FWHM worse than the best {pct:.0f}% cut: "
+                              f"{_shown(cut, stats[i].get('wfwhm') or 0.0)} px")
+    return reasons
+
+
+# --------------------------------------------------------------------------- staging
+def stage_inputs(unit: Unit, paths: list[str], prefix: str = "light") -> str:
+    """Create ``<unit.dir>/src/<prefix>_00001.fit ...`` symlinks (in the given order) and remove every
+    stale product of an earlier run (sequences, calibrated and registered frames, drizzle temp).  Siril's
+    ``link`` then sees exactly the frames we want, whatever else sits in the telescope's folder (``failed_*``,
+    jpg/png, stacks).  Why not point Siril at the raw folder: ``link``/``convert`` take every FITS in it."""
+    os.makedirs(unit.dir, exist_ok=True)
+    clean_process_dir(unit.dir)
+    src = os.path.join(unit.dir, "src")
+    os.makedirs(src, exist_ok=True)
+    for i, p in enumerate(paths, 1):
+        os.symlink(os.path.abspath(p), os.path.join(src, f"{prefix}_{i:05d}.fit"))
+    return src
+
+
+def clean_process_dir(d: str, keep_logs: bool = True) -> None:
+    """Delete sequences and frames of a previous run in ``d`` (Siril refuses to re-create a sequence over a
+    stale .seq: siril.md section 8.6) but keep logs/ and scripts/."""
+    if not os.path.isdir(d):
+        return
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        if name in ("logs", "scripts") and keep_logs:
+            continue
+        if os.path.isdir(p) and not os.path.islink(p):
+            if name.startswith(("src", "drizztmp", "cache", "u")) or name == "src":
+                shutil.rmtree(p, ignore_errors=True)
+            continue
+        if name.endswith((".fit", ".fits", ".seq", ".lst", ".txt", ".csv")) or os.path.islink(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def clean_registered(d: str) -> None:
+    """Remove the registered (r_*) frames and their sequence: the largest intermediates (up to 100 MB per
+    frame for a drizzled Seestar sub)."""
+    for name in os.listdir(d) if os.path.isdir(d) else []:
+        if name.startswith("r_") and name.endswith((".fit", ".seq")):
+            try:
+                os.remove(os.path.join(d, name))
+            except OSError:
+                pass
+    shutil.rmtree(os.path.join(d, "drizztmp"), ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- scripts
+def master_script(kind: str, work: str, out_base: str, bias: str | None = None) -> str:
+    """Stack raw calibration frames (staged as ``<work>/src/<kind>_NNNNN.fit``) into ``<out_base>.fit``.
+
+    dark / bias: ``stack <seq> rej 3 3 -nonorm`` (official OSC_Preprocessing.ssf).
+    flat: calibrate with the bias master, then ``stack pp_flat rej 3 3 -norm=mul`` (same script).
+    """
+    lines = [f"cd {quote(os.path.join(work, 'src'))}", f"link {kind} -out={quote(work)}", f"cd {quote(work)}"]
+    if kind == "flat":
+        lines.append(f"calibrate flat {quote('-bias=' + bias) if bias else ''}".rstrip())
+        lines.append(f"stack pp_flat rej 3 3 -norm=mul {quote('-out=' + out_base)}")
+    else:
+        lines.append(f"stack {kind} rej 3 3 -nonorm {quote('-out=' + out_base)}")
+    return "\n".join(lines) + "\n"
+
+
+def flat_bias_script(work: str, flat: str, bias: str, prefix: str = "cal_") -> str:
+    """Subtract the bias master from an already-stacked flat master (DWARF CALI_FRAME flats): the flat is then
+    normalised by Siril, but its pedestal (~200 ADU of 2400) would flatten the correction by ~8 %."""
+    return "\n".join([f"cd {quote(work)}", f"calibrate_single {quote(flat)} {quote('-bias=' + bias)} -prefix={prefix}"]) + "\n"
+
+
+def calibrate_script(unit: Unit, debayer: bool, force: bool = False) -> str:
+    """link + calibrate one unit.  ``-cfa`` keeps the mosaic for Bayer drizzle; ``-debayer`` only for the demosaic
+    path.  Bias is never passed together with a dark (it would be subtracted twice: Naztronomy, workflows.md 11.1).
+    Without any master and without debayering, calibrate is skipped altogether (it would only copy the frames),
+    unless ``force`` (another unit of a merged sequence is calibrated: all units must produce ``pp_light``)."""
+    lines = [f"cd {quote(os.path.join(unit.dir, 'src'))}", f"link light -out={quote(unit.dir)}", f"cd {quote(unit.dir)}"]
+    m = unit.masters
+    if unit.calibrated or debayer or force:
+        args = ["calibrate light"]
+        if m.get("dark"):
+            args.append(quote("-dark=" + m["dark"]))
+        elif m.get("bias"):
+            args.append(quote("-bias=" + m["bias"]))
+        if m.get("flat"):
+            args.append(quote("-flat=" + m["flat"]))
+        if m.get("dark"):
+            # official scripts use bare -cc=dark; spec-chum/DSA use "3 3" (hot and cold pixel sigma)
+            args.append("-cc=dark 3 3")
+        if debayer:
+            args.append("-debayer")
+        else:
+            args.append("-cfa")
+            if m.get("flat"):
+                args.append("-equalize_cfa")
+        args.append("-prefix=pp_")
+        lines.append(" ".join(args))
+    return "\n".join(lines) + "\n"
+
+
+def _plane_ratio(pl, row_med=15, sigma=None):
+    """Row-profile std / white-noise expectation of one 2-D plane over its central half of columns (see ``row_banding_ratio``)."""
+    import numpy as np
+    from scipy.ndimage import median_filter
+    pl = np.asarray(pl, dtype=np.float64)
+    w = pl.shape[1]
+    pl = pl[:, w // 8: w // 8 + w // 2]
+    dd = np.diff(pl, axis=1)
+    sig = 1.4826 * np.median(np.abs(dd - np.median(dd))) / math.sqrt(2)
+    if sigma is not None:
+        sig = sigma
+    prof = np.median(pl, axis=1)
+    hp = prof - median_filter(prof, size=row_med, mode="nearest")
+    return float(hp.std() / (1.2533 * sig / math.sqrt(pl.shape[1]))) if sig > 0 else None
+
+
+def banding_gate(ratios: list, n_rows: int) -> dict:
+    """Mean ratio against ``needed`` = 1 + BANDING_SIGMAS standard errors (1 / sqrt(2 n_rows)) of the estimate."""
+    ratios = [r for r in ratios if r is not None]
+    if not ratios:
+        return {"ratio": None, "needed": None, "banded": False}
+    r = float(sum(ratios) / len(ratios))
+    needed = 1.0 + BANDING_SIGMAS / math.sqrt(2 * n_rows)
+    return {"ratio": round(r, 3), "needed": round(needed, 3), "banded": r > needed}
+
+
+def pixel_noise(arr) -> list:
+    """Per-channel pixel noise (MAD of horizontal neighbour differences / sqrt 2) over the central half of the columns, as ``_plane_ratio`` measures it."""
+    import numpy as np
+    out = []
+    for pl in ([arr] if arr.ndim == 2 else list(arr)):
+        w = pl.shape[1]
+        dd = np.diff(np.asarray(pl, dtype=np.float64)[:, w // 8: w // 8 + w // 2], axis=1)
+        out.append(1.4826 * float(np.median(np.abs(dd - np.median(dd)))) / math.sqrt(2))
+    return out
+
+
+def image_banding_ratio(arr, noise_from=None) -> dict:
+    """Row banding of a finished-chain image ``(3, H, W)`` or ``(H, W)``: the same measure as ``row_banding_ratio`` per channel, mean over channels.  ``noise_from``: an image
+    whose pixel noise is the reference instead of the image's own (the stretched starless is measured against its noise BEFORE the denoiser: a denoiser removes the white
+    noise but keeps row-correlated structure, which inflates a ratio taken against the denoised image's own noise)."""
+    planes = [arr] if arr.ndim == 2 else list(arr)
+    ref = pixel_noise(noise_from) if noise_from is not None else [None] * len(planes)
+    return banding_gate([_plane_ratio(p, sigma=r) for p, r in zip(planes, ref)], planes[0].shape[0])
+
+
+def row_banding_ratio(paths: list[str], pattern: str = "RGGB") -> dict:
+    """Row banding of calibrated CFA subs, relative to the pixel noise.  Per Bayer plane: the clipped (median) row profile over the central half of
+    the columns, high-passed with a 15-row median (keeps stripes a few px apart, drops the gradient), its std divided by the white-noise expectation
+    1.2533 * sigma / sqrt(n_columns) (sigma = MAD of horizontal neighbour differences / sqrt 2; 1.2533 = the median's efficiency loss).  1.0 = no
+    row noise; the estimate's own standard error is 1 / sqrt(2 n_rows), so ``needed`` = 1 + BANDING_SIGMAS standard errors."""
+    import numpy as np
+    from astropy.io import fits
+    ratios, n_rows = [], 0
+    step = max(1, len(paths) // BANDING_SAMPLE)
+    for p in paths[::step][:BANDING_SAMPLE]:
+        try:
+            with fits.open(p) as h:
+                d = np.asarray(h[0].data, dtype=np.float64)
+        except (OSError, ValueError, TypeError):
+            continue
+        if d.ndim != 2:
+            continue
+        for oy in (0, 1):
+            for ox in (0, 1):
+                pl = d[oy::2, ox::2]
+                ratios.append(_plane_ratio(pl))
+                n_rows = pl.shape[0]
+    if not [r for r in ratios if r is not None]:
+        return {"ratio": None, "needed": None, "banded": False}
+    g = banding_gate(ratios, n_rows)
+    g["n_subs"] = len(ratios) // 4
+    return g
+
+
+def banding_split_script(unit: Unit, seq: str) -> str:
+    """Split the calibrated mosaic sequence into its four Bayer planes: ``CFA0_<seq>_NNNNN.fit`` .. ``CFA3_`` (Siril's default names; its
+    ``-prefix=`` option crashes 1.4.4)."""
+    return "\n".join([f"cd {quote(unit.dir)}", f"seqsplit_cfa {seq}"]) + "\n"
+
+
+def banding_fix_script(unit: Unit, seq: str, amount: float = BANDING_AMOUNT, sigma: float = BANDING_SIGMA) -> str:
+    """``seqfixbanding`` on each Bayer plane (horizontal banding, the default) -> ``unband_CFA<k>_<seq>_NNNNN.fit``."""
+    lines = [f"cd {quote(unit.dir)}"]
+    lines += [f"seqfixbanding CFA{k}_{seq} {amount:g} {sigma:g}" for k in range(4)]
+    return "\n".join(lines) + "\n"
+
+
+def banding_merge_script(unit: Unit, seq: str, pattern: str) -> str:
+    """Rebuild the mosaic: ``mCFA_unband_CFA0_<seq>_NNNNN.fit`` (the plane order CFA0..3 is the pattern's reading order, as ``seqsplit_cfa`` wrote it)."""
+    planes = " ".join(f"unband_CFA{k}_{seq}" for k in range(4))
+    return "\n".join([f"cd {quote(unit.dir)}", f"seqmerge_cfa {planes} {pattern.upper()}"]) + "\n"
+
+
+def banding_cleanup(unit_dir: str, seq: str, prefixes: tuple[str, ...]) -> None:
+    """Delete the intermediates ``<prefix><k>_<seq>_*`` (frames and .seq) of a banding stage: ``("CFA",)`` after the de-banding,
+    ``("unband_CFA",)`` after the merge, ``("mCFA_unband_CFA",)`` for the merge's own .seq file."""
+    for name in os.listdir(unit_dir):
+        if any(name.startswith(f"{p}{k}_{seq}_") for p in prefixes for k in range(4)):
+            try:
+                os.remove(os.path.join(unit_dir, name))
+            except OSError:
+                pass
+
+
+def banding_install(unit_dir: str, seq: str) -> int:
+    """Put the de-banded mosaics in place of ``<seq>_NNNNN.fit`` (the .seq file stays valid: same names and count).  Siril renames FILTER to
+    ``<FILTER>_CFA0`` in the merged files (the stack header, and with it the dual-band / SPCC filter decisions, inherit it): restored from the
+    calibrated sub.  Replaces the file itself, never a symlink target (lights-only sets: ``light_*.fit`` link to the raw subs).  Returns the count."""
+    from astropy.io import fits
+    n = 0
+    for name in sorted(os.listdir(unit_dir)):
+        if not (name.startswith(f"mCFA_unband_CFA0_{seq}_") and name.endswith(".fit")):
+            continue
+        dst = os.path.join(unit_dir, name[len(f"mCFA_unband_CFA0_"):])
+        filt = None
+        try:
+            with fits.open(dst) as h:
+                filt = h[0].header.get("FILTER")
+        except OSError:
+            pass
+        if filt is not None:
+            with fits.open(os.path.join(unit_dir, name), mode="update") as h:
+                h[0].header["FILTER"] = filt
+        if os.path.islink(dst):
+            os.remove(dst)
+        os.replace(os.path.join(unit_dir, name), dst)
+        n += 1
+    return n
+
+
+def seq_name(units: list[Unit], debayer: bool) -> str:
+    """Name of the (merged) calibrated sequence the registration works on."""
+    return "pp_light" if (debayer or any(u.calibrated for u in units)) else "light"
+
+
+def merge_script(units: list[Unit], process_dir: str, seq: str) -> str:
+    """Merge the units' sequences into ``<process_dir>/<seq>`` (one registration => true multi-night rejection;
+    DESIGN section 4)."""
+    srcs = " ".join(quote(os.path.join(u.dir, seq)) for u in units)
+    return f"cd {quote(process_dir)}\nmerge {srcs} {seq}\n"
+
+
+def register_script(process_dir: str, seq: str, n: int, resampling: dict | None = None) -> str:
+    """Select everything, then compute the 2-pass registration (transforms only: no output images)."""
+    return "\n".join([f"cd {quote(process_dir)}", f"select {seq} 1 {n}", f"register {seq} {REGISTER_ARGS}"]) + "\n"
+
+
+def apply_script(process_dir: str, seq: str, n: int, excluded: list[int], resampling: dict, reference: int | None = None) -> str:
+    """``unselect`` the excluded frames (0-based indices; Siril's select/unselect are 1-based and inclusive),
+    then ``seqapplyreg`` of the included ones.  ``-filter-included`` makes Siril honour the selection.  ``reference``: the 0-based index of the
+    frame whose grid the output takes (``setref``; it must be among the frames applied) - the experiments' frame subsets set it, so that stacks
+    of registrations that chose different reference frames share one grid."""
+    lines = [f"cd {quote(process_dir)}", f"select {seq} 1 {n}"]
+    if reference is not None:
+        lines.append(f"setref {seq} {int(reference) + 1}")
+    for a, b in ranges(excluded):
+        lines.append(f"unselect {seq} {a + 1} {b + 1}")
+    args = [f"seqapplyreg {seq}", f"-framing={resampling.get('framing', 'max')}", f"-scale={resampling.get('scale', 1.0):g}"]
+    if resampling["mode"] == "drizzle":
+        args += ["-drizzle", f"-pixfrac={resampling['pixfrac']:g}", f"-kernel={resampling['kernel']}"]
+    else:
+        args.append(f"-interp={resampling.get('interp', 'lanczos4')}")
+    args.append("-filter-included")
+    lines.append(" ".join(args))
+    return "\n".join(lines) + "\n"
+
+
+def unstackable_max_framing(seq_file: str) -> bool:
+    """Whether a ``seqapplyreg -framing=max`` output cannot be stacked by Siril: its frames differ in size but every
+    registration matrix is the identity.  Frames registered within a fraction of a pixel of each other (an
+    undithered night, SNR G180.0-01.7 2026-10-18: offsets <= 0.02 px) all sit at offset 0 on the max canvas, yet a
+    bounding box rounded one row short (3840 x 2159) makes the sequence variable-size; Siril then reports "No
+    registration data in the sequence" and "The sequence has different image sizes but no registration data, cannot
+    stack".  Such frames are re-applied at the reference frame's size (``-framing=current``): the same pixel grid."""
+    sizes, ident = set(), True
+    try:
+        with open(seq_file, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                p = ln.split()
+                if ln.startswith("I ") and len(p) >= 4 and "," in p[3]:
+                    sizes.add(p[3])
+                elif ln.startswith("R") and " H " in ln:
+                    h = [float(v) for v in ln.split(" H ", 1)[1].split()[:9]]
+                    if len(h) == 9 and max(abs(a - b) for a, b in zip(h, (1, 0, 0, 0, 1, 0, 0, 0, 1))) > 1e-9:
+                        ident = False
+    except (OSError, ValueError):
+        return False
+    return len(sizes) > 1 and ident
+
+
+def stack_script(process_dir: str, seq: str, rej: dict, n_stacked: int, out: str = "stack_raw",
+                 weight: str = "wfwhm", output_norm: bool = True) -> str:
+    """The final integration of the registered frames.  Flags: the community consensus of siril.md section 5.6
+    (``-norm=addscale -output_norm -rgb_equal -maximize -32b -weight=wfwhm``; ``-fastnorm`` above 1000 frames)."""
+    args = [f"stack r_{seq}", f"rej {rej['type']} {rej['low']:g} {rej['high']:g}", "-norm=addscale"]
+    if output_norm:
+        args.append("-output_norm")
+    args += ["-rgb_equal", "-maximize", "-32b", "-rejmap"]          # -rejmap: one merged rejection map (Siril docs), shown in the Diagnostics tab
+    if weight:
+        args.append(f"-weight={weight}")
+    args.append("-filter-included")
+    if n_stacked > FASTNORM_FRAMES:
+        args.append("-fastnorm")
+    args.append(quote("-out=" + out))
+    return f"cd {quote(process_dir)}\n" + " ".join(args) + "\n"
+
+
+def subset_stack_script(process_dir: str, seq: str, n_reg: int, others: list[int], ref_pos: int, rej: dict, out: str, n_stacked: int,
+                        weight: str = "wfwhm") -> str:
+    """Stack a subset of the registered sequence with the stack's own flags (``stack_script``): ``others`` = 1-based positions (in the r_
+    sequence) of the frames left out, ``ref_pos`` = the position of a frame of the subset (``setref``: the normalisation reference must be one
+    of the stacked frames).  Every frame of the r_ sequence lies on the one -framing=max canvas, so the subset stack has the stack's pixel grid."""
+    lines = [f"cd {quote(process_dir)}", f"select r_{seq} 1 {n_reg}"]
+    for a, b in ranges([o - 1 for o in others]):
+        lines.append(f"unselect r_{seq} {a + 1} {b + 1}")
+    lines.append(f"setref r_{seq} {ref_pos}")
+    body = stack_script(process_dir, seq, rej, n_stacked, out=out, weight=weight).split("\n", 1)[1]
+    return "\n".join(lines) + "\n" + body.replace(" -rejmap", "")
+
+
+def group_stack_script(process_dir: str, seq: str, n_reg: int, others: list[int], ref_pos: int, rej: dict,
+                       out: str, n_stacked: int) -> str:
+    """Stack ONE exposure group of the registered sequence (HDR).  ``others`` = 1-based positions (in the r_
+    sequence) of the frames of the other groups, ``ref_pos`` = position of this group's best frame.
+
+    * ``setref``: the additive+scale normalisation matches every frame to the sequence's reference; making the
+      reference a frame of THIS group keeps the group's own exposure scale, which the HDR blend needs (a long
+      exposure normalised to a short reference would lose the exposure ratio);
+    * no ``-output_norm`` and no ``-rgb_equal`` for the same reason (the blend works on radiance; colour balance
+      is equalised once, on the blend)."""
+    lines = [f"cd {quote(process_dir)}", f"select r_{seq} 1 {n_reg}"]
+    for a, b in ranges([o - 1 for o in others]):
+        lines.append(f"unselect r_{seq} {a + 1} {b + 1}")
+    lines.append(f"setref r_{seq} {ref_pos}")
+    args = [f"stack r_{seq}", f"rej {rej['type']} {rej['low']:g} {rej['high']:g}", "-norm=addscale", "-maximize", "-32b",
+            "-weight=wfwhm", "-filter-included"]
+    if n_stacked > FASTNORM_FRAMES:
+        args.append("-fastnorm")
+    args.append(quote("-out=" + out))
+    lines.append(" ".join(args))
+    return "\n".join(lines) + "\n"
+
+
+def platesolve_script(session_dir: str, stack: str, frame: Frame | None, force: bool = True,
+                      solved: str = "stack_solved") -> str:
+    """Plate-solve the stack with Siril (online catalogues: NOMAD/Gaia via VizieR).
+
+    Centre and scale come from the stack header (it inherits RA/DEC/FOCALLEN/XPIXSZ from the first sub: DWARF has
+    RA/DEC in degrees + FOCALLEN + XPIXSZ, Seestar has RA/DEC, ASIAIR too).  Explicit centre coordinates are NOT
+    passed: Siril 1.4.4 rejects every format we tried ("83.8,-5.4", "83.8 -5.4", sexagesimal) as an invalid
+    argument, while the header route works.  ``-focal``/``-pixelsize`` are given explicitly (the pixel size of the
+    stack, which differs from the sub's when drizzled at 2x).  Siril flips an upside-down solution to north-up
+    (default behaviour, kept: the exported image is then upright)."""
+    lines = [f"cd {quote(session_dir)}", f"load {quote(stack + '.fits')}"]   # explicit: a stale stack.fit would win
+    args = ["platesolve" + (" -force" if force else "")]
+    if frame is not None and frame.focallen:
+        args.append(f"-focal={frame.focallen:g}")
+    if frame is not None and frame.pixsize:
+        args.append(f"-pixelsize={frame.pixsize:g}")
+    lines.append(" ".join(args))
+    # `setext fit`: Siril writes <name>.fit; the session moves it over stack.fits afterwards
+    lines.append(f"save {quote(solved)}")
+    lines.append("close")
+    return "\n".join(lines) + "\n"

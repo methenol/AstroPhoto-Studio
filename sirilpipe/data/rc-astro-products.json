@@ -1,0 +1,66 @@
+{
+ "schemaVersion": 6,
+ "cliVersion": "2.6.10",
+ "devices": [
+  {
+   "id": "auto",
+   "kind": "auto",
+   "device": "gpu",
+   "name": "NVIDIA GeForce RTX 4080 Laptop GPU"
+  },
+  {
+   "id": "gpu",
+   "kind": "gpu",
+   "name": "NVIDIA GeForce RTX 4080 Laptop GPU"
+  },
+  {
+   "id": "cpu",
+   "kind": "cpu"
+  }
+ ],
+ "activationUrl": "https://www.rc-astro.com/account",
+ "products": [
+  {
+   "key": "bxt",
+   "name": "RC-Astro BlurXTerminator",
+   "displayName": "BlurXTerminator",
+   "mlVersions": [
+    5,
+    4,
+    2
+   ],
+   "license": {
+    "status": "required",
+    "valid": false,
+    "message": "A license is required to use this software"
+   }
+  },
+  {
+   "key": "sxt",
+   "name": "RC-Astro StarXTerminator",
+   "displayName": "StarXTerminator",
+   "mlVersions": [
+    11
+   ],
+   "license": {
+    "status": "required",
+    "valid": false,
+    "message": "A license is required to use this software"
+   }
+  },
+  {
+   "key": "nxt",
+   "name": "RC-Astro NoiseXTerminator",
+   "displayName": "NoiseXTerminator",
+   "mlVersions": [
+    3.1,
+    2
+   ],
+   "license": {
+    "status": "required",
+    "valid": false,
+    "message": "A license is required to use this software"
+   }
+  }
+ ]
+}
