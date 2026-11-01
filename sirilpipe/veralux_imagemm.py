@@ -107,8 +107,12 @@ switches (``run_imagemm`` arguments, ``imagemm_*`` settings), on by default.
     least-squared on, support to 80 px) instead of through a 1 px Gaussian, because a star deposited as a delta has no halo for the restoration to
     refine against: measured on C 20 (2026-11-01, the 14 rewritten stars of the ImageMM delivery) they carry 68.5 % of their r<12 light inside r<2 where the stack carries 10.7 %,
     and an eighth of the stack's share at r4-6 - the complaint against the ImageMM renders (hot point with missing halo, colour crowns after
-    finishing).  Off until the fleet's renders say otherwise; the shape each star was deposited with is recorded (the fraction of its light inside
-    r<2), because a change to the starting point of a restoration is only believable by its before/after measurement.
+    finishing).  A/B on C 49 (2026-11-01, its .ab14 private copy, 60 stars from the stack's own plateaus, 150 iterations, censor off, the only
+    difference the knob): the delta arm keeps 0.71 of the stack's r0-12 light and starts each star with 0.80-0.88 of its light inside r<2, the
+    kernel arm keeps 0.82 and starts them at 0.42-0.53, with every star's measured light and the sky ratio (x0.99) left where they were, the
+    restored PSF landing nearer the frames' own kernel (1.716 vs 1.759 px) and the run finishing 16 % quicker - so this is the shipped default.
+    The shape each star was deposited with is recorded in ``last_run_info['point_initial']``, because a change to the starting point of a
+    restoration is only believable by its before/after measurement.
 The lower bound's margin is 1 sigma (``bound_sigma``): 3 sigma let rings of -1.2 sigma form round bright stars in R / B,
 0 sigma clipped the sky noise.  The input frames are the stack's own Bayer drizzle when the stack is one (the stage):
 the script's debayer mixed the colours (ImageMM R/G = 0.32 + 1.28 x the stack's).
@@ -159,7 +163,8 @@ DEFAULTS = {"iterations": 150, "kappa": 2.0, "huber_delta": 0.05, "mu": 0.1, "st
             "point_init": True,
             # deposit that point through the frames' own kernel rather than as a 1 px Gaussian (change 34): a delta has no halo to refine against.
             # Measured on C 20 (its ImageMM delivery, 14 rewritten stars): those stars hold 68.5 % of their r<12 light inside r<2 (the stack: 10.7 %) and 1/8 of its share at r4-6.
-            "point_kernel": False,
+            # The A/B that settled the default is C 49's (change 34's entry): 0.71 -> 0.82 of the stack's r0-12 light kept, per-star light unchanged.
+            "point_kernel": True,
             # saturated pixels are missing data (the paper's mask), not censored: next to a full well the detector is
             # non-linear (charge spill to 8-10 px round the brightest stars, M 31), and "at least the clip level" there
             # forced the star's light up until its wings over-predicted 6-18 px - a moat held at the lower bound
@@ -2457,7 +2462,7 @@ class ImageMMEngine:
     def run_imagemm(self, store: FrameStore, iterations=20, upscale_factor=1,
                     huber_delta=0.05, kappa=2.0, mu=0.1, stop_epsilon=1e-5,
                     shot_noise_scale=1.0, read_noise=0.0, saturation_level=None,
-                    psf_sigma=1.0, variance_from="model", per_channel_psf=True, latent_sigma=1.0, lower_bound="local", reference_psf=True, photometry=True, noise_model="ptc", huber_sigma=2.0, halo=False, saturated_points=False, saturated_photometry=True, psf_wings=False, psf_asymmetry=True, psf_radial_wings=True, bound_sigma=1.0, bloom_grow=4, point_init=True, point_kernel=False, censor_saturated=False, wing_correction=None, callback=None, cancel=None, log=print):
+                    psf_sigma=1.0, variance_from="model", per_channel_psf=True, latent_sigma=1.0, lower_bound="local", reference_psf=True, photometry=True, noise_model="ptc", huber_sigma=2.0, halo=False, saturated_points=False, saturated_photometry=True, psf_wings=False, psf_asymmetry=True, psf_radial_wings=True, bound_sigma=1.0, bloom_grow=4, point_init=True, point_kernel=True, censor_saturated=False, wing_correction=None, callback=None, cancel=None, log=print):
         """The script's ``run_imagemm`` on a ``FrameStore`` (stars from ``store.stars``).  Returns the restored image
         (C, r H, r W) float32 in the frames' units; ``self.last_run_info`` says how it went."""
         torch, _, F, _ = _torch()

@@ -30,18 +30,21 @@ def test_available_does_not_import_torch_at_module_import():
     assert "import torch" not in head and "import astrophoto" not in head
 
 
-def test_map_params_defaults_are_the_scripts_gui_defaults_plus_the_fixes():
+def test_the_measured_fixes_ship_in_the_position_they_were_measured_to():
+    """What the stage owes the module docstring: every ImageMM fix that was measured into existence keeps the position
+    that measurement settled, so a refactor cannot quietly un-adopt it.  Deliberately a SUBSET comparison of the
+    decisions that carry provenance - the tuning values (iterations, mu, kappa, psf_sigma) are no contract at all, and
+    a whole-dict freeze has already been wrong twice: `r` arrived without it, and change 34's `point_kernel` default
+    moved on the C 49 A/B (0.71 -> 0.82 of the stack's r0-12 star light kept), which is not a regression."""
+    shipped = {"variance_from": "model", "per_channel_psf": True, "latent_sigma": 1.0, "lower_bound": "local",
+               "reference_psf": True, "photometry": True, "noise_model": "ptc", "huber_sigma": 2.0, "bound_sigma": 1.0,
+               "bloom_grow": 4, "point_init": True, "point_kernel": True, "saturated_photometry": True,
+               "psf_asymmetry": True, "psf_radial_wings": True,
+               # and the four the shipped configuration leaves off (change notes in veralux_imagemm's DEFAULTS say why)
+               "censor_saturated": False, "halo": False, "saturated_points": False, "psf_wings": False}
     kw = S.map_params({})
-    assert kw == {"iterations": 150, "kappa": 2.0, "huber_delta": 0.05, "mu": 0.1, "stop_epsilon": 1e-5,
-                  "saturation_level": None, "shot_noise_scale": 1.0, "read_noise": 0.0, "psf_sigma": 1.0,
-                  "formal_mode": False, "r": 1,
-                  # the pipeline's fixes (veralux_imagemm module docstring), on by default
-                  "variance_from": "model", "per_channel_psf": True, "latent_sigma": 1.0, "lower_bound": "local",
-                  "reference_psf": True, "photometry": True, "noise_model": "ptc", "huber_sigma": 2.0, "halo": False,
-                  "saturated_points": False, "saturated_photometry": True, "psf_wings": False, "psf_asymmetry": True, "psf_radial_wings": True,
-                  "bound_sigma": 1.0, "bloom_grow": 4, "point_init": True, "censor_saturated": False}
-    # the 1.x keys are ignored
-    assert S.map_params({"imagemm_delta": 2.0, "imagemm_max_iters": 2000, "imagemm_n2n": True}) == kw
+    assert {k: kw[k] for k in shipped} == shipped, {k: (kw[k], v) for k, v in shipped.items() if kw.get(k) != v}
+    assert S.map_params({"imagemm_delta": 2.0, "imagemm_max_iters": 2000, "imagemm_n2n": True}) == kw  # the 1.x keys are ignored
 
 
 def test_map_params_keys_ranges_and_types():
