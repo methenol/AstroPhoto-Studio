@@ -53,6 +53,14 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    SPCC colour calibration (sensor and filter from the headers; narrowband mode for dual-band filters); BlurXTerminator sharpen with
    the 1-2 h values of research/pro-workflow.md (Sharpen Stars 0.25-0.35, Nonstellar 0.5-0.6, halos 0; the lower end on noisy data); NoiseXTerminator `--dn` 0.8 .. 0.5 on the linear
    data (GraXpert denoise 0.8 .. 0.6, or Siril, as fallbacks).  `deconv_method = imagemm` runs VeraLux ImageMM (`sirilpipe/veralux_imagemm.py`) on the subs instead: the stack's own calibrated, cosmetic-corrected Bayer-drizzle frames with its registration, per-colour saturation masks (pixels within `imagemm_bloom_grow` px of them left out, and within 0.75 x the equivalent radius of a large saturated patch), then the multi-frame restoration with per-frame kernels (plus the optics' static asymmetry and an extended wing to 80 px joined from unsaturated and saturated stars, with its per-channel colour and lobe measured on the saturated stars); a saturated star starts as a point at the light PSF photometry of its unsaturated wings measures, centred on its missing data, and where the frames' data are sparse it becomes the restored image's PSF at its wings' colour, joined to the restoration with the restoration's own structure kept and the PSF's tail fading on; saturated galaxy nuclei get their colour from their wings; the result is put on the stack's photometric scale per channel from the unsaturated stars' flux ratios (sky offset from the median); no BlurXTerminator.
+   Before restoring, the frames' whole-pixel origin on stack.fits' canvas is measured (Siril rounds its `-framing=max` box
+   differently by up to 1 px, and an HDR stack's canvas is the union of the exposure groups' own boxes): the correlation
+   decides when it is confident, and where a real sky leaves it flat - best 0.49, the whole search within 0.003 - the
+   origins are tried from the frames' own box outward and the sub-pixel residual decides, the least move inside
+   `imagemm_stage.ALIGN_TOLERANCE` winning.  Frames that already sit on the stack's pixels are therefore never shifted
+   (C 20 2026-11-01 was refused for 1 px the correlation imagined, and delivered un-restored), and a session is refused
+   only when no origin within the sizes' allowance puts them there; every origin measured is recorded with the
+   preparation (`frames_flipped.origin_residuals`).
 6. **Stars** — StarXTerminator on the linear data (or StarNet2 `--linear`; Cosmic Clarity DarkStar with `star_removal = darkstar`), no unscreen: `stars = linear - starless`.
    **Linear tools are the user's choice** (*Integration & options*): deconvolution per region, `deconv_method` for the objects
    and `deconv_stars_method` for the stars (a request naming only `deconv_method` deconvolves the stars with it too; the former
@@ -69,6 +77,41 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
    deconvolved by its own tool. `denoise_method` auto (NXT, else GraXpert, else Siril) / nxt / graxpert / siril / none. A tool chosen
    explicitly that cannot run is recorded and nothing else runs in its place; the same holds for DarkStar, Cosmic Clarity's steps,
    the Hubble palette script and a super-resolution scale Cosmic Clarity has no model for (2x / 3x / 4x only).
+   The step then guards the stars' photometry, at the two points where a reference genuinely shares the image's units.
+   A restoration that came from ImageMM is judged **as it is adopted**, against `stack.fits` on the same grid (the two
+   were fitted to each other by `imagemm_stage.match_to_stack` and both then carry the same scale factor, so no scale
+   has to be guessed); the star pass is judged at the end of the step, against the image as it found it.  A star's
+   light is its aperture out to r=12 above its own neighbourhood sky -- a sum, so a deconvolution that merely moves
+   light inward reads 1.00 -- and the stars whose light moved by more than a tenth, in total or in one channel alone
+   (the coloured crown), are handed back from the reference pixels on a taper, because a deconvolution may move a
+   star's light inward but may not delete it.  Nothing is judged against the frames after the white balance: a
+   per-channel pedestal (background subtraction) cancels in a star's excess and a per-channel gain (white balance,
+   SPCC) does not, and a scale read off two sky medians cannot tell them apart -- judging that way reported every star
+   of C 20 as carrying 1.39 of the light the frames took, and would have handed the frame back un-white-balanced.
+   `restore_meta.json` records the population's ratios, how many stars were refused and which mode decided
+   (`star_photometry`); `star_photometry_guard = false` turns the check off.
+
+   The same yardstick guards the **denoiser**, which has no reason to touch a star: the stack has already averaged
+   that noise away, so whatever a denoiser removes from a star is light it should not have taken.  After the tool
+   runs, the same isolated population is measured again against the image the step was handed.  If the median star
+   has lost more than the tenth the restoration is allowed, the same tool is re-run weaker — the ladder from the
+   requested strength to zero in `post.DENOISE_DESCALATION` steps — and the strongest pass whose stars are back
+   inside tolerance is the one that ships, with its real strength written back into the step's recorded `params` and
+   every attempt kept in `restore_meta.json`.  Measured on C 49's chain: GraXpert at the requested strength (0.80)
+   left the stars at 0.75 of the light the frames took; the ladder tried 0.53 (0.82) and shipped 0.27, stars at 0.91.
+
+
+   The **satellite remover** repaints rather than models, so it is judged on its pixels.  A fill gives itself away
+   twice: nothing inside it varies, and it need not sit at the level of the sky it covers.  `post.painted_patch`
+   compares the step's own input and output on a `post.PAINT_CELL` grid and hands the frames back the cells the tool
+   made matte (or quiet) while their input was not *and* whose sky moved — past `post.PAINT_MIN` of the sky and past
+   the cell median's own `post.PAINT_SE` standard errors, so a fill that left the sky alone is left as the tool made
+   it.  The verdict then grows along the fill (`post.PAINT_GROW`), because a fill thins at its edges and leaves the
+   sky's noise there, and refuses itself above `post.PAINT_MAX` of the frame, which is a gradient and not paint.
+   Measured on IC 1848 (2026-11-01): `--sat-mode full --sensitivity 0.1` run alone on the session's own stack laid a
+   7 × 150 px stripe 8.3 % of the sky below its surroundings, 94 % of it at one value — and the stretch, whose slope
+   at the sky is 75-120, delivered that matte pedestal as a black bar.  The verdict is recorded as
+   `params.painted_patch` on the step.
 
    **Cosmic Clarity** (optional, instead of or in addition to the RC-Astro tools): siril-scripts' `CosmicClarity_Native.py`
    ("Cosmic Clarity AI4 for Siril", engines and models © SetiAstro) — its processing functions run headless by
@@ -90,19 +133,79 @@ RC-Astro's published guidance; the sources are cited next to each constant in `s
 7. **Auto-finish** — `autofinish.py` picks among published values by stated rules (small vs frame-filling target, clipping -> HDR, dual-band vs broadband -> palette / SCNR,
    star density -> reduction, SNR -> NXT strength); every decision is in the report with its rule.
 8. **Export** — `pro.py`, the professional chain, every step a Siril command, a pyscript or an rc-astro call, a picture saved after each step
-   (`process/finish/steps/NN_<step>.png`) and the verbatim commands in the sidecar (`linear_info.chain`):
+   (`process/finish/steps/NN_<step>.png` — shown through a linked autostretch, so they only carry the truth from the stretch onwards) and the
+   verbatim commands in the sidecar (`linear_info.chain`, whose per-step `levels` also carry `sky_channels`, the median of each channel over
+   `gates.sky_mask` — the numbers a colour cast is traced with, and which a layer holding no sky at all, the star layer, records nothing for):
    colour-gradient removal (`subsky 2`, mean model added back) and background neutralisation (per-channel offsets) on the linear starless;
    **Statistical Stretch** (Seti Astro, `pyscript Statistical_Stretch.py`, median 0.10 for a small subject / 0.25 frame-filling) as the default; or the **GHS two-pass stretch** by `ght` (pass 1 SP at the histogram's left half-maximum, b 10, D raised until the background reaches 0.10; `linstretch -BP` at the histogram toe;
    pass 2 SP on the nebula mask's median, b 4, D 1, LP = background, HP < 1 when `hdr` is on) — alternatives `statstretch` (`pyscript Statistical_Stretch.py -median 0.10|0.25 -sigma 5 -linked`),
    `autoghs`, `modasinh`, `autostretch`, `hms` (each after `linstretch -BP` at the histogram toe, its one parameter raised until the background is 0.10); highlights (GHS HP / Statistical Stretch `-hdr` / Wavescale HDR); NoiseXTerminator on the stretched starless
-   (`--di --dn`, `--dc 0.95`; GraXpert fallback; Cosmic Clarity Denoise instead with `cc_denoise`); Cosmic Clarity Sharpen on the recombined image with `cc_sharpen`; dual-band palette by
+   (`--di --dn`, `--dc 0.95`; GraXpert fallback; Cosmic Clarity Denoise instead with `cc_denoise`) — the amount is a floor, not a ceiling: the sky
+   the tool leaves is measured with the export's own statistic (`gates.pixel_noise`) and, while it sits above the `sky_pixel_noise` limit, the same
+   tool is re-run harder up to its own maximum (at most `pro.DENOISE_ESCALATION` extra passes, the ladder ending on the ceiling), a harder pass
+   that newly fails any other gate being refused and every attempt recorded in the chain; Cosmic Clarity Sharpen on the recombined image with `cc_sharpen`; dual-band palette by
    **Hubble_Palette_from_Dual-Band_OSC.py** itself (siril-scripts, Carlo Mollicone – AstroBOH; GUI-only, run headless inside Siril by
    `sirilpipe/hubble_palette_worker.py`, which selects the palette and formula preset and presses its *Apply*): HOO (default, Classic or
    Improved) and the Hubble-like SHO / HSO / OSH / OHS / HOS with its synthetic SII, presets Classic / Improved / Advanced / NonLinear S2
    (`hubble_formula`); SCNR after the Ha-in-green palettes (SHO, OHS); foraxx / hoo_warm by `pm`; NBN port as the palette `nbn` (its OIII boost `oiii_boost`); broadband `rmgreen 3`; local contrast by `clahe`
-   under a mask (150 and 40 px); the GHS saturation stretch (`ght -sat`, D fitted so the subject's mean saturation reaches its target, under the range mask); stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
+   under a mask (150 and 40 px) whose sky floor is the frame's own for one tile in from each edge, where that band is sky rather than the subject (`edge_sky_floor`); the GHS saturation stretch (`ght -sat`, D fitted so the subject's mean saturation reaches its target, under the range mask); stars by the Seti Star Stretch (`mtf 0 0.004098 1`), magenta fix, DSA star reduction and a screen recombination
    (`pm "~(~$starless$*~$stars$)"`); black point at the toe and `icc_convert_to sRGB relative`; sRGB JPEG + 16-bit TIFF + the JSON sidecar.  The exporter computes and prints the
-   **gates** of research/FINISH-SPEC.md (`gates.py`) and stores them in the sidecar.  The preview runs the same chain without the AI steps.  The outer 24 px of the stack are trimmed.
+   **gates** of research/FINISH-SPEC.md (`gates.py`) and stores them in the sidecar; the dataset card (`status.export_gates`) and the exports list
+   (`GET /api/exports`, `gates.verdict`) show that verdict, so a render that failed its own gates is never handed out
+   silently.  Where the chain holds a tool that can reach a failing number it is tried first - the delivered sky's
+   noise, the sky's colour through SCNR, the sky's level through the final midtones, the star light under the
+   deconvolution and the denoiser - and a gate no tool can answer is still delivered as a measurement, because the
+   person who set the parameters decides what to do with the picture.
+   `stars_coloured` measures a star's flux colour **above its own local sky** - the aperture's sum minus its area times the
+   median of the ring around it, per channel (`gates._SAT_APER`/`_SAT_RING`), with the peak detection reading above the star
+   layer's own median floor.  Summed raw, a brighter pedestal under the star is added equally to all three channels and
+   (max - min) / max collapses with the star unchanged - the same red star reads 0.80 over a dark sky and 0.003 over a
+   pedestal of 0.3, and sky pixels pass an absolute detection level once the pedestal rises - so the gate was reading the
+   sky's brightness and calling it the stars' colour (M 31, 2026-11-01: identical stars, 0.101 with the sky a shade lower and
+   0.097 against the 0.10 floor once the stretch's black clip lifted it).  A colour gate may not move with the light a star
+   sits on, which is also why the clip is no longer judged against this floor.
+   The preview runs the same chain without the AI steps.  The outer 24 px of the stack are trimmed.
+   SCNR (`rmgreen 3`) is judged on the sky it leaves, by the gate's own number.  Its amount is decided on the
+   *subject* (`autofinish`: median G - (R + B) / 2 over the subject mask) and Siril reduces green over the whole
+   frame while preserving lightness - the green it lifts out comes back through red and blue - so a subject's cast
+   gets subtracted from a neutral sky and leaves it magenta (M 31, 2026-11-01: the sky's median |a*| went 0.4 -> 13.4,
+   6.7 x the gate's limit, and the render was delivered).  `pro.Finisher._scnr` measures the sky's median |a*| and
+   |b*| over `gates.sky_mask` before and after the step, retries at `pro.SCNR_SKY_TRIES` fractions of the amount
+   (the strongest pass whose sky is still inside `sky_chroma` ships, so the subject keeps its correction), and
+   refuses the step - `status: refused`, both measurements in `params` - when every pass leaves the sky past the
+   gate *and* `pro.SCNR_SKY_WORSE` times as coloured as it arrived.
+   The stretched-image denoiser is judged on the sky it leaves too, and had no such rule until it was measured: over the
+   fleet's exports (`output/.ab12/audit_exports.py --cast`, which reads the per-step `sky_channels` the chain records) it is
+   the step that moves the sky's colour most wherever no palette runs - GraXpert's noise reduction on IC 434 walked the sky
+   +31.5e-3 in (R-G)/(R+G) - and it was the one colour-changing step with neither a refusal rule nor a recorded before/after.
+   `pro.Finisher._keep_denoise` wraps every backend (Cosmic Clarity, NXT, GraXpert): the sky's median |a*|, |b*| **and the
+   spread of its four quadrants' signed tints** (`gates.quadrant_spread`, the number `sky_chroma_quadrants` gates) before
+   and after, the step retried at the weakest strength that tool itself documents, and refused - pixels handed back,
+   `status: refused`, both measurements in `params` with `refused_for` naming which of the two ruled - when every pass
+   leaves either number past its gate *and* `pro.DENOISE_SKY_WORSE` times as coloured as it arrived.  Both are asked
+   because |a*| over the sky is dominated by chroma *noise*: a denoiser that smooths the noise while tinting part of the
+   sky *improves* it, and C 20 (2026-11-01) was delivered at |a*| 1.73 of 2.0 with its quadrants 1.97 apart of 1.5.  A
+   refused tool is dropped from `self.denoiser` as well, so the
+   noise ladder above cannot escalate the very step that coloured the sky.
+   The last midtones pass is the sky's last chance at its own number: `brightness` / the Midtones slider goes through
+   `mtf 0 m 1`, and the value the chain was handed can leave the sky above `sky_median` (M 31, Seestar, 2026-11-01:
+   the sky left `finalise` at 0.134 against the window's 0.12 top, delivered with the gate failing and no record of
+   which number had been missed).  `sky_median_guard` (on) solves `m` to the edge of the window with the same
+   closed form `sky_levelling` uses - recorded as `params.sky_median_clamped = {from, to, brightness}` - and touches
+   nothing on a render whose sky is already inside it.  Off, the slider is delivered exactly as asked.
+
+   Statistical Stretch's **black clip** is judged the same way - on the sky, not on the picture's average.  The clip is
+   a threshold at the sky minus `sigma` times the sky's own noise, so wherever the sky is locally noisier more pixels
+   fall under it, and the toe of the curve (slope 75-120 at the sky) turns that into a lightness step: C 20 (EXP_15,
+   2026-09-30) hands that step a sky flat to 0.1 % and takes back sky-mask cells spread +25 % / -29.8 %, which is the
+   fleet's "wide rim offset" family (C 20 +36 %, M 31 -17 %, NGC 1499 +13/-12) - none of it in the linear frame, and
+   the script has no background option to blame because it takes no background argument at all.  `pro.Finisher._stretch_stat`
+   therefore runs the command twice, with and without `-noblackclip`, and ships the clip-free one only when its sky is
+   `pro.STRETCH_CLIP_GAIN` times more even - `pro.sky_lump`, the worst `pro.SKY_LUMP_CELL` cell's deviation from the sky
+   over `gates.sky_mask` - so unevenness that *is* the subject costs nothing to keep: a render loses its black point only
+   when the black point was what cost it the sky.  Measured on the delivered files: C 20 31.8 with the clip and 6.4
+   without (its right rim offset +43 % of sky with it), and both M 31 sessions also measured the clip as the cost.  Both
+   commands and both measurements are in the step's `params` (`black_clip`, `sky_lump`, `tried`).
 
 Which tool runs is decided at run time from the licences (`GET /api/tools`); the Linear panel in the
 UI says what will be used.

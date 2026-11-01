@@ -14,7 +14,9 @@ stretch                the background after the stretch: 0.10 (Brecher's five fi
 hdr                    on (1 = the published values: GHS HP < 1, Statistical Stretch -hdr 0.15 / 0.75, Wavescale HDR 5 / 1.5 / 5.0) when, after the stretch, more than 0.05 % of
                        the starless pixels have any channel >= 0.995 or Lab lightness >= 0.97 (FINISH-SPEC gates; Siril / fas37: < 0.1 % clipped)
 luminance_denoise      NoiseXTerminator ``--dn`` on the stretched starless: 0.85 on the noisiest data (per-pixel object SNR <= 3) down to 0.6 on clean data (SNR >= 15)
-                       (RC-Astro / Brecher 0.6-0.85-0.9: the noisier the data the stronger)
+                       (RC-Astro / Brecher 0.6-0.85-0.9: the noisier the data the stronger).  A floor, not a ceiling: the
+                       finishing chain re-runs the tool harder - to its own maximum, at most DENOISE_ESCALATION extra passes -
+                       while the sky it leaves is above the sky_pixel_noise gate, and refuses a harder pass that fails another gate
 chroma_denoise         NXT colour denoise 0.95 (NXT manual: colour 90-100 %)
 palette / oiii_boost   dual-band: HOO Classic (Ha = R, OIII = (G + B) / 2), NBN only when the user picks the palette nbn (its OIII boost is the user's); broadband: natural colour
 scnr                   broadband: 0.6 (SW Skies 0.60-0.75, low end) when the subject has a green cast (median G - (R + B) / 2 > 0.01 after the stretch), else 0; dual-band: 0
@@ -188,7 +190,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     # stretch without highlight protection: clipping measure
     tick("stretch")
     p1 = {**p0, **tuned, "hdr": 0.0, "stretch_method": method}
-    fin = pro.Finisher(work, layers.header, p1, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+    fin = pro.Finisher(work, layers.header, p1, dual, external=False, checkpoint=checkpoint, keep_pictures=False, coverage=getattr(layers, "coverage", None))
     s0 = fin.stretch(base)
     if method == "statstretch":
         # Statistical Stretch pins the image median at the target; a small faint subject (C 33) then stays close to the sky.  The script's curves boost lifts the
@@ -201,7 +203,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
         for cand in STAT_BOOSTS:
             if c >= STAT_CONTRAST_MIN:
                 break
-            fin = pro.Finisher(work, layers.header, {**p1, "stretch_boost": cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+            fin = pro.Finisher(work, layers.header, {**p1, "stretch_boost": cand}, dual, external=False, checkpoint=checkpoint, keep_pictures=False, coverage=getattr(layers, "coverage", None))
             s_b = fin.stretch(base)
             st_b = pro.level_stats(s_b)
             if hdr_rule(st_b["clipped"], st_b["white"]):
@@ -221,7 +223,7 @@ def run(session: str, meta: dict, params: dict, progress=None, checkpoint=None) 
     if hdr_on:
         hdr_value = 1.0
         tick("highlights")
-        fin2 = pro.Finisher(work, layers.header, {**p1, "hdr": hdr_value}, dual, external=False, checkpoint=checkpoint, keep_pictures=False)
+        fin2 = pro.Finisher(work, layers.header, {**p1, "hdr": hdr_value}, dual, external=False, checkpoint=checkpoint, keep_pictures=False, coverage=getattr(layers, "coverage", None))
         s0 = fin2.stretch(base)
         st1 = pro.level_stats(s0)
         if method == "ghs2" and hdr_rule(st1["clipped"], st1["white"]) and st1["white"] >= st0["white"]:

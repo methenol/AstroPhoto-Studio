@@ -60,6 +60,8 @@ SAT_GROW_DRIZZLE = 2         # a square drizzle drop (pixfrac <= 1) reaches the 
 EDGE_ERODE = 6               # px of each registered frame's footprint edge dropped (Lanczos-4 reach + debayer)
 EDGE_ERODE_DRIZZLE = 2       # drizzle: an edge pixel's partial drops are normalised by their weight
 INTERP = "lanczos4"          # Siril's default registration interpolation (the script's `register`)
+ALIGN_TOLERANCE = 0.5        # px: the residual under which the registered frames are taken to sit on the stack's pixel grid
+ORIGIN_CONFIDENT = 0.9       # correlation level from which the origin search may decide: 1.000 where the frames are the stack's content, 0.49 where a real sky gives it nothing
 
 # stack_params keys (webui/server.py STACK_DEFAULTS) -> VeraLux run_imagemm arguments
 PARAM_KEYS = {"imagemm_iterations": "iterations", "imagemm_huber": "huber_delta", "imagemm_kappa": "kappa",
@@ -330,41 +332,67 @@ def canvas_origin(seq_file: str, frame_path: str, num: int, stack: np.ndarray, c
     -framing=max box of interpolated and drizzled frames differently by up to 1 px (IC 1805: 4062 vs 4063), and an HDR
     stack's canvas is the union of its exposure groups' own stacks, each with its own box, placed by rounded outline
     offsets (Sh2-131 2026-10-27: 4139 vs 4136).  The frames share the stack's pixel grid, so the box sits on the canvas
-    at a whole-pixel origin: the one where the frame's g channel correlates best with the stack's (normalised
-    cross-correlation over the frame's pixels, every origin within the size difference + 1 px for the rounding; an
-    exhaustive search, as for the HDR groups (stackpost.refine_shift) - unwindowed phase correlation peaks at zero
-    shift on the arrays' own borders).  The best origin on the edge of a search one pixel wider means the frames are
-    further off than the sizes allow: an error.  The frame is then placed with it and the sub-pixel alignment measured
-    - the residual must be under half a pixel."""
+    at a whole-pixel origin, every origin within the size difference + 1 px for the rounding being a candidate (an
+    exhaustive search, as for the HDR groups (stackpost.refine_shift); unwindowed phase correlation peaks at zero
+    shift on the arrays' own borders).  An origin on the edge of a search one pixel wider means the frames are
+    further off than the sizes allow: an error.  Whether the correlation may *decide* is its level: at
+    ``ORIGIN_CONFIDENT`` or above the frames are the stack's own content and its answer stands; below it the search is
+    flat, so the origins are tried from the frames' own box outward and the measured residual decides, the least move
+    that lands inside ``ALIGN_TOLERANCE`` winning - frames that already sit on the stack's pixels are then not moved
+    at all (C 20 2026-11-01: best correlation 0.4920, the argmax moved them 1 px, the residual then read 10 px and the
+    session was refused).  Every origin measured comes back in the flip info (``origin_residuals``)."""
     places = sequence_placements(seq_file, canvas)
     ext = (max(p[0] + p[2] for p in places.values()), canvas[1] - min(p[1] for p in places.values()))
     ref_img = np.moveaxis(stack, 0, -1)
     probe = read_frame(frame_path, crop, places[num])
     flip, flip_info = stack_is_flipped(ref_img, probe)
     room = (abs(ext[0] - canvas[0]) + 1, abs(ext[1] - canvas[1]) + 1)
-    origin, ncc = _best_origin(np.ascontiguousarray((ref_img[::-1] if flip else ref_img)[..., 1], np.float32),
-                               np.ascontiguousarray(probe[..., 1], np.float32), (room[0] + 1, room[1] + 1))
-    if abs(origin[0]) > room[0] or abs(origin[1]) > room[1]:
-        raise RuntimeError(f"the registered frames are {list(origin)} px off stack.fits (they span {ext[0]} x {ext[1]}, "
+    scores = origin_scores(np.ascontiguousarray((ref_img[::-1] if flip else ref_img)[..., 1], np.float32),
+                           np.ascontiguousarray(probe[..., 1], np.float32), (room[0] + 1, room[1] + 1))
+    best, ncc = (max(scores, key=scores.get), max(scores.values())) if scores else ((0, 0), -2.0)
+    if abs(best[0]) > room[0] or abs(best[1]) > room[1]:
+        raise RuntimeError(f"the registered frames are {list(best)} px off stack.fits (they span {ext[0]} x {ext[1]}, "
                            f"its canvas is {canvas[0]} x {canvas[1]})")
-    flip_info = {**flip_info, "origin_correlation": round(ncc, 4)}
-    if origin != (0, 0):
-        probe = read_frame(frame_path, crop, sequence_placements(seq_file, canvas, origin)[num])
-    shift = alignment_shift(ref_img, probe[::-1] if flip else probe)
-    if max(abs(v) for v in shift) > 0.5:
-        raise RuntimeError(f"the registered frames are {shift} px off stack.fits (canvas origin {list(origin)})")
+    # The correlation ranks the candidates; whether it may decide is its level.  Flat (a real sky: best 0.4920, the
+    # whole search within 0.003) it has no information to spend, and taking its argmax anyway moved C 20's frames a
+    # pixel the stack never asked for - the residual below then read ten of them and the session shipped un-restored,
+    # with no fallback to catch it.  Below the confidence the origins are therefore tried from the frames' own box
+    # outward and the residual decides, so the least move that satisfies it wins; above it the frames are the stack's
+    # content and the correlation's answer is taken first (an HDR union canvas, Sh2-131, needs that).
+    order = sorted(scores, key=lambda o: (abs(o[0]) + abs(o[1]), -o[0], -o[1]))
+    if ncc >= ORIGIN_CONFIDENT and best in order:
+        order.remove(best)
+        order.insert(0, best)
+    tried, hit = {}, None
+    for cand in order:
+        pr = probe if cand == (0, 0) else read_frame(frame_path, crop, sequence_placements(seq_file, canvas, cand)[num])
+        shift = alignment_shift(ref_img, pr[::-1] if flip else pr)
+        tried[f'{cand[0]:+d},{cand[1]:+d}'] = shift
+        if max(abs(v) for v in shift) <= ALIGN_TOLERANCE:
+            hit = (cand, shift)
+            break
+    if hit is None:
+        least = min(tried.values(), key=lambda s: max(abs(v) for v in s))
+        raise RuntimeError(f"no canvas origin within {room[0]} x {room[1]} px of Siril's box puts the frames on the "
+                           f"stack's pixels: the least residual of the {len(tried)} origins measured was {least} "
+                           f"(best correlation at {list(best)}, ncc {ncc:.3f})")
+    origin, shift = hit
+    flip_info = {**flip_info, "origin_correlation": round(ncc, 4), "origin_candidates": len(tried),
+                 "origin_residual_px": shift, "origin_residuals": tried}
     return origin, ext, flip, flip_info, shift
 
 
-def _best_origin(ref: np.ndarray, frame: np.ndarray, room: tuple[int, int]) -> tuple[tuple[int, int], float]:
-    """The whole-pixel shift (dx, dy), |dx| <= room[0], |dy| <= room[1], that moves ``frame`` (canvas coordinates, 0 =
-    no data) onto ``ref`` best: normalised cross-correlation over the frame's pixels inside the margin the shifts can
-    reach."""
+def origin_scores(ref: np.ndarray, frame: np.ndarray, room: tuple[int, int]) -> dict[tuple[int, int], float]:
+    """{origin: normalised cross-correlation} for every whole-pixel shift (dx, dy), |dx| <= room[0], |dy| <= room[1],
+    that moves ``frame`` (canvas coordinates, 0 = no data) onto ``ref``, over the frame's pixels inside the margin the
+    shifts can reach.  The *level* is the confidence, not merely the ranking: 1.000 where the frame is the stack's own
+    content, while on a real session's sky the best candidate measured 0.4920 with the whole search spread over 0.003
+    - there it cannot say where the frames sit, only where it would slightly prefer to believe they do."""
     mx, my = room
     H, W = ref.shape
     have = frame != 0
     r = ref[my:H - my, mx:W - mx].astype(np.float64)
-    best, at = -2.0, (0, 0)
+    out = {}
     for dy in range(-my, my + 1):
         for dx in range(-mx, mx + 1):
             f = frame[my - dy:H - my - dy, mx - dx:W - mx - dx]
@@ -374,10 +402,17 @@ def _best_origin(ref: np.ndarray, frame: np.ndarray, room: tuple[int, int]) -> t
             a_, b_ = f[m].astype(np.float64), r[m]
             a_, b_ = a_ - a_.mean(), b_ - b_.mean()
             d = float(np.sqrt((a_ * a_).sum() * (b_ * b_).sum()))
-            c = float((a_ * b_).sum() / d) if d > 0 else -1.0
-            if c > best:
-                best, at = c, (dx, dy)
-    return at, best
+            out[(dx, dy)] = float((a_ * b_).sum() / d) if d > 0 else -1.0
+    return out
+
+
+def _best_origin(ref: np.ndarray, frame: np.ndarray, room: tuple[int, int]) -> tuple[tuple[int, int], float]:
+    """The best origin of ``origin_scores`` and its correlation; (0, 0), -2.0 when no candidate had pixels."""
+    scores = origin_scores(ref, frame, room)
+    if not scores:
+        return (0, 0), -2.0
+    at = max(scores, key=scores.get)
+    return at, scores[at]
 
 
 def stack_is_flipped(ref: np.ndarray, frame: np.ndarray) -> tuple[bool, dict]:
@@ -925,6 +960,37 @@ def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> 
             "region": list(region) if region else None, "scale": scale, "flip": bool(flip)}
 
 
+STAR_REPORT = ("saturated_cores", "bloom_grow", "point_initial", "saturated_photometry", "saturated_point_sources",
+               "restored_psf_stars")
+# Every star, not the first two dozen: the star verdicts are per star, and a field of a few hundred saturated cores is
+# ~50 KB of meta -- cheaper than the one defect a truncated list hides. (C 49 measured 43; only 24 were ever visible.)
+STAR_LIST_CAP = 400
+
+
+def star_diagnostics(info: dict) -> dict:
+    """What the restoration did to the saturated stars, for ``imagemm_meta.json``.
+
+    ``meta_out`` copies a whitelist of the engine's ``last_run_info``, so the keys that answer "how did the stars come
+    out" never reach the file: C 49 (2026-10-31) records no ``point_initial``, no ``saturated_photometry`` and no
+    ``bloom_grow``, although instrumentation showed all three ran on 2920 core pixels.  With them absent, a
+    restoration whose cores are wrong -- the complaint against the ImageMM renders -- cannot be told apart from one
+    whose saturated-star handling never ran at all, which is the first question to ask of either.
+
+    The engine's per-star lists are capped: the counts it reports (``cores`` / ``measured`` / ``skipped`` /
+    ``extended``) are what the file is for, and the meta has to stay readable.
+    """
+    out: dict = {}
+    for key in STAR_REPORT:
+        v = info.get(key)
+        if isinstance(v, dict):
+            over = [k for k, val in v.items() if isinstance(val, list) and len(val) > STAR_LIST_CAP]
+            v = {k: (val[:STAR_LIST_CAP] if k in over else val) for k, val in v.items()}
+            if over:
+                v["list_cap"] = STAR_LIST_CAP
+        out[key] = v
+    return out
+
+
 def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, checkpoint=None, local=None, include: list[int] | None = None,
         out_dir: str | None = None) -> dict:
     """Restore the included frames of a stacked session with VeraLux ImageMM -> ``imagemm.fits`` and
@@ -1075,6 +1141,7 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
             "norm_factor": info.get("norm_factor"), "var_floor_median": info.get("var_floor_median"),
             "effective_fraction": info.get("effective_fraction"), "preparation": prep_info,
             "peak_scale": k_norm, "photometric_match": phot, "clipped_above_1": clipped, "device": str(dev), "torch": torch.__version__,
+            **star_diagnostics(info),                     # what the restoration did to the saturated stars
             "seconds": round(time.time() - t0, 1), "seconds_restore": round(t_rest, 1),
             "seconds_per_frame_iteration": round(t_rest / max(1, info.get("iters_done") or 1) / max(1, len(store)), 4),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),

@@ -492,3 +492,57 @@ def test_imagemm_region_measures_the_psf_on_the_stack(tmp_path, monkeypatch, fak
     r = post.Restorer(str(d), {"filter": "Duo-Band", "restore_source": "imagemm.fits", "imagemm_r": 1, "imagemm_offset": [0, 0]},
                       {"deconv_method": "imagemm", "deconv_stars_method": "graxpert"}, dict(post.DEFAULTS), None, None)
     assert r.image_fwhm() == 4.3 and seen == [pytest.approx(0.2)]   # measured on the stack's values
+
+
+# ----------------------------------------------------------------------------- the border of the frame the model sees
+
+def _stub_model(monkeypatch, scale: int = 1):
+    """The tool call replaced by a tiled network's boundary condition: a model that darkens the outermost 6 px of
+    whatever array it is handed, which is what Cosmic Clarity's denoise does at a frame edge (IC 1848, 2026-10-30)."""
+    def fake(argv, **_):
+        fin, fout = argv[argv.index("--input") + 1], argv[argv.index("--output") + 1]
+        a = np.load(fin).copy()                                                  # (H, W, 3), as the worker hands it over
+        if scale > 1:
+            a = np.repeat(np.repeat(a, scale, 0), scale, 1)
+        ramp = np.linspace(0.4, 1.0, 6, dtype=np.float32)
+        a[:6] *= ramp[:, None, None]
+        a[-6:] *= ramp[::-1, None, None]
+        a[:, :6] *= ramp[None, :, None]
+        a[:, -6:] *= ramp[::-1][None, :, None]
+        np.save(fout, a)
+        return 0, []
+    monkeypatch.setattr(tools, "run_streaming", fake)
+
+
+@pytest.fixture()
+def cc_stub(monkeypatch):
+    """The real wrapper with everything around the tool call stubbed out: the geometry it promises the frame is
+    what is under test, not the model's weights."""
+    cc = tools.cosmic_clarity
+    for name in ("require", "ensure_venv", "link_system_torch"):
+        monkeypatch.setattr(cc, name, lambda *a, **k: None)
+    for name in ("script", "models_dir", "venv_python"):
+        monkeypatch.setattr(cc, name, lambda *a, **k: "/bin/true")
+    return cc
+
+
+def test_the_models_border_response_never_reaches_the_frame(tmp_path, cc_stub, monkeypatch):
+    """The models tile the frame and there is no image beyond its edge, so a model's boundary condition lands on
+    the frame's own border: the denoiser took IC 1848's left border - level with the frame's interior - 18 % of the
+    display sky dark, one line deep, which the stretch turns into a hard line in the export.  The wrapper hands the
+    model reflected image out to the tile instead and crops it back off, so the frame that comes back is the frame
+    that went in."""
+    x = (0.3 + 0.2 * RNG.random((3, 180, 240))).astype(np.float32)
+    _stub_model(monkeypatch)
+    out, _ = cc_stub.run("denoise", x, [], work=str(tmp_path))
+    assert np.array_equal(out, x)                                     # with no padding the frame's own edge comes back dark by up to 60 %
+
+
+def test_super_resolution_is_cropped_back_to_the_frame(tmp_path, cc_stub, monkeypatch):
+    """The padding is cropped in the mode's own scale: an enlarged frame must come back enlarged by exactly the
+    asked factor, its own border intact and none of the reflected padding left in it."""
+    x = (0.3 + 0.2 * RNG.random((3, 60, 80))).astype(np.float32)
+    _stub_model(monkeypatch, scale=2)
+    out, _ = cc_stub.run("superres", x, ["--scale", "2"], work=str(tmp_path))
+    assert out.shape == (3, 120, 160)
+    assert np.array_equal(out, np.repeat(np.repeat(x, 2, 1), 2, 2))

@@ -329,7 +329,7 @@ def _processing_params(keys: list[str], tune: set[str], hypertune: dict | None =
     return out
 
 
-GATE_NAMES = ("sky_median", "clipped", "white", "sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise", "stars_count",
+GATE_NAMES = ("sky_median", "clipped", "white", "sky_chroma", "sky_chroma_quadrants", "sky_uniformity", "sky_band_structure", "sky_pixel_noise", "stars_count",
               "stars_round", "stars_coloured", "stars_physical")
 
 
@@ -1528,7 +1528,7 @@ class FinishTask(Task):
             raise RuntimeError("cancelled")
         t = time.time()
         fin = pro.Finisher(ctx["work"], ctx["header"], prm, ctx["dual"], external=bool(int(ctx["opts"].get("external", 0))), device=str(ctx["device"]),
-                           checkpoint=_checkpoint(cancel), keep_pictures=False)
+                           checkpoint=_checkpoint(cancel), keep_pictures=False, coverage=getattr(layers, "coverage", None))
         img, info = fin.run(layers.base, layers.stars)
         dt = time.time() - t
         sm = layers.starnet.get("stars") or {}

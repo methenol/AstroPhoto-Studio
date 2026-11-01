@@ -264,6 +264,8 @@ GRAXPERT_MODEL_DIRS = {"bge": "bge-ai-models", "denoise": "denoise-ai-models",
                        "deconv_stellar": "deconvolution-stars-ai-models"}
 GRAXPERT_COMMANDS = {"bge": "background-extraction", "denoise": "denoising",
                      "deconv_obj": "deconv-obj", "deconv_stellar": "deconv-stellar"}
+GX_PAD = 96                     # px of reflected image handed to GraXpert's denoising network on every side; see GraXpert.run
+GX_MESH_POINTS = 15            # graxpert/preferences.py's bg_pts_option: the background grid takes this many points per row, so its cells are the frame's width / 15
 
 # Pre-fetch of the newest model of every kind with the wheel's own client (tools.md A.5).
 _GRAXPERT_DOWNLOAD_PY = r'''
@@ -382,13 +384,35 @@ class GraXpert:
             pass
         arr, header = fitsio.read_rgb(src)
         arr, rng = _unit_range(arr)
+        # The same boundary-condition story as CosmicClarity.run: the denoising network has no image beyond the frame's edge, so what it answers there is its own boundary
+        # condition.  Measured on IC 1848 (2026-10-30) the frame's left border went in level with the frame's interior (+1.9 % of the display sky) and came back 13-15 %
+        # darker, one line deep - a hard line in the export, invisible in the linear; reflecting the frame out first and cropping it back leaves that border as the frames
+        # made it.  The background extraction reaches over the edge the same way, only further.  Its automatic grid stops half a cell inside the frame (spacing = the width
+        # over GX_MESH_POINTS, and its rows start at (height % spacing) / 2, upstream's stand-in for half a spacing, so how far the last row sits from the border varies from
+        # frame to frame), every sample out there is the mode of a box the border clips, and the model is a thin-plate RBF through those samples - which across the frame's
+        # outer cell has nothing left to interpolate through and is therefore extrapolated, where that kernel's curvature grows.  A subtraction correction prints the error
+        # into linear.fits and the stretch multiplies it.  Measured on LBN 429 (2026-10-30): the frame entered bge_in.fits with its top level flat to +-0.05 % of the sky and
+        # left bge_out.fits at +0.20 to +0.28 % across the outer 128 px, its left edge swinging 0.6 % - the export's bright frame.  A flat sky alone does not show it (a
+        # constant extrapolates exactly, worst line 0.01 % at every pad); it needs structure near the edge to smear.  The same reflected image, one mesh cell wide, leaves
+        # both borders as the frames made them (+-0.06 %).  It must be a cell of the frame GraXpert is *handed*, since the lattice is laid on that: p >=
+        # (m + 2p) / GX_MESH_POINTS, i.e. m / (GX_MESH_POINTS - 2).  The two deconvolutions were measured the same way on IC 434's borders and move them by at most 0.05 %,
+        # so they run on the frame exactly as it is.
+        h0, w0 = arr.shape[1:]
+        if kind == "denoise":
+            pad = min(GX_PAD, h0 // 2, w0 // 2)
+        elif kind == "bge":
+            pad = min(max(GX_PAD, int(np.ceil(max(h0, w0) / (GX_MESH_POINTS - 2)))), h0 // 2, w0 // 2)
+        else:
+            pad = 0
+        if pad:
+            arr = np.pad(arr, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
         scratch = tempfile.mkdtemp(prefix="gx_", dir=os.path.dirname(os.path.abspath(dst)) or None)
         try:
             inp = os.path.join(scratch, "in.fits")
             fitsio.write_rgb(inp, arr, header)
             ver = self.local_versions(kind)
             use_gpu = self._gpu_arg(gpu)
-            meta: dict = {"tool": "graxpert", "command": GRAXPERT_COMMANDS[kind], "model": ver[-1] if ver else None}
+            meta: dict = {"tool": "graxpert", "command": GRAXPERT_COMMANDS[kind], "model": ver[-1] if ver else None, "pad_px": pad}
             for attempt in (use_gpu, False) if use_gpu else (False,):
                 argv = cmd + [inp, "-cli", "-cmd", GRAXPERT_COMMANDS[kind], "-output", "out",
                               "-gpu", "true" if attempt else "false"]
@@ -421,6 +445,8 @@ class GraXpert:
             res, _ = fitsio.read_rgb(out)
             if res.shape != arr.shape:
                 raise ToolError("graxpert", f"output shape {res.shape} differs from the input {arr.shape}")
+            if pad:
+                res = res[:, pad:pad + h0, pad:pad + w0]                # the padding was never part of the frame
             fitsio.write_rgb(dst, _undo_range(res, rng), header)      # re-attach the input header (WCS, keywords)
             return meta
         finally:
@@ -614,6 +640,7 @@ class StarNet:
 
 CC_SCRIPT = "processing/CosmicClarity_Native.py"     # siril-scripts: "Cosmic Clarity AI4 for Siril" (A. Knagg-Baugh, engines and models (c) SetiAstro), 1.2.0 read
 CC_MODES = ("sharpen", "denoise", "superres", "darkstar", "satellite")
+CC_PAD = 96                                         # px of reflected image handed to the network on every side: see CosmicClarity.run
 CC_SYSTEM_SITE_PTH = "zz_astrophoto_system_site.pth"
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -775,7 +802,15 @@ class CosmicClarity:
         x = np.clip(np.nan_to_num(np.asarray(arr, np.float32)), 0.0, 1.0)
         if x.ndim == 2:
             x = x[None]
-        np.save(fin, np.ascontiguousarray(np.moveaxis(x if x.shape[0] == 3 else np.repeat(x[:1], 3, 0), 0, -1)))
+        # The modes cut the frame into tiles, and the tile that touches the frame edge has no image beyond it: what the network answers there is its own boundary
+        # condition, not the frame.  Measured on the pipeline's own arrays (IC 1848, 2026-10-30) the denoiser was handed a stretched starless whose left border sat level
+        # with its interior (+1.9 % of the display sky) and returned it 18 % darker - one line deep, ramping back over the next four - invisible in the linear and a hard
+        # frame line in the export once the stretch has multiplied the sky's slope by a hundred and fifty.  A flat sky shows nothing at all: the network only misbehaves
+        # where there is structure to answer to, which is why this survived.  Reflect-padding gives the border tile real image on both sides; the padding is cropped off
+        # again below, so what comes back is the frame that went in, with a border the network never had to guess at.
+        pad = min(CC_PAD, x.shape[1] // 2, x.shape[2] // 2)
+        y = np.pad(x, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
+        np.save(fin, np.ascontiguousarray(np.moveaxis(y if y.shape[0] == 3 else np.repeat(y[:1], 3, 0), 0, -1)))
         cli = ["--mode", mode, *[str(a) for a in cli_args]]
         if str(device or "auto").lower() == "cpu":
             cli.append("--cpu")
@@ -802,11 +837,14 @@ class CosmicClarity:
             for p in (fin, fout, finfo):
                 if os.path.exists(p):
                     os.remove(p)
+        if pad and out.shape[1] >= x.shape[1] + 2 * pad and out.shape[2] >= x.shape[2] + 2 * pad:
+            fy, fx = out.shape[1] / (x.shape[1] + 2 * pad), out.shape[2] / (x.shape[2] + 2 * pad)   # the mode's own scale: 1 except for super-resolution
+            out = out[:, round(pad * fy):round(pad * fy) + round(x.shape[1] * fy), round(pad * fx):round(pad * fx) + round(x.shape[2] * fx)]
         if x.shape[0] == 1:
             out = out[:1]
         meta = {"tool": f"cosmic clarity {mode}", "command": f"{os.path.basename(CC_SCRIPT)} " + " ".join(cli), "script_version": info.get("script_version"),
                 "backend": info.get("backend"), "device": info.get("device"), "onnx_providers": info.get("onnx_providers"), "params": info.get("params"),
-                "seconds": round(time.time() - t0, 1)}
+                "pad_px": pad, "seconds": round(time.time() - t0, 1)}
         if "trails_detected" in info:
             meta["trails_detected"] = info["trails_detected"]
         return out, meta

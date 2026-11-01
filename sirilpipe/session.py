@@ -20,6 +20,7 @@ import shutil
 import statistics
 import threading
 import time
+import uuid
 from datetime import datetime
 
 import numpy as np
@@ -49,8 +50,54 @@ def local_copy_enabled() -> bool:
 
 
 def local_copy_dir(workdir: str) -> str:
-    """``ASTROPHOTO_LOCAL_DIR``, else ``<workdir>/.local_copy``."""
+    """``ASTROPHOTO_LOCAL_DIR``, else ``<workdir>/.local_copy``.  Shared by the jobs on that output volume; each job
+    gets a folder of its own under it (``Session.local_copy``), so the root is a location, never a working set."""
     return os.path.abspath(os.environ.get("ASTROPHOTO_LOCAL_DIR") or os.path.join(workdir, ".local_copy"))
+
+
+LOCAL_STALE_SECONDS = 12 * 3600.0     # a job's copy older than this is not being copied into any more
+
+
+def _reap_local_copies(root: str) -> None:
+    """Delete what a dead job left in the copy root, and nothing that belongs to a job still running.
+
+    A job's folder is named ``<session>-<pid>-<token>`` (``Session.local_copy``), so its owner is knowable: the
+    folder goes when that pid no longer answers, or when the folder is older than ``LOCAL_STALE_SECONDS`` even if it
+    does -- a container restart recycles pids, and a copy that old is not being written into (the measured copy of a
+    session's subs takes well under a minute).  Anything not in that shape is debris from the time the root itself
+    was the working folder.  Deleting a live job's copy is the bug this guards: that is what a second job entering
+    the shared root used to do to a running one."""
+    now = time.time()
+    for name in os.listdir(root) if os.path.isdir(root) else []:
+        p = os.path.join(root, name)
+        pid = None
+        parts = name.rsplit("-", 2)
+        if len(parts) == 3 and len(parts[2]) == 8:
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                pid = None
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:                       # someone else's process: it answers, so it is alive
+                alive = True
+        if alive:
+            try:
+                alive = now - os.path.getmtime(p) < LOCAL_STALE_SECONDS
+            except OSError:
+                alive = False
+        if alive:
+            continue
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.remove(p)
 
 
 _ORIENTATIONS = {"identity": lambda a: a, "rot180": lambda a: a[:, ::-1, ::-1], "flipud": lambda a: a[:, ::-1, :], "fliplr": lambda a: a[:, :, ::-1]}
@@ -1224,11 +1271,14 @@ class Session:
     @contextlib.contextmanager
     def local_copy(self, progress=None):
         """Read the subs from a local copy for the duration of a job (``ASTROPHOTO_LOCAL_COPY``), for a library
-        on a NAS.  The folder (``ASTROPHOTO_LOCAL_DIR``, default ``<workdir>/.local_copy``) is cleared first (a
-        job that died leaves its copy behind), the subs are copied into it the first time a stage reads them
-        (``_localise``: calibration staging, ImageMM's raw saturation pass; a registration that is reused reads
-        no sub and copies nothing), and when the job ends, however it ends, the staging symlinks are pointed
-        back at the library and the copy is deleted.  Frame lists and caches keep the library paths."""
+        on a NAS.  Each job copies into a folder of its own under the root (``ASTROPHOTO_LOCAL_DIR``, default
+        ``<workdir>/.local_copy``), because the root is shared by every job on that output volume: with one shared
+        folder, a second job entering while the first was still copying deleted the first's copies under it and the
+        first died renaming a ``.part`` file.  The subs are copied into the folder the first time a stage reads them
+        (``_localise``: calibration staging, ImageMM's raw saturation pass; a registration that is reused reads no
+        sub and copies nothing), and when the job ends, however it ends, the staging symlinks are pointed back at the
+        library and the folder is deleted.  What a job that died leaves behind is reaped by the next job to start
+        (``_reap_local_copies``).  Frame lists and caches keep the library paths."""
         if not local_copy_enabled() or self._local_root:      # off, or already active (run_all inside a job)
             yield self
             return
@@ -1236,9 +1286,10 @@ class Session:
         if root in (os.sep, self.workdir) or self.workdir.startswith(root.rstrip(os.sep) + os.sep) or \
                 any(f == root or f.startswith(root.rstrip(os.sep) + os.sep) for f in self.folders):
             raise RuntimeError(f"ASTROPHOTO_LOCAL_DIR {root} holds the output or the images: it is deleted after every job")
-        shutil.rmtree(root, ignore_errors=True)
-        os.makedirs(root, exist_ok=True)
-        self._local, self._local_root, self._local_progress = {}, root, progress
+        _reap_local_copies(root)                              # a dead job's copy, never a live job's
+        job = os.path.join(root, f"{os.path.basename(self.dir)}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+        os.makedirs(job, exist_ok=True)
+        self._local, self._local_root, self._local_progress = {}, job, progress
         try:
             yield self
         finally:
@@ -1246,7 +1297,9 @@ class Session:
             self._local, self._local_root, self._local_progress = {}, None, None
             if back:
                 self._unlocalise_links(back)
-            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(job, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                os.rmdir(root)                                # ours to remove only while it holds nothing
 
     def _localise(self, frames: list[Frame]) -> None:
         """Copy ``frames`` into the active local copy (no-op when none is active or they are there already)."""
@@ -1291,6 +1344,23 @@ class Session:
                 os.remove(link)
                 os.symlink(back[tgt], link)
 
+    def _export_gates(self) -> dict | None:
+        """The verdict of the newest export's own quality gates, so a picture that failed them is not handed out silently.
+
+        ``post.export`` measures the gates, prints the table and files the report in the sidecar, and consumes none of
+        it: C 20's render shipped with five of the twelve gates failed and nothing on the dataset card said so.  The
+        export is still delivered -- a failed gate is a measurement, and withholding the picture would take the choice
+        away from the person who set the parameters -- but the card has to say what the pipeline itself measured.
+        Nothing here re-judges the picture: it is the verdict the export recorded, with the failing names on top.
+        ``error`` is the export's own "the gates never stop an export" exception -- a failure to measure, not a pass."""
+        from . import gates                                            # the report's shape is gates' business
+        side = sorted(glob.glob(self._p("exports", "*.json")), key=lambda p: (os.path.getmtime(p), p))
+        if not side:
+            return None
+        v = gates.verdict(read_json(side[-1], {}))
+        return None if v is None else clean_json({"export": os.path.basename(side[-1]).rsplit(".", 1)[0], **v})
+
+
     # ------------------------------------------------------------------ status
     def status(self) -> dict:
         """Everything the UI needs to draw the dataset card and its step ticks (derived from files)."""
@@ -1298,6 +1368,7 @@ class Session:
         fs = self.fs
         meta = self.meta
         exports = sorted(os.path.basename(p) for p in glob.glob(self._p("exports", "*")))
+        gates = self._export_gates()
         total_min = round(fs.total_exposure / 60.0, 1) if fs else None
         st = {
             "folder": self.folder, "folders": self.folders, "workdir": self.dir,
@@ -1313,7 +1384,7 @@ class Session:
             "has_autofinish": os.path.exists(self._p("autofinish.json")),
             "denoised": restoration_done(self.dir), "deconvolved": os.path.exists(self._p("restore_meta.json")),
             "star_remover": os.path.exists(self._p("starless.fits")), "autofinished": os.path.exists(self._p("autofinish.json")),
-            "exports": exports, "stack_meta": clean_json(meta),
+            "exports": exports, "export_gates": gates, "stack_meta": clean_json(meta),
             "calibration_checked": os.path.exists(self._p("calibration.json")),
             "calibration": clean_json({"summary": (self.calib_report or {}).get("summary"), **(self.calib_report or {})})
             if self.calib_report else (read_json(self._p("calibration.json"), {}) or {}).get("report"),

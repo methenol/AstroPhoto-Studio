@@ -107,9 +107,10 @@ docker compose down                               # stop
   local folder and read them from there instead of over the network: the copy is made when a stage
   first reads the subs (calibration before registering, the ImageMM restore's raw-saturation pass);
   a job that reuses an existing registration reads no sub and copies nothing.
-  The folder (`LOCAL_DIR`, default `/data/output/.local_copy` on the output volume) is cleared
-  at the start of every job (a job that died leaves its copy behind) and deleted when the job ends,
-  also when it fails or is cancelled. It needs free
+  The folder (`LOCAL_DIR`, default `/data/output/.local_copy` on the output volume) is shared by every job on
+  that volume, so each job copies into a folder of its own under it and deletes that when its job ends, also when it
+  fails or is cancelled; what a job that died left behind is reclaimed by the next job to start, never a running
+  job's. It needs free
   space for one dataset's subs. Natively, set `ASTROPHOTO_LOCAL_COPY=true` (and optionally
   `ASTROPHOTO_LOCAL_DIR`).
 - **Memory:** worker pools are sized from the container's memory and CPU limits (`mem_limit`,

@@ -9,12 +9,17 @@ clipped                  < 0.05 %      pixels with any channel >= 0.995 (the pro
 white                    < 0.05 %      pixels with Lab lightness >= 0.97 outside star cores (cores = the stars' footprint, dilated)
 sky_chroma               <= 2          median |a*| and |b*| (Lab) over the sky
 sky_chroma_quadrants     <= 1.5        spread (max - min) of the four quadrants' median a* and of b*
+sky_uniformity           <= 0.026      the sky floor of the border cells over the smooth surface fitted through the floors of a 16 x 16 mesh: the largest of the four borders
+                                       (its outer two cell rows), display units; the limit is the 99th percentile of 303 exports nobody complained about.  It flags a gross
+                                       one-sided border offset - not a band-free picture: accepted renders carry large-scale structure of their own (pro.sky_pedestal: it is the
+                                       coverage map, not the contrast, that decides whether a slow sky offset is a pedestal to remove or nebulosity to keep)
 sky_band_structure       <= 0.008      std of the lightness' 32-128 px band (G(10.7) - G(42.7)) over the sky, display units, stars excluded
 sky_pixel_noise          <= 0.008      robust sigma of the lightness' pixel-level scatter (L - G(2)) over the sky, display units, stars excluded
 stars_count              within 20 %   of the linear star layer's 5 sigma stars, the share still a 5 sigma detection at their positions against the picture's
                                        sky pixel noise (and above the CSF visibility threshold): at most 20 % lost (without the linear layer: the counts)
 stars_round              <= 0.25       median ellipticity (1 - minor / major axis of the second moments) of the 300 brightest unsaturated stars
-stars_coloured           >= 0.10       median HSV saturation at the stars' peaks
+stars_coloured           >= 0.10       median (max - min) / max of a star's three aperture fluxes, each taken above the star's own local sky (the 300
+                                       brightest unsaturated peaks); colour only, never the light the star sits on
 stars_physical           <= data + 5 % fraction of the stars measured at colour S/N >= 60 (in the linear data) whose flux colour in the picture is off the
                                        blackbody locus, at most the linear star layer's own fraction + 5 points (0.10 without the linear layer) (green above
                                        both red and blue, or below both, by more than 5 %): stars radiate nearly as blackbodies, whose sRGB colours
@@ -30,13 +35,19 @@ import numpy as np
 from . import finish
 
 LIMITS = {"sky_median": (0.08, 0.12), "clipped": 0.0005, "white": 0.0005, "sky_chroma": 2.0, "sky_chroma_quadrants": 1.5, "sky_band_structure": 0.008,
-          "sky_pixel_noise": 0.008, "stars_count": 0.20, "stars_round": 0.25, "stars_coloured": 0.10,
+          "sky_pixel_noise": 0.008, "sky_uniformity": 0.026, "stars_count": 0.20, "stars_round": 0.25, "stars_coloured": 0.10,
           "stars_physical": 0.10}
+SKY_BORDER_MESH, SKY_BORDER_CELLS, SKY_BORDER_SKY_FRACTION, SKY_BORDER_MAX_ABOVE_SKY = 16, 2, 0.45, 1.0
 STAR_COLOUR_SNR, LOCUS_TOL, PHYSICAL_MARGIN = 60.0, 0.05, 0.05
 # a star is visible when its display peak stands above the starless picture by the CSF visibility threshold at 16 cycles / degree - TMQI.m's
 # threshold for the finished image (lab.objectives.structural_fidelity): 128 / (1.4 CSF(16)) on 0-255
 _CSF16 = 100.0 * 2.6 * (0.0192 + 0.114 * 16) * np.exp(-(0.114 * 16) ** 1.1)
 STAR_VISIBLE = 128.0 / (1.4 * _CSF16) / 255.0
+# the star's aperture and the ring its local sky is read from: photometry over the aperture, background over the ring, so the
+# flux colour is the star's and not the sky's (see measure_stars)
+_SAT_APER, _SAT_RING = 4, 8
+_SAT_RING_MASK = np.ones((2 * _SAT_RING + 1, 2 * _SAT_RING + 1), bool)
+_SAT_RING_MASK[_SAT_RING - _SAT_APER:_SAT_RING + _SAT_APER + 1, _SAT_RING - _SAT_APER:_SAT_RING + _SAT_APER + 1] = False
 CLIP_LEVEL, WHITE_LEVEL = 0.995, 0.97
 STAR_SIGMA = 5.0
 
@@ -47,6 +58,30 @@ def _lab(img: np.ndarray) -> np.ndarray:
 
 def sky_mask(lum: np.ndarray) -> np.ndarray:
     return finish._sky_mask(lum, edge=finish.EDGE_CROP)
+
+
+def quadrant_spread(lab: np.ndarray, sm: np.ndarray) -> dict:
+    """The sky's net tint in each quadrant and the spread of those tints - the numbers ``sky_chroma_quadrants`` gates.
+
+    These medians are **signed**, and that is what makes them a cast.  ``median |a*|`` over the whole sky (what
+    ``sky_chroma`` gates) is a different quantity: it is large on a perfectly grey sky that carries chroma noise,
+    because it measures the noise, so a denoiser *improves* it.  A step that tints the sky while smoothing its
+    chroma noise therefore passes the gate the finishing steps are policed by and fails the one nothing was
+    policing - which is how C 20 was delivered on 2026-11-01 with ``sky_chroma`` at 1.73 of 2.0 and
+    ``sky_chroma_quadrants`` at 1.97 of 1.5.  The step that judges colour asks both.
+    """
+    h, w = lab.shape[:2]
+    a, b = lab[..., 1], lab[..., 2]
+    med: dict = {"a": [], "b": []}
+    for ys, xs in ((slice(0, h // 2), slice(0, w // 2)), (slice(0, h // 2), slice(w // 2, w)),
+                   (slice(h // 2, h), slice(0, w // 2)), (slice(h // 2, h), slice(w // 2, w))):
+        m = sm[ys, xs]
+        if m.sum() > 100:
+            med["a"].append(float(np.median(a[ys, xs][m])))
+            med["b"].append(float(np.median(b[ys, xs][m])))
+    return {"median_a": med["a"], "median_b": med["b"],
+            "spread_a": (max(med["a"]) - min(med["a"])) if med["a"] else 0.0,
+            "spread_b": (max(med["b"]) - min(med["b"])) if med["b"] else 0.0}
 
 
 def star_layer(final: np.ndarray, starless: np.ndarray | None) -> np.ndarray | None:
@@ -80,7 +115,13 @@ def _ellipticity(win: np.ndarray) -> float:
 def measure_stars(stars: np.ndarray, noise: float) -> dict:
     """Count, roundness and colour of the stars of a (3, H, W) star layer (display or linear) whose sky pixel noise is ``noise`` (same units)."""
     lum = stars.mean(0)                                                       # colour-invariant detection, as finish.count_stars
-    pk = _peaks(lum, STAR_SIGMA * max(noise, 1e-9))
+    # The layer's own sky floor, taken out of the detection level.  A star layer is sky everywhere but for the stars, so its
+    # median IS the pedestal the stars sit on, and ``_peaks`` compares the blurred plane with an absolute level: raise that
+    # pedestal (the stretch's black clip, a brighter sky) and every sky pixel passes it, so the 300 brightest "stars" are sky.
+    # M 31 (2026-11-01) read 0.097 against the 0.10 floor with the sky raised and 0.101 with it a shade lower, the stars
+    # themselves identical - the gate was detecting the sky and calling it the stars' colour.
+    floor = float(np.median(lum))
+    pk = _peaks(lum, floor + STAR_SIGMA * max(noise, 1e-9))
     ys, xs = np.nonzero(pk)
     out = {"count": int(len(ys)), "ellipticity": None, "saturation": None}
     if len(ys) == 0:
@@ -96,9 +137,17 @@ def measure_stars(stars: np.ndarray, noise: float) -> dict:
         if len(ell) < 300:
             ell.append(_ellipticity(lum[y - 10:y + 11, x - 10:x + 11]))
         if len(sat) < 300:
-            px = stars[:, y - 4:y + 5, x - 4:x + 5].sum(axis=(1, 2))          # flux colour of the star (a clipped core is white, its wings carry the colour)
+            # The flux colour of the star (a clipped core is white, its wings carry the colour), measured ABOVE ITS OWN LOCAL
+            # SKY.  Summing the aperture raw charges the star with the light the sky carries there: a neutral pedestal adds
+            # the same amount to all three channels, so (max - min) / max collapses without the star changing colour - on the
+            # fixture of tests/test_gates.py a red star reads 0.80 over a dark sky and 0.003 over one at 0.3.  The sky is the
+            # median of the ring around the aperture, subtracted per channel, as any aperture photometry does (and as
+            # lab.objectives._phot_cons already does with a far annulus for the same reason).
+            core = stars[:, y - _SAT_APER:y + _SAT_APER + 1, x - _SAT_APER:x + _SAT_APER + 1]
+            ring = stars[:, y - _SAT_RING:y + _SAT_RING + 1, x - _SAT_RING:x + _SAT_RING + 1]
+            px = core.reshape(3, -1).sum(1) - core.shape[1] * core.shape[2] * np.median(ring[:, _SAT_RING_MASK], axis=1)
+            px = np.maximum(px, 0.0)                                           # a star dimmer than its own ring carries no measurable colour
             sat.append(float((px.max() - px.min()) / max(px.max(), 1e-9)))
-        if len(ell) >= 300 and len(sat) >= 300:
             break
     out["ellipticity"] = round(float(np.median(ell)), 3) if ell else None
     out["saturation"] = round(float(np.median(sat)), 3) if sat else None
@@ -120,6 +169,21 @@ def sky_luminance(lum: np.ndarray, sm: np.ndarray, starless: np.ndarray | None) 
     keep = (cv2.dilate((hp > 5.0 * nz).astype(np.uint8), np.ones((7, 7), np.uint8)) == 0).astype(np.float32)
     bg = cv2.GaussianBlur(lum * keep, (0, 0), 8.0) / np.maximum(cv2.GaussianBlur(keep, (0, 0), 8.0), 1e-6)
     return np.where(keep > 0, lum, bg).astype(np.float32)
+
+
+def pixel_noise(lum: np.ndarray, sm: np.ndarray, starless: np.ndarray | None = None) -> float:
+    """The sky's pixel-level scatter **exactly as the ``sky_pixel_noise`` gate reports it**: the robust sigma of the sky
+    luminance minus its own 2 px smoothing, with the stars replaced by the local background.
+
+    Public because the finishing chain has to ask this same question to decide whether to denoise harder
+    (``pro.Finisher._close_sky_noise``).  A second implementation of the statistic would be a second truth about the
+    picture, and the two would drift - which is exactly how a chain ends up satisfying a measure the export then fails.
+    """
+    if int(np.count_nonzero(sm)) <= 100:
+        return 0.0
+    sl = sky_luminance(lum, sm, starless)
+    hp = sl - cv2.GaussianBlur(sl, (0, 0), 2.0)
+    return float(finish.mad_sigma(hp[sm][::7]))
 
 
 def off_locus(img: np.ndarray, linear_stars: np.ndarray | None = None, linear_noise: float | None = None) -> tuple[float | None, int]:
@@ -187,6 +251,7 @@ def compute(img: np.ndarray, *, starless: np.ndarray | None = None, linear_star_
     star after the star stretch (the detection threshold of the picture's star layer; default 5 sigma of the picture's own sky pixel noise)."""
     img = np.clip(np.nan_to_num(img), 0.0, 1.0).astype(np.float32)
     lum = finish.luminance(img)
+    h, w = lum.shape                                              # the border mesh below works in frame pixels
     sm = sky_mask(lum)
     lab = _lab(img)
     out: dict = {}
@@ -205,6 +270,14 @@ def compute(img: np.ndarray, *, starless: np.ndarray | None = None, linear_star_
     cores = np.zeros(lum.shape, bool)
     if stars is not None:
         cores = cv2.dilate((stars.max(0) > 0.05).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    else:
+        # No separate star layer (a starless render): the cores still have to come out, because the gate is specified "outside star cores" and a star field
+        # cannot pass it otherwise - the detection is the one sky_luminance already uses for the structure gates (a 5 sigma high-pass, dilated).  Measured on
+        # the starless IC 1848 render of 2026-10-29: white 0.001195, 2.4 x its limit, and every one of those pixels was a star core.
+        hp = lum - cv2.GaussianBlur(lum, (0, 0), 8.0)
+        nz = finish.mad_sigma(hp[sm][::7]) if sm.sum() > 100 else 0.0
+        if nz:
+            cores = cv2.dilate((hp > 5.0 * nz).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
     light = lab[..., 0] / 100.0
     white = float(((light >= WHITE_LEVEL) & ~cores).mean())
     gate("white", round(white, 6), white < LIMITS["white"])
@@ -212,27 +285,45 @@ def compute(img: np.ndarray, *, starless: np.ndarray | None = None, linear_star_
         a, b = lab[..., 1], lab[..., 2]
         ca, cb = float(np.median(np.abs(a[sm]))), float(np.median(np.abs(b[sm])))
         gate("sky_chroma", {"a": round(ca, 2), "b": round(cb, 2)}, max(ca, cb) <= LIMITS["sky_chroma"])
-        h, w = lum.shape
-        quads = [(slice(0, h // 2), slice(0, w // 2)), (slice(0, h // 2), slice(w // 2, w)), (slice(h // 2, h), slice(0, w // 2)), (slice(h // 2, h), slice(w // 2, w))]
-        spread = {"a": [], "b": []}
-        for ys, xs in quads:
-            m = sm[ys, xs]
-            if m.sum() > 100:
-                spread["a"].append(float(np.median(a[ys, xs][m])))
-                spread["b"].append(float(np.median(b[ys, xs][m])))
-        sa = (max(spread["a"]) - min(spread["a"])) if spread["a"] else 0.0
-        sb = (max(spread["b"]) - min(spread["b"])) if spread["b"] else 0.0
-        gate("sky_chroma_quadrants", {"a": round(sa, 2), "b": round(sb, 2)}, max(sa, sb) <= LIMITS["sky_chroma_quadrants"])
+        qs = quadrant_spread(lab, sm)
+        gate("sky_chroma_quadrants", {"a": round(qs["spread_a"], 2), "b": round(qs["spread_b"], 2)},
+             max(qs["spread_a"], qs["spread_b"]) <= LIMITS["sky_chroma_quadrants"])
         sl = sky_luminance(lum, sm, starless)
         band = cv2.GaussianBlur(sl, (0, 0), finish.BAND_LO) - cv2.GaussianBlur(sl, (0, 0), finish.BAND_HI)
         bs = float(band[sm].std())
         gate("sky_band_structure", round(bs, 5), bs <= LIMITS["sky_band_structure"])
-        hp = sl - cv2.GaussianBlur(sl, (0, 0), 2.0)
-        pn = finish.mad_sigma(hp[sm][::7])
+        pn = pixel_noise(lum, sm, starless)
         pn_sky = pn
         gate("sky_pixel_noise", round(pn, 5), pn <= LIMITS["sky_pixel_noise"])
+        # The sky's large-scale flatness: the border's floor over the smooth surface fitted through the floors of a mesh over the whole frame.  Not against the interior's own
+        # level: calibration against 303 exports of datasets nobody complained about showed a border standing far above the interior is normal output (accepted NGC 1499 and
+        # Sh2-132 renders measure a larger border excess than the Sh2-171 / IC 1848 exports that started this), while the residual over the frame's own gradient still separates
+        # the flat sky from the one-sided band a mosaic or canvas edge leaves.  The bands measured are 300 - 1000 px deep, so a cell is 1/16 of the frame: a finer mesh measures
+        # noise, a coarser one the subject.  On the raw luminance, not sky_luminance: its 5 sigma star replacement writes a band's pixels back as the local background.
+        ys = np.linspace(0, h, SKY_BORDER_MESH + 1).astype(int)
+        xs = np.linspace(0, w, SKY_BORDER_MESH + 1).astype(int)
+        ref = float(np.quantile(lum, SKY_BORDER_SKY_FRACTION))
+        floor, cy, cx = [], [], []
+        for i in range(SKY_BORDER_MESH):
+            for j in range(SKY_BORDER_MESH):
+                cell = lum[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+                v = cell[cell <= ref * (1.0 + SKY_BORDER_MAX_ABOVE_SKY)]      # a cell is judged while it is still background-like (twice the sky); beyond it stands the subject
+                if v.size > 200:
+                    floor.append(float(np.quantile(v, SKY_BORDER_SKY_FRACTION)))
+                    cy.append((ys[i] + ys[i + 1]) / 2 / h)
+                    cx.append((xs[j] + xs[j + 1]) / 2 / w)
+        su = None
+        if len(floor) >= SKY_BORDER_MESH * SKY_BORDER_MESH // 4:
+            f = np.array(floor)
+            Y, X = np.array(cy), np.array(cx)
+            A = np.column_stack([np.ones_like(X), X, Y, X * X, X * Y, Y * Y])
+            r = f - A @ np.linalg.lstsq(A, f, rcond=None)[0]
+            edge = [abs(float(np.median(m))) for m in (r[Y <= ys[SKY_BORDER_CELLS] / h], r[Y >= ys[-SKY_BORDER_CELLS - 1] / h],
+                                                        r[X <= xs[SKY_BORDER_CELLS] / w], r[X >= xs[-SKY_BORDER_CELLS - 1] / w]) if m.size]
+            su = max(edge) if edge else None
+        gate("sky_uniformity", None if su is None else round(su, 5), su is not None and su <= LIMITS["sky_uniformity"], cells=len(floor))
     else:
-        for n in ("sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise"):
+        for n in ("sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise", "sky_uniformity"):
             gate(n, None, False)
     if stars is not None:
         hp = lum - cv2.GaussianBlur(lum, (0, 0), 2.0)
@@ -291,3 +382,17 @@ def format_gates(g: dict) -> str:
         lim = v.get("limit")
         rows.append(f"  {'PASS' if v['pass'] else 'FAIL'}  {k:<22} {v['value']}   (limit {lim})")
     return "gates:\n" + "\n".join(rows) + f"\n  => {'all gates pass' if g.get('passed') else 'FAILED: ' + ', '.join(g.get('failed', []))}"
+
+
+def verdict(sidecar: dict | None) -> dict | None:
+    """The verdict an export recorded about itself, read back from its sidecar; ``None`` when it measured nothing.
+
+    ``post.export`` files ``compute``'s report in the sidecar and stops there, so whoever is handed the picture never
+    learns that the pipeline measured a failure in it (C 20, 2026-10-31: five of the twelve gates failed and the
+    render shipped looking like any other).  The reader lives next to the report's shape because every surface that
+    shows an export -- the dataset card, the exports list, a headless run -- has to say the same thing about it.
+    ``error`` is the export's own "the gates never stop an export" exception: a failure to measure, not a pass."""
+    lin = (sidecar or {}).get("linear_info") or (sidecar or {}).get("linear") or {}
+    g = lin.get("gates") if isinstance(lin, dict) else None
+    return None if not isinstance(g, dict) else {"passed": g.get("passed"), "failed": g.get("failed") or [],
+                                                 "error": g.get("error")}

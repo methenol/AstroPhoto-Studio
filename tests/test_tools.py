@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import textwrap
 
 import numpy as np
@@ -320,6 +321,61 @@ def test_graxpert_missing_is_unavailable(monkeypatch, tmp_path):
     with pytest.raises(ToolUnavailable):
         tools.GraXpert().background_extraction(str(tmp_path / "a.fits"), str(tmp_path / "b.fits"))
 
+def test_graxpert_denoising_is_given_image_beyond_its_frame(tmp_path, monkeypatch):
+    """GraXpert's denoising network has no image past the frame's edge, so what lands on the frame's own border is
+    the model's boundary condition: measured on IC 1848 (2026-10-30) the left border came back 13-15 % of the
+    display sky darker, one line deep, from a frame whose border was level with its interior.  The wrapper reflects
+    image out to the tiles and crops it back, so the frame that comes out is the frame that went in."""
+    runner = tmp_path / "gx_runner.py"
+    runner.write_text(textwrap.dedent('''
+        import sys
+        import numpy as np
+        from astropy.io import fits
+        a = fits.getdata(sys.argv[1]).astype(np.float32)
+        r = np.linspace(0.4, 1.0, 6, dtype=np.float32)                    # the model's own edge, as a tiled network answers it
+        a[:, :6] *= r[None, :, None]; a[:, -6:] *= r[::-1][None, :, None]
+        a[:, :, :6] *= r[None, None, :]; a[:, :, -6:] *= r[::-1][None, None, :]
+        fits.PrimaryHDU(a).writeto("out.fits", overwrite=True)
+    '''))
+    monkeypatch.setenv("GRAXPERT_BIN", sys.executable)
+    monkeypatch.setenv("GRAXPERT_RUNNER", str(runner))
+    src, dst = str(tmp_path / "in.fits"), str(tmp_path / "out.fits")
+    x = (0.3 + 0.2 * np.random.default_rng(3).random((3, 120, 160))).astype(np.float32)
+    fitsio.write_rgb(src, x)
+    tools.GraXpert().denoise(src, dst, strength=0.7, gpu=False)
+    out, _ = fitsio.read_rgb(dst)
+    assert out.shape == x.shape and np.abs(out - x).max() < 1e-6          # without the padding the frame's edge comes back dark by up to 60 %
+
+def test_graxpert_background_extraction_is_given_image_beyond_its_mesh(tmp_path, monkeypatch):
+    """GraXpert's background model reaches over the frame's edge too, one mesh cell wide.  Its automatic grid stops
+    half a cell inside the frame and Ordinary Kriging has no samples beyond that ring, so the frame's outer cell is
+    interpolated from the one side that has any - and a subtraction correction keeps the error.  Measured on LBN 429
+    (2026-10-30) a top border flat to +-0.05 % of the sky came back at +0.20 to +0.28 % across the outer 128 px: the
+    export's bright frame.  The wrapper reflects image out one cell wide and crops it back, so the border that comes
+    out is the border that went in."""
+    runner = tmp_path / "gx_runner.py"
+    runner.write_text(textwrap.dedent('''
+        import sys
+        import numpy as np
+        from astropy.io import fits
+        a = fits.getdata(sys.argv[1]).astype(np.float32)
+        dist = max(1, round(a.shape[2] / 15))                        # the lattice of background_grid_selection: bg_pts_option points per row
+        sky = np.median(a)
+        for band in (a[:, :dist], a[:, -dist:], a[:, :, :dist], a[:, :, -dist:]):
+            band += 0.1 * sky                                        # the outer cell, interpolated from the only side that has samples
+        fits.PrimaryHDU(a).writeto("out.fits", overwrite=True)
+    '''))
+    monkeypatch.setenv("GRAXPERT_BIN", sys.executable)
+    monkeypatch.setenv("GRAXPERT_RUNNER", str(runner))
+    src, dst = str(tmp_path / "in.fits"), str(tmp_path / "out.fits")
+    x = (0.3 + 0.2 * np.random.default_rng(5).random((3, 1080, 1920))).astype(np.float32)
+    fitsio.write_rgb(src, x)
+    meta = tools.GraXpert().background_extraction(src, dst, gpu=False)
+    out, _ = fitsio.read_rgb(dst)
+    # a cell of the frame GraXpert is *handed*, since that is where the lattice goes: 1920 / (15 - 2) - the two
+    # sides the pad itself adds widen the frame - so a pad sized for the network (GX_PAD) is not enough here
+    assert meta["pad_px"] == -(-1920 // (tools.GX_MESH_POINTS - 2)) > tools.GX_PAD
+    assert out.shape == x.shape and np.abs(out - x).max() < 1e-6     # without the padding the outer cell comes back 10 % of the sky high
 
 def test_unit_range_roundtrip():
     a = np.array([[-0.2, 0.5], [1.5, 0.0]], np.float32)

@@ -36,6 +36,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from sirilpipe import __version__  # noqa: E402
 from sirilpipe import finish as finish_mod  # noqa: E402
+from sirilpipe import gates as gates_mod  # noqa: E402
 from sirilpipe import tools as tools_mod  # noqa: E402
 from sirilpipe.post import DEFAULTS, EXTRA_DEFAULTS, PARAM_SPEC  # noqa: E402
 from sirilpipe.session import Cancelled, PreviewSuperseded, Session  # noqa: E402
@@ -828,9 +829,9 @@ def _run_job(job_id: str):
             raise Cancelled()
 
     with JOB_LOCK:
-        job["state"] = "running"
         job["started"] = time.time()
         job["message"] = "Starting"
+        job["state"] = "running"                # last of the three, as at the terminal states below
         _save_jobs(force=True)
         try:
             if kind == "tools":
@@ -840,16 +841,17 @@ def _run_job(job_id: str):
                 # (made when a stage first reads them, deleted when the job ends)
                 with s.local_copy(progress):
                     job["result"] = _run_session_job(kind, s, progress, params, stack_params, export_opts)
-            job["state"] = "done"
             job["progress"] = 1.0
             job["message"] = "Finished"
+            job["state"] = "done"               # last: a poller that sees "done" finds the result and the message too
         except Cancelled:
-            job["state"] = "cancelled"
             job["message"] = "Cancelled"
+            job["state"] = "cancelled"          # last: a poller used to read "cancelled" while the message still said
+                                                # "Cancelling at the next checkpoint" (tests/test_api.py, 2026-10-31)
         except Exception as e:
             if "cancelled" in str(e):
-                job["state"] = "cancelled"
                 job["message"] = "Cancelled"
+                job["state"] = "cancelled"      # last, same reason
             else:
                 job["message"] = f"{type(e).__name__}: {e}"
                 job["traceback"] = traceback.format_exc()
@@ -1265,7 +1267,8 @@ def exports(folder: str):
         base = f[:-4]
         items.append({"jpg": f, "tif": base + ".tif" if os.path.exists(base + ".tif") else None,
                       "name": os.path.basename(f), "size_mb": round(os.path.getsize(f) / 2**20, 1),
-                      "created": time.ctime(os.path.getmtime(f))})
+                      "created": time.ctime(os.path.getmtime(f)),
+                      "gates": gates_mod.verdict(_read_json(base + ".json"))})   # what the export measured about itself
     return {"exports": items}
 
 

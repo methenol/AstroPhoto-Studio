@@ -306,6 +306,174 @@ def test_saturated_star_is_a_point_at_its_wings_colour_and_a_galaxy_stays_extend
     assert abs(np.median(o[1][g_ring]) - np.median(lat[1][g_ring])) < 1e-3            # the galaxy: the restoration's
 
 
+def test_a_saturated_star_whose_wings_are_buried_in_noise_is_refused_not_repainted():
+    """The wing ratio was accepted for being *positive*, so a channel whose annulus light never rose above the noise
+    passed the guard with a ratio of ~4e-4 and its core was written at that ratio: C 49 (2026-10-31) put [0.0, 1.0,
+    0.0] - that ratio, rounded - into every saturated core and drove red and blue below the sky, which is the green
+    core the campaign was called in for.  A ratio with no measurement behind it now refuses the star and leaves the
+    restoration's own core, which measures far closer to the stack than an invented colour does."""
+    rng = np.random.default_rng(7)
+    C, N = 3, 300
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    sky, noise = 0.1, 0.001
+    lat = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    r1 = np.hypot(xx - 80, yy - 80)
+    for c in range(C):
+        lat[c] += 5.0 * (r1 <= 3)                                             # the core: full well, no data in any channel
+    core = (r1 <= 3)
+    k = np.exp(-(np.mgrid[-20:21, -20:21] ** 2).sum(0) / (2 * 1.8 ** 2)); k /= k.sum()
+    star = cv2.filter2D(np.where(r1 <= 0.5, 30.0, 0.0), -1, k)
+    mean_img = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    broad = np.exp(-(r1 / 6.0) ** 2)                                          # the light the wing annulus sees (r 9..13)
+    mean_img[1] += np.minimum(star, 1.0) + 0.12 * broad                        # green's wings: 87 sigmas of that annulus
+    mean_img[0] += 0.0041 * broad                                             # red and blue: 1.9 and 3.8 sigmas - a
+    mean_img[2] += 0.0041 * broad                                             # positive ratio that was never measured
+    kmean = np.stack([k] * C).astype(np.float32)
+    x = torch.from_numpy(lat.astype(np.float32))[None]
+    out, info = V.ImageMMEngine._saturated_star_photometry(x, core, mean_img, kmean, ann=(4, 8))
+    o = out[0].numpy().astype(np.float64)
+    assert info["measured"] == 0 and info["wing_below_noise"] == 1, info
+    snr = info["stars"][0][-1]                                                # what each channel's colour was worth
+    assert snr[1] > V.SAT_WING_SNR and snr[0] < V.SAT_WING_SNR and snr[2] < V.SAT_WING_SNR, info["stars"]
+    assert np.allclose(o[:, r1 <= 8], lat[:, r1 <= 8])                        # not repainted at the noise's colour
+
+
+def test_an_uncalibrated_wing_colour_is_the_light_and_not_the_kernel_weight():
+    """``q_in`` / ``q_out`` divide each channel's annulus light by that channel's *own* kernel weight: the star's colour
+    only once ``col_cal`` undoes it (fitted on real stars by this same estimator). With no calibration star in any ring
+    band the widest kernel divides its channel away - C 49 (2026-10-31) had none, and its saturated stars' red and blue
+    wings carried 12.7 and 26.4 sigmas of light (R/G 0.45, B/G 0.94, an ordinary star) while the ratio read [0.0, 1.0,
+    0.0] and wrote both channels below the sky. Uncalibrated, the colour is the light: the annulus is the same geometry
+    in every channel and a star's profile the same shape, so light compared to light needs no kernel to undo."""
+    rng = np.random.default_rng(11)
+    C, N = 3, 300
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    sky, noise = 0.1, 0.001
+    lat = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    r1 = np.hypot(xx - 80, yy - 80)
+    for c in range(C):
+        lat[c] += 5.0 * (r1 <= 3)
+    core = (r1 <= 3)
+    k = np.exp(-(np.mgrid[-20:21, -20:21] ** 2).sum(0) / (2 * 1.8 ** 2)); k /= k.sum()
+    star = cv2.filter2D(np.where(r1 <= 0.5, 30.0, 0.0), -1, k)
+    broad = np.exp(-(r1 / 6.0) ** 2)
+    mean_img = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    for c in range(C):
+        mean_img[c] += np.minimum(star, 1.0) + 0.12 * broad                   # the same light everywhere: a white star
+    ks = []
+    for sig in (4.0, 1.8, 1.8):                                               # the frames' PSF, red's far the widest
+        kk = np.exp(-(np.mgrid[-20:21, -20:21] ** 2).sum(0) / (2 * sig ** 2)); ks.append(kk / kk.sum())
+    kmean = np.stack(ks).astype(np.float32)
+    x = torch.from_numpy(lat.astype(np.float32))[None]
+    out, info = V.ImageMMEngine._saturated_star_photometry(x, core, mean_img, kmean, ann=(4, 8))
+    o = out[0].numpy().astype(np.float64)
+    assert info["measured"] == 1 and info["wing_below_noise"] == 0, info
+    s = info["stars"][0]
+    assert s[5][0] < 0.05, s                                                  # the kernel-normalised ratio crushes red
+    assert s[7][0] > 0.5, s                                                   # the light does not: that is what the core got
+    c0 = r1 <= 3
+    ratio = [(o[c][c0] - sky).sum() / (o[1][c0] - sky).sum() for c in range(C)]
+    assert abs(ratio[0] - 1.0) < 0.2 and abs(ratio[1] - 1.0) < 0.02 and abs(ratio[2] - 1.0) < 0.2, ratio
+
+
+def test_a_calibrated_wing_colour_undoes_the_kernel_weight_using_real_stars():
+    """The same estimator with stars to calibrate on: ``col_cal`` is each ring band's measured colour divided by what
+    this same estimator returned for it, fitted on the bright unsaturated catalogue stars, so multiplying by it cancels
+    each channel's kernel weight. Here red's wider PSF (C 49's measured FWHM 7.42 px against green's 6.33) leaves the
+    ratio 2.8 x low in red and 2.7 x low in blue; the calibration lifts both back toward the light and the delivered
+    core carries exactly what the engine recorded -- the invariant the green cores violated. It is an aperture
+    correction and not an identity: the aperture it calibrates against (6 px) and the annulus it corrects (10 px) see
+    differently shaped channel profiles, so it still lands ~40 % under the star's colour, which is why the wing's own
+    ``snr`` -- the light, needing no correction -- is recorded beside it."""
+    rng = np.random.default_rng(7)
+    C, N = 3, 700
+    sky, noise = 0.1, 0.001
+    SIG = (3.15, 2.69, 3.05)                                                   # C 49's FWHM 7.42 / 6.33 / 7.18 px
+
+    def gauss(sig):
+        g = np.mgrid[-30:31, -30:31] ** 2
+        k = np.exp(-g.sum(0) / (2 * sig * sig))
+        return k / k.sum()
+
+    ks = [gauss(s) for s in SIG]
+    wings = gauss(5.0)                                                          # the extended PSF: one shape, all channels
+    lat = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    mean_img = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+
+    def star(img, sx, sy, amps):
+        d = np.zeros((N, N)); d[sy, sx] = 1.0
+        for c in range(C):
+            img[c] += amps[c] * (0.7 * cv2.filter2D(d, -1, ks[c]) + 0.3 * cv2.filter2D(d, -1, wings))
+
+    sat_col, cal_col = (0.45, 1.0, 0.94), (0.60, 1.0, 0.80)                   # C 49's star; the calibration stars' colour
+    star(mean_img, 200, 200, [8.0 * v for v in sat_col])
+    yy, xx = np.mgrid[:N, :N]
+    r1 = np.hypot(xx - 200, yy - 200)
+    for c in range(C):
+        lat[c] += 5.0 * (r1 <= 3)
+    core = (r1 <= 3)
+    catalog = []
+    for gx in (350, 450, 550):                                                 # nine, 100 px apart: no ring sees a neighbour
+        for gy in (350, 450, 550):
+            star(mean_img, gx, gy, [5.0 * v for v in cal_col])                 # bright enough for the calibration's floor
+            catalog.append((float(gx), float(gy)))
+    kmean = np.stack(ks).astype(np.float32)
+    x = torch.from_numpy(lat.astype(np.float32))[None]
+    out, info = V.ImageMMEngine._saturated_star_photometry(x, core, mean_img, kmean, ann=(4, 8), catalog=catalog)
+    o = out[0].numpy().astype(np.float64)
+    assert info["measured"] == 1 and info["wing_below_noise"] == 0, info
+    assert info["calibration_bands"] >= 1, info
+    s = info["stars"][0]
+    q, col, truth = np.array(s[5]), np.array(s[7]), np.array(sat_col)
+    assert q[0] < 0.6 * truth[0] and q[2] < 0.6 * truth[2], s                  # the kernel weight buries both channels
+    assert col[0] > 1.4 * q[0] and col[2] > 1.4 * q[2], s                      # the calibration lifts them back
+    assert np.abs(col - truth)[[0, 2]].max() < np.abs(q - truth)[[0, 2]].max(), s
+    c0 = r1 <= 3
+    ratio = np.array([(o[c][c0] - sky).sum() for c in range(C)])
+    assert np.allclose(ratio / ratio[1], col, atol=0.02), (ratio.tolist(), col.tolist())
+
+
+def test_a_core_is_never_left_dimmer_than_the_frames_say_the_star_is():
+    """``amps`` is the model's TOTAL light -- it multiplies a PSF normalised to unit light over the region -- and it is
+    taken from ``Lg``, the restoration's own light inside the censored region. So when the restoration has crushed that
+    region, the star lands short everywhere at once: C 49 (2026-10-31) delivered 0.34 of the stack's aperture flux at
+    every radius and, because ``post.py`` keeps ImageMM's pixels outside the stack's fitted footprint, a dark annulus at
+    r 6-12 in ``linear.fits`` -- while the frames' mean image carries a PSF-consistent halo out there. The frames are the
+    only unbiased photometry a saturated star has, so a rewritten core may not be quieter than the star they show: it has
+    to sit within a factor of two of the flux the mean image holds for the same aperture."""
+    rng = np.random.default_rng(5)
+    C, N = 3, 700
+    sky, noise = 0.1, 1e-5                                                   # quiet: a crushed core must not read as extended
+
+    def gauss(sig):
+        g = np.mgrid[-30:31, -30:31] ** 2
+        k = np.exp(-g.sum(0) / (2 * sig * sig))
+        return k / k.sum()
+
+    ks = [gauss(s) for s in (3.15, 2.69, 3.05)]                             # C 49's per-channel FWHM
+    wings = gauss(5.0)                                                       # the extended PSF, one shape per channel
+    lat = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    d = np.zeros((N, N)); d[200, 200] = 1.0
+    col_true = (0.45, 1.0, 0.94)
+    mean_img = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    for c in range(C):
+        mean_img[c] += 8.0 * col_true[c] * (0.7 * cv2.filter2D(d, -1, ks[c]) + 0.3 * cv2.filter2D(d, -1, wings))
+    r1 = np.hypot(*[a - 200 for a in np.mgrid[:N, :N]])
+    for c in range(C):                                                       # the restoration crushed the core: what
+        lat[c] += 0.01 * (r1 <= 3)                                           # Lg would happily accept as the star
+    core = (r1 <= 3)
+    x = torch.from_numpy(lat.astype(np.float32))[None]
+    out, info = V.ImageMMEngine._saturated_star_photometry(x, core, mean_img, np.stack(ks).astype(np.float32), ann=(4, 8))
+    assert info["measured"] == 1, info                                       # the wings are significant: it is rewritten
+    o = out[0].numpy().astype(np.float64)
+    a_out = [(o[c][core] - sky).sum() for c in range(C)]
+    a_ref = [(mean_img[c][core] - sky).sum() for c in range(C)]
+    a = info["amplitudes"]["200,200"]
+    assert a["Lg_wing"] > 4.0 * a["Lg_region"], a                             # the region's light was a fraction of the star
+    assert min(a_out) > 0.5 * min(a_ref), (a_out, a_ref)                       # never quieter than the frames by 2x
+    assert max(float(o[c][core].max()) for c in range(C)) > 0.5 * max(float(mean_img[c][core].max()) for c in range(C))
+
+
 def test_bloom_zone_grows_with_a_large_saturated_patch():
     """Round a large saturated patch the missing zone reaches 0.75 x its equivalent radius (M 31's brightest star: the
     light beyond the PSF's out to 8-9 px); round a small one, bloom_grow px."""
@@ -450,3 +618,50 @@ def test_photon_transfer_with_mixed_frame_scales():
     mixed = np.array([1.0] * 10 + [0.5] * 10)
     assert fit(mixed) == pytest.approx(one, rel=0.08)                # (two noise draws: ~5 % apart)
     assert fit(mixed, weighted=False) > 1.25 * one                 # pooled unweighted: ~1.4 x
+
+
+def test_the_core_rewrite_gives_back_the_light_the_restoration_had():
+    """A rewritten saturated core may not leave the region quieter than the restoration found it.  ``amps`` is decided
+    on green -- ``Lg``, or green's edge fit -- and shared by every channel through the wing colour, so a star whose
+    channels the fit left level is written at the wings' colour ratios and loses the difference.  On C 49 (2026-10-31)
+    that is exactly what happened: ``from_wings / amps`` was 0.68 identically for every star and channel, i.e. ``Lg``
+    always took the restoration's own region light and the wing anchor never fired, only 1 of 43 stars had a
+    significant edge fit, and the step that is supposed to restore the star's photometry delivered 0.403 / 0.754 /
+    0.557 of the stack's aperture flux against 0.645 / 0.793 / 0.741 with it off.  The wings keep the colour -- what
+    they cannot do is pay for the light -- so the total is given back with the colour ratios intact."""
+    rng = np.random.default_rng(7)
+    C, N = 3, 700
+    sky, noise = 0.1, 1e-5
+
+    def gauss(sig):
+        g = np.mgrid[-30:31, -30:31] ** 2
+        k = np.exp(-g.sum(0) / (2 * sig * sig))
+        return k / k.sum()
+
+    ks = [gauss(s) for s in (3.15, 2.69, 3.05)]
+    wings = gauss(5.0)
+    col_true = (0.45, 1.0, 0.94)
+    d = np.zeros((N, N)); d[200, 200] = 1.0
+    mean_img = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    for c in range(C):                                                    # the frames: a red-faint star, significant wings
+        mean_img[c] += 1.0 * col_true[c] * (0.7 * cv2.filter2D(d, -1, ks[c]) + 0.3 * cv2.filter2D(d, -1, wings))
+    lat = np.full((C, N, N), sky) + rng.normal(0, noise, (C, N, N))
+    blob = cv2.filter2D(d, -1, gauss(3.0))
+    for c in range(C):                                                    # the restoration: level across the channels,
+        lat[c] += 16.0 * blob                                             # and carrying more there than the wings imply
+    r1 = np.hypot(*[a - 200 for a in np.mgrid[:N, :N]])
+    core = (r1 <= 3)
+    x = torch.from_numpy(lat.astype(np.float32))[None]
+    out, info = V.ImageMMEngine._saturated_star_photometry(x, core, mean_img, np.stack(ks).astype(np.float32), ann=(4, 8))
+    assert info["measured"] == 1, info                                    # the wings are significant: the star is rewritten
+    o = out[0].numpy().astype(np.float64)
+    a = info["amplitudes"]["200,200"]
+    assert a["Lg_region"] > a["Lg_wing"] and a["Lg"] == a["Lg_region"], a   # the case C 49 was in: the anchor is the region
+    tot_in = sum(float((lat[c][core] - sky).sum()) for c in range(C))
+    tot_out = sum(float((o[c][core] - sky).sum()) for c in range(C))
+    assert sum(a["amps_pre_floor"]) < sum(a["region_light"]), a           # the case: the model's total was short of the region's
+    assert sum(a["amps"]) > sum(a["amps_pre_floor"]), a                    # ... and it was given back
+    assert tot_out >= 0.92 * tot_in, (tot_out, tot_in)                     # the region is not left quieter than it was
+    pre = np.array(a["amps_pre_floor"], float)
+    post = np.array(a["amps"], float)
+    assert post / post[1] == pytest.approx(pre / pre[1], rel=1e-3)       # given back at the wings' colour, not level

@@ -179,11 +179,25 @@ def weighting(params: dict) -> str:
     return "" if w == "none" else w
 
 
+def _shown(low: float, high: float) -> str:
+    """``low < high``, printed at the first precision that still shows the gap.  A C 20 frame measured roundness
+    0.7049 against a cut of 0.7048 and the frames table rendered it as "stars too elongated (roundness 0.70 <
+    0.70)": a filter the user can see working and cannot see the reason for, which is how a legitimate exclusion
+    gets reported as a bug.  Numbers that really are equal say so instead of claiming a gap."""
+    for dp in range(2, 12):
+        x, y = f"{low:.{dp}f}", f"{high:.{dp}f}"
+        if x != y:
+            return f"{x} < {y}"
+    return f"{low:.4f} and the cut are the same number"
+
+
 def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]]:
     """Reasons to exclude each frame ([] = keep).  ``stats``: per frame dicts with registered (bool), nbstars,
     roundness, wfwhm (from the .seq).  Rules (same semantics as Siril's -filter-* options, evaluated here so the
     UI shows exactly what will be stacked and user overrides compose with them):
-      1. registration failed (Siril excluded the frame);
+      1. registration failed: Siril returned no transform for the frame (its cause is not measured here, so it is
+         not asserted - see the note in the loop; the telescope's own failed_* verdict is stated, because that one
+         is a recorded fact);
       2. fewer than MIN_STARS stars, or "stars" narrower than MIN_STAR_FWHM (pixel defects: no star field);
       3. roundness more than ROUNDNESS_K sigma below the mean (``-filter-round=2.5k``);
       4. worse than the best ``keep_percent(sensitivity)`` % by weighted FWHM (``-filter-wfwhm=N%``)."""
@@ -192,7 +206,17 @@ def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]
     alive = []
     for i, s in enumerate(stats):
         if not s.get("registered", True):
-            reasons[i].append("registration failed (no matching star field: clouds, or too few stars)")
+            # The fact we actually have is that Siril returned no transform for this frame.  Why is not measured
+            # here, and asserting one lost data to weather that was never observed: C 20 (2026-10-31) dropped 34 of
+            # 157 subs under "clouds, or too few stars".  Checking the files: 31 of the 34 are the telescope's own
+            # failed_* captures (device_rejected), which is a recorded fact and is stated; for the other 3 nothing
+            # was known, which is exactly why the invented cause is dropped and the measurements are printed instead.
+            got = ", ".join(f"{k} {s[k]:g}" for k in ("nbstars", "fwhm", "roundness")
+                            if isinstance(s.get(k), (int, float)) and s[k])
+            flagged = "; the telescope itself flagged this file as a failed capture" if s.get("device_rejected") else ""
+            reasons[i].append("registration failed: Siril returned no transform for this frame ("
+                              + (f"although it measured {got}" if got else "no FWHM and no star count measured")
+                              + flagged + ")")
         elif s.get("nbstars") is None or s["nbstars"] < MIN_STARS:
             reasons[i].append(f"fewer than {MIN_STARS} stars")
         elif s.get("fwhm") is not None and 0 < s["fwhm"] < MIN_STAR_FWHM:
@@ -207,7 +231,7 @@ def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]
         for i in list(alive):
             r = stats[i].get("roundness")
             if r is not None and r < thr:
-                reasons[i].append(f"stars too elongated (roundness {r:.2f} < {thr:.2f})")
+                reasons[i].append(f"stars too elongated (roundness {_shown(r, thr)})")
                 alive.remove(i)
     pct = keep_percent(sensitivity)
     if len(alive) >= 10 and pct < 100.0:
@@ -215,7 +239,8 @@ def select_frames(stats: list[dict], sensitivity: float = 1.0) -> list[list[str]
         keep = max(3, int(math.ceil(len(order) * pct / 100.0)))
         cut = stats[order[keep - 1]].get("wfwhm")
         for i in order[keep:]:
-            reasons[i].append(f"weighted FWHM {stats[i].get('wfwhm') or 0:.2f} px above the best {pct:.0f}% cut ({cut:.2f})")
+            reasons[i].append(f"weighted FWHM worse than the best {pct:.0f}% cut: "
+                              f"{_shown(cut, stats[i].get('wfwhm') or 0.0)} px")
     return reasons
 
 

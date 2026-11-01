@@ -246,7 +246,8 @@ class SeqFrame:
     fwhm: float | None = None        # px
     wfwhm: float | None = None       # px (weighted by star count)
     roundness: float | None = None   # 0..1, 1 = round
-    quality: float | None = None
+    quality: float | None = None   # Siril's own R-line column: 0.0 whenever the registration mode does not compute
+                                   # it (C 20: 0.0 on all 157), so it is carried for the record and no rule reads it
     background: float | None = None  # [0,1] image units
     nbstars: int | None = None
     H: list[float] | None = None     # 3x3 homography row-major (image -> reference)

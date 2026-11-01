@@ -45,6 +45,22 @@ def test_select_frames_rules():
     assert not any(w.select_frames(_stats(8), 2.0))
 
 
+def test_registration_exclusion_states_the_measurement_not_a_guess():
+    """C 20 (2026-10-31): 34 of 157 subs were discarded on a cause this function invented - "clouds, or too few
+    stars" - while it had measured no star field for them at all (nbstars/fwhm None).  Checking the files: 31 of the
+    34 were the telescope's own failed_* captures, so the telescope's verdict is a recorded fact and gets stated; the
+    other 3 are unexplained, which is precisely why the invented cause goes and the measurements come instead."""
+    st = _stats(12, {0: {"registered": False},
+                     1: {"registered": False, "nbstars": 241, "fwhm": 3.1},
+                     2: {"registered": False, "device_rejected": True}})
+    why = w.select_frames(st, 1.0)
+    assert "registration failed" in why[0][0] and "no transform" in why[0][0]
+    assert "cloud" not in why[0][0].lower() and "too few stars" not in why[0][0]
+    assert "failed capture" not in why[0][0]                                    # nothing claims the telescope rejected it
+    assert "nbstars 241" in why[1][0] and "fwhm 3.1" in why[1][0]
+    assert "failed capture" in why[2][0] and "cloud" not in why[2][0].lower()
+
+
 def test_decide_resampling_default_is_bayer_drizzle_1x():
     r = w.decide_resampling({}, 148, 3.6)
     assert (r["mode"], r["scale"], r["pixfrac"], r["kernel"]) == ("drizzle", 1.0, 1.0, "square")

@@ -684,6 +684,23 @@ def test_ui_jobs_flow(env):
     assert c.get("/api/download", params={"path": "/etc/passwd"}).status_code == 403
 
 
+def test_exports_list_carries_the_verdict_the_export_recorded(env):
+    """The export's own gate report sat unread in its sidecar, so a render that failed its gates was listed like one
+    that passed them (C 20, 2026-10-31: five of twelve failed).  The list carries the recorded verdict now, and stays
+    silent about an export that recorded none."""
+    c = env.client
+    folder = os.path.join(env.images, "M 42", "night1")
+    j = c.post("/api/jobs", json={"kind": "export", "folder": folder, "params": {}, "stack_params": {},
+                                  "export": {"quality": 90, "upscale": 1, "tiff": False}}).json()
+    wait_state(c, j["id"], base="/api")
+    ex = c.get("/api/exports", params={"folder": folder}).json()["exports"]
+    assert ex and ex[0]["gates"] is None                                # a sidecar with no report says nothing
+    json.dump({"linear_info": {"gates": {"passed": False, "failed": ["sky_chroma"], "sky_chroma": {"pass": False}}}},
+              open(ex[0]["jpg"][:-4] + ".json", "w"))
+    assert c.get("/api/exports", params={"folder": folder}).json()["exports"][0]["gates"] == \
+        {"passed": False, "failed": ["sky_chroma"], "error": None}
+
+
 def test_pause_resume(env):
     c = env.client
     folder = os.path.join(env.images, "M 42", "night1")

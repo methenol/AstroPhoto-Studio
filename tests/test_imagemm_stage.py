@@ -229,6 +229,42 @@ def test_canvas_origin_beyond_the_size_difference_is_an_error(tmp_path):
         S.canvas_origin(seq, frame, 3, stack, (0, 0, canvas[0], canvas[1]), canvas)
 
 
+def test_a_flat_correlation_does_not_move_frames_that_already_sit_on_the_stack(tmp_path, monkeypatch):
+    """C 20 2026-11-01: the registered frames sat on the stack's pixels (residual 0.06 / 0.21 px), but the origin
+    search's correlation surface was flat over the whole search - 0.4920 at (1, -1) against 0.4945 at (1, 0) - and
+    taking its argmax as an answer shifted the frames one pixel the stack never asked for, which the residual then
+    read as ten whole pixels: the session was refused and delivered un-restored, with no fallback.  The correlation
+    ranks the candidates; the residual decides, and the least move it accepts wins."""
+    seq, frame, stack, canvas = _offset_canvas(tmp_path, (0, 0))
+
+    def flat(ref, frm, room):                                      # a real sky: nothing distinguishes the origins
+        return {(dx, dy): 0.49 for dy in range(-room[1], room[1] + 1)
+                for dx in range(-room[0], room[0] + 1)} | {(1, -1): 0.4920}
+
+    monkeypatch.setattr(S, "origin_scores", flat)
+    got, ext, flip, info, shift = S.canvas_origin(seq, frame, 3, stack, (0, 0, canvas[0], canvas[1]), canvas)
+    assert got == (0, 0), info                                    # the frames were not moved to satisfy a coin toss
+    assert max(abs(v) for v in shift) <= S.ALIGN_TOLERANCE
+    assert info["origin_residual_px"] == shift and info["origin_candidates"] >= 1
+
+
+def test_a_frame_that_no_origin_places_is_refused_with_the_residuals_that_say_so(tmp_path, monkeypatch):
+    """The guard still guards.  When no candidate leaves the frames on the stack's pixels the session is refused - and
+    the refusal names the measurements behind it, because the reason a session was never restored is the first thing
+    anyone asks afterwards."""
+    seq, frame, stack, canvas = _offset_canvas(tmp_path, (0, 0))
+    seen = []
+
+    def never(ref, frm):                                           # a residual no origin can satisfy
+        seen.append(frm[..., 1].sum())
+        return [1.7, -0.9]
+
+    monkeypatch.setattr(S, "alignment_shift", never)
+    with pytest.raises(RuntimeError, match=r"no canvas origin within 4 x 9 px") as exc:
+        S.canvas_origin(seq, frame, 3, stack, (0, 0, canvas[0], canvas[1]), canvas)
+    assert "1.7" in str(exc.value) and len(seen) == 11 * 21        # the whole search (room + 1) was measured first
+
+
 def test_sequence_placements_without_registration_needs_one_size(tmp_path):
     f = tmp_path / "r_.seq"
     f.write_text("S 'r_' 1 1 1 5 1 6 1 0 1\nL 3\nI 1 1 10,10\n")
@@ -529,6 +565,39 @@ def test_run_region_and_kept_store(tmp_path, monkeypatch):
     assert os.path.exists(os.path.join(d, S.WORK, "frames.npy"))
 
 
+def test_star_diagnostics_reports_the_saturated_star_handling():
+    """C 49 (2026-10-31): ``meta_out`` copies a whitelist of the engine's ``last_run_info``, and the keys that say what
+    the restoration did to the saturated stars were not on it -- the delivered ``imagemm_meta.json`` carries no
+    ``point_initial``, no ``saturated_photometry`` and no ``bloom_grow``, although instrumentation showed all three ran
+    on 2920 core pixels.  With them absent, "the cores came out with no star's colour" cannot be told apart from "the
+    saturated-star handling never ran at all", which is the first question to ask of either."""
+    info = {"saturated_cores": 2920, "bloom_grow": 4, "point_initial": {"points": 41},
+            "saturated_photometry": {"cores": 41, "measured": 38, "skipped": 2, "extended": 1,
+                                     "colour_ratio_median": [0.25, 1.0, 0.55], "calibration_bands": 0,
+                                     "stars": [{"x": i} for i in range(2 * S.STAR_LIST_CAP)]}}
+    got = S.star_diagnostics(info)
+    assert got["saturated_cores"] == 2920 and got["bloom_grow"] == 4 and got["point_initial"] == {"points": 41}
+    phot = got["saturated_photometry"]
+    assert phot["measured"] == 38 and phot["colour_ratio_median"] == [0.25, 1.0, 0.55]
+    assert phot["calibration_bands"] == 0                         # the documented way the cores come out green
+    assert len(phot["stars"]) == S.STAR_LIST_CAP and phot["list_cap"] == S.STAR_LIST_CAP
+    assert phot["stars"][0]["x"] == 0 and phot["stars"][-1]["x"] == S.STAR_LIST_CAP - 1   # the head is kept
+    assert got["restored_psf_stars"] is None                      # never ran: the report says so, not silence
+
+
+def test_run_writes_the_saturated_star_report_into_the_meta(tmp_path, monkeypatch):
+    """The same through the stage: what the engine decided about the saturated stars has to reach the file."""
+    pytest.importorskip("torch")
+    d, meta, _ = _fake_session(tmp_path)
+    monkeypatch.setattr(S, "siril_preprocess", _fake_preprocess(200, 190))
+    out = S.run(d, meta, {"device": "cpu", "imagemm_iterations": 3})
+    written = json.load(open(os.path.join(d, S.OUT_META)))
+    for key in S.STAR_REPORT:
+        assert key in written and key in out, key                 # recorded, not silently dropped
+    assert written["saturated_cores"] == 0                        # these synthetic frames saturate nothing
+    assert written["saturated_photometry"] is None
+
+
 def test_match_to_stack_on_a_dark_star_field_keeps_each_channels_scale():
     """M 31's outer field 2026-10-23: a line through the two smoothed images had no lever arm on dark sky and the
     field's brightest star (clipped in the stack only) set green's slope to 0.4.  The stars' flux ratio sets it now."""
@@ -563,6 +632,31 @@ def test_confirm_on_calibrated_keeps_saturated_pixels_under_a_strong_flat(tmp_pa
     kept, same, info = S.confirm_on_calibrated({1: rc}, {1: p}, 4095.0)
     k = kept[1].tolist()
     assert len(k) == 36 and [11, 21] in k and [35, 45] not in k
+
+
+def test_deconvolution_records_imagemm_as_a_run_and_not_a_skip(tmp_path):
+    """Both regions on ImageMM means the image WAS deconvolved - upstream, by the session's own restore, before the
+    chain ran.  The step recorded that as ``skipped``, so a correct run reported itself as a missing sharpening
+    (the C 20 audit, 2026-10-31); the record has to say ``done`` and carry the restoration's own numbers, which
+    ``imagemm_meta.json`` already holds."""
+    from sirilpipe import post
+    s = _session(tmp_path)                                          # writes stack.fits on a small grid
+    fitsio.write_rgb(s._p("imagemm.fits"), np.full((3, 4, 4), 0.25, np.float32))
+    with open(s._p("imagemm_meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"frames_used": 87, "frames_total": 108, "seconds_restore": 1234.5,
+                   "iterations": {"done": 147, "max": 150, "converged": True},
+                   "psf": {"kernel_fwhm_px_median": [10.2, 9.7, 9.9]}}, f)
+    r = post.Restorer(os.path.dirname(s._p("stack.fits")), {"restore_source": "imagemm.fits"},
+                      {"deconv_method": "imagemm", "deconv_stars_method": "imagemm"},
+                      {"deconvolution": 1.0}, lambda *a, **k: None, None)
+    r.deconvolve()
+    rec = [x for x in r.steps.records if x["step"] == "deconvolution"]
+    assert len(rec) == 1
+    assert rec[0]["tool"] == "imagemm" and rec[0]["status"] == "done"
+    assert rec[0]["params"]["frames_used"] == 87 and rec[0]["params"]["frames_total"] == 108
+    assert rec[0]["params"]["iterations"] == 147 and rec[0]["params"]["converged"] is True
+    assert rec[0]["params"]["psf_kernel_fwhm_px"] == [10.2, 9.7, 9.9]
+    assert "upstream" in rec[0]["note"]
 
 
 def test_saturation_masks_added_after_the_frames_match_masks_read_with_them(tmp_path):

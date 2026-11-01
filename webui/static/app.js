@@ -701,12 +701,19 @@ function renderCharts() {
 }
 
 /* ------------------------------------------------------------ export & diag */
+function gatesPill(g) {
+  if (!g) return "";                                                          // recorded nothing: say nothing
+  if (g.error || g.passed === null) return `<span class="pill bad" title="the export could not measure its own gates">gates not measured</span>`;
+  if (g.passed) return `<span class="pill">gates ok</span>`;
+  const f = g.failed || [];
+  return `<span class="pill bad" title="${f.join(", ")}">${f.length} gate${f.length === 1 ? "" : "s"} failed</span>`;
+}
 async function refreshExports() {
   if (!S.folder) return;
   const r = await api(`/api/exports?folder=${encodeURIComponent(S.folder)}`);
   $("#exportsList").innerHTML = r.exports.length ? r.exports.map(e => `
     <div class="exp"><a href="/api/download?inline=1&path=${encodeURIComponent(e.jpg)}" target="_blank"><img src="/api/download?inline=1&path=${encodeURIComponent(e.jpg)}" loading="lazy" alt=""></a>
-      <div class="meta"><b>${e.name}</b><span class="muted">${e.created} · ${e.size_mb} MB</span>
+      <div class="meta"><b>${e.name}</b>${gatesPill(e.gates)}<span class="muted">${e.created} · ${e.size_mb} MB</span>
       <span><a href="/api/download?path=${encodeURIComponent(e.jpg)}">JPG</a>${e.tif ? `<a href="/api/download?path=${encodeURIComponent(e.tif)}">16-bit TIFF</a>` : ""}</span></div></div>`).join("")
     : `<p class="muted">No exports yet.</p>`;
 }

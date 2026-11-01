@@ -146,6 +146,25 @@ def test_status_before_and_after_scan(session):
     for k in ("has_linear", "has_starless", "has_autofinish", "calibration", "tools"):
         assert k in st
 
+def test_status_carries_the_verdict_of_the_newest_export(session):
+    """``post.export`` measures the gates, prints the table and files the report, and consumed none of it: a render
+    that failed five of the twelve was delivered and listed exactly like one that failed none (C 20, 2026-10-31).
+    The card now states what the pipeline itself measured about the picture it handed out."""
+    d = os.path.join(session.dir, "exports")
+    os.makedirs(d, exist_ok=True)
+    assert session.status()["export_gates"] is None                     # nothing exported: nothing to report
+    json.dump({"linear_info": {"gates": {"passed": False, "failed": ["sky_pixel_noise", "stars_count"],
+                                         "sky_pixel_noise": {"value": 0.0172, "limit": 0.008, "pass": False}}}},
+              open(os.path.join(d, "M42_20261031-101010.json"), "w"))
+    g = session.status()["export_gates"]
+    assert g["export"] == "M42_20261031-101010" and g["passed"] is False and g["error"] is None
+    assert g["failed"] == ["sky_pixel_noise", "stars_count"]
+    json.dump({"linear_info": {"gates": {"passed": True, "failed": []}}},
+              open(os.path.join(d, "M42_20261031-111111.json"), "w"))
+    assert session.status()["export_gates"]["passed"] is True           # the newest export is what the card says
+    json.dump({"params": {}}, open(os.path.join(d, "M42_20261031-121212.json"), "w"))
+    assert session.status()["export_gates"] is None                     # one that measured nothing says so
+
 
 def test_analysis_writes_frames_json_with_included_flags(session):
     r = session.run_analysis(1.0)
@@ -293,6 +312,58 @@ def test_local_copy_copies_and_cleans(session, monkeypatch, tmp_path):
     with session.local_copy(lambda i, n, m: msgs.append(m)):
         session.run_stack({})                       # the registration is reused: no sub is read, nothing copied
     assert not any(m.startswith("Copying") for m in msgs)
+
+def test_a_second_job_leaves_a_running_jobs_local_copy_alone(session, monkeypatch, tmp_path):
+    """The copy root is shared by every job on the output volume and used to be cleared at each job's entry, so a
+    second job that started while a first was still copying deleted the first's copies under it and the first died
+    renaming a ``.part`` file (border_census, 2026-10-31, exit 1, while an export was using the same root).  Each
+    job now copies into a folder of its own, which the other neither reads nor removes."""
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_COPY", "1")
+    root = tmp_path / "local"
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_DIR", str(root))
+    other = sess.Session(session.folders, session.workdir)
+    with session.local_copy() as a, other.local_copy() as b:      # b enters while a has copied nothing yet
+        a.scan()
+        paths = [f.path for f in a.fs.frames]
+        a._local_paths(paths)                                     # this is where the first used to die
+        b._local_paths(paths)
+        assert len(a._local) == len(b._local) == len(paths)
+        assert set(a._local.values()).isdisjoint(b._local.values())
+        assert all(os.path.exists(p) for p in list(a._local.values()) + list(b._local.values()))
+        assert os.path.basename(a._local_root).startswith(f"{os.path.basename(a.dir)}-{os.getpid()}-")
+    assert not root.exists()                                      # both folders gone, then the empty root
+
+
+def test_a_dead_jobs_copy_is_reaped_and_a_live_jobs_is_not(session, monkeypatch, tmp_path):
+    """What the shared folder used to reclaim from every job at entry is now reclaimed only from jobs that are
+    gone: a folder whose pid no longer answers, one too old to still be copying even if it does (a container
+    restart recycles pids), and debris from when the root itself was the working folder.  A live job's is untouchable."""
+    import subprocess
+    import sys
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_COPY", "1")
+    root = tmp_path / "local"
+    monkeypatch.setenv("ASTROPHOTO_LOCAL_DIR", str(root))
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()                                                 # reaped: this pid answers to nobody now
+    dead_pid = gone.pid
+    for name in (f"M 42-{dead_pid}-deadbeef",                    # its job is gone
+                 f"M 42-{os.getpid()}-cafebab0",                 # a job running now
+                 f"M 42-{os.getpid()}-f00df00d",                 # answers, but from before a restart
+                 "5f4dcc3b5aa7"):                                 # the old layout's hash folder
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "sub_00001.fit").write_bytes(b"x")
+    os.utime(root / f"M 42-{os.getpid()}-f00df00d", (0, 0))
+    with session.local_copy() as s:
+        assert not (root / f"M 42-{dead_pid}-deadbeef").exists()
+        assert not (root / "5f4dcc3b5aa7").exists()
+        assert not (root / f"M 42-{os.getpid()}-f00df00d").exists()
+        assert (root / f"M 42-{os.getpid()}-cafebab0" / "sub_00001.fit").exists()
+        assert s._local_root.startswith(str(root)) and os.path.isdir(s._local_root)
+    assert (root / f"M 42-{os.getpid()}-cafebab0").exists()           # the neighbour outlives our exit
+    shutil.rmtree(root / f"M 42-{os.getpid()}-cafebab0")
+    root.rmdir()
+    assert not root.exists()
 
 
 def test_local_copy_off_and_unsafe_dir(session, monkeypatch, tmp_path):

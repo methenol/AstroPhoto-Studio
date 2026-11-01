@@ -166,6 +166,7 @@ AP_RADIUS = 8.0                  # px: its normalising aperture flux
 MIN_STAR_SNR = 20.0              # aperture SNR a star needs to enter the PSF stack
 WING_JOIN = 5.0                  # px: a frame's kernel is its own inside, the mean image's radial wing beyond (change 28)
 SAT_BLEND = 3.0              # px over which a saturated star's photometric core joins the restoration
+SAT_WING_SNR = 5.0         # sigmas of the wing annulus' own noise a channel must reach before its colour may set a core's
 SPARSE_FRAC = 0.95               # a pixel valid in fewer of the frames than this is the star's model (change 25): the frames that
                                  # still see it there are the poorer-seeing ones (a smaller saturated core) - a biased sample
 TAIL_FLOOR = 0.01                # x the restoration's pixel noise: a saturated star's tail is carried out to this level (change 33)
@@ -1618,11 +1619,14 @@ class ImageMMEngine:
             hp = xc[c] - cv2.blur(xc[c], (3, 3))
             noise.append(1.4826 * float(np.median(np.abs(hp - np.median(hp)))) / math.sqrt(8.0 / 9.0))
         done, ratios, dbg = 0, [], []
-        skipped = extended = 0
+        amps_report: dict[str, dict] = {}                  # per star, what its core's amplitude was made of
+        skipped = extended = wing_weak = 0
         # the wing-colour estimator calibrated on stars of known colour (an aperture correction per band): for the bright
         # unsaturated catalogue stars, their colour within 6 px over their colour by the same estimator in 4 px rings
         # centred 6 .. 30 px out; the median per channel and ring.  Uncalibrated, a channel's kernel wing error went
         # straight into the core's colour (M 31: green-tinged cores, R / G and B / G both low - no star's spectrum)
+        cal_reject = {"edge": 0, "near_saturated": 0, "holes": 0, "faint": 0}
+        cal_counts: dict[int, int] = {}
         col_cal = {}
         if catalog:
             near_sat = cv2.dilate(grown.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61))) > 0
@@ -1630,15 +1634,21 @@ class ImageMMEngine:
             acc_ = {b_: [] for b_ in bands}
             for (sx_, sy_) in catalog:
                 ix_, iy_ = int(round(sx_)), int(round(sy_))
-                if not (R < ix_ < W - R - 1 and R < iy_ < H - R - 1) or near_sat[iy_, ix_]:
+                if not (R < ix_ < W - R - 1 and R < iy_ < H - R - 1):
+                    cal_reject["edge"] += 1
+                    continue
+                if near_sat[iy_, ix_]:
+                    cal_reject["near_saturated"] += 1
                     continue
                 mw_ = mean_img[:, iy_ - R:iy_ + R + 1, ix_ - R:ix_ + R + 1].astype(np.float64)
                 if not np.isfinite(mw_[:, rr0 <= 34]).all():
+                    cal_reject["holes"] += 1
                     continue
                 bgv = np.array([np.median(mw_[c][(rr0 >= 36) & (rr0 <= 44)]) for c in range(C)])
                 sdv = 1.4826 * np.median(np.abs(mw_[g_][(rr0 >= 36) & (rr0 <= 44)] - bgv[g_]))
                 ap_ = np.array([(mw_[c] - bgv[c])[rr0 <= 6].sum() for c in range(C)])
                 if ap_[g_] < 2000.0 * sdv or (ap_ <= 0).any():
+                    cal_reject["faint"] += 1
                     continue
                 for b_ in bands:
                     ring_ = (rr0 >= b_ - 2) & (rr0 < b_ + 2)
@@ -1648,6 +1658,7 @@ class ImageMMEngine:
             for b_ in bands:
                 if len(acc_[b_]) >= 8:
                     col_cal[b_] = np.median(np.array(acc_[b_]), 0)
+            cal_counts = {int(b_): int(len(v)) for b_, v in acc_.items()}
         # (padded by R with "no data": a star near the edge gets the same treatment)
         xp = np.pad(xc, ((0, 0), (R, R), (R, R)), constant_values=np.nan)
         mp = np.pad(mean_img.astype(np.float64), ((0, 0), (R, R), (R, R)), constant_values=np.nan)
@@ -1727,17 +1738,39 @@ class ImageMMEngine:
                 Fo[c] = d_[a_out].sum() / max(float(kws[c][a_out].sum()), 1e-12)
             with np.errstate(divide="ignore", invalid="ignore"):
                 q_in, q_out = Fi / Fi[g_], Fo / Fo[g_]
-            ok_ = bool(np.all(np.isfinite(q_in) & np.isfinite(q_out) & (q_in > 0) & (q_out > 0)))
+            # What a channel's colour is worth is its annulus light against the noise of *those same pixels*, measured
+            # here on the frames' mean image and its own sky annulus: the latent's noise (used for the profile above)
+            # belongs to a different array and is far the larger of the two - against it every star looks unmeasurable.
+            # The guard that was here asked only for a ratio above zero, so a ratio with nothing behind it passed.
+            kw_in = np.array([float(kws[c][a_in].sum()) for c in range(C)])
+            kw_out = np.array([float(kws[c][a_out].sum()) for c in range(C)])
+            wing = Fi * kw_in + Fo * kw_out                                   # the annulus' light, per channel
+            sg = np.array([1.4826 * float(np.nanmedian(np.abs(mw[c][skym] - np.nanmedian(mw[c][skym])))) for c in range(C)])
+            sg = np.where(np.isfinite(sg) & (sg > 0.0), sg, 1e-12)            # that annulus' own pixel noise
+            snr = wing / (sg * math.sqrt(max(float(a_in.sum() + a_out.sum()), 1.0)))
+            weak = [c for c in range(C) if snr[c] < SAT_WING_SNR]
+            # q_in / q_out are the star's colour *divided by each channel's own kernel weight*: honest once ``col_cal``
+            # undoes that (it is fitted on real stars by this same estimator), ruinous without it, because the widest
+            # kernel divides its channel away.  C 49 (2026-10-31) had no calibration star in any ring band
+            # (catalog_stars 1, rejected for sitting at the edge); its saturated stars' wings carried 12.7 and 26.4
+            # sigmas of light in red and blue - R/G 0.45, B/G 0.94, an ordinary star - while the kernel-normalised
+            # ratio read [0.0, 1.0, 0.0] and drove red and blue below the sky: the green core.  With nothing to
+            # calibrate on the colour is the light itself: the annulus is the same geometry in every channel and a
+            # star's profile is the same shape in every channel, so light compared to light needs no kernel to undo.
+            r_ann = float(np.mean(rr0[annm]))
+            b_near = min(col_cal, key=lambda b_: abs(b_ - r_ann)) if col_cal else None
+            col = 0.5 * (q_in + q_out) * col_cal[b_near] if b_near is not None else wing / max(float(wing[g_]), 1e-30)
+            ok_ = bool(np.all(np.isfinite(col) & (col > 0.0))) and not weak
             dbg.append((ix - R, iy - R, "extended" if is_ext else "point", round(r_out, 1), round(L_ext / max(L_core, 1e-30), 3),
-                        [round(float(v), 3) for v in q_in], [round(float(v), 3) for v in q_out]))
+                        [round(float(v), 3) for v in q_in], [round(float(v), 3) for v in q_out],
+                        [round(float(v), 3) for v in col],                       # the colour that was actually used
+                        [round(float(v), 1) for v in snr]))       # what each channel was worth, in sigmas of the annulus
             if not ok_:
-                skipped += 1
+                if weak:                                                      # the colour was never measured: leave the
+                    wing_weak += 1                                            # restoration's own core rather than invent one
+                else:
+                    skipped += 1
                 continue
-            col = 0.5 * (q_in + q_out)
-            if col_cal:
-                r_ann = float(np.mean(rr0[annm]))
-                b_near = min(col_cal, key=lambda b_: abs(b_ - r_ann))
-                col = col * col_cal[b_near]
             inner = dist <= inner_px
             d_in = cv2.distanceTransform((~inner).astype(np.uint8), cv2.DIST_L2, 3)
             wgt = np.where(inner, 1.0, np.clip(1.0 - d_in / blend_px, 0.0, 1.0))
@@ -1772,7 +1805,20 @@ class ImageMMEngine:
                     jb = max(3.0, 0.3 * float(rr[sparse].max()) if sparse.any() else 3.0)
                     ws = np.where(sparse, 1.0, np.clip(1.0 - d_s / jb, 0.0, 1.0))
                     wgt = np.where(sparse, 1.0, 0.5 - 0.5 * np.cos(np.pi * ws)) * (ws > 0)
-                Lg = float((np.clip(win[g_] - fl[g_], 0.0, None) * wgt)[have].sum())
+                Lg_channels = [float((np.clip(win[c] - fl[c], 0.0, None) * wgt)[have].sum()) for c in range(C)]
+                Lg_region = Lg_channels[g_]
+                # ``amps`` multiplies a PSF normalised to unit light over the region, so it is the star's TOTAL light -- and
+                # the region's own light is only a ring plus its blend. Anchoring the total on it makes the star short
+                # everywhere at once: C 49 (2026-10-31) delivered 0.34 of the stack's aperture flux at every radius, and a
+                # dark annulus at r 6-12 in ``linear.fits`` where ``post.py`` keeps ImageMM's pixels outside the stack's
+                # fitted footprint, while the frames' mean image carries a PSF-consistent halo out there (measured: 0.031 of
+                # the implied core at r=6 and 0.0037 at r=10, the same as the unsaturated stars' 0.033 and 0.0055). The
+                # kernel-normalised wing flux -- the light over the kernel's light, both annuli, in the latent's own units
+                # (mean_norm and x are both divided by norm_factor) -- is what the frames say the star's total light is, and
+                # for a saturated star the frames are the only unbiased photometry there is. So it anchors the amplitude
+                # wherever it is significant, and never lowers what the restoration already has.
+                Lg_wing = float(wing[g_] / max(float(kw_in[g_] + kw_out[g_]), 1e-30))
+                Lg = max(Lg_wing, Lg_region) if (Lg_wing > 0.0 and snr[g_] >= SAT_WING_SNR) else Lg_region
                 from scipy.ndimage import shift as _nd_shift
                 Sks = []
                 for c in range(C):
@@ -1791,6 +1837,7 @@ class ImageMMEngine:
                 # channel without a significant fit of its own takes green's x the wing colour (decided per channel, the
                 # channels mixed two methods - a green core)
                 edge_ = (wgt == 0) & have & free & (cv2.distanceTransform((wgt == 0).astype(np.uint8), cv2.DIST_L2, 3) <= 3)
+                fits = None                                 # (the least-squares fit to the restoration just outside; None if too few px)
                 if psi is not None and edge_.sum() >= 30:
                     fits = []
                     for c in range(C):
@@ -1866,6 +1913,53 @@ class ImageMMEngine:
                         tail_w = np.where(sparse, 0.0, (1.0 - wgt) * w_f) * (rr <= r_f) * have
                         for c in range(C):
                             amps[c] *= float((Sks[c] * wgt).sum()) / max(float((Sks[c] * (wgt + tail_w)).sum()), 1e-30)
+                # PIPELINE: the rewrite may not leave the star shorter than the light the restoration already carries
+                # there.  The amplitudes are decided once -- on green -- and shared by every channel through the wing
+                # colour, so the channels' sum is the colour's, not the star's: C 49 (2026-10-31) measured 0.403 /
+                # 0.754 / 0.557 of the stack's aperture flux with this step on against 0.645 / 0.793 / 0.741 with it
+                # off, and the shortfall was worst in red, where the colour ratio bites.  The wings are the only
+                # unbiased colour a saturated star has; they are not a licence to delete light.  So the total the
+                # region already held is given back with the wings' ratios intact -- and never by more than 3 x,
+                # because a region that much brighter than the model is contamination, not the star.
+                amps_pre_floor = list(amps)
+                # both sides in the same units: what the model puts *into the region*, against what the restoration
+                # had there.  ``amps`` is the star's total and the PSF is normalised over the region only when no tail
+                # was fitted, so the model's side is measured, not assumed.
+                tot_model = float(sum(a * float((Sks[c] * wgt).sum()) for c, a in enumerate(amps)))
+                tot_have = float(np.sum(Lg_channels))
+                if tot_model > 0.0 and tot_have > tot_model:
+                    for c in range(C):
+                        amps[c] *= min(tot_have / tot_model, 3.0)
+                # PIPELINE: what the core's amplitude was made of, per star. ``Lg`` is the restoration's own green light
+                # inside the region and every channel's fallback amplitude is green's (``col[c] * fits[g_][0]``), so when
+                # the restoration has crushed green alone -- C 49 (179,726): a core at 0.080 of the stack's green, with
+                # red and blue intact at 0.92/1.00 until the rewrite touched them -- one channel's failure is written into
+                # all three. This is the record that says whether the amplitude came from the wings, from the edge fit, or
+                # from the crushed quantity itself; ``wing`` is the frames' mean image's light, the only unbiased photometry
+                # a saturated star has.
+                #
+                # ``from_wings`` is the candidate replacement anchor, measured but NOT used: the star's total light as the
+                # frames' mean image says it is (the kernel-normalised wing flux, the same quantity the colour comes from,
+                # and mean_norm shares the latent's units -- both divided by norm_factor at 2732 and 2966). Why Lg is not
+                # it: the delivered star at (161,1787) keeps the restored PSF's shape yet carries 0.34 of the stack's light
+                # in every annulus, because Lg is the light inside the censored region -- a ring plus its 2 px blend -- and
+                # is then spread over the whole PSF as if it were the star's total. The edge fit cannot rescue it either:
+                # it fits the restored PSF (sigma 1.77 px, ~0 beyond r=8) on a ring at r~8-11 where that basis is ~0, so
+                # Sigma(sv^2)~0 and every amplitude it returns is garbage (+/-1e5, negative), the guard rejects all of them
+                # and Lg always wins. ``hole_px`` counts the pixels inside the region's outer radius that are not part of
+                # it -- a donut's hole is exactly where the model is never written (1919: ``Sks[c] * (wgt > 0)``).
+                amps_report[f"{ix - R},{iy - R}"] = {
+                    "kind": "point", "Lg": round(Lg, 4), "Lg_region": round(Lg_region, 4), "Lg_wing": round(Lg_wing, 4),
+                    "edge_px": int(edge_.sum()),
+                    "edge": None if fits is None else [[round(float(a), 4), round(float(s), 1)] for a, s in fits],
+                    "amps": [round(float(a), 4) for a in amps],
+                    "amps_pre_floor": [round(float(a), 4) for a in amps_pre_floor],
+                    "region_light": [round(float(v), 4) for v in Lg_channels],
+                    "wing": [round(float(v), 4) for v in wing], "psi": psi is not None,
+                    "Fi": [round(float(v), 4) for v in Fi], "Fo": [round(float(v), 4) for v in Fo],
+                    "kw": [round(float(kw_in[c] + kw_out[c]), 2) for c in range(C)],
+                    "from_wings": [round(float(col[c] * Lg_wing), 4) for c in range(C)],
+                    "hole_px": int(((dist > 0) & (dist <= (float(dist[reg].max()) if reg.any() else 0.0) + 1.0) & ~reg).sum())}
                 # (the texture comes in over the join from the sparse zone's edge: right at it the restoration's pile-up of
                 # the frames' last unsaturated pixels varies round the ring per channel - coloured specks)
                 tex_w = np.clip(d_s / max(3.0, jb), 0.0, 1.0) if valid_frac is not None else 1.0
@@ -1877,7 +1971,19 @@ class ImageMMEngine:
         xc = xp[:, R:R + H, R:R + W]
         out = torch.from_numpy(xc.astype(np.float32)).to(x.device)[None]
         return out, {"cores": int(n), "measured": done, "skipped": skipped, "extended": extended,
-                     "colour_ratio_median": [round(float(v), 3) for v in np.median(ratios, 0)] if ratios else None, "stars": dbg}
+                     "wing_below_noise": int(wing_weak),
+                     "colour_ratio_median": [round(float(v), 3) for v in np.median(ratios, 0)] if ratios else None,
+                     # PIPELINE: the wing-colour calibration's own report.  An empty ``col_cal`` is how the restored
+                     # cores came out green -- "uncalibrated, a channel's kernel wing error went straight into the
+                     # core's colour (R / G and B / G both low - no star's spectrum)" -- and nothing said whether it had
+                     # stars to calibrate on: imagemm_meta.json copies a whitelist of these keys.  ``wing_below_noise``
+                     # counts the stars refused because a channel's wing never rose above the annulus' noise (the same
+                     # report as ``stars``, whose last field is each channel's ratio worth in sigmas of that noise).
+                     "calibration_bands": int(len(col_cal)), "calibration_stars_per_ring": cal_counts,
+                     "calibration_rejected": cal_reject, "catalog_stars": int(len(catalog or [])), "stars": dbg,
+                     # per star: the amplitude's provenance (``Lg`` from the restoration, ``edge`` the least-squares fit to
+                     # the data just outside, ``wing`` the frames' mean image's light) -- which of the three set the core
+                     "amplitudes": amps_report}
 
     @staticmethod
     def _point_initial(x, core, sigma: float, noise, grow: int = 2, R: int = 104, bg_ring: tuple = (90, 104), ext_max: float = 0.5, valid=None,
@@ -2769,6 +2875,7 @@ class ImageMMEngine:
         sat_core = ((sat_cnt >= 0.5 * torch.clamp(cov_cnt, min=1.0)) & (cov_cnt > 0)).cpu().numpy()
         self._sat_core = sat_core
         self.last_run_info['bloom_grow'] = int(bloom_grow)
+        self.last_run_info['saturated_cores'] = int(sat_core.sum())   # the gate every star-level fix hangs on
         del sat_cnt, cov_cnt
         current_step = 0
         EPSILON = 1e-8 if self.formal_mode else 1e-5
