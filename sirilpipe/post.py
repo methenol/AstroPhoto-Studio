@@ -777,6 +777,13 @@ class Restorer:
                     raise
                 except (ToolUnavailable, ToolError) as e:
                     info["graxpert"] = f"unavailable ({str(e)[:120]}): skyref's own model"
+                # what stays fixed to the sensor's rows and columns (an edge fall-off without a flat, wide row bands) in what the survey cannot
+                # explain: GraXpert's smooth model does not follow a ramp a few hundred pixels wide at the frame's edge (skyref.line_profiles)
+                E = np.moveaxis(skyref_mod.emission(refs, info, self.arr.shape[1:]), -1, 0)
+                resid = np.moveaxis(self.arr - bgm - E, 0, -1)
+                rows, cols, lines = skyref_mod.line_profiles(resid, skyref_mod._star_mask_simple(resid.mean(-1)))
+                bgm = bgm + np.moveaxis(rows[:, None, :] + cols[None, :, :], -1, 0)
+                del resid, E
                 # the model's shape is removed and its mean - the sky pedestal - stays (GraXpert "subtract" and Siril subsky keep it too).  Subtracting
                 # the whole model put the sky on 0 and _sanitize clipped its lower half (M 42 2026-10-24: 44 % of the values zeroed, the pixel noise
                 # 1.72e-4 -> 1.01e-4); NXT then shifted every area by how much of it was clipped (blocks) and the stretch blew the nebula out
@@ -792,6 +799,7 @@ class Restorer:
                 s.add("gradient", "sky survey reference (skyref)" + (" + graxpert" if model_by.startswith("graxpert") else ""), seconds=time.time() - t0,
                       method=info["method"], model=model_by, gradient_scale_px=info["gradient_scale_px"], coverage=info["coverage"],
                       gradient_range=round(info["gradient_range"], 2), survey_coefficients=info["survey_coefficients"], credit=info["credit"],
+                      star_halos=info.get("star_halos", []), line_profiles=lines,
                       sky_level=None if level is None else round(level, 6), clipped_fraction=round(clipped, 6))
                 return
             except Cancelled:
@@ -849,8 +857,11 @@ class Restorer:
         if refs is None:
             refs, source = skyref_mod.fetch(wcs, shape)
             np.savez_compressed(path, key=key, refs=refs, source=source)
+        # the survey's own scattered light around bright stars is not emission (skyref.remove_star_halos)
+        refs, halos = skyref_mod.remove_star_halos(refs, skyref_mod.bright_stars(wcs, shape))
         img = np.ascontiguousarray(np.moveaxis(self.arr, 0, -1), np.float32)
         bg, info = skyref_mod.fit(img, refs, float(skyref_mod.FACTOR), smooth=1.5, source=source)
+        info["star_halos"] = [{**h, "map": skyref_mod.SURVEYS[h["map"]][0]} for h in halos]
         return bg.astype(np.float32), info, refs
 
     def plate_solve(self) -> bool:

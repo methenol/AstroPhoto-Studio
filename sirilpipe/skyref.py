@@ -280,6 +280,189 @@ def emission(refs: np.ndarray, info: dict, shape, factor: int = FACTOR) -> np.nd
     return np.stack([sum(up[..., i] * float(k[name][c]) for i, (name, _) in enumerate(SURVEYS)) for c in range(3)], -1).astype(np.float32)
 
 
+def bright_stars(wcs, shape, factor: int = FACTOR, path: str | None = None) -> list[tuple[str, float, float, float]]:
+    """The catalogued bright stars (Siril's stars.csv) whose halo can reach the field: (name, magnitude, x, y) on the grid reduced by ``factor``,
+    within HALO_R_MAX reference pixels of it.  Empty when the catalogue is not there."""
+    import csv
+    import os
+    from . import config
+    path = path or os.path.join(config.SIRIL_CATALOGUE, "stars.csv")
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("ra") and r.get("dec")]
+    if not rows:
+        return []
+    ra = np.array([float(r["ra"]) for r in rows])
+    dec = np.array([float(r["dec"]) for r in rows])
+    # only stars on the field's side of the sky (the TAN projection maps the far hemisphere onto the plane too)
+    c0 = wcs.wcs.crval
+    cosd = (np.sin(np.radians(dec)) * np.sin(np.radians(c0[1])) +
+            np.cos(np.radians(dec)) * np.cos(np.radians(c0[1])) * np.cos(np.radians(ra - c0[0])))
+    near = cosd > np.cos(np.radians(20.0))
+    if not near.any():
+        return []
+    x, y = wcs.world_to_pixel_values(ra[near], dec[near])
+    gx, gy = (np.asarray(x) + 0.5) / factor - 0.5, (np.asarray(y) + 0.5) / factor - 0.5
+    h, w = int(math.ceil(shape[0] / factor)), int(math.ceil(shape[1] / factor))
+    keep = (gx > -HALO_R_MAX) & (gx < w + HALO_R_MAX) & (gy > -HALO_R_MAX) & (gy < h + HALO_R_MAX)
+    sel = [r for r, n in zip(rows, near) if n]
+    return [(sel[i]["name"], float(sel[i]["mag"] or 99), float(gx[i]), float(gy[i])) for i in np.nonzero(keep)[0]]
+
+
+# A survey's maps carry its own telescopes' scattered light around bright stars (NSNS [OIII] around zeta Ori: 370x the map's median at the
+# star, falling as r^-1.9 out to ~40 reference pixels).  Scaled to the image as emission, that light is subtracted from the gradient model's
+# input, the model dips there and the correction leaves the survey's halo in the picture as a coloured glow.  A halo is the star's aureole:
+# a core and a power-law fall-off, ~r^-2 (Racine 1996, PASP 108, 699; King 1971, PASP 83, 199 - r^-2 to r^-3 far out); emission around a
+# star is not.  So per star and map: the annulus medians about the star (robust to emission covering part of an annulus), and the halo is
+# taken out only where the profile peaks at the star and falls off as background + A r^-alpha, alpha within HALO_ALPHA, significantly better
+# than a flat background (HALO_DCHI2); a plateau or a rise (an HII region around its ionising star) is left as it is.
+HALO_R_MAX = 128         # reference pixels: the widest halo considered (~2500" at 20"/px)
+HALO_ALPHA = (1.5, 4.0)  # the aureole's power-law index range accepted (the literature's r^-2 .. r^-3, with room for the fit's spread);
+                         # a fit that ends on either bound is no aureole (a nebula's slow decline away from a star fits r^-1)
+HALO_DCHI2 = 25.0        # the halo model's chi^2 improvement over a flat background required (~5 sigma)
+
+
+def _halo_profile(m: np.ndarray, r: np.ndarray, edges: np.ndarray):
+    """Annulus medians, their standard errors (1.2533 x MAD-sigma / sqrt n) and pixel counts of map ``m`` (NaN = no data) in the rings ``edges``."""
+    ok = np.isfinite(m)
+    med, err, cnt = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        v = m[ok & (r >= a) & (r < b)]
+        if v.size < 8:
+            med.append(np.nan); err.append(np.nan); cnt.append(v.size)
+            continue
+        q = float(np.median(v))
+        med.append(q)
+        err.append(1.2533 * 1.4826 * float(np.median(np.abs(v - q))) / math.sqrt(v.size) + 1e-12)
+        cnt.append(v.size)
+    return np.array(med), np.array(err), np.array(cnt)
+
+
+def remove_star_halos(refs: np.ndarray, stars) -> tuple[np.ndarray, list[dict]]:
+    """``refs`` (h, w, k) without the bright ``stars``' halos (see HALO_*): returns (maps, one record per halo removed)."""
+    from scipy.optimize import least_squares
+    out = refs.astype(np.float32).copy()
+    h, w = out.shape[:2]
+    Y, X = np.mgrid[0:h, 0:w].astype(np.float32)
+    edges = np.unique(np.round(np.geomspace(1.0, HALO_R_MAX, 24)).astype(int))
+    edges = np.r_[0, edges]
+    rc = np.sqrt(np.maximum(edges[:-1], 0.5) * edges[1:])                     # each ring's representative radius
+    done = []
+    for name, mag, gx, gy in sorted(stars, key=lambda s: s[1]):
+        r = np.hypot(Y - gy, X - gx)
+        if not (r < HALO_R_MAX).any():
+            continue
+        for k in range(out.shape[-1]):
+            med, err, _ = _halo_profile(out[..., k], r, edges)
+            v = np.isfinite(med)
+            if v.sum() < 6:
+                continue
+            first = int(np.argmax(v))
+            far = float(np.median(med[v][-3:]))
+            # it peaks at the star: the innermost ring with data holds the profile's maximum (within its error)
+            if med[first] + 3 * err[first] < np.nanmax(med):
+                continue
+            # the core's edge: the first ring where the excess has fallen below half the peak's; the power law is fitted from there out
+            exc0 = med[first] - far
+            if exc0 <= 3 * err[first]:
+                continue
+            below = np.nonzero(v & (np.arange(len(med)) > first) & (med - far < 0.5 * exc0))[0]
+            if below.size == 0:
+                continue
+            j0 = int(below[0])
+            sel = v & (np.arange(len(med)) >= j0)
+            if sel.sum() < 4:
+                continue
+            rr, mm, ee = rc[sel], med[sel], err[sel]
+            # robust (soft L1 beyond 3 standard errors): a ring that crosses other emission is an outlier to both models, not a reason to
+            # reject the aureole or to bend it
+            null = least_squares(lambda p: (p[0] - mm) / ee, x0=[far], loss="soft_l1", f_scale=3.0)
+            fit = least_squares(lambda p: (p[0] + np.exp(p[1]) * rr ** -p[2] - mm) / ee,
+                                x0=[far, math.log(max(exc0, 1e-12)) + 2 * math.log(max(rc[j0], 1.0)), 2.0],
+                                bounds=([-np.inf, -np.inf, HALO_ALPHA[0]], [np.inf, np.inf, HALO_ALPHA[1]]), loss="soft_l1", f_scale=3.0)
+            b, A, alpha = float(fit.x[0]), float(math.exp(fit.x[1])), float(fit.x[2])
+            dchi2 = 2.0 * (float(null.cost) - float(fit.cost))
+            if dchi2 < HALO_DCHI2 or not (HALO_ALPHA[0] + 0.02 < alpha < HALO_ALPHA[1] - 0.02):
+                continue
+            # the halo: the fitted aureole beyond the core's edge, out to where it falls below the ring's error; inside the core (the star's
+            # own residue, brighter than any ring median shows) everything above the background.  Halo light only adds, so nothing is taken
+            # below the fitted background: a ring median raised by emission on one side would otherwise dig a hole on the other
+            past = np.nonzero((rc >= rc[j0]) & (A * rc ** -alpha < np.nan_to_num(err, nan=np.inf)))[0]
+            r_end = float(edges[past[0]]) if past.size else float(HALO_R_MAX)
+            m = out[..., k]
+            above = np.maximum(np.nan_to_num(m - b), 0.0)
+            aureole = (A * np.maximum(r, rc[j0]) ** -alpha).astype(np.float32)
+            halo = np.where(r < rc[j0], above, np.minimum(aureole, above))
+            halo[r >= r_end] = 0.0
+            out[..., k] = m - halo
+            done.append({"star": name, "mag": round(mag, 2), "map": k, "alpha": round(alpha, 2), "radius_px": round(r_end, 1),
+                         "core_excess": round(float(exc0), 4), "dchi2": round(dchi2, 1)})
+    return out, done
+
+
+
+def _whittaker(y: np.ndarray, se: np.ndarray) -> np.ndarray:
+    """``y`` (with standard errors ``se``) smoothed by the Whittaker smoother - weighted least squares with a second-difference penalty
+    (Eilers 2003, Anal. Chem. 75, 3631) - its smoothness chosen by the unbiased risk estimate (Mallows' Cp / UBRE: the noise is known, from
+    ``se``; Craven & Wahba 1979) over a log grid: the data decide how much of the profile is structure, and noise alone gives an (almost)
+    straight line."""
+    y = np.asarray(y, np.float64)
+    n = y.size
+    if n < 6:
+        return np.zeros_like(y)
+    w = 1.0 / np.maximum(np.asarray(se, np.float64), 1e-30) ** 2
+    D = np.diff(np.eye(n), 2, axis=0)
+    P = D.T @ D
+    Wd = np.diag(w)
+    best = None
+    from scipy.linalg import cho_factor, cho_solve
+    for lam in np.logspace(-2, 10, 25) * float(np.median(w)):
+        Hm = cho_solve(cho_factor(Wd + lam * P), Wd)                  # the hat matrix: z = H y (the system is symmetric positive definite)
+        z = Hm @ y
+        risk = float(np.sum(w * (y - z) ** 2)) + 2.0 * float(np.trace(Hm)) - n
+        if best is None or risk < best[0]:
+            best = (risk, z)
+    return best[1]
+
+
+def line_profiles(resid: np.ndarray, star_mask: np.ndarray, block: int = FACTOR) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Light that varies along the sensor's rows and columns in what the survey cannot explain (``resid`` (H, W, 3) = the corrected image minus
+    the survey's emission): per block row (and column) the median over the sky blocks of the line (star-free, sigma-clipped at GRADIENT_CLIP),
+    so structure covering less than half a line does not move it - Siril's fixbanding's estimator, at the scale of blocks.  A sensor's edge
+    fall-off (no flat) and wide row bands stay fixed to the rows while the frames are registered with little rotation; a smooth gradient model
+    cannot follow a ramp a few hundred pixels wide at the frame's edge.  Each profile is smoothed with weights from its lines' standard errors
+    and a smoothness chosen by the unbiased risk estimate (``_whittaker``), so no smoothing scale is picked by hand and lines that differ
+    from the field by their noise only are not taken for a pattern.  Returns (rows (H, 3), columns (W, 3), info)."""
+    H, W = resid.shape[:2]
+    b = max(2, int(block))
+    hb, wb = H // b, W // b
+    okb = ~star_mask[:hb * b, :wb * b].reshape(hb, b, wb, b).transpose(0, 2, 1, 3).reshape(hb, wb, b * b)
+    rows, cols, amp = np.zeros((H, 3), np.float32), np.zeros((W, 3), np.float32), []
+    yc, xc = (np.arange(hb) + 0.5) * b - 0.5, (np.arange(wb) + 0.5) * b - 0.5
+    for c in range(3):
+        x = resid[:hb * b, :wb * b, c].reshape(hb, b, wb, b).transpose(0, 2, 1, 3).reshape(hb, wb, b * b)
+        D = np.nanmedian(np.where(okb, x, np.nan), axis=-1)
+        D = np.where(okb.mean(-1) > 0.3, D, np.nan)
+        med = float(np.nanmedian(D))
+        sc = 1.4826 * float(np.nanmedian(np.abs(D - med))) + 1e-12
+        D = np.where(np.abs(D - med) <= GRADIENT_CLIP * sc, D - med, np.nan)
+        prof = {}
+        for axis in (1, 0, 1, 0):                                      # rows, columns, then both again: each without the other's part
+            other = prof.get(1 - axis)
+            Dc = D if other is None else D - (other[None, :] if axis == 1 else other[:, None])
+            p = np.nanmedian(Dc, axis=axis)
+            n = np.isfinite(Dc).sum(axis=axis)
+            se = 1.2533 * sc / np.sqrt(np.maximum(n, 1))
+            p = np.where(n >= 8, np.nan_to_num(p), 0.0)
+            p = _whittaker(p, se)
+            prof[axis] = (p - np.median(p)).astype(np.float32)
+        rows[:, c] = np.interp(np.arange(H), yc, prof[1])
+        cols[:, c] = np.interp(np.arange(W), xc, prof[0])
+        amp.append([float(np.ptp(prof[1])), float(np.ptp(prof[0]))])
+    return rows, cols, {"row_range": [round(a[0], 7) for a in amp], "column_range": [round(a[1], 7) for a in amp], "block_px": b}
+
+
 def _star_mask_simple(lum: np.ndarray) -> np.ndarray:
     """Stars and their halos: pixels more than 4 sigma above a 15 px median-filtered sky, dilated by 5 px (the mask the block medians exclude)."""
     from scipy.ndimage import median_filter

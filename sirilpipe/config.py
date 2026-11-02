@@ -15,6 +15,8 @@ import shutil
 _SETTINGS: dict[str, tuple[str, object]] = {
     "SIRIL_BIN": ("SIRIL_BIN", "/usr/local/bin/siril-cli"),
     "SIRIL_DATA": ("SIRIL_DATA", "/opt/siril-data"),
+    # Siril's bundled annotation catalogues (stars.csv: the named bright stars with magnitudes), inside the AppImage tree
+    "SIRIL_CATALOGUE": ("SIRIL_CATALOGUE", lambda: os.path.join(os.environ.get("APPDIR") or "/opt/siril", "usr", "share", "siril", "catalogue")),
     "GRAXPERT_BIN": ("GRAXPERT_BIN", "/opt/graxpert/bin/python"),
     "GRAXPERT_RUNNER": ("GRAXPERT_RUNNER", "/opt/graxpert/gx_run.py"),
     "STARNET_DIR": ("STARNET_DIR", "/opt/starnet2"),
