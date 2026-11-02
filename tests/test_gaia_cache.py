@@ -38,3 +38,4 @@ def test_field_circle_from_wcs():
     assert (ra, dec) == (312.8, 31.2) and r == pytest.approx(0.5 * 0.001 * np.hypot(2000, 4000))
     with pytest.raises(KeyError):
         post.field_circle(fits.Header(), (10, 10))
+

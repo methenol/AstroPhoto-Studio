@@ -64,9 +64,8 @@ def lower_half_sigma(x: np.ndarray) -> float:
 # (it turns noise into texture and rings), NoiseXTerminator wants 0.6-0.9 and the noisier the data the higher; GraXpert's AI denoise is the same kind of tool.  The
 # signal-to-noise they key on is measured here, per pixel, on the object: the 90th percentile of the (1.5 px smoothed) luminance above the sky over the pixel noise
 # (MAD of the 5 px high-pass), over the pixels that stand 3 sigma of the smoothed luminance above the sky and are not stars (compact excess over a 4 px
-# smoothing: more than 5 sigma of pixel noise, dilated 15 px; a nebula is smooth and stays in).  Calibration of the ladder on this statistic: IC 1805, Sh2-132 / 157 / 171
-# (1-3 h of 30 s DWARF 3 frames, the nebula barely above the noise per pixel) read 1.5-3, M 42 / M 31 / M 45 4-8, so "noisy" = 3 and below (the pixel signal is
-# smaller than the pixel noise) and "clean" = 15 and above (the signal stands 5 sigma above the noise even after the 1.5 px smoothing).
+# smoothing: more than 5 sigma of pixel noise, dilated 15 px; a nebula is smooth and stays in).  The ladder's ends are detection limits on this statistic:
+# "noisy" = 3 and below (the 3 sigma detection limit), "clean" = 15 and above (5 sigma once the 1.5 px smoothing, whose noise gain is ~3, is taken out).
 SNR_LOW, SNR_HIGH = 3.0, 15.0
 
 
@@ -377,7 +376,7 @@ def star_white_balance(rgb: np.ndarray) -> tuple[np.ndarray, dict]:
     return out, {"gains": [round(g, 4) for g in gains], "stars": int(sel.sum())}
 
 
-EDGE_CROP = 24                    # px trimmed from every side of the stack before the render (post._Layers): the rim holds fewer dithered frames, measured 25 % noisier
+EDGE_CROP = 24                    # px of the frame's edge left out of the sky measurements (sky masks, SNR); no pixels are trimmed
                                   # the output range sits 0.4 % above the black point of a white-scaled plane: the slope below it would have to exceed the slope above it
 _STARLET_NOISE: dict = {}
 

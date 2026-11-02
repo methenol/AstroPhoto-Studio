@@ -89,7 +89,9 @@ def crop_box(valid: np.ndarray, coverage: np.ndarray | None, threshold: float, n
         c = coverage
         if c.shape != m.shape:
             c = cv2.resize(c.astype(np.float32), (m.shape[1], m.shape[0]), interpolation=cv2.INTER_NEAREST)
-        m = m & (c >= max(1.0, threshold * n_frames))
+        # at least threshold x n_frames frames, but never more than any pixel actually has: frames of two nights whose pointing drifted may
+        # have no pixel in common, and then the best-covered region is the frame (an impossible threshold made the crop fall back to the whole canvas)
+        m = m & (c >= max(1.0, min(threshold * n_frames, float(c[m].max()) if m.any() else 1.0)))
     x0, y0, x1, y1 = largest_rectangle(m)
     x0, y0, x1, y1 = x0 * down, y0 * down, min(W, x1 * down), min(H, y1 * down)
     # refine at full resolution: shrink until the border rows/columns are all valid

@@ -46,3 +46,10 @@ def touch(path: str) -> str:
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "docker: integration test that needs siril-cli and the NAS data (run inside the image)")
+
+
+@pytest.fixture(autouse=True)
+def _no_local_catalogue(monkeypatch):
+    """Plate solving in the tests sees no local Gaia astrometric catalogue (whatever the machine has installed), unless a test says otherwise."""
+    from sirilpipe import tools
+    monkeypatch.setattr(tools.GaiaAstrometric, "ensure", lambda self, progress=None, checkpoint=None: False)

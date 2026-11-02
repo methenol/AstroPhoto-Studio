@@ -1,36 +1,7 @@
-"""``sky_uniformity``: the border's sky floor over the smooth surface fitted through the mesh of sky floors - a gross one-sided border offset."""
+"""The star colour measurement of the gates."""
 import numpy as np
 
 from sirilpipe import gates
-
-
-def _picture(band=0.0, blob=0.0, size=600):
-    """A finished picture: sky at 0.10 with its noise, an optional band across the top of the frame, an optional extended subject in the middle.  The band is two cell
-    rows of the gate's mesh deep - the scale of the canvas border bands (300 - 1000 px) the gate is for."""
-    rng = np.random.default_rng(4)
-    lum = 0.10 + rng.normal(0, 0.002, (size, size)).astype(np.float32)
-    if blob:
-        y, x = np.mgrid[0:size, 0:size]
-        lum += blob * np.exp(-((y - size / 2) ** 2 + (x - size / 2) ** 2) / (2 * (size / 8) ** 2)).astype(np.float32)
-    img = np.stack([lum] * 3)
-    if band:
-        d = 2 * size // gates.SKY_BORDER_MESH
-        img[:, :d, :] = np.clip(img[:, :d, :] + band, 0.0, 1.0)
-    return np.clip(img, 0.0, 1.0)
-
-
-def test_a_border_band_fails_and_the_same_picture_without_it_passes():
-    clean = gates.compute(_picture())["sky_uniformity"]
-    banded = gates.compute(_picture(band=0.10))["sky_uniformity"]
-    assert clean["pass"], clean
-    assert not banded["pass"], banded
-    assert banded["value"] > 4 * max(clean["value"], 1e-4)
-
-
-def test_an_extended_subject_in_the_middle_does_not_fail_it():
-    """The 12 x 12 mesh this gate replaced failed nebula frames: a spiral arm is not a seam."""
-    g = gates.compute(_picture(blob=0.25))["sky_uniformity"]
-    assert g["pass"], g
 
 
 def _star_field(colour=(1.0, 0.62, 0.2), pedestal=0.0, size=160, step=16, peak=0.6):

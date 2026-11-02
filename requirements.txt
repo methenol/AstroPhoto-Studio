@@ -16,3 +16,5 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 astropy-healpix>=1.0
+# skyref fallback: the NSNS HiPS read from the survey's own server when CDS hips2fits is down (reproject.hips.hips_as_dask_array)
+reproject>=0.21

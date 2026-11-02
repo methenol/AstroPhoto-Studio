@@ -217,6 +217,16 @@ def test_banding_scripts_split_fix_merge(tmp_path):
     assert w.BANDING_AMOUNT == 1.0 and w.BANDING_SIGMA == 1.0
 
 
+def test_frame_background_scripts_follow_the_official_siril_script(tmp_path):
+    """Per-frame background (local_norm): seqsubsky degree 1 as Siril's OSC_Preprocessing_BackgroundExtraction script does, on each Bayer plane of a mosaic."""
+    u = _unit(tmp_path, {"dark": "/d.fit"})
+    assert w.frame_bkg_script(u, "pp_light", None).splitlines()[1:] == ["seqsubsky pp_light 1"]
+    cfa = w.frame_bkg_script(u, "light", "grbg").splitlines()[1:]
+    assert cfa == ["seqsplit_cfa light"] + [f"seqsubsky CFA{k}_light 1" for k in range(4)] + [
+        "seqmerge_cfa bkg_CFA0_light bkg_CFA1_light bkg_CFA2_light bkg_CFA3_light GRBG"]
+    assert w.frame_bkg_prefix(None) == "bkg_" and w.frame_bkg_prefix("RGGB") == "mCFA_bkg_CFA0_"
+
+
 def test_banding_install_restores_filter_and_replaces_links(tmp_path):
     import numpy as np
     from astropy.io import fits
@@ -245,3 +255,9 @@ def test_image_banding_ratio_reference_noise_and_gate():
     assert own["banded"] and own["ratio"] > ref["ratio"]                   # against the denoised noise the ratio is inflated
     assert ref["needed"] == pytest.approx(1 + 5 / (800 ** 0.5), abs=1e-3)
     assert not w.image_banding_ratio(rng.normal(0, 1, (3, 400, 600)))["banded"]
+
+
+def test_platesolve_script_uses_the_local_catalogue_when_given(tmp_path):
+    lines = w.platesolve_script(str(tmp_path), "stack", None, catalog_lines=['set "core.catalogue_gaia_astro=/c.dat"']).splitlines()
+    assert lines[2] == 'set "core.catalogue_gaia_astro=/c.dat"' and lines[3] == "platesolve -force -catalog=localgaia"
+    assert "localgaia" not in w.platesolve_script(str(tmp_path), "stack", None)

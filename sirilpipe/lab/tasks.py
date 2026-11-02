@@ -329,7 +329,7 @@ def _processing_params(keys: list[str], tune: set[str], hypertune: dict | None =
     return out
 
 
-GATE_NAMES = ("sky_median", "clipped", "white", "sky_chroma", "sky_chroma_quadrants", "sky_uniformity", "sky_band_structure", "sky_pixel_noise", "stars_count",
+GATE_NAMES = ("sky_median", "clipped", "white", "sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise", "stars_count",
               "stars_round", "stars_coloured", "stars_physical")
 
 
@@ -411,7 +411,8 @@ class StackTask(Task):
          "default": "square", "tune": False, "hypertune": True, "pipeline": "drizzle_kernel", "when": {"mode": ["auto", "drizzle"]}},
         {"name": "scale", "label": "Drizzle scale", "type": "categorical", "choices": [1.0, 1.5, 2.0], "default": 1.0, "tune": False, "pipeline": "scale"},
         {"name": "pattern_correction", "label": "Row banding correction (seqfixbanding)", "type": "bool", "default": True, "tune": False, "hypertune": True, "pipeline": "pattern_correction"},
-        {"name": "crop_threshold", "label": "Crop: minimum frame coverage", "type": "float", "low": 0.1, "high": 1.0, "default": 0.3, "tune": False, "hypertune": True,
+        {"name": "local_norm", "label": "Per-frame background (seqsubsky)", "type": "bool", "default": True, "tune": False, "hypertune": True, "pipeline": "local_norm"},
+        {"name": "crop_threshold", "label": "Crop: minimum frame coverage", "type": "float", "low": 0.1, "high": 1.0, "default": 1.0, "tune": False, "hypertune": False,
          "pipeline": "crop_threshold"},
         # the calibration choices (Session.calib_prefs): calibration on / off, each master type automatic or none - a change re-calibrates and
         # re-registers (the masters are part of the registration's signature)
@@ -518,7 +519,7 @@ class StackTask(Task):
         s, ds = ctx["session"], ctx["ds"]
         sp = {**(ctx["opts"].get("stack_params") or {}),
               **{k: p[k] for k in ("rejection", "sigma_low", "sigma_high", "stack_weighting", "sensitivity", "mode", "drizzle_pixfrac", "drizzle_kernel",
-                                   "scale", "pattern_correction", "crop_threshold") if k in p}}
+                                   "scale", "pattern_correction", "local_norm", "crop_threshold") if k in p}}
         apply_calibration(s, {**(ctx["opts"].get("stack_params") or {}), **p})
         t = time.time()
         from .. import post

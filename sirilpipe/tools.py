@@ -1349,60 +1349,125 @@ class GaiaCatalog:
 
     def _install_chunk(self, n: int, i: int, total: int, progress, checkpoint, deadline: float | None = None) -> None:
         name = f"{GAIA_SPCC_NAME}_{n}.dat"
-        url = f"https://zenodo.org/records/{GAIA_SPCC_RECORD}/files/{name}.bz2"
-        bz, part = os.path.join(self.dir(), name + ".bz2"), os.path.join(self.dir(), name + ".part")
-        last: Exception | None = None
-        for attempt in range(GAIA_SPCC_ATTEMPTS):
+        _fetch_bz2(f"https://zenodo.org/records/{GAIA_SPCC_RECORD}/files/{name}.bz2", self.dir(), name, self.chunk_path(n),
+                   f"Gaia SPCC catalogue: sky chunk {n}", "cached for every later field here", i, total, progress, checkpoint, deadline)
+
+
+def _fetch_bz2(url: str, folder: str, name: str, final: str, label: str, why: str, i: int, total: int, progress, checkpoint,
+               deadline: float | None) -> None:
+    """Siril_Catalog_Installer.py's install of one catalogue file: the ``.sha256sum`` beside it, the ``.bz2`` (resumed by an HTTP range request when a
+    partial file is there), the checksum verified, decompressed to ``final``.  Raises ``_FetchBudget`` past ``deadline`` (the partial file stays) and
+    ToolError after GAIA_SPCC_ATTEMPTS failed attempts."""
+    import fcntl
+    with open(os.path.join(folder, name + ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)                # one fetcher per file: a second one (another job, the Tools panel) waits, then finds the file
+        if os.path.isfile(final):
+            return
+        _fetch_bz2_locked(url, folder, name, final, label, why, i, total, progress, checkpoint, deadline)
+
+
+def _fetch_bz2_locked(url: str, folder: str, name: str, final: str, label: str, why: str, i: int, total: int, progress, checkpoint,
+                      deadline: float | None) -> None:
+    bz, part = os.path.join(folder, name + ".bz2"), os.path.join(folder, name + ".part")
+    last: Exception | None = None
+    for attempt in range(GAIA_SPCC_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(url + ".sha256sum", timeout=GAIA_SPCC_TIMEOUT) as r:
+                want = r.read().decode("ascii", "replace").split()[0].lower()
+            have = os.path.getsize(bz) if os.path.exists(bz) else 0
             try:
-                with urllib.request.urlopen(url + ".sha256sum", timeout=GAIA_SPCC_TIMEOUT) as r:
-                    want = r.read().decode("ascii", "replace").split()[0].lower()
-                have = os.path.getsize(bz) if os.path.exists(bz) else 0
-                try:
-                    req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
-                    with urllib.request.urlopen(req, timeout=GAIA_SPCC_TIMEOUT) as r:
-                        resumed = have > 0 and r.status == 206
-                        if not resumed:
-                            have = 0
-                        total_b = int(r.headers.get("Content-Length") or 0) + have
-                        got = have
-                        with open(bz, "ab" if resumed else "wb") as f:
-                            while True:
-                                chunk = r.read(1 << 20)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                got += len(chunk)
-                                if progress:
-                                    progress(i + 0.9 * got / max(total_b, got), total, f"Gaia SPCC catalogue: sky chunk {n} ({got / 1e6:.0f} of {total_b / 1e6:.0f} MB), cached for every later field here")
-                                if checkpoint:
-                                    checkpoint()
-                                if deadline and time.time() > deadline:
-                                    raise _FetchBudget(f"sky chunk {n}: {got / 1e6:.0f} of {total_b / 1e6:.0f} MB fetched within the {GAIA_SPCC_BUDGET:.0f} s budget; the rest next time")
-                except urllib.error.HTTPError as e:
-                    if e.code != 416 or not have:                   # 416: the partial file already is the whole file
-                        raise
-                sha = hashlib.sha256()
-                with open(bz, "rb") as f:
-                    for blk in iter(lambda: f.read(1 << 22), b""):
-                        sha.update(blk)
-                if sha.hexdigest() != want:
-                    os.remove(bz)
-                    raise ToolError("gaia", f"chunk {n}: checksum mismatch (removed)")
-                if progress:
-                    progress(i + 0.92, total, f"Gaia SPCC catalogue: unpacking sky chunk {n}")
-                with bz2.BZ2File(bz, "rb") as fi, open(part, "wb") as fo:
-                    shutil.copyfileobj(fi, fo, 1 << 22)
-                os.replace(part, self.chunk_path(n))
+                req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+                with urllib.request.urlopen(req, timeout=GAIA_SPCC_TIMEOUT) as r:
+                    resumed = have > 0 and r.status == 206
+                    if not resumed:
+                        have = 0
+                    total_b = int(r.headers.get("Content-Length") or 0) + have
+                    got = have
+                    with open(bz, "ab" if resumed else "wb") as f:
+                        while True:
+                            chunk = r.read(1 << 20)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            got += len(chunk)
+                            if progress:
+                                progress(i + 0.9 * got / max(total_b, got), total, f"{label} ({got / 1e6:.0f} of {total_b / 1e6:.0f} MB), {why}")
+                            if checkpoint:
+                                checkpoint()
+                            if deadline and time.time() > deadline:
+                                raise _FetchBudget(f"{label}: {got / 1e6:.0f} of {total_b / 1e6:.0f} MB fetched within the {GAIA_SPCC_BUDGET:.0f} s budget; the rest next time")
+            except urllib.error.HTTPError as e:
+                if e.code != 416 or not have:                   # 416: the partial file already is the whole file
+                    raise
+            sha = hashlib.sha256()
+            with open(bz, "rb") as f:
+                for blk in iter(lambda: f.read(1 << 22), b""):
+                    sha.update(blk)
+            if sha.hexdigest() != want:
                 os.remove(bz)
-                return
-            except (OSError, ToolError) as e:
-                last = e
-                if os.path.exists(part):
-                    os.remove(part)
-                if checkpoint:
-                    checkpoint()
-                time.sleep(5.0 * (attempt + 1))
-        raise ToolError("gaia", f"sky chunk {n} could not be cached after {GAIA_SPCC_ATTEMPTS} attempts: {last}")
+                raise ToolError("gaia", f"{label}: checksum mismatch (removed)")
+            if progress:
+                progress(i + 0.92, total, f"{label}: unpacking")
+            with bz2.BZ2File(bz, "rb") as fi, open(part, "wb") as fo:
+                shutil.copyfileobj(fi, fo, 1 << 22)
+            os.replace(part, final)
+            os.remove(bz)
+            return
+        except (OSError, ToolError) as e:
+            last = e
+            if os.path.exists(part):
+                os.remove(part)
+            if checkpoint:
+                checkpoint()
+            time.sleep(5.0 * (attempt + 1))
+    raise ToolError("gaia", f"{label} could not be fetched after {GAIA_SPCC_ATTEMPTS} attempts: {last}")
+
+
+# --------------------------------------------------------------------------- Gaia DR3 astrometric catalogue (plate solving)
+# Siril's platesolve fetches its stars from CDS VizieR (NOMAD, Gaia DR3) unless the local astrometric extract is installed; VizieR times out often enough to
+# cost a session its plate solution, and with it SPCC and the sky-survey gradient model (IC 434 2026-11-01: four attempts, libcurl error 28).  Siril's own
+# advice in that error is the local extract from Siril_Catalog_Installer.py: one file, siril_cat_healpix8_astro.dat (Zenodo record ASTRO_RECORD, 1.1 GB
+# compressed), registered as core.catalogue_gaia_astro and used by ``platesolve -catalog=localgaia``.  Downloaded from the Tools panel (resumable); the
+# panel and the restoration plan say when it is missing.
+GAIA_ASTRO_RECORD = 14692304
+GAIA_ASTRO_NAME = "siril_cat_healpix8_astro.dat"
+
+
+@dataclass
+class GaiaAstrometric:
+    """The offline Gaia DR3 astrometric catalogue for Siril's plate solver."""
+
+    def dir(self) -> str:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        return os.path.join(home, ".local", "share", "siril")
+
+    def path(self) -> str:
+        return os.path.join(self.dir(), GAIA_ASTRO_NAME)
+
+    def ok(self) -> bool:
+        return os.path.isfile(self.path())
+
+    def status(self) -> dict:
+        partial = os.path.join(self.dir(), GAIA_ASTRO_NAME + ".bz2")
+        return {"ok": self.ok(), "path": self.path(), "bytes": os.path.getsize(self.path()) if self.ok() else 0,
+                "partial_bytes": os.path.getsize(partial) if os.path.exists(partial) else 0, "record": f"https://zenodo.org/records/{GAIA_ASTRO_RECORD}"}
+
+    def siril_lines(self) -> list[str]:
+        """Siril script lines that point the solver at the local catalogue (``-catalog=localgaia`` reads core.catalogue_gaia_astro)."""
+        return [f'set "core.catalogue_gaia_astro={self.path()}"']
+
+    def install(self, progress: Progress | None = None, checkpoint: Callable[[], None] | None = None, **_) -> dict:
+        """The whole download now (the Tools panel's button): no per-job budget; raises ToolError when the fetch fails."""
+        if not self.ok():
+            os.makedirs(self.dir(), exist_ok=True)
+            _fetch_bz2(f"https://zenodo.org/records/{GAIA_ASTRO_RECORD}/files/{GAIA_ASTRO_NAME}.bz2", self.dir(), GAIA_ASTRO_NAME, self.path(),
+                       "Gaia astrometric catalogue", "kept for every later plate solve", 0, 1, progress, checkpoint, None)
+        return self.status()
+
+    def ensure(self, progress: Progress | None = None, checkpoint: Callable[[], None] | None = None) -> bool:
+        """Whether the solver can use the local catalogue.  Nothing is fetched here: the download is the user's (the Tools panel's button,
+        ``install``), and until then the plate solve uses the online catalogues and the Tools panel says the catalogue is missing."""
+        return self.ok()
 
 
 
@@ -1411,9 +1476,11 @@ starnet = StarNet()
 rcastro = RCAstro()
 cosmic_clarity = CosmicClarity()
 gaia = GaiaCatalog()
+gaia_astro = GaiaAstrometric()
 
 
 def tools_status() -> dict:
     """The ``GET /api/tools`` document (DESIGN section 5)."""
     return {"siril": siril_status(), "graxpert": graxpert.status(), "starnet": starnet.status(),
-            "rcastro": rcastro.status(), "cosmic_clarity": cosmic_clarity.status(), "gaia": gaia.status()}
+            "rcastro": rcastro.status(), "cosmic_clarity": cosmic_clarity.status(), "gaia": gaia.status(),
+            "gaia_astro": gaia_astro.status()}

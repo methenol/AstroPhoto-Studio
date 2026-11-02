@@ -448,7 +448,7 @@ def test_tools_status_shape(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "x"))
     tools.rcastro._info_cache = None                      # the singleton caches info() for a few seconds
     st = tools.tools_status()
-    assert set(st) == {"siril", "graxpert", "starnet", "rcastro", "cosmic_clarity", "gaia"}
+    assert set(st) == {"siril", "graxpert", "starnet", "rcastro", "cosmic_clarity", "gaia", "gaia_astro"}
     assert set(st["cosmic_clarity"]) >= {"ok", "version", "models", "torch", "models_dir"}
     assert set(st["siril"]) >= {"ok", "version", "path"}
     assert set(st["graxpert"]) == {"ok", "version", "models", "gpu"}
@@ -471,3 +471,55 @@ def test_run_streaming_kills_the_child_when_the_checkpoint_raises(tmp_path):
 
     with pytest.raises(Stop):
         tools.run_streaming(["sleep", "30"], checkpoint=cp, env=dict(os.environ))
+
+
+def test_gaia_astrometric_catalogue_points_the_solver_at_the_local_file(tmp_path, monkeypatch):
+    """Siril_Catalog_Installer.py's layout: siril_cat_healpix8_astro.dat in Siril's user data folder, registered as core.catalogue_gaia_astro."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    g = tools.GaiaAstrometric()
+    assert not g.ok() and g.status()["ok"] is False and g.status()["record"].endswith("/14692304")
+    assert g.siril_lines() == [f'set "core.catalogue_gaia_astro={tmp_path}/.local/share/siril/siril_cat_healpix8_astro.dat"']
+    os.makedirs(g.dir())
+    open(g.path(), "wb").close()
+    assert g.ok() and g.install() ["ok"] is True                         # installed: nothing fetched
+
+
+def test_two_fetchers_of_one_catalogue_file_download_it_once(tmp_path, monkeypatch):
+    """Two writers on one .bz2 (a job's plate solve and the Tools panel, 2026-11-01) corrupted it, failed the checksum and restarted the
+    download over and over: the fetch holds a lock, and the second fetcher finds the finished file."""
+    import bz2 as bz2mod
+    import hashlib
+    import io
+    import threading
+    import time as _time
+    payload = bz2mod.compress(b"catalogue" * 1000)
+    digest = hashlib.sha256(payload).hexdigest()
+    gets = []
+
+    class Resp(io.BytesIO):
+        status = 200
+        headers = {"Content-Length": str(len(payload))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        if url.endswith(".sha256sum"):
+            return Resp(f"{digest}  x.bz2\n".encode())
+        gets.append(url)
+        _time.sleep(0.2)                                             # long enough for the second fetcher to arrive meanwhile
+        return Resp(payload)
+
+    monkeypatch.setattr(tools.urllib.request, "urlopen", urlopen)
+    final = str(tmp_path / "cat.dat")
+    th = [threading.Thread(target=tools._fetch_bz2, args=("https://z/cat.dat.bz2", str(tmp_path), "cat.dat", final, "cat", "", 0, 1, None, None, None))
+          for _ in range(2)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    assert len(gets) == 1 and open(final, "rb").read() == b"catalogue" * 1000

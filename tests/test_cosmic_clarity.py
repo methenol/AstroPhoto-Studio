@@ -492,7 +492,7 @@ def test_scnr_after_ha_in_green_palettes_only(tmp_path, monkeypatch):
     for pal, want in (("sho", True), ("hso", False), ("hoo", False)):
         lines_run.clear()
         pro.Finisher(str(tmp_path), {}, {"palette": pal, "scnr": 0.6, "synthetic_luminance": 0.0}, True, keep_pictures=False).colour(_stack())
-        assert any(ls == ["rmgreen 3 0.600"] for ls in lines_run) == want
+        assert any("rmgreen 3 0.600" in ls for ls in lines_run) == want
 
 
 # ----------------------------------------------------------------------------- the model inventory (no torch import)
@@ -541,6 +541,7 @@ def test_imagemm_region_measures_the_psf_on_the_stack(tmp_path, monkeypatch, fak
     monkeypatch.setattr(MX, "star_fwhm", lambda img, sat: (seen.append(float(np.median(img))), 4.3)[1])
     r = post.Restorer(str(d), {"filter": "Duo-Band", "restore_source": "imagemm.fits", "imagemm_r": 1, "imagemm_offset": [0, 0]},
                       {"deconv_method": "imagemm", "deconv_stars_method": "graxpert"}, dict(post.DEFAULTS), None, None)
+    seen.clear()                                                   # the restore's star photometry measured its own FWHM at the join
     assert r.image_fwhm() == 4.3 and seen == [pytest.approx(0.2)]   # measured on the stack's values
 
 

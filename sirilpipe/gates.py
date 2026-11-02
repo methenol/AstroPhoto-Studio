@@ -9,10 +9,6 @@ clipped                  < 0.05 %      pixels with any channel >= 0.995 (the pro
 white                    < 0.05 %      pixels with Lab lightness >= 0.97 outside star cores (cores = the stars' footprint, dilated)
 sky_chroma               <= 2          median |a*| and |b*| (Lab) over the sky
 sky_chroma_quadrants     <= 1.5        spread (max - min) of the four quadrants' median a* and of b*
-sky_uniformity           <= 0.026      the sky floor of the border cells over the smooth surface fitted through the floors of a 16 x 16 mesh: the largest of the four borders
-                                       (its outer two cell rows), display units; the limit is the 99th percentile of 303 exports nobody complained about.  It flags a gross
-                                       one-sided border offset - not a band-free picture: accepted renders carry large-scale structure of their own (pro.sky_pedestal: it is the
-                                       coverage map, not the contrast, that decides whether a slow sky offset is a pedestal to remove or nebulosity to keep)
 sky_band_structure       <= 0.008      std of the lightness' 32-128 px band (G(10.7) - G(42.7)) over the sky, display units, stars excluded
 sky_pixel_noise          <= 0.008      robust sigma of the lightness' pixel-level scatter (L - G(2)) over the sky, display units, stars excluded
 stars_count              within 20 %   of the linear star layer's 5 sigma stars, the share still a 5 sigma detection at their positions against the picture's
@@ -35,9 +31,8 @@ import numpy as np
 from . import finish
 
 LIMITS = {"sky_median": (0.08, 0.12), "clipped": 0.0005, "white": 0.0005, "sky_chroma": 2.0, "sky_chroma_quadrants": 1.5, "sky_band_structure": 0.008,
-          "sky_pixel_noise": 0.008, "sky_uniformity": 0.026, "stars_count": 0.20, "stars_round": 0.25, "stars_coloured": 0.10,
+          "sky_pixel_noise": 0.008, "stars_count": 0.20, "stars_round": 0.25, "stars_coloured": 0.10,
           "stars_physical": 0.10}
-SKY_BORDER_MESH, SKY_BORDER_CELLS, SKY_BORDER_SKY_FRACTION, SKY_BORDER_MAX_ABOVE_SKY = 16, 2, 0.45, 1.0
 STAR_COLOUR_SNR, LOCUS_TOL, PHYSICAL_MARGIN = 60.0, 0.05, 0.05
 # a star is visible when its display peak stands above the starless picture by the CSF visibility threshold at 16 cycles / degree - TMQI.m's
 # threshold for the finished image (lab.objectives.structural_fidelity): 128 / (1.4 CSF(16)) on 0-255
@@ -295,35 +290,8 @@ def compute(img: np.ndarray, *, starless: np.ndarray | None = None, linear_star_
         pn = pixel_noise(lum, sm, starless)
         pn_sky = pn
         gate("sky_pixel_noise", round(pn, 5), pn <= LIMITS["sky_pixel_noise"])
-        # The sky's large-scale flatness: the border's floor over the smooth surface fitted through the floors of a mesh over the whole frame.  Not against the interior's own
-        # level: calibration against 303 exports of datasets nobody complained about showed a border standing far above the interior is normal output (accepted NGC 1499 and
-        # Sh2-132 renders measure a larger border excess than the Sh2-171 / IC 1848 exports that started this), while the residual over the frame's own gradient still separates
-        # the flat sky from the one-sided band a mosaic or canvas edge leaves.  The bands measured are 300 - 1000 px deep, so a cell is 1/16 of the frame: a finer mesh measures
-        # noise, a coarser one the subject.  On the raw luminance, not sky_luminance: its 5 sigma star replacement writes a band's pixels back as the local background.
-        ys = np.linspace(0, h, SKY_BORDER_MESH + 1).astype(int)
-        xs = np.linspace(0, w, SKY_BORDER_MESH + 1).astype(int)
-        ref = float(np.quantile(lum, SKY_BORDER_SKY_FRACTION))
-        floor, cy, cx = [], [], []
-        for i in range(SKY_BORDER_MESH):
-            for j in range(SKY_BORDER_MESH):
-                cell = lum[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
-                v = cell[cell <= ref * (1.0 + SKY_BORDER_MAX_ABOVE_SKY)]      # a cell is judged while it is still background-like (twice the sky); beyond it stands the subject
-                if v.size > 200:
-                    floor.append(float(np.quantile(v, SKY_BORDER_SKY_FRACTION)))
-                    cy.append((ys[i] + ys[i + 1]) / 2 / h)
-                    cx.append((xs[j] + xs[j + 1]) / 2 / w)
-        su = None
-        if len(floor) >= SKY_BORDER_MESH * SKY_BORDER_MESH // 4:
-            f = np.array(floor)
-            Y, X = np.array(cy), np.array(cx)
-            A = np.column_stack([np.ones_like(X), X, Y, X * X, X * Y, Y * Y])
-            r = f - A @ np.linalg.lstsq(A, f, rcond=None)[0]
-            edge = [abs(float(np.median(m))) for m in (r[Y <= ys[SKY_BORDER_CELLS] / h], r[Y >= ys[-SKY_BORDER_CELLS - 1] / h],
-                                                        r[X <= xs[SKY_BORDER_CELLS] / w], r[X >= xs[-SKY_BORDER_CELLS - 1] / w]) if m.size]
-            su = max(edge) if edge else None
-        gate("sky_uniformity", None if su is None else round(su, 5), su is not None and su <= LIMITS["sky_uniformity"], cells=len(floor))
     else:
-        for n in ("sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise", "sky_uniformity"):
+        for n in ("sky_chroma", "sky_chroma_quadrants", "sky_band_structure", "sky_pixel_noise"):
             gate(n, None, False)
     if stars is not None:
         hp = lum - cv2.GaussianBlur(lum, (0, 0), 2.0)

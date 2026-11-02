@@ -39,6 +39,18 @@ def test_frame_coverage_and_crop_box_matches_common_area():
     assert w2 * h2 > w * hh                              # a lower threshold keeps more of the field
 
 
+def test_full_coverage_crop_takes_the_best_covered_region_when_no_pixel_has_every_frame():
+    """Two groups of frames with no pixel in common (two nights whose pointing drifted): threshold 1.0 cannot be met anywhere, and the crop is
+    the best-covered region, not the whole canvas."""
+    H, W = 300, 600
+    valid = np.ones((H, W), bool)
+    cov = np.zeros((H, W), np.float32)
+    cov[:, :250] = 10                                   # night 1
+    cov[:, 350:] = 12                                   # night 2, the better covered
+    x, y, w, h = sp.crop_box(valid, cov, 1.0, 22, down=2, margin=0)
+    assert x >= 350 - 4 and w <= 250 + 4 and (w, h) != (W, H)
+
+
 def test_auto_crop_validates_geometry_against_data_and_falls_back():
     hm = _shifted_frames()
     W, H = 458, 329

@@ -342,3 +342,4 @@ details.adv label input[type=text] { width: 160px; }
 #htReport .htstage { padding: 5px 0; border-bottom: 1px solid var(--line); }
 #htReport .htrow { display: flex; justify-content: space-between; gap: 8px; }
 #htReport .htch { margin-top: 2px; line-height: 1.4; }
+#toolPlan .warn { color: var(--warn); }

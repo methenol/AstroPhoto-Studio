@@ -133,8 +133,7 @@ def test_export_writes_named_files_and_the_sidecar(session):
                         {"saturation": 1.2, "crop": False, "grade_tint": 0.3, "mystery": 1}, {"quality": 90, "upscale": 1.5})
     assert set(files) == {"jpg", "tif", "json", "size"}
     assert os.path.basename(files["jpg"]).startswith("M42_") and files["jpg"].endswith(".jpg")
-    e = finish.EDGE_CROP
-    assert files["size"] == [int(round((800 - 2 * e) * 1.5)), int(round((600 - 2 * e) * 1.5))]   # the stack's rim trimmed, then x 1.5 Lanczos
+    assert files["size"] == [int(round(800 * 1.5)), int(round(600 * 1.5))]   # the stack's own framing, x 1.5 Lanczos
     side = json.load(open(files["json"]))
     assert set(side) == {"params", "linear_info", "meta", "ignored_params"}
     assert side["params"]["saturation"] == 1.2 and side["params"]["scnr"] == post.DEFAULTS["scnr"]   # {**DEFAULTS, **params}

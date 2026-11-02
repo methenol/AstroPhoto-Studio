@@ -436,6 +436,32 @@ def banding_merge_script(unit: Unit, seq: str, pattern: str) -> str:
     return "\n".join([f"cd {quote(unit.dir)}", f"seqmerge_cfa {planes} {pattern.upper()}"]) + "\n"
 
 
+# Per-frame background (``local_norm``): each calibrated sub's own gradient is removed before registration, so that every subset of the frames
+# averages to the same sky - an alt-az field rotation or a dither leaves the stack's rim built from fewer frames, and with each frame's own gradient
+# in it that rim carries another sky level, a band once stretched.  Siril's official OSC_Preprocessing_BackgroundExtraction script:
+# ``calibrate -debayer``, ``seqsubsky pp_light 1``, register, stack; on the Bayer-drizzle path the mosaic is split into its planes first, as for
+# the banding (seqsplit_cfa / seqmerge_cfa), each plane modelled on its own.
+FRAME_BKG_DEGREE = 1
+
+
+def frame_bkg_script(unit: Unit, seq: str, pattern: str | None) -> str:
+    """``seqsubsky`` (degree FRAME_BKG_DEGREE) on the calibrated subs: the debayered sequence directly (-> ``bkg_<seq>_NNNNN.fit``), or each Bayer plane
+    of the mosaic (``seqsplit_cfa``, ``seqsubsky CFA<k>_<seq>``, ``seqmerge_cfa`` -> ``mCFA_bkg_CFA0_<seq>_NNNNN.fit``)."""
+    lines = [f"cd {quote(unit.dir)}"]
+    if pattern is None:
+        lines.append(f"seqsubsky {seq} {FRAME_BKG_DEGREE}")
+    else:
+        lines.append(f"seqsplit_cfa {seq}")
+        lines += [f"seqsubsky CFA{k}_{seq} {FRAME_BKG_DEGREE}" for k in range(4)]
+        lines.append(f"seqmerge_cfa {' '.join(f'bkg_CFA{k}_{seq}' for k in range(4))} {pattern.upper()}")
+    return "\n".join(lines) + "\n"
+
+
+def frame_bkg_prefix(pattern: str | None) -> str:
+    """The file prefix ``frame_bkg_script`` leaves its result under."""
+    return "bkg_" if pattern is None else "mCFA_bkg_CFA0_"
+
+
 def banding_cleanup(unit_dir: str, seq: str, prefixes: tuple[str, ...]) -> None:
     """Delete the intermediates ``<prefix><k>_<seq>_*`` (frames and .seq) of a banding stage: ``("CFA",)`` after the de-banding,
     ``("unband_CFA",)`` after the merge, ``("mCFA_unband_CFA",)`` for the merge's own .seq file."""
@@ -447,16 +473,16 @@ def banding_cleanup(unit_dir: str, seq: str, prefixes: tuple[str, ...]) -> None:
                 pass
 
 
-def banding_install(unit_dir: str, seq: str) -> int:
+def banding_install(unit_dir: str, seq: str, prefix: str = "mCFA_unband_CFA0_") -> int:
     """Put the de-banded mosaics in place of ``<seq>_NNNNN.fit`` (the .seq file stays valid: same names and count).  Siril renames FILTER to
     ``<FILTER>_CFA0`` in the merged files (the stack header, and with it the dual-band / SPCC filter decisions, inherit it): restored from the
     calibrated sub.  Replaces the file itself, never a symlink target (lights-only sets: ``light_*.fit`` link to the raw subs).  Returns the count."""
     from astropy.io import fits
     n = 0
     for name in sorted(os.listdir(unit_dir)):
-        if not (name.startswith(f"mCFA_unband_CFA0_{seq}_") and name.endswith(".fit")):
+        if not (name.startswith(f"{prefix}{seq}_") and name.endswith(".fit")):
             continue
-        dst = os.path.join(unit_dir, name[len(f"mCFA_unband_CFA0_"):])
+        dst = os.path.join(unit_dir, name[len(prefix):])
         filt = None
         try:
             with fits.open(dst) as h:
@@ -587,7 +613,7 @@ def group_stack_script(process_dir: str, seq: str, n_reg: int, others: list[int]
 
 
 def platesolve_script(session_dir: str, stack: str, frame: Frame | None, force: bool = True,
-                      solved: str = "stack_solved") -> str:
+                      solved: str = "stack_solved", catalog_lines: list[str] | None = None) -> str:
     """Plate-solve the stack with Siril (online catalogues: NOMAD/Gaia via VizieR).
 
     Centre and scale come from the stack header (it inherits RA/DEC/FOCALLEN/XPIXSZ from the first sub: DWARF has
@@ -597,7 +623,8 @@ def platesolve_script(session_dir: str, stack: str, frame: Frame | None, force: 
     stack, which differs from the sub's when drizzled at 2x).  Siril flips an upside-down solution to north-up
     (default behaviour, kept: the exported image is then upright)."""
     lines = [f"cd {quote(session_dir)}", f"load {quote(stack + '.fits')}"]   # explicit: a stale stack.fit would win
-    args = ["platesolve" + (" -force" if force else "")]
+    lines += catalog_lines or []                                             # the local Gaia astrometric catalogue (tools.GaiaAstrometric)
+    args = ["platesolve" + (" -force" if force else "") + (" -catalog=localgaia" if catalog_lines else "")]
     if frame is not None and frame.focallen:
         args.append(f"-focal={frame.focallen:g}")
     if frame is not None and frame.pixsize:

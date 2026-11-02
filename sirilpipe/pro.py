@@ -37,12 +37,10 @@ The preview runs this class without the external AI steps (``external=False``: s
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import subprocess
 import time
-from statistics import NormalDist
 
 import cv2
 import numpy as np
@@ -57,9 +55,7 @@ SKY_BAND = (0.09, 0.11)            # Brecher's finished backgrounds
 SKY_TARGET = 0.10                  # background after the stretch (Brecher: 0.10 / 0.11 / 0.09 / 0.11 / 0.10)
 GHS1_B = 10.0                      # pass 1 local intensity: b 15 -> 10 (ghsastro "perhaps around 10")
 GHS2_B = 4.0                       # pass 2: b 3-5 (ghsastro) / 2-6 (Siril); the ``contrast`` setting
-GHS2_D = 2.5                       # pass 2 D (Siril -D scale 0-10; the ``ghs_d2`` setting): 2.5 measured on IC 1805 / M 42 / M 31 2026-10-15 (1 left the nebula flat, 4 posterised it)
-GHS2_D_FILLING = 1.5               # pass 2 D when the subject covers more than GHS2_FILLING_COVERAGE: M 31's core blew at 2.5 and the frame-filling IC 1805 (2026-10-16) became a red wall
-GHS2_FILLING_COVERAGE = 0.3        # = SKY_STEPS_MAX_COVERAGE
+GHS2_D = 2.5                       # pass 2 D (Siril -D scale 0-10): the ``ghs_d2`` setting's starting value; autofinish searches it on the image
 TOE_PERCENTILE = 0.1               # "linear black point just left of the histogram rise": the level below which 0.1 % of the pixels lie (the clipping limit of Siril / fas37, VeraLux)
 HP_PERCENTILE = 99.5               # HP < 1 (highlight protection) starts at this percentile of the subject
 STAT_SMALL, STAT_FILLING = 0.10, 0.25   # Statistical_Stretch median target: small target (pro-workflow.md A8 route 2 / SW Skies) / frame-filling target (script default)
@@ -68,6 +64,7 @@ STAT_SIGMA, STAT_HDR_AMOUNT, STAT_HDR_KNEE = 5.0, 0.15, 0.75
 WAVESCALE = (5, 1.5, 5.0)          # compute_wavescale_hdr: scales, compression, mask gamma (HDR_multiscale.py defaults / SASpro)
 NXT_DC = 0.95                      # NXT colour denoise (manual: colour 90-100 %)
 NXT_DN = (0.60, 0.85)              # NXT --dn on stretched starless (RC-Astro / Brecher); 1.0 is the tool's own ceiling, not a tuned value
+CLIP_CLOSE_STEPS = 4               # bisection steps of the closing clipping step (1/16 of the asked sharpening amount)
 DENOISE_ESCALATION = 3             # extra runs of the stretched-image denoiser, at most, when the sky it leaves is noisier than
                                    # sky_pixel_noise allows: the ladder from the requested amount to the tool's ceiling in this
                                    # many steps, so a frame that cannot be denoised clean costs a bounded amount of time and is
@@ -76,12 +73,11 @@ CHROMA_SIGMA_MAX = 2.0                 # px, the chroma kernel at ``chroma_denoi
                                        # Cosmic Clarity's --denoise-color publish no kernel scale (manual: colour 90-100 %)
 CLAHE_CLIP = 1.5                   # Brecher's LHE contrast limit
 CLAHE_SCALES = (150, 40)           # px, Brecher's LHE scales (M51: 150 then 40; IC 1848 40 then 150)
+LC_WEAKEST = 0.5                   # ``local_contrast`` at Brecher's lowest published LHE strength (x LC_STRENGTH = 0.2): the closing clipping step's floor
 LC_STRENGTH = 0.4                  # blend per unit of ``local_contrast`` (0.5 -> 0.2, the lowest published strength)
-LC_EDGE_BAND = 1.0                   # px, in units of CLAHE_SCALES[0]: how deep the frame's edge is asked what *its* sky's top is
-LC_EDGE_MAX_EXCESS = 3.0               # x the frame's own sky scatter: a band lying higher above the frame's sky than this is subject, not a model residue, and keeps the global threshold
 SAT_B, SAT_SP = 0.0, 0.0           # GHS saturation stretch (ght -sat): the plain hyperbolic curve on the saturation channel, strongest at 0 (grey gains most, saturated pixels are compressed, nothing clips)
-SAT_D_MAX = 1.5                    # Siril -D scale (GHS D 3.5), the fit's cap: measured 2026-10-16 on C 33 / IC 1805, 1.5 vivid and still textured, 2.0 flattens IC 1805, 6.0 posterised both
-SAT_FACTOR_MAX = 4.0               # the ``saturation`` setting: the subject's mean saturation x 1 .. x 4 (C 33: 0.09 after the palette, the HOO target 0.45)
+SAT_D_MAX = 10.0                   # Siril ght -D range (0-10): the fit's bound
+SAT_FACTOR_MAX = 4.0               # the ``saturation`` setting's range: the subject's mean saturation x 1 .. x 4
 SAT_MEAN_MAX = 0.9                 # the fit's target never exceeds this mean saturation
 STAR_STRETCH = 5.0                 # Seti Astro Star Stretch amount (0-8, default 5)
 MASK_SIGMA = 8.0                   # px, smoothing of the lightness the nebula / local contrast masks are taken from
@@ -106,20 +102,8 @@ CC_SHARPEN_AMOUNT = 0.5            # Cosmic Clarity Sharpen stellar / non-stella
 SHARPEN_SIGMA = 1.0                # px, Siril unsharp sigma for the final sharpening (PixInsight UnsharpMask default 2.0 px std dev at 1x; 1.0 for 2.3-2.8"/px smart-scope data)
 SHARPEN_GAIN = 0.5                 # unsharp amount per unit of ``sharpen`` (0.25 -> 0.125: Brecher's MMT sharpening 0.03-0.06 per layer is the lower end)
 UNPURPLE_THRESH = 0.4              # Siril unpurple threshold (its default)
-SCNR_SKY_TRIES = (1.0, 0.5, 0.25)   # an SCNR that colours the sky is retried at these fractions of the requested amount before it is refused
-SCNR_SKY_WORSE = 2.0                # how much more coloured than it arrived the sky may leave SCNR looking: past the gate's own limit *and* past
-                                    # this multiple of what it came with, the step is the thing that coloured it
-DENOISE_SKY_WORSE = 2.0             # how much more coloured than it arrived the sky may leave the stretched-image denoiser looking: past the gate's own
-                                    # limit *and* past this multiple of what it came with, the step is the thing that coloured it (SCNR's rule, the same
-                                    # evidence class; the denoiser was the one colour-changing step of the chain with no such rule)
-SKY_LUMP_CELL = 128                 # px, the cell the sky's unevenness is measured on: the scale at which the stretch's black clip leaves its steps
-STRETCH_CLIP_GAIN = 1.4             # the clip-free stretch ships only when it leaves the sky this times more even than the clipped one
-STAT_CLIP_FLOOR = 1.0               # % of sky: below this the clipped stretch's sky is already flat, and the clip-free trial - which costs a whole second run of the
-                                    # script - could only win a fraction of a percent nobody can see, so it is not made
+SKY_LUMP_CELL = 128                 # px, the cell the sky's unevenness is measured on (recorded with the stretch)
 FRAME_FILLING = 0.5                # the object covers at least this fraction of the frame: ``auto_stretch`` raises the background to the top of Brecher's band
-SKY_STEPS_MAX_COVERAGE = 0.3       # above this subject coverage the frame has no sky to sample: the colour-gradient step is skipped (C 20: the degree-2
-                                   # per-channel model took the North America Nebula's own red, 2026-10-15); DBE needs true sky samples.  It gates the global
-                                   # polynomial only - see Finisher.stretch for why the neutralisation runs whatever the coverage
 
 
 def ghs_colour_model(color_preservation: float) -> str:
@@ -194,717 +178,9 @@ def nebula_mask(lum: np.ndarray, mode: float) -> tuple[np.ndarray, dict]:
     return m, {"threshold": thr, "coverage": float(m.mean()), "sigma_smoothed": sig}
 
 
-SKY_PEDESTAL_CAP = 0.02              # the correction never exceeds 2 % of the sky, and only where the coverage map says the pixels are degraded
-SKY_PEDESTAL_EPS = 0.0005            # below 0.05 % of the sky there is nothing worth taking away
-SKY_PEDESTAL_BAND = 16               # px on each side of a region's own border that are compared - the region's skin against the frame's skin across that same boundary - so a
-                                     # smooth gradient across the frame falls out of the difference and only a step at the class boundary, which is what a pedestal is, can
-                                     # survive it
-SKY_PEDESTAL_MIN_PIXELS = 1024       # each of the two skins needs this many of the frame's sky pixels before its level is believed
-SKY_PEDESTAL_MIN_SIGMA = 3.0         # ... and the step between them has to stand this many standard errors of the two estimates clear of zero: under that it is the
-                                     # noise of two different parts of the frame, not a pedestal
-SKY_PEDESTAL_WITNESS = 12.0          # sigma (px) of the plane the witness is taken against: stars and filaments are rejected, a large-scale level offset is not - it is the
-                                     # very thing being measured, and it may not disqualify the pixels that carry it
-SKY_PEDESTAL_WITNESS_K = 4.0         # ... within this many pixel-level sigma of that plane
-SKY_COVERAGE_LOW = 0.7               # a pixel is degraded below this fraction of the frame's median coverage: only its sky is re-levelled
-SKY_COVERAGE_HIGH = 0.9              # the reference sky is measured at or above this fraction, so the reference is always the well-dithered part of the frame
-EDGE_RING = 64                       # the depth of the frame ring measured against the interior, line by line - the boundary behaviour of the stages before the stretch lives
-                                     # in its first pixels, see edge_ring
-EDGE_RING_DEPTH = 16                 # the deepest a boundary artefact reaches, and therefore the control region: the frame line measured 2 px deep on IC 1848 and 8 px on
-                                     # M 31, while a deviation still standing this far in is sky (a nebula's edge, a gradient) and the tool leaves every last bit of it
-EDGE_RING_MIN_SIGMA = 3.0            # a line's offset must stand this many standard errors of its own median off the interior to be believed
-EDGE_RING_MIN = 0.001                # ... and be at least this fraction of the sky, or there is nothing worth taking (the lines that reach the export start at 0.1 %)
-EDGE_RING_BUDGET = 0.32               # the light the ring may take back along one line through it, summed over the ring's lines, as a fraction of the sky: amplitude on its own
-                                      # cannot tell a boundary artefact from a nebula, so what is bounded is the amount taken.  Measured on the frames - the excess a frame line
-                                      # carries is 4 %-px on M 31 and 9 on IC 434 (percent of the sky, summed over the depth) and a real processing step at 3 % over 8 px is 27
-                                      # - while a nebula's edge confined to the outer half of the ring reaches 36, and that is what this bound exists to leave alone
-EDGE_RING_MAX = 0.30                  # ... and no single line by more than this fraction of the sky: past that the line has no sky in it to level, and supplying one would be
-                                      # inventing what the frames never recorded
-EDGE_RING_SHARP = 0.35               # the lines behind the border may carry at most this fraction of its deviation: one that goes on behind the border is sky, and sky stays
-EDGE_RING_MIN_SIDES = 2              # a deviation smaller than the one below has to appear on this many sides: the boundary is a property of the frame, and a lone offset the
-                                     # size of faint sky is far more likely to be sky than to be the frame's own edge
-EDGE_RING_LONE = 0.01                # ... unless one side carries at least this fraction of the sky: a step that size confined to the border band is no sky feature that happened
-                                     # to end near the edge, and the stretch's toe turns it into a line across the export (IC 434's top border measures -3.8 % of the sky)
-SKY_RIM_REPEAT = 2        # a depth beyond the run has to stand again this many times in a row to be a second step at all: one line reaching the bar is a fluctuation of the
-                          # first, not a structure behind it (C 20's right border lost its correction to exactly one such sample, at 96 px)
-SKY_RIM_ECHO = 0.5        # ... and it has to carry this fraction of the border's own deviation while it does: sky lying behind a pedestal sits well below it, and a deviation
-                          # half the border's height that returns over two depths is the subject or the gradient coming back, which is what this refuses
-
-
 def _sigma(v: np.ndarray) -> float:
     """A class of pixels' own noise: 1.4826 x its median absolute deviation, robust to the nebulosity a cell or a border can carry."""
     return (1.4826 * float(np.median(np.abs(v - np.median(v))))) or 1e-12
-
-def edge_sky_floor(lum: np.ndarray, lo: float, band: int, stats: dict) -> tuple[np.ndarray, dict]:
-    """Raise the mask's sky floor near each edge to that edge's own sky top, where the band is sky.
-
-    ``range_mask`` thresholds the smoothed lightness at one global value - the sky mode plus ``MASK_K`` sigma of the sky scatter - which is the wrong
-    reference at the frame's edge.  A band the background model left uniformly elevated clears that threshold everywhere at once, is classed subject,
-    and clahe - whose tile there has no pixels past the edge to judge it against - lifts it again on top of a stretch whose slope is already ~100.
-    Measured on Sh2-171 (2026-10-30): this step took the left border from +161 % of the display sky to +321 % while leaving the interior alone, and the
-    export came out with a band across the frame.  Each edge is therefore asked for its own sky top - its median plus ``MASK_K`` sigma, the definition
-    ``nebula_mask`` uses - and the floor is raised to it, ramped linearly to nothing at ``band`` px so the mask cannot seam there.  A band lying more
-    than ``LC_EDGE_MAX_EXCESS`` of the frame's own sky scatter above that sky is not a residue the model left but the subject itself - M 31's galaxy
-    running off the edge - and is left exactly as the global threshold leaves it.  Returns the floor and, per side, what it was judged to be.
-    """
-    h, w = lum.shape
-    floor = np.full((h, w), lo, np.float32)
-    sm = cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), MASK_SIGMA)
-    sides = {}
-    for name, strip, ramp in (("top", sm[:band], np.linspace(1.0, 0.0, band)[:, None]),
-                              ("bottom", sm[h - band:], np.linspace(0.0, 1.0, band)[:, None]),
-                              ("left", sm[:, :band], np.linspace(1.0, 0.0, band)[None, :]),
-                              ("right", sm[:, w - band:], np.linspace(0.0, 1.0, band)[None, :])):
-        med = float(np.median(strip))
-        if med - float(stats["sky"]) > LC_EDGE_MAX_EXCESS * max(float(stats["sigma"]), 1e-6):
-            sides[name] = "subject"                                      # far above the frame's own sky: the subject lying on the border, not a residue the model left
-            continue
-        top = med + MASK_K * max(_sigma(strip), 1e-6)                    # the top of this band's own sky population
-        frac = float(np.mean(strip <= top))
-        if top <= lo:
-            sides[name] = "clean"
-            continue
-        sel = ((slice(0, band), slice(None)) if name == "top" else (slice(h - band, h), slice(None)) if name == "bottom"
-               else (slice(None), slice(0, band)) if name == "left" else (slice(None), slice(w - band, w)))
-        floor[sel] = np.maximum(floor[sel], lo + ramp.astype(np.float32) * (top - lo))
-        sides[name] = f"sky {round(100 * frac)} %"
-    return floor, sides
-
-def _sky_witness(lum: np.ndarray) -> np.ndarray:
-    """The pixels this tool may consult: everything within ``SKY_PEDESTAL_WITNESS_K`` sigma of the plane a ``SKY_PEDESTAL_WITNESS`` px smoothing leaves - stars and
-    filaments out, and **blind to large-scale level differences**, which is what a pedestal is.  ``finish._sky_mask`` cannot serve here: it thresholds a 64 px smoothing at
-    its darkest 45 %, so a rim that sits a percent of the sky bright is declared not-sky and the tool is left without a witness exactly where its subject is (measured on
-    the pedestal's own test frame: 0 sky pixels on both sides of the boundary it exists to compare)."""
-    big = cv2.GaussianBlur(np.ascontiguousarray(lum, np.float32), (0, 0), SKY_PEDESTAL_WITNESS)
-    d = np.asarray(lum, np.float32) - big
-    sig = 1.4826 * float(np.median(np.abs(d - np.median(d))))                                    # the pixel-level scatter; the subject lies entirely on the bright side
-    return d <= SKY_PEDESTAL_WITNESS_K * max(sig, 1e-9)
-
-
-def _boundary_step(v: np.ndarray, region: np.ndarray, high: np.ndarray, sky: np.ndarray, din: np.ndarray, dout: np.ndarray,
-                   band: int) -> tuple[float | None, float, int, int]:
-    """The level difference across the border a degraded region shares with the well-covered frame, by **regression discontinuity**: the median of the sky in every 1 px shell of
-    that border, on both sides of it, fitted against signed distance from the border with terms for the level, the local slope and the local curvature - the pedestal being the
-    **jump at the border**, and nothing else.  The two shape terms are the point of the fit: a nebula's wing or a gradient rising past the region is a slope, and comparing the
-    two sides' levels without a term for it reads that rise as a pedestal (measured: a wing of 8 % of the sky over 300 px leaks 0.43 % of the sky as one, and the stretch's slope
-    turns it into exactly the band this tool exists to remove).  The shells are symmetric, so curvature cannot be confounded with the jump; each shell enters with the weight of
-    its own median - 1.253 sigma over the root of its count - and those weights are what the reported standard error of the jump is made of.  Stars, filaments and unrecorded
-    pixels are already out of ``sky``.  Returns the jump, its standard error, and the sky population of each side."""
-    t, y, w, n_in, n_out = [], [], [], 0, 0
-    for k in range(1, int(band) + 1):
-        for sign, side, d in ((-1.0, region, din), (1.0, high, dout)):
-            s = v[side & sky & (d >= k - 0.5) & (d < k + 0.5)]
-            if s.size < 64:
-                continue                                                                        # a shell too thin to have a level of its own: it is left out of the fit, never averaged in
-            sig = _sigma(s)
-            t.append(sign * (k - 0.5))
-            y.append(float(np.median(s)))
-            w.append(s.size / (1.5708 * sig * sig))                                             # the inverse variance of that median
-            if sign < 0:
-                n_in += int(s.size)
-            else:
-                n_out += int(s.size)
-    if n_in < SKY_PEDESTAL_MIN_PIXELS or n_out < SKY_PEDESTAL_MIN_PIXELS or len(t) < 6:
-        return None, 0.0, n_in, n_out
-    t, y, W = np.asarray(t), np.asarray(y), np.asarray(w)
-    X = np.column_stack([np.ones_like(t), t, np.square(t), (t < 0).astype(np.float64)])         # level, slope, curvature, and the jump at the border
-    A = X.T @ (X * W[:, None])
-    if np.linalg.matrix_rank(A) < X.shape[1]:
-        return None, 0.0, n_in, n_out
-    Ainv = np.linalg.inv(A)
-    return float((Ainv @ (X.T @ (y * W)))[3]), float(math.sqrt(max(float(Ainv[3, 3]), 0.0))), n_in, n_out
-
-
-def sky_pedestal(base: np.ndarray, ref: float, cov: np.ndarray | None = None) -> tuple[np.ndarray | None, dict]:
-    """The sky's slowly varying pedestal, measured as a **step between provenance classes at their shared border**.
-
-    Why the stretch cares: its slope at the sky is ~120 at ``-median 0.1 -sigma 5`` (the black point sits five noise-sigma below the sky, so the rescaled median is 0.00075
-    and the map has to lift that to 0.10).  A pedestal of 0.47 % of the sky at the frame border - what the low-coverage dithered rim of a mosaic carries - therefore becomes
-    the 40-60 % band the export shows, and ``neutralise``'s one offset per channel cannot reach a step that varies across the frame.
-
-    What a pedestal is: the level one set of frames leaves behind.  It is shared by every pixel of one origin, and it shows as a **step** where that origin meets the pixels the
-    other frames built - so that is where it is measured, and as a step and nothing else: ``_boundary_step`` fits the sky's level in 1 px shells on both sides of the border the
-    region shares with the well-covered frame - or, when a gradual coverage falloff leaves the two classes too far apart to share a border, with the frame immediately outside
-    the region's own class - granting that level its own slope and curvature, and the pedestal is the jump at the border alone.  A real one is on the order of
-    half a percent of the sky; a jump the tool cannot tell from the noise of the two classes (``SKY_PEDESTAL_MIN_SIGMA`` standard errors, never less than
-    ``SKY_PEDESTAL_EPS``) is refused, because everything this tool does after measuring is irreversible.
-
-    The witness is the frame's sky at its own scale, ``_sky_witness``: stars and filaments are excluded, while a large-scale offset cannot exclude the pixels carrying it.
-
-    Why the reference has to be adjacent: the previous version fitted a plane through the well-covered cells of the whole frame and measured the degraded cells against it,
-    which asks that plane to be *extrapolated* into the region - and the regions are exactly where the coverage ran out, at the frame's edges.  Measured on IC 1848
-    (2026-10-30) it took +0.86 % of the sky along the frame's left edge, where the two classes' own medians differ by 0.1 %: the region lies under the nebula complex, the
-    ceiling rejected every cell the nebula touched, and what was left of the fit was no longer the sky.  The stretch's slope sprayed that correction out as a bright red band
-    down the export's left edge - the rectangular patch this tool exists to remove, remade by the tool itself.  Comparing a region against the frame immediately around it
-    cannot be fooled that way: whatever gradient or nebulosity lies near the region sits on both sides of the comparison.
-
-    One number per region (the largest channel's step), applied to **exactly the pixels the coverage map calls degraded** and nowhere else: a pedestal is a property of the
-    provenance class, so the correction has to have that class's own shape, and a correction faded out at the region's edge leaves half the step standing precisely where the
-    step is (measured: a correction faded over 16 px took 53 % of a 1.5 %-of-sky pedestal off and left the rest at the border, which is the line the export shows).  Interior
-    nebula sits at exactly zero correction either way, and what guards it against a wrong measurement is the refusal gates above, not a taper that also disarms the tool.
-    Without a coverage map nothing is modelled: guessing here costs nebulosity."""
-    if cov is None:
-        return None, {"cells": 0, "note": "no coverage map: the pedestal is not modelled"}
-    a = np.asarray(base, np.float64)
-    ch, h, w = a.shape
-    c = np.asarray(cov, np.float64)
-    if c.shape != (h, w):
-        c = cv2.resize(c, (w, h), interpolation=cv2.INTER_AREA)
-    cmed = float(np.median(c))
-    if cmed <= 0:
-        return None, {"cells": 0, "note": "coverage map empty"}
-    low = c < SKY_COVERAGE_LOW * cmed
-    high = c >= SKY_COVERAGE_HIGH * cmed
-    mid = ~low                           # everything the degraded class is not: the reference for a region whose border never reaches the well-covered class
-    if low.mean() < 0.002 or high.mean() < 0.2:
-        return None, {"cells": 0, "note": f"coverage uniform: {low.mean() * 100:.2f} % degraded, {high.mean() * 100:.0f} % reference"}
-    from . import finish as _finish                                                              # late: finish imports this module for the render itself
-    sky = _sky_witness(_finish.luminance(np.ascontiguousarray(a, np.float32)))                   # stars and filaments out; a pedestal may not disqualify its own pixels
-    lab = cv2.connectedComponents(np.ascontiguousarray(low, np.uint8), connectivity=8)[1]
-    regions = [int(L) for L in np.unique(lab) if L > 0]
-    if not regions:
-        return None, {"cells": 0, "note": "no degraded region big enough to measure"}
-    din_ref = cv2.distanceTransform(np.ascontiguousarray(1 - high.astype(np.uint8), np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)      # every pixel's distance to the well-covered frame
-    din_out = cv2.distanceTransform(np.ascontiguousarray(1 - mid.astype(np.uint8), np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)       # ... and to everything the degraded class is not
-    v = np.zeros((ch, h, w), np.float64)
-    offsets: list[float] = []
-    verdicts: list[list] = []
-    for L in regions:
-        region = lab == L
-        dout = cv2.distanceTransform(np.ascontiguousarray(1 - region.astype(np.uint8), np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)   # and to this region
-        # A mosaic margin whose coverage falls off gradually leaves a band of pixels that are neither class, and then the region shares no border with the reference at all.
-        # Measured on NGC 1499 (2026-10-30): its degraded top and bottom margins lay 20.2 and 17.5 px from the reference class with the band 16 px wide, every shell came back
-        # empty, the verdict was "0 inside, 0 outside", and the +0.4 % of the sky those margins carried became the band across the export - the stretch's slope at the sky is
-        # ~120.  Such a region is measured against the frame immediately outside its own class, which does share a border with it; the well-covered class stays the reference
-        # whenever it reaches, because it is the one built by every frame.
-        measured, why, used = None, None, None
-        for cls, din, name in ((high, din_ref, "the well-covered frame"), (mid, din_out, "the frame outside its class")):
-            steps, why = [], None
-            for c_ in range(ch):
-                step, se, n_in, n_out = _boundary_step(a[c_], region, cls, sky, din, dout, int(SKY_PEDESTAL_BAND))
-                if step is None:
-                    why = f"too few sky pixels at its border to compare ({n_in} inside, {n_out} outside)"
-                    break
-                if abs(step) > max(SKY_PEDESTAL_EPS * ref, SKY_PEDESTAL_MIN_SIGMA * se):
-                    steps.append((c_, step))
-            if why is None:
-                measured, used = steps, name
-                break
-        if not measured:
-            verdicts.append([L, why if used is None else f"level with {used} at its border"])
-            continue
-        for c_, step in measured:
-            v[c_][region] = step
-        off = max(abs(s) for _, s in measured)
-        offsets.append(round(off, 7))
-        verdicts.append([L, f"{off / ref * 100:.3f} % of the sky, across its border with {used}"])
-    if not offsets:
-        return None, {"cells": len(regions), "peak": 0.0, "cap": round(SKY_PEDESTAL_CAP * ref, 7), "degraded": round(float(low.mean()), 5),
-                      "regions": regions, "offsets": [], "verdicts": verdicts, "note": "no degraded region differs from the frame around it"}
-    cap = SKY_PEDESTAL_CAP * ref
-    total = np.clip(v, -cap, cap)                                                                       # the class's own shape, unblurred: see the docstring
-    peak = float(np.abs(total).max())
-    if peak <= SKY_PEDESTAL_EPS * ref:
-        return None, {"cells": len(regions), "peak": round(peak, 7), "offsets": offsets, "verdicts": verdicts}
-    return total.astype(np.float32), {"cells": len(regions), "band_px": int(SKY_PEDESTAL_BAND), "peak": round(peak, 7), "cap": round(cap, 7),
-                                      "degraded": round(float(low.mean()), 5), "regions": regions, "offsets": offsets, "verdicts": verdicts}
-
-
-
-SKY_FLOOR_BIAS = abs(NormalDist().inv_cdf(0.5 * float(finish.BAND_SKY_FRACTION)))   # the median of the darkest f of a Gaussian sits this many sigma under its mean (0.755 at f = 0.45)
-
-
-def sky_floor(values: np.ndarray, fraction: float = finish.BAND_SKY_FRACTION) -> tuple[float, float]:
-    """The sky's level in a class of pixels, and the standard error of that estimate: the median of the darkest ``fraction`` of them - ``finish._sky_mask``'s definition of the
-    sky, applied to whatever class is being measured - put back on the class's own mean by the bias that statistic carries.  The correction is what makes two classes of
-    *unequal noise* comparable: an uncorrected floor reads low by ``SKY_FLOOR_BIAS`` x sigma, so a region whose sigma is 1.6 x the frame's - the low-coverage dithered rim of
-    IC 1848, measured - is taken for 0.2 % of the sky darker than its surroundings without being darker at all, and a tool that levelled on the raw floor would pour light
-    into exactly the rim it was meant to flatten (and darken an ordinary border by the same amount, which is 30 % of the display sky once the stretch's toe has multiplied it).
-    """
-    v = np.asarray(values, np.float64).ravel()
-    sigma = _sigma(v)                                                                   # the class's own noise, robust to the nebulosity a border can carry
-    k = max(1, int(fraction * v.size))
-    sel = np.partition(v, k)[:k]
-    return float(np.median(sel)) + SKY_FLOOR_BIAS * sigma, 1.253 * sigma / math.sqrt(sel.size)
-
-
-def edge_ring(a: np.ndarray, cov: np.ndarray | None = None, ped: np.ndarray | None = None) -> tuple[np.ndarray | None, dict]:
-    """Level the frame's own border against the interior: the boundary behaviour of every stage before the stretch, which the stretch's slope at the sky turns into a line.
-
-    Measured on IC 1848 (2026-10-30), whose export showed a bright strip down the left edge and a dark one across the bottom while its starless is flat to the eye: the outer
-    2 px of the frame sit +0.5 % of the sky above the interior - nothing at all in the linear, and 37.8 % of the display sky in the export, which is the step trace's own
-    reading across the stretch (0.3 % before the Statistical Stretch, 37.8 % after it).  The stretch's toe multiplies a deviation at the sky by a hundred and fifty, so a
-    border the eye cannot see in the linear is a frame line in the export, and nothing downstream of the stretch can take it out again.
-
-    Each side is measured **line by line**: one median per row / column, read against the interior, for the outer ``EDGE_RING`` px.  Not a statistic over a band, however
-    thin - the sky's floor is the mean of the darkest fraction of its sample, so anything occupying less than that fraction of the band is invisible in it, and the frame line
-    is 2 px of an 8 px band on IC 1848: the first version of this tool measured nothing there and left the line standing.  A **median**, and not ``sky_floor``, because a line
-    is a one-dimensional sample that a minority of pixels can contaminate from either side, and a floor is the statistic least able to resist it: measured on IC 1848
-    (2026-10-30), its last row sits level with the interior by median (99.6-99.9 % of the sky) and 5.8 % of the sky under the interior by the floor statistic, and a tool that
-    corrects that floor pours light into the border - the bright frame line down the export.  The median is also unbiased where the border is the noisier part of the frame,
-    which a floor is not: a low-coverage rim reads low by a fixed multiple of its own sigma.  A border that crosses a star field or a galaxy needs no special rejection
-    either: what is measured is the border's excess over the ring behind it, and subject that is not confined to the border cancels in that difference.
-
-    Four things decide whether a border deviation is an artefact and may be taken.  **Ownership**: a ring the coverage map calls degraded *and* the provenance pedestal above
-    has already levelled belongs to that tool - its offset has a cause in the frames that contributed, and this one would only be guessing over it.  **Confinement**: what is
-    measured is the border's **excess over the ring behind it** - the median of the ring's inner quarter is the frame's own broad level at that side, sky or gradient, and not
-    this tool's to take.  M 31 (2026-10-30), whose export shows a dark line across the bottom edge, measures -3.6 % of the sky at the border over a plateau of -0.9 % that
-    reaches past the ring: the 2.7 % of excess above the plateau is the boundary's doing (a deconvolution reaching its reflect condition, the calibration pedestal, a gradient
-    model extrapolated past its last sample), the plateau is the frame, and the plateau stays.  The excess in turn has to have died out by ``EDGE_RING_DEPTH`` px in - a
-    deviation still standing there is sky, and IC 1848's edges carry 0.1-0.4 % that reaches past the ring, which is faint nebulosity, and flattening that is what
-    ``sky_pedestal`` exists to refuse.  **Scale**: how big a deviation may be taken is decided by the *light* it accounts for (``EDGE_RING_BUDGET``) rather than by its
-    amplitude, because amplitude cannot tell the two cases apart - 12.8 % of the sky in the outer line alone (IC 434's top) is the frame's own edge, while the same 8 % carried
-    8 px deep is a nebula's edge and stays.  **Consent of the frame**: the boundary is a property of the frame, so a small deviation has to show on
-    ``EDGE_RING_MIN_SIDES`` sides; a lone side is only believed from ``EDGE_RING_LONE`` of the sky up, far past anything sky itself leaves in its last pixels.
-
-    The correction is the measured excess itself, so the artefact is taken out at the depth it has - one line on IC 434 and M 31, two on IC 1848 - rather than at a depth
-    assumed here, and the sky the side was carrying underneath it is left exactly where the frames put it."""
-    a = np.asarray(a, np.float64)
-    ch, h, w = a.shape
-    ring = int(min(EDGE_RING, h // 4, w // 4))
-    if ring < 2 * EDGE_RING_DEPTH:
-        return None, {"note": "frame too small for a ring"}
-    keep = np.ones((h, w), bool)
-    keep[:ring, :] = keep[h - ring:, :] = keep[:, :ring] = keep[:, w - ring:] = False
-    if int(keep.sum()) < 4096:
-        return None, {"note": "too little interior to measure the sky on"}
-    # the interior's sky is measured exactly as every border line is - the same median on the same class of pixels - because the two are subtracted from each other, and two
-    # statistics that answer different questions on the same pixels make an offset the border cannot be blamed for (see above: IC 1848's last row, level by median and 5.8 %
-    # of the sky under the interior by floor)
-    interior = np.array([float(np.median(a[c][keep])) for c in range(ch)])
-    degraded = None
-    if cov is not None:                                                              # a degraded rim is the provenance pedestal's to level, not this tool's
-        c = np.asarray(cov, np.float64)
-        if c.shape != (h, w):
-            c = cv2.resize(c, (w, h), interpolation=cv2.INTER_AREA)
-        degraded = c < SKY_COVERAGE_LOW * float(np.median(c))
-
-    def line_slice(side, d):                                                          # 0 top, 1 bottom, 2 left, 3 right; the line d px in from that border
-        if side == 0:
-            return slice(d, d + 1), slice(None)
-        if side == 1:
-            return slice(h - 1 - d, h - d), slice(None)
-        return (slice(None), slice(w - 1 - d, w - d)) if side == 3 else (slice(None), slice(d, d + 1))
-
-    num, den, table, qual, cand, strength = np.zeros((ch, h, w)), np.zeros((ch, h, w)), [], set(), [], np.zeros(4)
-    ped_mag = np.abs(np.asarray(ped, np.float64)).max(0) if ped is not None else None
-    for side in range(4):
-        sl0 = line_slice(side, 0)
-        if degraded is not None and ped_mag is not None and degraded[sl0].mean() > 0.5 and ped_mag[sl0].max() > EDGE_RING_MIN * float(interior.mean()):
-            table.append((side, -1, "degraded and already levelled by the provenance pedestal"))
-            continue                                                                # that side's offset has a cause in the frames that contributed and the tool above owns it
-        prof = np.zeros((ch, ring))
-        for d in range(ring):
-            sl = line_slice(side, d)
-            for c in range(ch):
-                v = a[c][sl]
-                if v.size < 256:
-                    continue
-                se = 1.253 * _sigma(v) / math.sqrt(v.size)                              # the standard error of the line's own median, which is what the gate below is stated in
-                x = float(np.median(v)) - interior[c]
-                prof[c, d] = x if abs(x) > EDGE_RING_MIN_SIGMA * se else 0.0
-        for c in range(ch):
-            behind = float(np.median(prof[c, ring - ring // 4:]))                  # what the ring behind the border itself carries - the frame's own broad level at this side,
-                                                                                    # which is sky or a gradient and is not this tool's to take: M 31's bottom line (2026-10-30) sits
-                                                                                    # -3.6 % of the sky under the interior over a plateau of -0.9 % that reaches past the ring, and only
-                                                                                    # the 2.7 % of excess above that plateau is the boundary's doing
-            x = prof[c] - behind
-            edge = abs(x[0])                                                       # the border line's excess is the whole candidate: a boundary artefact lives there
-            control = float(np.abs(x[EDGE_RING_DEPTH:]).max())                     # and it has to have died out by EDGE_RING_DEPTH px in, or the deviation is sky
-            light = float(np.abs(x).sum())                                         # the light the correction would take back along a line through the ring
-            why = None
-            if edge < EDGE_RING_MIN * interior[c]:
-                continue                                                           # the border sits level with the ring behind it: nothing here to take
-            if edge > EDGE_RING_MAX * interior[c]:
-                why = "missing data, not a boundary artefact"                      # the line holds no sky to level; supplying one is not this tool's job
-            elif light > EDGE_RING_BUDGET * interior[c]:
-                why = "too much of the sky's light to be a boundary artefact"      # this large at this depth is a nebula's edge, and a nebula's edge is not an artefact
-            elif control > EDGE_RING_SHARP * edge:
-                why = "the deviation goes on behind the border"                    # that is sky, or a gradient, and sky stays
-            if why is not None:
-                table.append((side, c, round(edge / interior[c], 5), round(light / interior[c], 3), why))
-                continue
-            cand.append((side, c, x))                                              # the excess only: the broad level the side was carrying stays exactly where it was
-            qual.add(side)
-            strength[side] = max(strength[side], edge / interior[c])              # how far the side's strongest channel stands above the ring behind it
-    lone = float(strength[next(iter(qual))]) if len(qual) == 1 else 0.0
-    if not qual or (len(qual) < EDGE_RING_MIN_SIDES and lone < EDGE_RING_LONE):
-        # the boundary is a property of the frame, so a deviation the size of faint sky needs a second side to agree with it before anything is taken
-        return None, {"ring": ring, "sides": table, "qualifying": sorted(qual), "lone": round(lone, 5),
-                      "note": "the border's profile is not on enough sides to be the frame's own"}
-    for side, c, prof in cand:
-        for d in range(ring):
-            if prof[d] == 0.0:
-                continue
-            sl = line_slice(side, d)
-            num[c][sl] += prof[d]                                                   # a corner belongs to two sides: their offsets are averaged, never added
-            den[c][sl] += 1.0
-    if not den.any():
-        return None, {"ring": ring, "sides": table, "note": "the border carries no artefact"}
-    field = num / np.maximum(den, 1.0)
-    return field.astype(np.float32), {"ring": ring, "sides": table, "peak": round(float(np.abs(field).max()), 7)}
-
-
-SKY_RIM_BAND = 0.125      # the outer eighth of the short side, capped at 512 px, is as deep as a stage's boundary behaviour reaches.  Measured on the frames that still show a band:
-                          # NGC 1499's right border sits -2.04 % of the sky at its line and -0.23 % by 256 px, IC 434's left +1.10 % at its line and -0.32 % by 128 px.  A deviation
-                          # still standing deeper than this band is not a boundary residue and this tool has no business taking it (SKY_RIM_BEHIND)
-SKY_RIM_DEPTHS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
-                          # how deep into the border the sky's floor is read.  The *profile* is what tells the three things a border can be apart: a step that dies within tens
-                          # of pixels (LBN 429's bottom, +0.23 % of the sky at 10 px and gone by 40, which the export showed as +22 %), a step that reaches a few hundred
-                          # (IC 434's left, +1.02 % above what lies 128 px behind it, shown as +25 %), and a deviation that never dies (M 31's left, which is a galaxy and stays
-                          # exactly where it is)
-SKY_RIM_MIN = 0.0007      # the smallest step worth taking back: 0.07 % of the sky.  The frames that already render clean deviate at their border by no more than ~5 % of the
-                          # display sky, and the stretch's slope at the sky here is 75-120, so a step this small cannot reach the export; the bands that started this measure
-                          # 0.2-1.0 %, which is why the floor used to sit at 0.35 % was itself the bug - it refused exactly what the user was seeing
-SKY_RIM_MIN_DEPTH = 3     # a deviation standing on no more than the outer two pixels is a frame *line*, not a band: it has a different cause (a stage writing its boundary
-                          # condition into the edge) and its own instrument, ``edge_ring``, which is allowed to touch two pixels and no more.  A step this shallow is left to the
-                          # ring rather than taken as a band's worth of sky; the residues this tool exists for measure 30-150 px deep on the frames that have them
-SKY_RIM_CAP = 0.04        # the ceiling on what one side may hand back: no stage displaces the sky's floor at a border by more than 4 % of the sky (the largest measured anywhere
-                          # here is 2.04 %), and a deviation bigger than that is a gradient the model never got hold of - the model's to fix, not this tool's to bury
-SKY_RIM_SIGMA = 3.0       # a floor has to clear 3 of its own standard errors before it is called a deviation at all
-SKY_RIM_KEEP = 0.55       # and the witness has to keep on at least this *fraction of what it keeps in the middle of the frame* on every line it measures, counted about that
-                          # line's own sky: a border whose extra light is subject rather than sky holds two populations where the sky holds one, and spreads wider about its
-                          # own centre than the frame's sky does.  Measured here: a sky displaced 2 % reads 0.85-0.88 of the middle's share and a border under 45 % filaments
-                          # still reads 0.63, while a 2 %-of-sky wing over 40 % of the line reads 0.35-0.39 - the two are not close
-SKY_RIM_TOL = 1.5         # how far from a line's own sky a kept pixel may sit to count: the sky's mass interval at the frame's noise, so the comparison is with the frame's
-                          # own spread and not with an absolute width that no two frames share
-SKY_RIM_MIN_SKY = 256     # the fewest sky pixels a line, or the strip behind the band, may offer for its floor to be read at all: the same number the ring's own statistic
-                          # asks of a border, and on the smallest frames here (a line of ~1100 witness pixels) still four times it.  Below this the line is refused, not guessed
-SKY_RIM_BEHIND = 2        # the reference is the sky's floor in this same side's strip, one band width out to two - not the middle of the frame.  Against the middle, a border
-                          # under a frame-scale gradient looks like whatever the gradient makes it: every real frame here sits 0.4-1.9 % below its own interior at the border on
-                          # *all four sides*, which is the gradient, not the border, and a tool that levelled to the middle would draw the sky flat across the whole frame.
-                          # Against the strip behind it the gradient cancels and only the step the border itself made is left.  The middle keeps one job: saying whether the
-                          # deviation died out inside the band, which no frame-scale gradient does
-
-
-def sky_rim(a: np.ndarray) -> tuple[np.ndarray | None, dict]:
-    """Level the sky's floor in the frame's outer band against the strip of sky lying just behind it: the residue the stages before the stretch leave at the border, taken back before the slope at the sky turns it into a band.
-
-    Three tools stand between here and the export and none of them can do this.  ``edge_ring`` may touch two pixels and no more, because a wider claim about a border is a
-    claim about the sky; ``sky_pedestal`` levels a region only where its provenance class differs from the class around it, and a gradient model's residue carries no
-    provenance; ``border_debt`` may take back only what the background step itself changed, and by construction leaves whatever the frames brought - which is exactly what a
-    model that removed 78 % of a border gradient (NGC 1499: -7.83 % entering, -1.86 % leaving) did not remove.  The residue is a processing artifact all the same: the sky does
-    not step 2 % at the edge of a frame, and the stretch's slope at the sky (75-120) multiplies those 2 % into the -60 % band the export showed.
-
-    **The subject is never in this measurement, and that is not an assumption.**  What is compared is the *sky's floor* on each line - ``sky_floor`` over the pixels
-    ``_sky_witness`` kept, stars and filaments out - and not the line's median: the median of a border line on a nebula-dominated frame measures where the subject is, which is
-    how a tool comes to confuse the two and pour light into a rim.  Because a level error is removed by a constant offset under a taper, every pixel under the band moves by the
-    same amount at its own depth, so the subject's contrast against its own sky is preserved exactly; and where the subject crowds the sky out of a line there are not
-    ``SKY_RIM_MIN_SKY`` pixels the witness will accept as sky left on it, and the side is refused rather than guessed at - the rim that started this offered 194 accepted
-    pixels out of 5658.  M 31 is the standing proof of both halves: its left border, where the galaxy lies, measures no larger a floor offset than its clean sky sides do, and
-    this tool leaves all four of them alone.
-
-    A side is taken only when all of this holds, in every channel or none:
-
-    * every sampled line offers at least ``SKY_RIM_MIN_SKY`` pixels the witness accepts as sky - a line the subject has filled has no floor to read, and reading one there is
-      guessing - and the pixels it does accept on that line sit as tightly about the line's own sky as the middle's do about theirs (``SKY_RIM_KEEP``, ``SKY_RIM_TOL``).  Light
-      lying across a border that the sky did not make cannot be told from a displaced sky by its level alone, and this is what tells them apart: the one adds a second
-      population, the other moves the first;
-    * the deviation is a step and not a ramp.  It stands ``SKY_RIM_MIN`` of the sky and ``SKY_RIM_SIGMA`` standard errors clear of the strip behind the band from the very edge
-      in, in one direction, with no gap in the depths it stands at, and it has died out by the deepest line read inside the band.  One still standing there is a frame-scale
-      gradient, and levelling a border against a gradient would draw the sky flat across the whole frame: that is the gradient model's to remove, and sky stays;
-    * it is under ``SKY_RIM_CAP`` of the sky.
-
-    What is taken is the measured profile itself - the offset read at each depth, joined between the samples and faded to nothing with a cos^2 over as much room again beyond the
-    depth where it last stood - so the correction ends where the deviation ends and cannot leave a step of its own, rather than reaching the full band width whether the
-    deviation is 20 px deep or 400.  It is faded out along the border over a quarter of a band at each end, so the corners - where two sides overlap - average the two sides'
-    offsets instead of adding them (the ring's discipline).
-
-    Returns ``(field, info)``; subtract the field.  ``info["sides"]`` carries every side and channel this tool looked at: how far its floor stood from the strip behind the
-    band, as a percentage of that sky, and either what was taken or why nothing was.
-    """
-    a = np.asarray(a, np.float32)
-    ch, h, w = a.shape
-    lum = finish.luminance(a)
-    keep = _sky_witness(lum)
-    band = max(64, min(512, int(round(min(h, w) * SKY_RIM_BAND))))
-    cut = max(16, int(0.05 * min(h, w)))                                                              # the corners are where two sides' ramps overlap: neither side's evidence
-    m = max(140, min(h, w) // 8)
-    mid = np.zeros((h, w), bool)
-    mid[m:h - m, m:w - m] = True
-    ref_sel = keep & mid
-    if int(ref_sel.sum()) < 4 * SKY_RIM_MIN_SKY:
-        return None, {"band_px": band, "sides": [], "note": "the middle of the frame offers no sky to measure a border against"}
-    ref, ref_se = sky_floor(a[:, ref_sel].reshape(-1))
-    ref_lum = float(np.median(lum[ref_sel]))                                                         # the middle's sky, on the plane every side is compared on
-    sig = max(float(_sigma(lum[mid])), 1e-5 * max(1.0, abs(ref_lum)))                                # the frame's sky spread: stars and nebula are outliers to it, and a frame
-                                                                                                      # with no noise at all has nothing for a subject to hide behind
-    ref_share = float(np.mean(np.abs(lum[ref_sel] - ref_lum) <= SKY_RIM_TOL * sig))                  # how tightly this frame's sky sits about its own level: the yardstick,
-                                                                                                      # measured on the witness's pixels exactly as a border line is
-    ref = float(ref)
-    if ref <= 0.0:
-        return None, {"band_px": band, "sides": [], "note": "the frame's own sky is not a level anything can be measured against"}
-    depths = tuple(d for d in SKY_RIM_DEPTHS if d < band)                                             # the profile is read across the band, and the band is never shallower
-
-    def pixels(side, d0, d1):
-        """The pixels from d0 to d1 in from that border, with the ends of each line cut back, as one sample per channel with the witness's share of them alongside."""
-        if side == 0:
-            v, s = a[:, d0:d1, cut:w - cut], keep[d0:d1, cut:w - cut]
-        elif side == 1:
-            v, s = a[:, h - d1:h - d0, cut:w - cut], keep[h - d1:h - d0, cut:w - cut]
-        elif side == 2:
-            v, s = a[:, cut:h - cut, d0:d1], keep[cut:h - cut, d0:d1]
-        else:
-            v, s = a[:, cut:h - cut, w - d1:w - d0], keep[cut:h - cut, w - d1:w - d0]
-        return v.reshape(ch, -1), s.reshape(-1)
-
-    def sky_share(side, d):
-        """How tightly the sky the witness accepts on the line d in from that border sits about its own level, against the same figure for the middle of the frame.
-
-        A level error moves the sky; a subject lying across the border adds a second population to it.  Both raise the line's floor and, once the line's own centre is used,
-        both sit at the level the tool would be told to remove - so the level cannot separate them and the shape can.  Counted over the pixels the witness accepted, on both
-        sides of the comparison, because that is what keeps the two cases apart: filaments are rejected there and cost the line nothing, while a smooth plateau of a couple of
-        percent of the sky is accepted along with the sky and halves the line's share.  A border whose sky has gone entirely is not this gate's to catch - its centre is the
-        subject's own level, its share looks perfect, and ``SKY_RIM_CAP`` is what refuses it."""
-        if side == 0:
-            sl = (slice(d, d + 1), slice(cut, w - cut))
-        elif side == 1:
-            sl = (slice(h - 1 - d, h - d), slice(cut, w - cut))
-        elif side == 2:
-            sl = (slice(cut, h - cut), slice(d, d + 1))
-        else:
-            sl = (slice(cut, h - cut), slice(w - 1 - d, w - d))
-        s = lum[sl][keep[sl]]
-        if s.size < SKY_RIM_MIN_SKY:
-            return 0.0                                                                                 # no sky accepted here at all is not a line to measure a level on
-        return float(np.mean(np.abs(s - float(np.median(s))) <= SKY_RIM_TOL * sig))
-
-    def place(side, d):
-        """Where the line d in from that border lives - its whole length, because a corner belongs to two sides and their offsets have to be averaged there, never added.  The
-        fade along the border (``ramp``) is what keeps each side's claim to the length it actually measured."""
-        if side == 0:
-            return slice(d, d + 1), slice(None)
-        if side == 1:
-            return slice(h - 1 - d, h - d), slice(None)
-        if side == 2:
-            return slice(None), slice(d, d + 1)
-        return slice(None), slice(w - 1 - d, w - d)
-
-    num = np.zeros_like(a, np.float64)
-    den = np.zeros_like(a, np.float64)
-    table = []
-    taken = []
-    for side in range(4):
-        n = w if side < 2 else h
-        tail = max(1, band // 4)
-        ramp = np.ones(n, np.float64)
-        fade = 0.5 * (1.0 + np.cos(np.pi * np.arange(tail) / tail))                                   # the corner belongs to two sides: fade out before it is reached
-        ramp[:tail] = fade
-        ramp[n - tail:] = fade[::-1]
-        vb, sb = pixels(side, band, SKY_RIM_BEHIND * band)
-        if int(sb.sum()) < SKY_RIM_MIN_SKY:
-            for c in range(ch):
-                table.append((side, c, None, "too little sky behind this border to know what it should be"))
-            continue
-        back, back_se = [], []
-        for c in range(ch):
-            fb, seb = sky_floor(vb[c][sb])
-            back.append(float(fb))
-            back_se.append(float(seb))
-        if min(back) <= 0.0:
-            for c in range(ch):
-                table.append((side, c, None, "the sky behind this border is not a level anything can be measured against"))
-            continue
-        outside, shallow = [], []                                                       # the channels that carry a band, and the ones whose own profile is only a frame line
-        for c in range(ch):
-            offs, ses, cov = [], [], 1.0
-            for d in depths:
-                v, s = pixels(side, d, d + 1)
-                cov = min(cov, sky_share(side, d))
-                if int(s.sum()) < SKY_RIM_MIN_SKY:
-                    offs = None
-                    break
-                fl, se = sky_floor(v[c][s])
-                offs.append(float(fl) - back[c])                                                       # the border's own step, with the gradient behind it cancelled
-                ses.append(float(np.hypot(se, back_se[c])))
-            if offs is None:
-                table.append((side, c, None, "the witness keeps too little of this side's lines to measure it"))
-                continue
-            sign = 1.0 if offs[0] >= 0.0 else -1.0                                                    # the border deviates one way or it does not deviate: a profile that turns
-                                                                                                      # round inside the band is not the step the edge was set to
-            stood = [o * sign > max(SKY_RIM_MIN * back[c], SKY_RIM_SIGMA * se) for o, se in zip(offs, ses)]
-            how = round(offs[0] / back[c], 5)
-            if cov < SKY_RIM_KEEP * ref_share:
-                table.append((side, c, how, "the subject lies across this side's lines; its light is not the sky's level"))
-                continue
-            if not stood[0]:
-                table.append((side, c, how, "level with the sky behind the border"))
-                continue
-            last = 0
-            while last + 1 < len(stood) and stood[last + 1]:
-                last += 1
-            if depths[last] < SKY_RIM_MIN_DEPTH:
-                shallow.append(c)
-                table.append((side, c, how, "a deviation this shallow is a frame line, and the ring's to take"))
-                continue
-            # What has to kill the side is a second step, never a noisy sample of the first.  The first version refused on
-            # *any* standing depth beyond the run, and C 20's right border paid for it: +0.2 % of the sky lying uniformly
-            # 48 px in, vetoed by one sample at 96 px that stood a hair over the bar with the depths either side of it
-            # flat, so the untaken offset went through the stretch (slope 75-120 at the sky) and came out the export's
-            # bright edge.  A deviation that really returns behind the border - the nebula, the galaxy, the gradient this
-            # rule exists to leave alone - returns over SKY_RIM_REPEAT depths in a row and carries SKY_RIM_ECHO of the
-            # border's own height; a single line above the bar neither does nor needs to.
-            height = max(abs(o) for o in offs[:last + 1])
-            echo = 0
-            for i in range(last + 1, len(stood)):
-                echo = echo + 1 if stood[i] and abs(offs[i]) >= SKY_RIM_ECHO * height else 0
-                if echo >= SKY_RIM_REPEAT:
-                    break
-            if echo >= SKY_RIM_REPEAT:
-                table.append((side, c, how, "the deviation is not a step: a second one of its own height returns behind the border"))
-                continue
-            if last == len(depths) - 1:
-                table.append((side, c, how, "the gradient reaches past the band: that is the model's to remove, and sky stays"))
-                continue
-            amplitude = height                                                                # the same measurement the returning deviation was judged against above
-            if amplitude > SKY_RIM_CAP * back[c]:
-                table.append((side, c, how, "more than a stage can have displaced at a border"))
-                continue
-            outside.append((side, c, offs, last, amplitude))
-        if not outside:
-            continue
-        # The border is one object measured three times, and handing back the channels that passed while leaving the one
-        # that did not paints the border in the colour that was left out - so a side is taken whole or not at all.  What
-        # is *not* a disagreement is a channel whose own profile is nothing but a frame line: two pixels deep, too
-        # shallow for this tool and ``edge_ring``'s own claim, which it declined.  Such a channel carries no evidence
-        # about a band either way, and refusing on it is how C 20's right border kept +0.3 % of its sky over 48 px - the
-        # R channel held hostage by G and B carrying a two-pixel line.  A channel that was read and found level, or found
-        # not to be a step at all, is a disagreement, and the side stays whole.
-        channels = {o[1] for o in outside}
-        if any(c not in channels and c not in shallow for c in range(ch)):
-            reason = "a channel of this side is refused, so the side stays as it is"
-            for side_, c, _, _, amplitude in outside:
-                table.append((side_, c, round(amplitude / back[c], 5), reason))
-            continue
-        for side_, c, offs, last, amplitude in outside:
-            table.append((side_, c, round(amplitude / back[c], 5), "taken"))
-            ds = list(depths[:last + 1])
-            prof = np.interp(np.arange(band), ds, offs[:last + 1])                                     # the step as it was measured, joined between the depths it was read at
-            end = min(band - 1, ds[-1] + max(4, ds[-1]))                                               # as much room again as the step is deep to fade out in
-            taper = np.ones(band, np.float64)
-            inner = np.arange(ds[-1] + 1, end + 1)
-            taper[inner] = 0.5 * (1.0 + np.cos(np.pi * (inner - ds[-1]) / max(1, end - ds[-1])))      # to nothing, with a zero slope, where the deviation has gone
-            prof = prof * taper
-            along = ramp[:, None] if side_ >= 2 else ramp                                             # a left/right strip is (h, 1): the fade along the border runs down the rows
-                                                                                                      # there, not across them
-            for d in range(band):
-                t = float(prof[d])
-                if t == 0.0:
-                    continue
-                rows, cols = place(side_, d)
-                num[c][rows, cols] += t * along
-                den[c][rows, cols] += along
-                taken.append((side_, c))
-    if not den.any():
-        return None, {"band_px": band, "depths": list(depths), "sides": table, "note": "no border differs from the sky behind it"}
-    field = num / np.maximum(den, 1e-9)
-    return field.astype(np.float32), {"band_px": band, "depths": list(depths), "sides": table, "taken": taken,
-                                      "peak": round(float(np.abs(field).max()), 7), "sky": round(ref, 7)}
-
-SKY_TINT_SAMPLES = 20000      # the fewest sky pixels (subject excluded) a plane may be fitted on: below it the plane is the noise of one part of the frame
-SKY_TINT_BUFFER = 9           # px of sky thrown away around the subject, because the subject's edge is not sky either.  The subject is ``nebula_mask``'s own - the same
-                              # definition ``subject_coverage`` uses to refuse the colour-gradient step - and not a high-pass threshold of mine: my first version excluded
-                              # anything standing 3 sigma above an 8 px high-pass of the *linear* light and dilated it 15 px, which on C 20's starless left 10.9k of 2.3M sky
-                              # pixels - a noise-relative threshold on linear data flags a sprinkling, and 15 px of dilation around a sprinkling is the whole frame
-SKY_TINT_MIN_SPREAD = 1.0     # the gate's own units: below this the quarters already agree (a delivery is failed for 1.5), so the frame is left strictly alone - a tool that
-                              # touched clean frames would be processing, not correcting
-SKY_TINT_CAP = 0.10           # the largest peak-to-peak gain allowed in one channel: past 10 % the colour is the sky's own (dual-band, dust, an unbalanced white) and a plane
-                              # fitted on the sky has no business touching it - that is a calibration question, not a residue
-SKY_TINT_GAIN = 1.2           # the correction ships only when it leaves the gate's own quadrant spread this times smaller - a comparison, not a threshold, in the spirit of
-                              # ``STRETCH_CLIP_GAIN``: what is refused is a fit that does not measurably help the thing the delivery is judged on
-SKY_TINT_CLIP = 3.0           # sigma clips of the plane fit: the sky is the bulk of the frame and the subject must not drag the plane, so the sample is trimmed from both tails
-
-
-def sky_quadrant_spread(a: np.ndarray) -> tuple[float, dict]:
-    """What ``gates.quadrant_spread`` will find, read on the frame's own display transform: the worse of the a* and b* spreads between the four quarters of the sky, with the
-    measurement behind it.  This is the number a delivery is failed for - read here, where it can still be corrected, rather than in the sidecar after the export.  It is taken
-    through ``autostretch_display`` (the transform the chain's own step pictures go through) rather than through the whole downstream chain: the delivered gate is the final
-    judge, and the two numbers this records are what the tool saw.
-    """
-    disp = autostretch_display(a)
-    sm = gates.sky_mask(finish.luminance(disp))
-    if sm.sum() < SKY_TINT_SAMPLES:
-        return 0.0, {"refused": "no sky to measure on the display transform"}
-    qs = gates.quadrant_spread(gates._lab(disp), sm)
-    return max(float(qs["spread_a"]), float(qs["spread_b"])), qs
-
-
-def sky_tint(a: np.ndarray) -> tuple[np.ndarray | None, dict]:
-    """Take out the sky's slowly varying **channel-to-channel** tilt: what the refused ``colour_gradient`` step would have done, fitted on sky alone.
-
-    Why it exists (C 20, 2026-11-01, one fixed display transform, the sky taken with the subject excluded, measured on the session's own checkpoints): the registered stack's
-    quadrant tints are neutral - ``gates.quadrant_spread`` reads b* 0.88 - and they grow through the stages after it: restoration 1.55, linear 1.98, starless 3.41, with the
-    bottom-right quadrant's b* at 4.88 while the other three sit at 1.5-2.0.  The delivery then fails ``sky_chroma_quadrants`` on a cast that was never in the data.  Nothing
-    between the frame and the export reaches it: ``colour_gradient`` is refused above ``SKY_STEPS_MAX_COVERAGE`` (this frame's subject covers 34 %), ``neutralise``'s offsets
-    are per channel but *global*, and ``sky_pedestal``/``sky_rim`` are spatial but *achromatic*.
-
-    Why the fit may only look at sky, and only at degree 1: the refusal it stands in for was written for a real hazard - on C 20 (2026-10-15) Siril's degree-2 model "took the
-    North America Nebula's own red".  Running that step on this frame (``output/.ab12/subsky_probe.py``) takes out a model 10x the size of the sky's actual tilt (2.35 % and
-    1.96 % of the sky in R and G where the sky only tilts 0.25 % and 0.43 %), anti-correlated with it in R (corr -0.23), and the quadrant tints get **worse**: a 1.89 -> 3.44.
-    So the replacement is never shown the subject, and stays linear because degree 2 and 3 are what ate the nebula.
-
-    Three things this measures rather than assumes, each learned from it being wrong on these same pixels:
-
-    * it fits in the **log**, because colour is a channel *ratio* and the stretch carries ratios to the picture; the first version fitted absolute differences, and on the
-      starless that raised the gate's a* spread from 1.89 to 3.59 while its own metric said it had halved the tilt;
-    * it **centres** each channel's field on its own sky, so the frame keeps the colour it arrived with (``neutralise``'s offsets own the overall balance, one step later, on
-      purpose); uncentred, this pulled C 20's registered stack from b* -2.9 to about 0 - the sky's colour removed, not a residue;
-    * it **adopts on the gate's own reading** (``sky_quadrant_spread``) rather than on a proxy of it: measured on the real checkpoints, a metric of percent-of-sky tints said
-      the correction improved the restoration frame 1.4x while the gate's number said the opposite, and only the gate's number agreed with what the export does with it.
-
-    The gain is applied to the whole frame rather than under a sky mask: a plane cannot draw an edge, whereas a smooth field multiplied by a blurred mask does - at the
-    nebula's boundary, where the stretch's slope at the sky is a hundred - which is the artifact class this file's other tools exist to remove.  Returns the field to
-    *multiply* by, or None with the reason it refused.
-    """
-    lum = finish.luminance(a)
-    before, qs0 = sky_quadrant_spread(a)
-    if before <= SKY_TINT_MIN_SPREAD:
-        return None, {"refused": "the quarters' sky tints already agree", "spread": round(before, 2),
-                      "limit": gates.LIMITS["sky_chroma_quadrants"]}
-    sm = finish._sky_mask(lum, edge=finish.EDGE_CROP)
-    if sm.sum() < SKY_TINT_SAMPLES:
-        return None, {"refused": f"the frame has no sky to measure ({int(sm.sum())} pixels)"}
-    subject = nebula_mask(lum, _hist_stats(lum)["mode"])[0]                          # the project's own subject definition - the one ``subject_coverage`` refuses the
-    structure = cv2.dilate(subject.astype(np.uint8), np.ones((SKY_TINT_BUFFER, SKY_TINT_BUFFER), np.uint8)) > 0   # gradient on - buffered, because its edge is not sky
-    samples = sm & ~structure
-    if samples.sum() < SKY_TINT_SAMPLES:
-        return None, {"refused": f"only {int(samples.sum())} sky pixels survive the subject", "sky": round(float(sm.mean()), 3)}
-    ys, xs = np.nonzero(samples)
-    stride = max(1, len(ys) // 60000)                                                # a plane has three parameters; 60 k samples is twenty thousand times over-determined,
-                                                                                     # and this fit's cost is paid by every preview (it measured 7 s a frame at 200 k)
-    yi, xi = ys[::stride], xs[::stride]
-    A = np.stack([np.ones(len(yi)), yi.astype(np.float64), xi.astype(np.float64)], -1)
-    yy, xx = np.arange(lum.shape[0], dtype=np.float64), np.arange(lum.shape[1], dtype=np.float64)   # evaluated by row/column below, not as two full grids
-    loga = np.log(np.maximum(a, 1e-12))                                              # colour is a ratio: fit the channels' log levels, and the difference of those
-    planes = np.empty((3,) + lum.shape, np.float64)
-    for c in range(3):
-        v = loga[c][yi, xi].astype(np.float64)
-        keep = np.ones(v.shape, bool)
-        coef = np.zeros(3)
-        for _ in range(3):
-            coef = np.linalg.lstsq(A[keep], v[keep], rcond=None)[0]
-            r = v - A @ coef
-            keep = np.abs(r - np.median(r)) <= SKY_TINT_CLIP * _sigma(r)
-        planes[c] = coef[0] + coef[1] * yy[:, None] + coef[2] * xx[None, :]
-    field = planes - planes.mean(0)                                                   # the channel-to-channel part: the mean of the three is added back, so the frame's
-    for c in range(3):                                                                # luminance gradient is left exactly where the frames put it
-        field[c] -= float(np.mean(field[c][samples]))                                 # ... and only its SPATIAL part: each channel keeps the sky level it arrived with
-    gain = np.exp(-field).astype(np.float32)
-    ptp = [float(np.ptp(gain[c])) for c in range(3)]
-    if max(ptp) < 1e-4:
-        return None, {"refused": "no tilt to take", "spread": round(before, 2)}
-    if max(ptp) > SKY_TINT_CAP:
-        return None, {"refused": f"a {100.0 * max(ptp):.1f} % tilt in one channel is the sky's own colour, not a residue",
-                      "gain_ptp_pct": [round(100.0 * p, 2) for p in ptp]}
-    after, qs1 = sky_quadrant_spread(a * gain)
-    if after * SKY_TINT_GAIN >= before:
-        return None, {"refused": f"the fit leaves the gate's quadrant spread at {after:.2f} (was {before:.2f})",
-                      "gain_ptp_pct": [round(100.0 * p, 2) for p in ptp],
-                      "spread_before": round(before, 2), "spread_after": round(after, 2)}
-    return gain, {"samples": int(samples.sum()), "sky": round(float(sm.mean()), 3),
-                  "gain_ptp_pct": [round(100.0 * p, 2) for p in ptp],
-                  "spread_before": round(before, 2), "spread_after": round(after, 2),
-                  "medians_b_before": [round(float(v), 2) for v in qs0.get("median_b", [])],
-                  "medians_b_after": [round(float(v), 2) for v in qs1.get("median_b", [])]}
 
 
 def level_stats(arr: np.ndarray) -> dict:
@@ -1060,10 +336,9 @@ class Finisher:
                  steps=None, keep_pictures: bool = True, coverage: np.ndarray | None = None):
         self.work, self.header, self.p, self.dual, self.external = work, header, p, dual, external
         self.progress, self.checkpoint, self.tick, self.device, self.steps = progress, checkpoint, tick, device, steps
-        self.coverage = coverage                            # the stacking coverage map (frames per pixel), or None: see sky_pedestal
+        self.coverage = coverage                            # the stacking coverage map (frames per pixel), or None
         self.denoiser = None                                 # (tool, run(amount, array), ceiling, requested) once denoise() has run its tool; the closing
                                                              # step (run -> _close_sky_noise) re-runs that same tool on the starless the contrast steps left
-        self.denoiser_refused = None                               # {"tool", "sky_chroma", "limit"} when _keep_denoise refused the step: the closing
                                                                    # step must then say the tool was refused for colouring, not that none existed
         self.cwd = os.path.join(work, "siril")
         self.pdir = os.path.join(work, "steps")
@@ -1157,10 +432,9 @@ class Finisher:
 
     # ---- 0a. colour gradient (linear) ----------------------------------------------------------------------------------------
     def colour_gradient(self, base: np.ndarray) -> np.ndarray:
-        """The channel-to-channel gradient the restore stage's background extraction leaves (R - G varies by +-8e-5 across IC 1805's starless layer, 0.4 % of the sky; the stretch
-        multiplies it by hundreds): Siril ``subsky 2 -samples=20 -tolerance=1.0`` (the command's polynomial degree 2 / default samples and tolerance, pro-workflow.md A2) on each
+        """The channel-to-channel gradient the restore stage's background extraction leaves (the stretch multiplies it by hundreds): Siril ``subsky 2 -samples=20 -tolerance=1.0`` (the command's polynomial degree 2 / default samples and tolerance, pro-workflow.md A2) on each
         channel, with the MEAN of the three channels' models added back so that only the colour part of the gradient is removed and the brightness of the faint nebula is left alone."""
-        deg = 2 if self.dual else 3          # broadband colour gradients (an amber / green glow in NGC 1499's corners) need one more order; Siril allows 1-4
+        deg = 2                              # subsky's polynomial degree 2 (pro-workflow.md A2)
         t0 = time.time()
         lines = ["split cg_r cg_g cg_b", "load cg_in", f"subsky {deg} -samples=20 -tolerance=1.0", "split cg_sr cg_sg cg_sb"]
         for ch in "rgb":
@@ -1186,38 +460,15 @@ class Finisher:
     # ---- 0. background neutralisation (linear) -----------------------------------------------------------------------------
     def neutralise(self, base: np.ndarray) -> np.ndarray:
         """Equal sky level in R, G and B immediately before the stretch: per-channel OFFSETS (no gains) that bring the median of the sky of each channel to the highest one
-        (Siril's SPCC ``-bgtol`` background neutralisation / PixInsight BackgroundNeutralization, offsets only).  The stretch multiplies the linear differences by its slope at the sky
-        (hundreds on a stack whose nebula is 1-5 % above the sky): the 0.3 % channel-to-channel differences BXT, NXT and SXT leave after SPCC (R 0.018865, G 0.018911, B 0.018919 on
-        IC 1805's starless layer) would otherwise become a 0.1 display-unit colour cast of the sky.  The same slope turns a pedestal that varies across the frame (the low-coverage
-        dithered rim, measured 0.3 % of the sky over ~300 px in IC 1848, 40-60 % of the display sky after the stretch) into a band, so the sky's slowly varying pedestal is modelled
-        and removed before it, measured at the border where the provenance classes meet - see ``sky_pedestal``.  The frame's own border is levelled in the same step - see
-        ``edge_ring``: the outer 2 px of IC 1848 sit +0.5 % of the sky above the interior, which is nothing in the linear and a bright line down the edge of the export once
-        the stretch has multiplied it.  And so is the band behind that line: ``sky_rim`` compares the *sky's floor* on each border line with the sky's floor in the middle of the
-        frame, which is the only comparison that cannot mistake a nebula for an artifact, and takes back the residue the gradient model left there while it is still 1-2 % of the
-        sky rather than 50 % of the display sky."""
+        (Siril's SPCC ``-bgtol`` background neutralisation / PixInsight BackgroundNeutralization, offsets only).  The stretch multiplies the linear differences by its slope at the sky,
+        so the channel-to-channel differences the restoration tools leave after SPCC would otherwise become a colour cast of the sky."""
         lum = finish.luminance(base)
         sm = finish._sky_mask(lum, edge=finish.EDGE_CROP)
-        ref0 = max(float(np.median(base[c][sm])) for c in range(3))
-        ped, ped_info = sky_pedestal(base, ref0, self.coverage)
-        if ped is not None:                                              # the spatial half: one offset per channel cannot reach a pedestal that varies across the frame
-            base = np.maximum(base - ped, 0.0).astype(np.float32)
-        ring, ring_info = edge_ring(base, self.coverage, ped)                      # and the frame's own border: the +0.5 % of the sky over its outer 2 px is nothing in the
-        if ring is not None:                                             # linear, and a bright line down the edge of the export once the stretch's toe has multiplied it
-            base = np.maximum(base - ring, 0.0).astype(np.float32)
-        rim, rim_info = sky_rim(base)                                                    # and the band behind the ring's line: what the gradient model left in the outer eighth of
-        if rim is not None:                                                              # the frame, 1-2 % of the sky in the linear and a band across the export after the toe
-            base = np.maximum(base - rim, 0.0).astype(np.float32)
-        gain, tint_info = sky_tint(base)                                                       # and the colour half of the same problem: quarters of the sky carrying different
-        if gain is not None:                                      # channel-to-channel levels, which no global offset can reach and the stretch's slope delivers as a cast
-            base = (base * gain).astype(np.float32)
-        if ped is not None or ring is not None or rim is not None or gain is not None:
-            lum = finish.luminance(base)
-            sm = finish._sky_mask(lum, edge=finish.EDGE_CROP)
         med = [float(np.median(base[c][sm])) for c in range(3)]
         ref = max(med)
         off = [ref - m for m in med]
         t0 = time.time()
-        if max(off) < 1e-7 and ped is None and ring is None and rim is None and gain is None:
+        if max(off) < 1e-7:
             self.record("background neutralisation (linear)", "none", None, status="skipped", note="the sky is already neutral", params={"sky_median": med})
             return base
         lines = ["split bn_r bn_g bn_b"]
@@ -1229,15 +480,10 @@ class Finisher:
             fp = os.path.join(self.cwd, f + ".fit")
             if os.path.exists(fp):
                 os.remove(fp)
-        self.record("background neutralisation (linear)",
-                    ("sky tint + " if gain is not None else "") + ("provenance sky pedestal + " if ped is not None else "") + ("frame ring + " if ring is not None else "") + ("border sky rim + " if rim is not None else "")
-                    + "siril split / pm (offsets) / rgbcomp", out,
+        self.record("background neutralisation (linear)", "siril split / pm (offsets) / rgbcomp", out,
                     commands=lines, seconds=time.time() - t0, linear=True,
-                    params={"sky_median_before": [round(m, 7) for m in med], "offsets": [round(o, 8) for o in off], "pedestal": ped_info, "ring": ring_info, "rim": rim_info, "tint": tint_info},
-                    source="Siril SPCC -bgtol / PixInsight BackgroundNeutralization: per-channel offsets so that the sky has equal levels (no gains), plus one offset per"
-                           " low-coverage provenance region for the sky's slowly varying pedestal, a measured profile across the frame's outer ring, and the sky's floor on the"
-                           " border lines levelled against the frame's own where the gradient model left a residue, and a degree-1 per-channel plane fitted on sky alone for the"
-                           " quarters' channel-to-channel tilt the refused colour-gradient step would have taken; needed because the stretch's slope at the sky is hundreds")
+                    params={"sky_median_before": [round(m, 7) for m in med], "offsets": [round(o, 8) for o in off]},
+                    source="Siril SPCC -bgtol / PixInsight BackgroundNeutralization: per-channel offsets so that the sky has equal levels (no gains)")
         return out
 
     # ---- 0b. banding (second line of defence) --------------------------------------------------------------------------------
@@ -1282,15 +528,10 @@ class Finisher:
         self._say("Stretching")
         cov = self.subject_coverage(base)
         self.info["subject_coverage"] = round(cov, 3)
-        if cov <= SKY_STEPS_MAX_COVERAGE:
-            base = self.colour_gradient(base)
+        if str(self.p.get("background", True)).lower() not in ("false", "0", "", "none"):
+            base = self.colour_gradient(base)                   # Siril subsky's own sample rejection (-tolerance) picks the sky samples
         else:
-            self.record("colour gradient (linear)", "none", None, status="skipped", note=f"the subject covers {cov * 100:.0f} % of the frame (> {SKY_STEPS_MAX_COVERAGE * 100:.0f} %): no sky to sample, the nebula's own colour would be taken")
-        # neutralisation is NOT gated by the coverage.  The gate guards a specific hazard (C 20: the degree-2 per-channel model of ``colour_gradient`` took the North America
-        # Nebula's own red), and a global polynomial is indeed unsafe on a frame-filling subject; offsets relative to the sky samples and a mesh capped at 2 % of the sky are not.
-        # Skipping it is the worse failure: the stretch's slope at the sky is ~120, so every sky difference left here is amplified a hundredfold, and the coverage figure cannot
-        # be trusted for this decision anyway - its threshold is mode + 3 sigma of the *smoothed sky's own scatter* (IC 1848: 0.4 % of the sky), so a well-flattened frame of
-        # faint diffuse nebula reads "40 % subject" while 41 % of its pixels still lie below the mode.
+            self.record("colour gradient (linear)", "none", None, status="skipped", note="background = off")
         base = self.neutralise(base)
         base = self.banding(base, "linear starless", True)
         if method == "statstretch":
@@ -1309,8 +550,7 @@ class Finisher:
         neb_hi = float(np.percentile(sel, HP_PERCENTILE)) if sel.size else h["mode"]
         hdr_on = float(p.get("hdr", 0.0)) > 0 and str(p.get("hdr_method", "auto")) != "wavescale"
         b2 = float(np.clip(p.get("contrast", GHS2_B), 0.25, 13.0))
-        d2_default = GHS2_D if mi["coverage"] < GHS2_FILLING_COVERAGE else GHS2_D_FILLING     # autofinish's rule, also without autofinish (a plain export)
-        d2 = float(np.clip(p.get("ghs_d2") or d2_default, 0.05, 10.0))
+        d2 = float(np.clip(p.get("ghs_d2") or GHS2_D, 0.05, 10.0))
         target = float(np.clip(p.get("stretch", SKY_TARGET), 0.02, 0.4))
         if p.get("auto_stretch", True) and mi["coverage"] >= FRAME_FILLING:
             target = max(target, SKY_BAND[1])                    # a frame-filling object: the background at the top of Brecher's band (0.11), the midtones get the room
@@ -1357,43 +597,17 @@ class Finisher:
         if float(np.abs(out - base).max()) < 1e-6:
             raise SirilError("Statistical_Stretch.py left the image unchanged (pyscript failed)")
         seconds = time.time() - t0
+        # The script's own black clip (median - sigma x its noise estimate) is its black point and runs as published.  An automatic
+        # clip-free retry used to ship whenever its sky measured "more even" in percent of the sky - but a stretch that keeps the
+        # linear pedestal compresses everything near the sky, so it always measures more even: IC 434 (2026-11-01) shipped it at a
+        # quarter of the subject contrast with the sky as even in units of its own noise (0.37 vs 0.36 sigma).
         lump = sky_lump(out)
-        tried = [{"command": line, "black_clip": True, "sky_lump": lump}]
-        # The script's black clip is a threshold at the sky minus ``sigma`` times the sky's own noise, so wherever the sky is
-        # locally noisier more pixels fall under it - and the toe of the curve is steep enough (75-120 at the sky) to turn that
-        # into a lightness step.  C 20 (EXP_15, 2026-09-30) hands this step a sky flat to 0.1 % and takes back a sky whose
-        # sky-mask cells spread +25 % / -29.8 %: that is the "wide rim offset" the fleet ledger recorded on C 20, M 31 and
-        # NGC 1499, none of which the linear frame carries.  The same step without the clip measures +-8 %.  Which of the two
-        # ships is decided on the pixels rather than on a threshold this file would have to invent: unevenness that *is* the
-        # subject (M 31's envelope measures +21 % with a clip that is doing nothing) is not improved by dropping the clip and
-        # keeps it, so a render loses its black point only when the black point was what cost it the sky.
-        line_nc = f"{line} -noblackclip"
-        out_nc = lump_nc = None
-        if lump is not None and lump < STAT_CLIP_FLOOR:
-            # Nothing to win: the clip-free run ships only when it is STRETCH_CLIP_GAIN times more even, and a sky that
-            # already measures flat under the clip cannot gain a difference anyone can see - while the second run of
-            # the script costs as much as the first.  The record says the trial was not made, not that it failed.
-            tried.append({"command": line_nc, "black_clip": False, "sky_lump": None,
-                          "skipped": f"the clipped sky already measures {lump} % of sky"})
-        else:
-            try:
-                t1 = time.time()
-                out_nc = self.siril("stat", base, [line_nc], "Statistical stretch")
-                seconds += time.time() - t1
-                lump_nc = sky_lump(out_nc)
-            except SirilError as exc:                               # the clip-free run is a candidate, never a requirement
-                out_nc, lump_nc = None, None
-                tried.append({"command": line_nc, "black_clip": False, "sky_lump": None, "error": str(exc)[:120]})
-        if lump_nc is not None:
-            tried.append({"command": line_nc, "black_clip": False, "sky_lump": lump_nc})
-        if lump is not None and lump_nc is not None and lump_nc * STRETCH_CLIP_GAIN < lump:
-            out, line, lump = out_nc, line_nc, lump_nc
         self.record("stretch (Statistical Stretch)", "siril pyscript Statistical_Stretch.py", out, commands=[line], seconds=seconds,
                     params={"median": t, "sigma": STAT_SIGMA, "coverage": round(cov, 3), "hdr": hdr,
-                            "black_clip": "-noblackclip" not in line, "sky_lump": lump, "tried": tried},
+                            "black_clip": True, "sky_lump": lump},
                     source="Seti Astro Statistical Stretch (Siril port, C. Richard): median -> target; 0.10 for a small target, 0.25 (script default) when the target fills the "
-                           "frame (pro-workflow.md A8); the black clip is kept unless dropping it measurably evens the sky, the clip being a threshold at the sky's own noise")
-        self.info["stretch"] = {"method": "statstretch", "median": t, "coverage": cov, "black_clip": "-noblackclip" not in line, "sky_lump": lump}
+                           "frame (pro-workflow.md A8); the script's black clip at -sigma (its default) is the stretch's black point")
+        self.info["stretch"] = {"method": "statstretch", "median": t, "coverage": cov, "black_clip": True, "sky_lump": lump}
         return out
 
     def _stretch_alt(self, base: np.ndarray, method: str) -> np.ndarray:
@@ -1473,14 +687,25 @@ class Finisher:
         step read 0.00387 on the denoiser's output while the export reported 0.01075, and so never fired.
         """
         lum = finish.luminance(pic)
-        return gates.pixel_noise(lum, gates.sky_mask(lum.astype(np.float32)), starless)
+        return gates.pixel_noise(lum, gates.sky_mask(lum.astype(np.float32)), self.delivered_starless(starless))
+
+    def delivered_starless(self, starless: np.ndarray | None) -> np.ndarray | None:
+        """``starless`` through the last step's levels (``final_levels``: the black point, then the midtones), so that the star gates, which
+        measure a star's light against the starless it was screened onto, compare the two in the same levels.  Before the black point and the
+        sky's midtones existed the two were the same; with them, the undelivered starless made every star read colourless."""
+        lv = getattr(self, "final_levels", None)
+        if starless is None or lv is None:
+            return starless
+        bp, mid = lv
+        x = np.clip((np.asarray(starless, np.float32) - bp) / max(1.0 - bp, 1e-9), 0.0, 1.0)
+        return x if abs(mid - 0.5) <= 1e-4 else mtf_balance(mid, x).astype(np.float32)
 
     def _failed_of(self, pic: np.ndarray, starless: np.ndarray) -> list:
         """Which gates the delivered picture fails, for the comparison that decides whether a harder pass is allowed.
         The export hands ``gates.compute`` the linear-side measurements as well; here incumbent and candidate are judged
         by the same call, which is what makes the comparison fair rather than absolute.
         """
-        return sorted(k for k, v in gates.compute(pic, starless=starless).items() if isinstance(v, dict) and not v["pass"])
+        return sorted(k for k, v in gates.compute(pic, starless=self.delivered_starless(starless)).items() if isinstance(v, dict) and not v["pass"])
 
     def _close_sky_noise(self, starless: np.ndarray, compose):
         """Denoise the sky the delivered picture actually carries, not the one the denoiser left behind.
@@ -1511,14 +736,9 @@ class Finisher:
         limit = float(gates.LIMITS["sky_pixel_noise"])
         noise = self._sky_noise_of(out, starless)
         if not self.external or self.denoiser is None:
-            why = ("preview: no AI steps" if not self.external else
-                   (f"{self.denoiser_refused['tool']} was refused at every strength it was asked "
-                    f"({', '.join(str(a) for a in self.denoiser_refused['asked'])}) for leaving the sky at |a*| "
-                    f"{self.denoiser_refused['sky_chroma']['a']} / |b*| {self.denoiser_refused['sky_chroma']['b']} over its "
-                    f"{self.denoiser_refused['limit']} gate, and escalating a tool this frame's sky cannot trust would deepen "
-                    "the cast" if self.denoiser_refused else "nothing was available to ask"))
+            why = "preview: no AI steps" if not self.external else "nothing was available to ask"
             self.record("noise reduction (sky gate)", "none", out, status="skipped", seconds=time.time() - t0,
-                        params={"sky_pixel_noise": round(noise, 5), "gate": limit, "denoiser_refused": self.denoiser_refused},
+                        params={"sky_pixel_noise": round(noise, 5), "gate": limit},
                         note=f"the sky the delivered picture carries measured {noise:.5f} against its {limit} gate, and no denoiser ran "
                              f"({why})")
             return starless, out
@@ -1547,6 +767,7 @@ class Finisher:
                     self.records = saved
                 if "error" in attempts[-1] or noise <= limit:
                     break
+        self._sky_noise_used = used                                          # the closing clipping step re-renders with the same escalation
         info = {"sky_pixel_noise": round(noise, 5), "gate": limit, "requested": round(float(requested), 3),
                 "used": used, "attempts": attempts}
         if used is not None:
@@ -1559,66 +780,19 @@ class Finisher:
 
     def _keep_denoise(self, run, arr: np.ndarray, amount: float, *, tool: str, ceiling: float, params, start: float,
                       source: str, note: str = "", amounts: tuple | None = None) -> np.ndarray:
-        """Run the stretched-image denoiser and keep its pixels only while it leaves the sky inside the gate's own colour limit.
-
-        Nothing ever judged this step's colour.  ``output/.ab12/audit_exports.py --cast`` -- which reads the per-step
-        ``sky_channels`` the chain already records, over the fleet's exports -- found the denoiser to be the step that moves
-        the sky's colour most wherever no palette runs: GraXpert's noise reduction on the stretched starless walked IC 434's
-        sky by +31.5e-3 in ``(R-G)/(R+G)``, the same step that amplifies banding, and the only colour-changing step of the
-        chain with neither a measured refusal rule nor a recorded before/after, while SCNR, the stretch's black clip and the
-        border tools all had one.  So it is judged by the numbers the export is judged by -- the sky's median ``|a*|``
-        and ``|b*|`` over ``gates.sky_mask`` *and* the spread of its four quadrants' signed tints, before and after
-        (``_sky_chroma``).  The second one is not decoration: ``|a*|`` is dominated by chroma noise, so a denoiser
-        *improves* it and no rule written on it alone can refuse a tint -- which is how C 20 (2026-11-01) shipped
-        with ``sky_chroma`` at 1.73 of 2.0 and ``sky_chroma_quadrants`` at 1.97 of 1.5.  A step may leave the sky as
-        coloured as it arrived (whose colour that is belongs to the calibration, not to this step); the step that
-        takes either number past its gate *and* past ``DENOISE_SKY_WORSE`` times what it came with is the thing that
-        coloured it, so it is asked again at the weakest strength that tool itself documents, and then refused: the
-        pixels handed back, both measurements recorded, and ``self.denoiser`` cleared, because the closing step
-        (``run`` -> ``_close_sky_noise``) escalating a tool this frame's sky cannot trust would only deepen the cast.
-
-        ``params`` is called with the amount that was accepted, *after* the tool ran, so it can record what the tool reported.
-        """
-        lim = float(gates.LIMITS["sky_chroma"])
-        lim_q = float(gates.LIMITS["sky_chroma_quadrants"])
-        before = self._sky_chroma(arr)
-        cands = [a for a in dict.fromkeys(round(float(x), 3) for x in (amounts if amounts is not None else (amount,))) if a > 0]
-        tried: list[dict] = []
-        for a in cands:
-            out, cmd = run(a, arr)
-            after = self._sky_chroma(out)
-            tried.append({"amount": a, "sky_chroma": after})
-            verdict = None
-            if before is not None and after is not None:
-                chroma = (max(after["a"], after["b"]) > lim
-                          and max(after["a"], after["b"]) > DENOISE_SKY_WORSE * max(before["a"], before["b"]))
-                cast = (after["spread"] > lim_q
-                        and after["spread"] > DENOISE_SKY_WORSE * before["spread"])
-                verdict = "sky_chroma" if chroma else ("sky_chroma_quadrants" if cast else None)
-            tried[-1]["refused_for"] = verdict                             # the sidecar says which rule each amount tripped
-            if verdict is None:
-                self.denoiser, self.denoiser_refused = (tool, run, ceiling, a), None
-                self.record("noise reduction (stretched)", tool, out, commands=[cmd] if isinstance(cmd, str) else list(cmd),
-                            seconds=time.time() - start,
-                            params={**params(a), "sky_chroma_before": before, "sky_chroma_after": after, "tried": tried, "limit": lim},
-                            note=note, source=source)
-                return out
-        if not cands:
+        """Run the stretched-image denoiser at the strength asked and keep its result; the sky's colour before and after (``_sky_chroma``: the gates'
+        median |a*| / |b*| and the quadrants' spread) is recorded.  ``self.denoiser`` is set so the closing step (``_close_sky_noise``) can run the same
+        tool harder while the delivered sky fails the sky_pixel_noise gate.  ``params`` is called with the amount, after the tool ran."""
+        a = round(float(amount), 3)
+        if a <= 0:
             return arr
-        last = tried[-1]["sky_chroma"]
-        why = tried[-1].get("refused_for") or "sky_chroma"
-        self.denoiser, self.denoiser_refused = None, {"tool": tool, "sky_chroma": last, "limit": lim,
-                                                      "spread": last["spread"], "spread_limit": lim_q,
-                                                      "refused_for": why, "asked": cands}
-        self.record("noise reduction (stretched)", tool, None, seconds=time.time() - start, status="refused",
-                    params={**params(cands[-1]), "sky_chroma_before": before, "sky_chroma_after": last,
-                            "tried": tried, "limit": lim, "spread_limit": lim_q},
-                    note=f"{tool} left the sky at |a*| {last['a']} / |b*| {last['b']} (the gate's {lim}) with its four "
-                         f"quadrants' signed tints {last['spread']} apart (the gate's {lim_q}), where it arrived at "
-                         f"{before['a']} / {before['b']} and {before['spread']}; every strength asked left the sky "
-                         f"coloured that way ({why}), so the step's pixels were handed back",
-                    source=source)
-        return arr
+        before = self._sky_chroma(arr)
+        out, cmd = run(a, arr)
+        after = self._sky_chroma(out)
+        self.denoiser = (tool, run, ceiling, a)
+        self.record("noise reduction (stretched)", tool, out, commands=[cmd] if isinstance(cmd, str) else list(cmd), seconds=time.time() - start,
+                    params={**params(a), "sky_chroma_before": before, "sky_chroma_after": after}, note=note, source=source)
+        return out
 
     def denoise(self, arr: np.ndarray) -> np.ndarray:
         p = self.p
@@ -1872,49 +1046,24 @@ class Finisher:
                 "spread": round(max(qs["spread_a"], qs["spread_b"]), 2)}
 
     def _scnr(self, arr: np.ndarray, scnr: float, *, source: str) -> np.ndarray:
-        """``rmgreen 3 <amount>`` (Siril's SCNR), kept only while it leaves the sky no more coloured than it found it.
-
-        The amount is decided on the **subject** (``autofinish``: median G - (R + B) / 2 over the subject mask, above
-        ``SCNR_CAST``) and Siril reduces green over the whole frame, so a subject's cast is subtracted from the sky as
-        well -- and rmgreen preserves lightness, so the green it lifts out comes back through red and blue.  A neutral
-        sky therefore leaves it magenta: M 31 (Seestar, 2026-11-01) went from a sky at |a*| 0.4 / |b*| 0.6 to
-        13.4 / 9.0 -- 6.7 x the gate's own limit, ``sky_chroma`` failing -- with a green nebula as the only reason the
-        step ran, and the render was delivered with the cast in it.  A step may leave the sky as coloured as it
-        arrived (whose colour that is belongs to the calibration, not to this step); the step that *takes* it past the
-        gate is retried weaker -- a pass that reaches the gate keeps the subject its correction -- and then refused,
-        the pixels handed back and both measurements recorded.
-        """
-        lim = float(gates.LIMITS["sky_chroma"])
+        """``rmgreen 3 <amount>`` (Siril's SCNR) under the background-protecting range mask (``range_mask``, as the saturation step): the amount is
+        decided on the subject, and Siril's rmgreen acts on the whole frame and preserves lightness, so on the sky it would put the green it lifts
+        out back through red and blue (a magenta sky).  The sky's colour before and after is recorded."""
+        lum = finish.luminance(arr)
+        h = _hist_stats(lum)
+        mask, mi = nebula_mask(lum, h["mode"])
+        w = self.range_mask(lum, mask, mi)
         before = self._sky_chroma(arr)
-        tried: list[dict] = []
-        total = 0.0
-        last: dict | None = None
-        for scale in SCNR_SKY_TRIES:
-            amount = round(scnr * scale, 3)
-            if amount <= 0:
-                break
-            line = f"rmgreen 3 {amount:.3f}"
-            t0 = time.time()
-            out = self.siril("scnr", arr, [line], "SCNR")
-            total += time.time() - t0
-            after = self._sky_chroma(out)
-            tried.append({"amount": amount, "sky_chroma": after})
-            last = after
-            if before is None or after is None or not (max(after["a"], after["b"]) > lim
-                                                       and max(after["a"], after["b"]) > SCNR_SKY_WORSE * max(before["a"], before["b"])):
-                self.record("SCNR", "siril rmgreen", out, commands=[line], seconds=total,
-                            params={"type": 3, "amount": amount, "sky_chroma_before": before, "sky_chroma_after": after,
-                                    "tried": tried, "limit": lim}, source=source)
-                return out
-        if not tried:
-            return arr
-        self.record("SCNR", "siril rmgreen", None, commands=[f"rmgreen 3 {t['amount']:.3f}" for t in tried], seconds=total,
-                    status="refused", params={"type": 3, "amount": scnr, "sky_chroma_before": before, "sky_chroma_after": last,
-                                               "tried": tried, "limit": lim},
-                    note=f"rmgreen left the sky at |a*| {last['a']} / |b*| {last['b']} over the gate's {lim}, where it arrived at "
-                         f"{before['a']} / {before['b']}; retried weaker {len(tried) - 1} time(s) and every pass coloured the sky, "
-                         "so the step's pixels were handed back", source=source)
-        return arr
+        lines = ["save sc_a", f"rmgreen 3 {scnr:.3f}", "save sc_b", 'pm "$sc_a$+$sc_m$*($sc_b$-$sc_a$)"']
+        t0 = time.time()
+        out = self.siril("scnr", arr, lines, "SCNR", extra={"sc_m": np.stack([w, w, w])})
+        for f in ("sc_a", "sc_b"):
+            fp = os.path.join(self.cwd, f + ".fit")
+            if os.path.exists(fp):
+                os.remove(fp)
+        self.record("SCNR", "siril rmgreen + pm (range mask)", out, commands=lines, seconds=time.time() - t0,
+                    params={"type": 3, "amount": scnr, "sky_chroma_before": before, "sky_chroma_after": self._sky_chroma(out)}, source=source)
+        return out
 
     def colour(self, arr: np.ndarray) -> np.ndarray:
         self._say("Colour")
@@ -2046,9 +1195,7 @@ class Finisher:
         h = _hist_stats(lum)
         mask, mi = nebula_mask(lum, h["mode"])
         lo, hi = float(mi["threshold"]), float(np.percentile(cv2.GaussianBlur(np.ascontiguousarray(lum), (0, 0), MASK_SIGMA)[mask], 95)) if mask.any() else float(mi["threshold"]) + 0.1
-        band = int(round(LC_EDGE_BAND * CLAHE_SCALES[0]))
-        floor, sides = edge_sky_floor(lum, lo, band, h) if 4 <= band <= min(arr.shape[1:]) // 2 else (None, {})
-        w = self.range_mask(lum, mask, mi, floor=floor)
+        w = self.range_mask(lum, mask, mi)
         k = LC_STRENGTH * amount
         longside = max(arr.shape[1:])
         grids = [max(2, int(round(longside / s))) for s in CLAHE_SCALES]
@@ -2062,8 +1209,7 @@ class Finisher:
             if os.path.exists(fp):
                 os.remove(fp)
         self.record("local contrast", "siril clahe + pm (background mask)", out, commands=lines, seconds=time.time() - t0,
-                    params={"clip_limit": CLAHE_CLIP, "tile_px": list(CLAHE_SCALES), "grid": grids, "strength": round(k, 3), "mask_low": round(lo, 4), "mask_high": round(hi, 4),
-                            "edge_band_px": band if floor is not None else 0, "edge_sides": sides},
+                    params={"clip_limit": CLAHE_CLIP, "tile_px": list(CLAHE_SCALES), "grid": grids, "strength": round(k, 3), "mask_low": round(lo, 4), "mask_high": round(hi, 4)},
                     source="Brecher LHE (astrodoc.ca M51 / IC 1848 / Sh2-140): contrast limit 1.5, scales 150 and 40 px, strength 0.2-0.35 under a background-protecting mask, after NR; "
                            "the mapping of LHE to Siril clahe is not published (pro-workflow.md A11)")
         return out
@@ -2279,6 +1425,7 @@ class Finisher:
                     clamped = {"from": round(y0, 4), "to": hi, "brightness": round(float(p.get("brightness", 0.0)), 4)}
         if abs(mid - 0.5) > 1e-4:
             lines.append(f"mtf 0 {mid:.4f} 1")
+        self.final_levels = (float(bp), float(mid))                          # the starless the star gates compare against goes through the same levels
         lines += ["icc_assign sRGB", "icc_convert_to sRGB relative"]
         t0 = time.time()
         out = self.siril("fin", arr, lines + ["save finish"], "Final", out="finish")
@@ -2299,15 +1446,100 @@ class Finisher:
         s = self.denoise(s)
         s = self.banding(s, "stretched starless", False, noise_from=pre)
         s = self.colour(s)
+        self._pre_local_contrast = s
         s = self.local_contrast(s)
         s = self.sharpen(s)
+        self._pre_saturation = s
         s = self.saturation(s)
         t = None
         if stars is not None and float(self.p.get("star_reduction", 0.4)) < 1.0:
             t = self.stars(stars)
         s, out = self._close_sky_noise(s, lambda sl: self._compose(sl, t))   # the gate measures the delivered picture, so the loop runs after the
-        self.info.update(chain=self.records, starless=s)                     # composition and recomposes every candidate it tries
+        out = self._close_clipping(s, t, out)                                # composition and recomposes every candidate it tries
+        self.info.update(chain=self.records, starless=s, starless_delivered=self.delivered_starless(s))
         return out, self.info
+
+    def _close_clipping(self, starless: np.ndarray, stars: np.ndarray | None, out: np.ndarray) -> np.ndarray:
+        """The clipping gates on the delivered picture, as ``_close_sky_noise`` does for the sky's noise.  Each search before the delivery takes
+        the largest setting its own measure allows, so the steps after it (the escalated denoiser, the sharpening on the composed picture) can
+        carry the picture over the gate, several steps sharing in it.  When the delivered picture has more clipped or white pixels than the gates
+        allow, the intensities that can be re-run on it and raise its brightest pixels - Cosmic Clarity Sharpen's stellar amount, the local
+        contrast and the saturation stretch's factor - are scaled together, one common fraction of the way from their weakest to the settings,
+        and the fraction bisected (CLIP_CLOSE_STEPS + 1 trials, two-sided: a candidate that clips goes weaker, one that fails a gate the delivered
+        picture passes goes stronger) to the strongest that passes; the picture is recomposed.  Otherwise nothing is changed and that is recorded."""
+        lim_c, lim_w = float(gates.LIMITS["clipped"]), float(gates.LIMITS["white"])
+
+        def fails(img: np.ndarray) -> tuple[bool, dict]:
+            st = level_stats(img)
+            return st["clipped"] > lim_c or st["white"] > lim_w, {"clipped": st["clipped"], "white": st["white"]}
+
+        bad, st0 = fails(out)
+        if not bad or not self.external:
+            return out
+        base_failed = set(self._failed_of(out, starless)) - {"clipped", "white"}
+        new_fails = lambda img, sl: sorted(set(self._failed_of(img, sl)) - {"clipped", "white"} - base_failed)   # noqa: E731  a gate passing now must keep passing
+        t0 = time.time()
+        pre = getattr(self, "_pre_saturation", None)
+        knobs = []
+        if str(self.p.get("cc_sharpen") or "off").lower() in ("both", "stellar"):
+            knobs.append(("cc_stellar_amount", float(np.clip(self.p.get("cc_stellar_amount", CC_SHARPEN_AMOUNT), 0.0, 1.0)), 0.0))
+        pre_lc = getattr(self, "_pre_local_contrast", None)
+        if pre_lc is not None and float(self.p.get("local_contrast", 0.0)) > LC_WEAKEST:
+            knobs.append(("local_contrast", float(self.p.get("local_contrast", 0.0)), LC_WEAKEST))
+        if pre is not None and float(self.p.get("saturation", 1.0)) > 1.0:
+            knobs.append(("saturation", float(np.clip(self.p.get("saturation", 1.0), 1.0, SAT_FACTOR_MAX)), 1.0))
+        saved_p, saved_rec = dict(self.p), self.records
+
+        if not knobs:
+            return out
+
+        def render(frac: float) -> tuple[np.ndarray, np.ndarray]:
+            vals = {k: round(w + frac * (a - w), 3) for k, a, w in knobs}
+            self.p = {**saved_p, **vals}
+            self.records = []
+            if "local_contrast" in vals:
+                sl = self.saturation(self.sharpen(self.local_contrast(pre_lc)))
+            elif "saturation" in vals:
+                sl = self.saturation(pre)
+            else:
+                sl = starless
+            used = getattr(self, "_sky_noise_used", None)
+            if sl is not starless and used is not None and self.denoiser is not None:
+                sl, _cmd = self.denoiser[1](used, sl)                       # the starless as the chain has it: with the sky-noise step's escalation
+            return self._compose(sl, stars), sl
+
+        attempts: list[dict] = [{"fraction": 1.0, **{k: a for k, a, _ in knobs}, **st0}]
+        try:
+            # two-sided: clipping wants weaker settings, the star gates stronger ones; a candidate that clips goes weaker, one that passes the
+            # clipping gates but fails another gate goes stronger, one that passes both is kept and a stronger one tried
+            lo, hi, best, best_out = 0.0, 1.0, None, None
+            for _ in range(CLIP_CLOSE_STEPS + 1):
+                f = round(0.5 * (lo + hi), 4)
+                cand, sl = render(f)
+                clips, stc = fails(cand)
+                nf = [] if clips else new_fails(cand, sl)
+                rej = bool(nf)
+                attempts.append({"fraction": f, **stc, "new_failures": nf})
+                if clips:
+                    hi = f
+                elif rej:
+                    lo = f
+                else:
+                    lo, best, best_out = f, f, cand
+        finally:
+            self.p, self.records = saved_p, saved_rec
+        if best is None:
+            self.record("clipping gate", "none", None, status="skipped", seconds=time.time() - t0, params={"attempts": attempts},
+                        note="no common fraction of the sharpening, local contrast and saturation brings the delivered picture inside the clipping gates "
+                             "without failing another gate: kept as composed")
+            return out
+        used = {k: round(w + best * (a - w), 3) for k, a, w in knobs}
+        self.p.update(used)
+        self.record("clipping gate", "+".join(k for k, _, _ in knobs), best_out, seconds=time.time() - t0,
+                    params={"fraction": best, "asked": {k: a for k, a, _ in knobs}, "used": used, "attempts": attempts, "limits": {"clipped": lim_c, "white": lim_w}},
+                    note=f"the delivered picture had {st0['clipped'] * 100:.3f} % clipped / {st0['white'] * 100:.3f} % white pixels; the finishing intensities "
+                         f"scaled to {best:g} of the way from their weakest to the settings")
+        return best_out
 
     def _compose(self, starless: np.ndarray, stars: np.ndarray | None) -> np.ndarray:
         """The delivered picture from a starless and a star layer: screen the two, tame the halos, sharpen the whole,

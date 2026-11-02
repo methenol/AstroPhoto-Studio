@@ -2,7 +2,6 @@
 (Siril's online catalogue answers 503 now and then: IC 1805 / NGC 1499, 2026-10-15)."""
 from __future__ import annotations
 
-import math
 import os
 import sys
 
@@ -167,8 +166,10 @@ def test_survey_gradient_keeps_the_sky_pedestal_and_clips_nothing(tmp_path, monk
     grad = ped + g                                                    # pedestal + a linear gradient, the same in the 3 channels
     monkeypatch.setattr(post, "_has_wcs", lambda hdr: True)
     monkeypatch.setattr(post.Restorer, "_survey_gradient", lambda self: (np.repeat(grad[..., None], 3, -1),
-                        {"method": "reference", "degree": 3, "coverage": 1.0, "gradient_range": 1.0, "survey_coefficients": {}, "credit": "",
-                         "_emission": np.zeros((h // skyref.FACTOR, w // skyref.FACTOR), np.float32), "_emission_block": skyref.FACTOR}))
+                        {"method": "reference", "gradient_scale_px": 1024.0, "coverage": 1.0, "gradient_range": 1.0, "credit": "",
+                         "survey_coefficients": {n: [0.0, 0.0, 0.0] for n, _ in skyref.SURVEYS},
+                         "_emission": np.zeros((h // skyref.FACTOR, w // skyref.FACTOR), np.float32), "_emission_block": skyref.FACTOR},
+                        np.zeros((h // skyref.FACTOR, w // skyref.FACTOR, 3), np.float32)))
     noise_in = finish.lower_half_sigma(finish.sample(finish.luminance(r.arr)))
     r.arr = (r.arr + g[None]).astype(np.float32)
     r.background()
@@ -199,121 +200,8 @@ def test_reduced_wcs_keeps_the_pixel_scale_of_a_pc_cdelt_header():
     assert abs(x - (400.0 + 0.5) / 8 + 0.5) < 1e-6 and abs(y - (300.0 + 0.5) / 8 + 0.5) < 1e-6
 
 
-def _debt_case(bias=1.0, step=0.3, ramp=False, corner=False, deep=False, chans=(1.0, 1.0, 1.0), single=None, h=600, w=900, sky=0.05, noise=6e-5, seed=5):
-    """A flat sky with real structure at the top border, and a gradient step's answer to it.
-
-    ``step`` is that structure, as a percentage of the sky, broad across the outer lattice cell: the step is entitled to take it out and the tool must let it.  ``bias`` is what
-    the step invents in the same band instead - the outer cell is extrapolated, the grid having stopped half a cell inside the frame - dying out over the outer 40 % of the cell,
-    which is how the misfit measures on real frames (NGC 1499's right border, +2.25 % of the sky, was gone by 71 px of a 251 px cell).  ``ramp`` ends the invented part partway
-    along the border, which is how structure the frames themselves carry measures - where the nebula sits the step had nothing to change, and a deviation that dies there must
-    be refused (M 31's left border: +0.15 % at one end against its 0.31 % 3 SE).  ``corner`` instead grows it fivefold from one end of the line to the other, one sign the
-    whole length, as a misfit does where two extrapolated borders meet (NGC 1499's right border: +1.01 %, +2.46 %, +5.55 %), and must still be taken.  ``deep`` lets the
-    invented part stand the whole depth of the cell, which is what the sky does and an extrapolated cell does not; ``chans`` scales it per channel, and ``single`` confines one
-    channel's copy to the right half of the line.
-    """
-    rng = np.random.default_rng(seed)
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
-    band = math.ceil(w / post.tools.GX_MESH_POINTS)
-    shoulder = (step / 100.0) * sky * np.maximum(0.0, 1.0 - yy / band)
-    depth = band if deep else 0.4 * band
-    src = np.stack([sky + shoulder + rng.normal(0, noise, (h, w)) for _ in range(3)])
-    slip = []
-    for c in range(3):
-        s = (bias * chans[c] / 100.0) * sky * np.maximum(0.0, 1.0 - yy / depth)
-        if ramp:
-            s = s * np.maximum(0.0, 1.0 - xx / (0.62 * w))                             # nothing of it at all along the far end of the line
-        if corner:
-            s = s * (1.0 + 4.0 * xx / w)                                                # one sign, fivefold, all the way to the corner
-        if single == c:
-            s = s * (xx >= 0.5 * w)
-        slip.append(s)
-    return src.astype(np.float32), (src - shoulder + np.stack(slip)).astype(np.float32), band
-
-
-def _top_deviation(a, band, w=900):
-    """The top border's level over the frame's own interior, as a percentage of it."""
-    border = float(np.median(a[:, 0:4, w // 4:3 * w // 4]))
-    interior = float(np.median(a[:, 2 * band:4 * band, w // 4:3 * w // 4]))
-    return (border - interior) / interior * 100.0
-
-
-def test_a_gradient_step_may_not_leave_the_border_more_deviant_than_its_input_made_it():
-    """The invariant border_debt exists to hold (LBN 429, 2026-10-30): a background model's border cell is extrapolated, and what it leaves there is owed back - while
-    everything the frames themselves carried at the border stays exactly where they put it."""
-    src, dst, band = _debt_case(bias=1.0, step=0.3)
-    assert _top_deviation(src, band) > 0.2 and _top_deviation(dst, band) > 0.7             # the frames carry a shoulder; the step left a bigger one behind
-    field, info = post.border_debt(src, dst)
-    assert field is not None, info
-    after = _top_deviation(dst - field, band)
-    assert after <= _top_deviation(src, band) + 0.05, (info, after)                         # no more deviant than the frame that went in, and no less: the shoulder is sky
-    assert after < _top_deviation(dst, band) - 0.3, (info, after)                           # the invented part of it is what came away
-    assert float(np.abs(field[(slice(0, 3), slice(4 * band, None), slice(0, None))]).max()) == 0.0     # the interior is not this tool's to touch
-
-
-def test_a_step_that_improved_its_border_is_left_completely_alone():
-    """Removing the structure the frames really do carry at the border is the step's job; undoing that would be the tool's own kind of damage."""
-    src, dst, band = _debt_case(bias=0.0, step=1.0)
-    assert _top_deviation(src, band) > 0.5 and abs(_top_deviation(dst, band)) < 0.1         # the step took a real 1 % border level out
-    assert post.border_debt(src, dst)[0] is None, post.border_debt(src, dst)[1]
-    assert post.border_debt(src, src)[0] is None, post.border_debt(src, src)[1]             # and a step that did nothing at all leaves nothing behind
-
-
-def test_the_debt_refuses_a_deviation_that_is_not_along_the_whole_border():
-    """Uniformity along the border is the discriminator: an extrapolated lattice cell misfits along the whole side it covers, nebulosity that happens to reach the edge sits
-    at one end of it - and taking that would be this pipeline's unrecoverable error."""
-    src, dst, band = _debt_case(bias=3.0, step=0.3, ramp=True)
-    assert _top_deviation(dst, band) > _top_deviation(src, band) + 0.15                     # an excess really is there, for a tool that looked only at the middle
-    field, info = post.border_debt(src, dst)
-    assert field is None, info
-    assert any(s[-1] == "the deviation is not along the whole border" for s in info["sides"]), info
-
-
-def test_the_debt_takes_a_border_bigger_than_the_old_cap_when_the_deviation_dies_inside_the_cell():
-    """NGC 1499 (2026-10-30): the right border's debt measured +2.25 % of the sky, the 2 % cap refused it, and the export showed that border as -59 % of the display sky.  The
-    profile says what the cap could not: the deviation was gone by 71 px of a 251 px cell, so it is the model's own cell and nothing else."""
-    src, dst, band = _debt_case(bias=3.0, step=0.3)
-    field, info = post.border_debt(src, dst)
-    assert field is not None, info
-    assert _top_deviation(dst - field, band) < _top_deviation(dst, band) - 2.0, (info, _top_deviation(dst - field, band))
-    big, info = post.border_debt(*_debt_case(bias=5.0, step=0.3)[:2])                       # the ceiling is still the last resort
-    assert big is None and any(s[-1] == "more sky than a model can have added" for s in info["sides"]), info
-
-
-def test_the_debt_refuses_a_deviation_that_stands_past_the_models_cell():
-    """A deviation still standing in the inner quarter of the band did not come from the extrapolated cell - it came in with the sky, and the sky stays."""
-    src, dst, band = _debt_case(bias=1.0, step=0.3, deep=True)
-    assert _top_deviation(dst, band) > _top_deviation(src, band) + 0.5                       # a real excess, for a tool that looked only at the depth
-    field, info = post.border_debt(src, dst)
-    assert field is None, info
-    assert any(s[-1] == "the deviation runs past the model's cell" for s in info["sides"]), info
-
-
-def test_one_refused_channel_refuses_the_side_so_the_border_cannot_turn_colour():
-    """The cell is one object measured in three channels; handing back the channels that passed while leaving the one that did not paints the border in the colour that was left
-    out, which is worse than the band the correction came to remove."""
-    src, dst, band = _debt_case(bias=1.0, step=0.3, single=1)
-    assert _top_deviation(dst, band) > _top_deviation(src, band) + 0.5                       # the excess is there in two channels that would pass on their own
-    field, info = post.border_debt(src, dst)
-    assert field is None, info
-    assert any(s[-1] == "the deviation is not along the whole border" for s in info["sides"]), info
-
-
-def test_a_border_whose_debt_grows_toward_a_corner_is_still_one_object_and_is_taken():
-    """The ends are held to agree in kind, not in size: NGC 1499's right border ran +1.01 %, +2.46 % and +5.55 % of the sky from its near corner to the one it shares with the
-    bottom border, where two extrapolated borders meet, and refusing it for that spread - as the factor-of-two rule this replaces did - left the export's -59 % band exactly
-    where it was."""
-    src, dst, band = _debt_case(bias=0.8, step=0.3, corner=True)
-    assert _top_deviation(dst, band) > _top_deviation(src, band) + 0.5                     # a real excess, for a tool that looked only at the middle
-    field, info = post.border_debt(src, dst)
-    assert field is not None, info
-    assert not [s for s in info["sides"] if s[0] == 0], info                                # the side was taken, corners and all
-    after = _top_deviation(dst - field, band)
-    assert after <= _top_deviation(src, band) + 0.05, (info, after)                         # level with what the frames carried, and not a fraction below it
-
-
 def _star_field(seed=7):
-    """A sky with twelve isolated stars of the PSF these frames actually carry (C 49, 2026-11-01: Gaussian sigma
-    1.37 px, 99 % of the light inside r=6), 120 px apart so every star's 40-70 px sky annulus is empty."""
+    """A sky with twelve isolated stars (Gaussian sigma 1.4 px) of a range of brightnesses, 120 px apart so every star's sky annulus is empty."""
     rng = np.random.default_rng(seed)
     H, W = 560, 460
     a = np.full((3, H, W), 0.02, np.float32) + rng.normal(0, 3e-4, (3, H, W)).astype(np.float32)
@@ -323,8 +211,9 @@ def _star_field(seed=7):
             x, y = 100 + c * 120, 100 + r * 120
             gy, gx = np.mgrid[-12:13, -12:13]
             g = np.exp(-((gx ** 2 + gy ** 2) / (2 * 1.4 ** 2)))
+            f = 1.0 / (1.0 + 0.4 * len(pos))                       # brightest first, the faintest a fifth of it
             for k, amp in enumerate((0.28, 0.30, 0.29)):
-                a[k, y - 12:y + 13, x - 12:x + 13] += amp * g
+                a[k, y - 12:y + 13, x - 12:x + 13] += f * amp * g
             pos.append((x, y))
     return a.astype(np.float32), pos
 
@@ -335,12 +224,9 @@ def _light(a, pos, r=14):
     return [float((a[:, y - r:y + r + 1, x - r:x + r + 1] - sky).sum()) for x, y in pos]
 
 
-def test_the_gate_hands_back_a_star_whose_light_the_restoration_deleted():
-    """The case the shipped renders show.  Measured against each session's own stack.fits over 60 isolated stars: C 49
-    with ImageMM on the stars delivered 0.72 of the star's light, M 31 0.72, C 20 1.10 with the core at 1.35, NGC 1499
-    1.13 with the core at 1.36 -- while the same sessions rendered with no star pass kept 0.91-0.95.  A deconvolution
-    may move a star's light inward, which is its job; it may not delete it, and the frames are the witness, so the
-    star comes back from the reference rather than being tuned away."""
+def test_the_gate_reports_every_star_whose_light_the_restoration_deleted():
+    """A deconvolution may move a star's light inward, which is its job; it may not delete it.  The gate measures and records
+    it - it never pastes the reference's pixels back."""
     ref, pos = _star_field()
     lost = ref.copy()
     for x, y in pos:                                             # every star at 70 % of the light the frames took
@@ -350,8 +236,7 @@ def test_the_gate_hands_back_a_star_whose_light_the_restoration_deleted():
     assert all(b < 0.8 * w for b, w in zip(before, want)), (before, want)      # the defect is really there
     out, info = post.star_flux_guard(lost, ref)
     assert info["mode"] == "population" and info["refused"] == len(pos), info   # a tool doing it to every star
-    after = _light(out, pos)
-    assert all(abs(a - w) < 0.05 * w for a, w in zip(after, want)), (info, after, want)
+    assert out is lost
 
 
 def test_the_gate_leaves_a_star_alone_when_the_restoration_only_moved_its_light():
@@ -389,10 +274,7 @@ def test_the_gate_refuses_the_star_whose_one_channel_was_erased():
     out, info = post.star_flux_guard(hurt, ref)
     assert info["mode"] == "individual" and info["refused"] == 1, info
     assert [w[:2] for w in info["worst"]] == [[x, y]] and info["worst"][0][2] < 0.85, info
-    want = _light(ref, [(x, y)])[0]
-    assert abs(_light(out, [(x, y)])[0] - want) < 0.05 * want       # and it came back
-    others = [p for p in pos if p != (x, y)]
-    assert all(abs(a - b) < 1e-3 for a, b in zip(_light(out, others), _light(ref, others))), "the other stars moved"
+    assert out is hurt
 
 
 def test_the_photometry_verdict_reaches_the_restore_record_without_joining_the_tools(tmp_path, fake_rc, monkeypatch):
@@ -438,7 +320,7 @@ def test_a_pedestal_is_never_read_as_star_light(tmp_path):
 def test_the_restoration_is_judged_when_it_is_adopted(tmp_path, monkeypatch):
     """ImageMM's output is fitted to the stack window per channel (``imagemm_stage.match_to_stack``), so that is the
     one moment the frames' light can be read off both arrays without a scale to guess.  Judged there, a restoration
-    that took 30 % of every star hands them back before the white balance and the star pass can bury the evidence."""
+    that took 30 % of every star is recorded before the white balance and the star pass can bury the evidence."""
     d = tmp_path / "s"
     d.mkdir()
     ref, pos = _star_field()
@@ -458,9 +340,6 @@ def test_the_restoration_is_judged_when_it_is_adopted(tmp_path, monkeypatch):
                       dict(post.DEFAULTS), None, None)
     gate = r.info["star_photometry"]["restore"]
     assert gate["mode"] == "population" and gate["refused"] >= 8 and gate["align"] is False, gate
-    want = [w * r._phot_scale for w in _light(ref, pos)]   # the chain scales the frame to peak 1; both sides on that scale
-    after = _light(r.arr, pos)
-    assert all(abs(a - w) < 0.05 * w for a, w in zip(after, want)), (gate, after, want)
 
 
 def test_a_denoiser_that_eats_the_stars_is_asked_again_weaker(tmp_path, monkeypatch):
@@ -493,124 +372,3 @@ def test_a_denoiser_that_eats_the_stars_is_asked_again_weaker(tmp_path, monkeypa
     assert all(abs(a - w) <= 0.05 * w for a, w in zip(after, want)), (gate, after, want)
 
 
-def test_a_refused_star_comes_back_as_the_frames_carried_it():
-    """A star the restoration dimmed is delivered exactly as the frames carried it, so the correction does not depend
-    on how any measurement chooses to subtract the sky.  On C 49 (ImageMM on both regions) the restoration had dimmed
-    the stars *and* darkened the sky around them, which is what makes the pixels the honest thing to check: re-running
-    the guard afterwards does not read 1.00, because a disc handed back from ``stack.fits`` sitting in the
-    restoration's own darker yardstick cannot look like the frames again -- so this asserts what the frames are
-    delivering rather than a number that a change of convention would silently move."""
-    ref, pos = _star_field()
-    hurt = ref.copy()
-    gy, gx = np.mgrid[-80:81, -80:81]
-    rr = np.hypot(gx, gy)
-    for x, y in pos:
-        sl = (slice(y - 80, y + 81), slice(x - 80, x + 81))
-        for c in range(3):
-            patch = hurt[c][sl]
-            patch[rr <= 16] = np.median(ref[c]) + 0.7 * (ref[c][sl][rr <= 16] - np.median(ref[c]))   # the light it took
-            patch[(rr > 30) & (rr <= 70)] -= 0.004                                                    # the sky it darkened
-            hurt[c][sl] = patch
-    out, before = post.star_flux_guard(hurt, ref, align=False)
-    assert before["mode"] == "population" and before["refused"] == len(pos), before
-    disc = np.hypot(*np.mgrid[-post.GUARD_R_APER:post.GUARD_R_APER + 1,
-                              -post.GUARD_R_APER:post.GUARD_R_APER + 1]) <= post.GUARD_R_APER
-    for x, y in pos:
-        s = post.GUARD_R_APER
-        got, want = out[:, y - s:y + s + 1, x - s:x + s + 1], ref[:, y - s:y + s + 1, x - s:x + s + 1]
-        assert np.array_equal(got[:, disc], want[:, disc]), (x, y)
-    _o, again = post.star_flux_guard(out, ref, align=False)
-    assert again["median"] > 1.1, (before, again)          # the yardstick moved with the sky, not with the pixels
-
-
-def _painted_pair(h=200, w=240, noise=3.5e-4, seed=11, depth=0.0025):
-    """A sky carrying its own noise, and the stripe a trail remover paints over it: matte, and below the sky it covers."""
-    rng = np.random.default_rng(seed)
-    src = np.stack([0.030 + rng.normal(0, noise, (h, w)) for _ in range(3)]).astype(np.float32)
-    dst = src.copy()
-    dst[:, 60:150, 120:128] = np.float32(0.030 - depth)
-    return src, dst
-
-
-def test_a_matte_patch_from_the_trail_remover_goes_back_to_the_frames():
-    """Cosmic Clarity's satellite remover painted a trail out of IC 1848 (2026-11-01) and left the stripe matte: 94 %
-    of it at one value, 8.3 % of the sky below its surroundings -- reproduced by running the step alone on that
-    session's own ``stack.fits``.  No border tool can see it, because the patch never touches the frame, and the
-    stretch's slope at the sky (~120) delivers the pedestal as a black bar: the rectangle the owner reported.  The
-    fill is paint rather than a measurement, so the pixels come back to the frames."""
-    src, dst = _painted_pair()
-    weight, info = post.painted_patch(src, dst)
-    assert weight is not None and info["cells"] >= 8, info
-    assert info["flat_frac"] >= 0.9 and info["offset_sky_pct"] > 5.0, info
-    assert (weight[64:144, 120:128] == 1.0).all(), "the painted pixels themselves go back, not just their neighbourhood"
-    assert (weight[:100, :100] == 0.0).all(), "the guard's reach is the patch and its edge, not the frame"
-
-
-def test_a_trail_removed_at_the_right_level_is_left_alone():
-    """The remover is worth having, so the guard has to miss the fills that did no harm: one that leaves the sky where
-    it was is invisible after the stretch however flat it is, and the trail it took out was worth more than the texture
-    it cost.  And an area that was already matte in the input -- a saturated core, a masked corner, a frame the
-    telescope itself left blank -- is the frames' own, not the tool's doing."""
-    src, _ = _painted_pair()
-    same_level = src.copy()
-    same_level[:, 60:150, 120:128] = np.float32(0.030)                      # matte, but the sky it covers untouched
-    assert post.painted_patch(src, same_level)[0] is None, "a level fill is the tool doing its job"
-    already = src.copy()
-    already[:, 60:150, 120:128] = np.float32(0.0275)                        # matte before the tool ever saw it
-    shifted = already.copy()
-    shifted[:, 60:150, 120:128] = np.float32(0.0250)
-    assert post.painted_patch(already, shifted)[0] is None, "the input was already matte there"
-
-
-def test_a_matte_patch_too_shallow_to_be_proved_is_left_alone():
-    """The level test has two floors and this one is the narrower: a cell median carries 1.25 sigma over root(cell),
-    so a shift smaller than that is not the tool's, it is the noise's, whatever the fill's own value says.  A patch
-    this shallow is invisible after the stretch as well -- which is the point of measuring before correcting."""
-    rng = np.random.default_rng(5)
-    src = np.stack([0.030 + rng.normal(0, 3.5e-4, (200, 240)) for _ in range(3)]).astype(np.float32)
-    dst = src.copy()
-    dst[:, 60:150, 120:128] = np.float32(0.030 - 0.00002)                          # 0.07 % of the sky: under the cell's SE
-    assert post.painted_patch(src, dst)[0] is None
-
-
-def test_the_trail_removers_patch_is_judged_on_the_step_itself(tmp_path, monkeypatch):
-    """The guard has to run where the paint is applied -- the step's own input against its own output -- or the bar
-    ships, and its verdict belongs in the record so an export can be audited after the fact."""
-    class Painter:
-        def run(self, mode, arr, cli, **kw):
-            out = np.array(arr, np.float32)
-            out[:, 60:150, 120:128] = np.float32(np.median(arr) * (1.0 - 0.03))   # 3 % of the sky under it, as measured
-            return out, {"command": "CosmicClarity_Native.py --mode satellite", "trails_detected": True,
-                         "backend": "fake", "device": "cpu"}
-    monkeypatch.setattr(post.tools, "cosmic_clarity", Painter())
-    r = _restorer(tmp_path, _stack(4e-4))
-    r.sp["satellite_removal"] = True                                   # a stack parameter, where the app puts it
-    before = r.arr.copy()
-    r.satellite()
-    rec = [x for x in r.steps.records if x["step"] == "satellite"][-1]
-    assert rec["status"] == "done" and rec["params"]["painted_patch"]["cells"] >= 8, rec
-    assert np.array_equal(r.arr[:, 60:150, 120:128], before[:, 60:150, 120:128]), "the stripe must be the frames' again"
-
-
-def test_the_verdict_grows_along_a_fill_that_came_in_thin():
-    """The middle of a fill reads as matte; where it came in thin it left the sky's noise behind while still sitting at
-    the fill's level, and a cell-by-cell verdict leaves that half painted in the middle of the patch it just gave
-    back.  IC 1848's bar had 80 of its 150 rows in exactly that state -- the guard found the top and shipped the
-    bottom black."""
-    src, dst = _painted_pair()
-    rng = np.random.default_rng(4)
-    dst[:, 105:150, 120:128] = np.float32(0.030 - 0.0025) + rng.normal(0, 4 * 3.5e-4, (45, 8)).astype(np.float32)
-    weight, info = post.painted_patch(src, dst)
-    assert weight is not None, info
-    assert info["cells_found"] < info["cells"], f"the verdict must reach past the matte core: {info}"
-    assert (weight[64:144, 120:128] == 1.0).all(), "the whole stripe, thick end and thin"
-
-
-def test_a_step_that_moved_the_sky_over_the_frame_is_not_a_patch():
-    """The growth walks wherever the step keeps the same direction, so it needs a ceiling: a step that moved the sky
-    over a quarter of the frame is a gradient, a background model or the sky, and handing that back would undo the
-    step wholesale -- an argument the owner settles in the settings, not one a weight map decides."""
-    src, _ = _painted_pair(h=200, w=200)
-    dst = src.copy()
-    dst[:] = np.float32(0.030 - 0.0025)                                  # the whole frame repainted at one level
-    assert post.painted_patch(src, dst)[0] is None

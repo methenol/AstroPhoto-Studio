@@ -42,13 +42,14 @@ def test_run_writes_report_with_a_measurement_per_decision(session):
     assert os.path.exists(os.path.join(session, "autofinish.json"))
     p, rep = out["params"], out["report"]
     assert set(p) >= set(post.DEFAULTS)
-    assert p["stretch_method"] == "statstretch" and p["stretch"] == 0.10 and p["hdr"] in (0.0, 1.0) and p["black_point"] == 0.0
+    assert p["stretch_method"] == "statstretch" and p["stretch"] == 0.10 and p["hdr"] in (0.0, 1.0) and 0.0 <= p["black_point"] < 0.1
+    assert p["sky_levelling"] is True and p["sky_level"] == 0.10 and 0.0 <= p["stretch_boost"] <= 1.0
     assert 1.0 <= p["saturation"] <= 4.0 and p["star_reduction"] in (0.2, 0.3, 0.4, 0.5, 0.6) and p["scnr"] in (0.0, 0.6)
-    assert 0.6 <= p["luminance_denoise"] <= 0.85 and p["chroma_denoise"] == 0.95
+    assert p["luminance_denoise"] == 0.6 and p["chroma_denoise"] == 0.95 and 0.5 <= p["local_contrast"] <= 0.875
     assert p["grade_temperature"] == 0 and p["grade_contrast"] == 0
     for s in rep["steps"]:
         assert s["why"] and "to" in s and "from" in s
-    assert {"stretch", "hdr", "luminance_denoise", "saturation", "star_reduction"} <= {s["step"] for s in rep["steps"]}
+    assert {"stretch", "stretch_boost", "black_point", "hdr", "luminance_denoise", "saturation", "star_reduction"} <= {s["step"] for s in rep["steps"]}
     assert rep["class"].startswith("broadband")
 
 

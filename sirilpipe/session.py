@@ -25,7 +25,7 @@ from datetime import datetime
 
 import numpy as np
 
-from . import __version__, calibration, dataset, fitsio, stackpost, workflow
+from . import __version__, calibration, dataset, fitsio, stackpost, tools, workflow
 from .dataset import Frame, FrameSet
 from .siril import SirilError, SirilRunner, parse_seq
 from .util import (Cancelled, clean_json, dataset_slug, read_json, restoration_done, slugify, split_folders,  # noqa: F401
@@ -406,6 +406,31 @@ class Session:
         v = sp.get("pattern_correction", sp.get("banding"))
         return None if v is None else v not in (False, 0, "false", "off")
 
+    @staticmethod
+    def _frame_bkg_param(sp: dict | None) -> bool | None:
+        """The stack parameter ``local_norm`` (per-frame background, workflow.FRAME_BKG_*): None = not given."""
+        v = (sp or {}).get("local_norm")
+        return None if v is None else v not in (False, 0, "false", "off")
+
+    def _frame_bkg_unit(self, u: workflow.Unit, seq: str, pattern: str | None, progress) -> None:
+        """Siril ``seqsubsky`` on the calibrated subs of one unit (workflow.frame_bkg_script), installed over ``<seq>_NNNNN.fit``."""
+        n = len(u.frames)
+        prefix = workflow.frame_bkg_prefix(pattern)
+        r = SirilRunner(self.process, progress=self._cb(progress), checkpoint=self.checkpoint)
+        r.run(workflow.frame_bkg_script(u, seq, pattern), f"frame_bkg_{u.index + 1}", expect=[os.path.join(u.dir, f"{prefix}{seq}_{n:05d}.fit")],
+              count_glob=os.path.relpath(os.path.join(u.dir, f"{prefix}{seq}_[0-9]*.fit"), self.process), total=n,
+              label="Per-frame background (Siril seqsubsky)")
+        if pattern is not None:
+            workflow.banding_cleanup(u.dir, seq, ("CFA", "bkg_CFA"))
+        if workflow.banding_install(u.dir, seq, prefix) != n:
+            raise SirilError(f"per-frame background: {n} subs expected in {u.dir}")
+        if pattern is not None:
+            workflow.banding_cleanup(u.dir, seq, ("mCFA_bkg_CFA",))
+        else:
+            seqf = os.path.join(u.dir, f"bkg_{seq}_.seq")
+            if os.path.exists(seqf):
+                os.remove(seqf)
+
     def _banding_on(self, units: list[workflow.Unit], debayer: bool, banding: bool) -> str | None:
         """Bayer pattern to de-band with (None: switched off, demosaic path, or not a Bayer mosaic: mono data are not touched)."""
         pat = (units[0].frames[0].bayer or "").upper() if units and units[0].frames else ""
@@ -428,7 +453,7 @@ class Session:
             raise SirilError(f"banding: {n} subs expected in {u.dir}")
         workflow.banding_cleanup(u.dir, seq, ("mCFA_unband_CFA",))
 
-    def _signature(self, units: list[workflow.Unit], debayer: bool, banding: str | None = None) -> dict:
+    def _signature(self, units: list[workflow.Unit], debayer: bool, banding: str | None = None, frame_bkg: bool = False) -> dict:
         h = hashlib.sha1()
         for u in units:
             for f in u.frames:
@@ -443,7 +468,8 @@ class Session:
         h.update(("|".join(f"g{u.group}" for u in units)).encode())
         return {"format": SESSION_FORMAT, "frames": h.hexdigest(), "debayer": debayer,
                 "register": workflow.REGISTER_ARGS, "n": sum(len(u.frames) for u in units),
-                "banding": [workflow.BANDING_AMOUNT, workflow.BANDING_SIGMA, banding] if banding else None}
+                "banding": [workflow.BANDING_AMOUNT, workflow.BANDING_SIGMA, banding] if banding else None,
+                **({"frame_bkg": workflow.FRAME_BKG_DEGREE} if frame_bkg else {})}
 
     def _ordered_frames(self, units: list[workflow.Unit]) -> list[Frame]:
         return [f for u in units for f in u.frames]
@@ -452,7 +478,7 @@ class Session:
         return str((stack_params or {}).get("mode", "auto")).lower() == "demosaic"
 
     def _ensure_registered(self, progress, sensitivity: float, debayer: bool = False, force: bool = False,
-                           hdr: bool | None = None, banding: bool | None = None) -> dict:
+                           hdr: bool | None = None, banding: bool | None = None, frame_bkg: bool | None = None) -> dict:
         """Calibrate + 2-pass registration unless the process dir already holds a registration of exactly
         these inputs.  Returns the state dict."""
         if self.fs is None:
@@ -469,7 +495,8 @@ class Session:
         state = read_json(st_path, {}) or {}
         # banding=None (analysis): keep what the registered state was made with (default on), so analysing never re-registers
         band = self._banding_on(units, debayer, state.get("banding_requested", True) if banding is None else banding)
-        sig = self._signature(units, debayer, band)
+        fbkg = bool(state.get("frame_bkg_requested", True) if frame_bkg is None else frame_bkg)
+        sig = self._signature(units, debayer, band, fbkg)
         seq = workflow.seq_name(units, debayer)
         seqfile = os.path.join(self.process, f"{seq}_.seq")
         if not force and state.get("signature") == sig and os.path.exists(seqfile) and \
@@ -514,6 +541,13 @@ class Session:
                 if m["banded"]:
                     self._band_unit(u, seq, band, progress)
             self._time("banding", time.time() - t0)
+        if fbkg:
+            t0 = time.time()
+            pat = (units[0].frames[0].bayer or "").upper() if units and units[0].frames else ""
+            pat = pat if not debayer and pat in workflow.BANDING_PATTERNS else None
+            for u in units:
+                self._frame_bkg_unit(u, seq, pat, progress)
+            self._time("frame_background", time.time() - t0)
         if len(units) > 1:
             runner.run(workflow.merge_script(units, self.process, seq), "merge", expect=[f"{seq}_.seq"],
                        label="Calibrating (merging nights)")
@@ -522,6 +556,9 @@ class Session:
                    label="Registering (pass 1/2)", markers=[(r"Trial #|choosing image|Matching stars", "Registering (pass 2/2)")])
         self._time("register", time.time() - t0)
         state = {"signature": sig, "seq": seq, "n": n, "debayer": debayer, "hdr": hdr, "created": time.time(), "banding_requested": band is not None,
+                 "frame_bkg_requested": fbkg,
+                 "frame_background": {"command": f"seqsubsky <{'Bayer plane' if not debayer else 'sequence'}> {workflow.FRAME_BKG_DEGREE}",
+                                      "source": "Siril OSC_Preprocessing_BackgroundExtraction script"} if fbkg else None,
                  "left_out_single_subs": list(getattr(self, "dropped_subs", []) or []),
                  "banding": {"command": f"seqfixbanding <CFA plane> {workflow.BANDING_AMOUNT:g} {workflow.BANDING_SIGMA:g}", "amount": workflow.BANDING_AMOUNT,
                              "sigma": workflow.BANDING_SIGMA, "pattern": band, "sequence": seq, **band_info} if band else None}
@@ -606,7 +643,7 @@ class Session:
             t0 = time.time()
             self.scan(progress)
             self._rows = None
-            self._ensure_registered(progress, float(sensitivity), banding=self._banding_param(stack_params))
+            self._ensure_registered(progress, float(sensitivity), banding=self._banding_param(stack_params), frame_bkg=self._frame_bkg_param(stack_params))
             self._load_rows()
             self._apply_selection(float(sensitivity))
             self.analysis = {**(self.analysis or read_json(self._p("analysis.json"), {}) or {}),
@@ -680,7 +717,7 @@ class Session:
             t_all = time.time()
             if self.fs is None:
                 self.scan(progress)
-            state = self._ensure_registered(progress, sens, debayer, banding=self._banding_param(sp))
+            state = self._ensure_registered(progress, sens, debayer, banding=self._banding_param(sp), frame_bkg=self._frame_bkg_param(sp))
             rows = self._load_rows()
             if (self.analysis or {}).get("sensitivity") != sens:
                 self._apply_selection(sens)
@@ -777,7 +814,7 @@ class Session:
             meta = read_json(self._p("stack_meta.json"), {}) or {}
             sp = dict(stack_params if stack_params is not None else (meta.get("params") or {}))
             sens = float(sp.get("sensitivity", 1.0) or 1.0)
-            state = self._ensure_registered(progress, sens, self._debayer(sp), banding=self._banding_param(sp))
+            state = self._ensure_registered(progress, sens, self._debayer(sp), banding=self._banding_param(sp), frame_bkg=self._frame_bkg_param(sp))
             if stack_params is not None and (self.analysis or {}).get("sensitivity") != sens:
                 self._apply_selection(sens)
                 self.analysis = {**(self.analysis or {}), "sensitivity": sens}
@@ -941,7 +978,7 @@ class Session:
         t0 = time.time()
         H, W = arr.shape[1:]
         do_crop = bool(sp.get("crop", True))
-        thr = float(sp.get("crop_threshold", 0.3) or 0.3)
+        thr = float(sp.get("crop_threshold", 1.0) or 1.0)          # 1.0: the area every frame covers (Siril's minimum framing) - no rim seams
         hgroups = None
         if hdr_info and hdr_info.get("groups"):          # HDR: crop to where every group has data, else a seam (M 45: 15 s group alone) shows
             hgroups = [[rows[i]["H"] for i in inc if rows[i].get("group", 0) == g["group"] and rows[i].get("H")]
@@ -993,7 +1030,7 @@ class Session:
                             "cc": "dark 3 3" if masters.get("dark") else None, "summary": rep.get("summary")},
             "banding": band,
             "siril_version": "1.4.4", "sirilpipe_version": __version__,
-            "params": sp, "local_norm": False, "sensor_pattern": None, "split": None,
+            "params": sp, "local_norm": bool((read_json(os.path.join(self.process, "state.json"), {}) or {}).get("frame_bkg_requested")), "sensor_pattern": None, "split": None,
             "nights": [{"folder": d, "n": len([i for i in inc if rows[i]["folder"] == d])} for d, _ in self.fs.nights],
             "plate_solve": None,
         }
@@ -1060,11 +1097,18 @@ class Session:
             try:
                 runner = SirilRunner(self.dir, progress=self._cb(progress), checkpoint=self.checkpoint)
                 tmp = self._p("stack_solved.fit")
-                for stale in (tmp, self._p("stack.fit")):
-                    if os.path.exists(stale):
-                        os.remove(stale)
-                runner.run(workflow.platesolve_script(self.dir, "stack", fr), "platesolve", expect=[tmp],
-                           label="Plate solving")
+                local = tools.gaia_astro.ensure(self._cb(progress), self.checkpoint)      # the local catalogue first: VizieR times out
+                for lines in ([tools.gaia_astro.siril_lines()] if local else []) + [None]:
+                    for stale in (tmp, self._p("stack.fit")):
+                        if os.path.exists(stale):
+                            os.remove(stale)
+                    try:
+                        runner.run(workflow.platesolve_script(self.dir, "stack", fr, catalog_lines=lines), "platesolve", expect=[tmp],
+                                   label="Plate solving" + (" (local Gaia catalogue)" if lines else ""))
+                        break
+                    except SirilError:
+                        if lines is None:
+                            raise
                 _, h = fitsio.read_fits(tmp)
                 res = _wcs_summary(h)
                 if res.get("ok"):

@@ -263,7 +263,7 @@ def tools_status() -> dict:
     try:
         return clean_json(tools_mod.tools_status())
     except Exception as e:  # the tools package must never take the server down
-        return {n: {"ok": False, "error": f"{type(e).__name__}: {e}"} for n in ("siril", "graxpert", "starnet", "rcastro", "cosmic_clarity", "gaia")}
+        return {n: {"ok": False, "error": f"{type(e).__name__}: {e}"} for n in ("siril", "graxpert", "starnet", "rcastro", "cosmic_clarity", "gaia", "gaia_astro")}
 
 
 # ------------------------------------------------------------------ pages
@@ -766,9 +766,9 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
 def _tool_member(tool: str, attr: str):
     """``sirilpipe.tools.<tool>.<attr>``: the module's singleton (``graxpert`` / ``starnet`` /
     ``rcastro``, which share their status caches), else the wrapper class instantiated."""
-    names = {"graxpert": "GraXpert", "rcastro": "RCAstro", "starnet": "StarNet", "cosmic_clarity": "CosmicClarity"}
+    names = {"graxpert": "GraXpert", "rcastro": "RCAstro", "starnet": "StarNet", "cosmic_clarity": "CosmicClarity", "gaia_astro": "GaiaAstrometric"}
     if tool not in names:
-        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet | cosmic_clarity)")
+        raise ValueError(f"unknown tool {tool!r} ({' | '.join(names)})")
     obj = getattr(tools_mod, tool, None) or getattr(tools_mod, names[tool])     # the module's singleton, else the class
     if inspect.isclass(obj):
         obj = obj()
@@ -786,9 +786,11 @@ def _run_tools_job(params: dict, progress) -> dict:
         fn = _tool_member("starnet", "download")
     elif tool == "cosmic_clarity":
         fn = _tool_member("cosmic_clarity", "download_models")
+    elif tool == "gaia_astro":
+        fn = _tool_member("gaia_astro", "install")
     else:
-        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet | cosmic_clarity)")
-    progress(0, 1, f"Downloading {tool} models" if tool != "starnet" else "Downloading StarNet")
+        raise ValueError(f"unknown tool {tool!r} (graxpert | rcastro | starnet | cosmic_clarity | gaia_astro)")
+    progress(0, 1, {"starnet": "Downloading StarNet", "gaia_astro": "Downloading the Gaia astrometric catalogue"}.get(tool, f"Downloading {tool} models"))
     ret = _call(fn, progress=progress, accept_licence=bool(params.get("accept_licence")),
                 kinds=params.get("models"))
     progress(1, 1, "Done")
@@ -1123,13 +1125,13 @@ def tools_download(body: dict = Body(...)):
     (download-models), Cosmic Clarity's (the siril-scripts script's own download, ~2.4 GB), or StarNet2
     (needs ``accept_licence: true``: the download comes from starnetastro.com under their licence)."""
     tool = body.get("tool")
-    if tool not in ("graxpert", "rcastro", "starnet", "cosmic_clarity"):
-        raise HTTPException(400, "tool: graxpert | rcastro | starnet | cosmic_clarity")
+    if tool not in ("graxpert", "rcastro", "starnet", "cosmic_clarity", "gaia_astro"):
+        raise HTTPException(400, "tool: graxpert | rcastro | starnet | cosmic_clarity | gaia_astro")
     if tool == "starnet" and not body.get("accept_licence"):
         raise HTTPException(400, "StarNet is downloaded from starnetastro.com under their licence: send accept_licence: true")
     opts = {k: body[k] for k in ("accept_licence", "models", "product") if k in body}
     return start_job({"kind": "tools", "folder": "", "params": {"tool": tool, **opts}, "origin": "ui",
-                      "label": f"Download {tool} models" if tool != "starnet" else "Download StarNet"})
+                      "label": {"starnet": "Download StarNet", "gaia_astro": "Download the Gaia astrometric catalogue"}.get(tool, f"Download {tool} models")})
 
 
 # ------------------------------------------------------------------ previews

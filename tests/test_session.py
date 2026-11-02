@@ -36,7 +36,7 @@ class FakeRunner:
         if stage.startswith("calibrate"):
             for e in expect:
                 touch(e)
-        elif stage.startswith("banding_merge"):                     # one merged mosaic per sub (the real seqmerge_cfa output names)
+        elif stage.startswith("banding_merge") or stage.startswith("frame_bkg"):   # one merged / background-subtracted file per sub
             import re
             from astropy.io import fits
             last = expect[0]
@@ -396,6 +396,22 @@ def test_banding_stage_runs_only_when_measured(session, monkeypatch):
     monkeypatch.setattr(workflow, "row_banding_ratio", lambda paths, pattern="RGGB": {"ratio": 0.98, "needed": 1.1, "banded": False, "n_subs": 8})
     session.run_stack({"pattern_correction": False})
     assert not [s for s, _ in FakeRunner.log if s.startswith("banding")]
+
+
+def test_per_frame_background_runs_before_registration_and_is_a_choice(session):
+    """local_norm (default on): Siril seqsubsky 1 on each Bayer plane of the calibrated subs, before the registration; off, the stage does not
+    run, and the change re-registers (the signature carries it)."""
+    session.run_analysis(1.0)
+    stages = [s for s, _ in FakeRunner.log]
+    assert stages.index("calibrate_1") < stages.index("frame_bkg_1") < stages.index("register")
+    assert "seqsubsky CFA0_light 1" in dict(FakeRunner.log)["frame_bkg_1"]
+    st = json.load(open(os.path.join(session.process, "state.json")))
+    assert st["frame_bkg_requested"] is True and st["signature"]["frame_bkg"] == 1
+    FakeRunner.log.clear()
+    meta = session.run_stack({"local_norm": False})
+    stages = [s for s, _ in FakeRunner.log]
+    assert "register" in stages and not [s for s in stages if s.startswith("frame_bkg")]
+    assert meta["local_norm"] is False
 
 
 def test_previews_of_a_dataset_never_overlap_and_a_superseded_one_is_skipped(session, monkeypatch):

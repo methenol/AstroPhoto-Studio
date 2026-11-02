@@ -40,6 +40,7 @@ const Tools = (() => {
       background: bge ? "GraXpert background extraction" : "Siril background extraction (RBF)",
       deconv: deconv + (ccSharpen ? (ccOk("sharpen") ? "; Cosmic Clarity Sharpen on the stretched image" : "; Cosmic Clarity Sharpen (models not installed)") : ""),
       denoise: (denoiseNames[nm] || denoiseAuto) + (ccDenoise ? (ccOk("denoise") ? "; Cosmic Clarity Denoise on the stretched image" : "; Cosmic Clarity Denoise (models not installed)") : ""),
+      solve: d.gaia_astro && !d.gaia_astro.ok ? "online catalogues only: the Gaia astrometric catalogue is missing (Tools: Download now)" : "",
       stars: sm === "darkstar" ? (ccOk("darkstar") ? "Cosmic Clarity DarkStar" : "Cosmic Clarity DarkStar (models not installed), then " + starsAuto) : starsAuto,
     };
   }
@@ -48,7 +49,8 @@ const Tools = (() => {
     if (!T.data) { el.textContent = "Checking the tools…"; return; }
     const p = plan();
     el.innerHTML = `Restoration will use: <b>${esc(p.background)}</b>, colour calibration (Siril SPCC), ` +
-      `deconvolution <b>${esc(p.deconv)}</b>, noise reduction <b>${esc(p.denoise)}</b>; star removal <b>${esc(p.stars)}</b>.`;
+      `deconvolution <b>${esc(p.deconv)}</b>, noise reduction <b>${esc(p.denoise)}</b>; star removal <b>${esc(p.stars)}</b>.` +
+      (p.solve ? ` <span class="warn">Plate solving: ${esc(p.solve)}.</span>` : "");
   }
 
   const kv = rows => `<div class="tkv">${rows.filter(r => r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("")}</div>`;
@@ -134,6 +136,15 @@ const Tools = (() => {
     return card("rcastro", "RC-Astro", t, body + note("rcastro"), t.version ? "CLI " + t.version : "");
   }
 
+  function gaiaAstroCard(t) {
+    t = t || {};
+    const gb = v => v ? (v / 1e9).toFixed(2) + " GB" : "0 GB";
+    return card("gaia_astro", "Gaia astrometric catalogue (plate solving)", t, kv([["Installed", t.ok ? "yes" : (t.partial_bytes ? `downloading (${gb(t.partial_bytes)} of ~1.14 GB so far)` : "not yet")], ["Size", gb(t.bytes)], ["File", esc(t.path)]]) +
+      `<div class="small muted">Siril's local Gaia DR3 astrometric extract (Siril_Catalog_Installer.py; Zenodo, 1.1 GB compressed). Plate solving uses it first (platesolve -catalog=localgaia); the online VizieR catalogues time out often enough to cost a stack its plate solution, and with it SPCC and the sky-survey gradient model. Download it once here; an interrupted download resumes.</div>` +
+      (t.ok ? "" : `<div class="tmsg err">Missing: plate solving depends on the online catalogues until it is installed, and a failed solve leaves the export without SPCC colour calibration and the sky-survey gradient model.</div>
+        <div class="row gap"><button class="btn small" data-act="dl" data-tool="gaia_astro" ${T.busy ? "disabled" : ""}>${t.partial_bytes ? "Finish the download" : "Download now (1.1 GB)"}</button></div>`) +
+      note("gaia_astro"), t.ok ? "installed" : "");
+  }
   function gaiaCard(t) {
     t = t || {};
     const gb = v => v ? (v / 1e9).toFixed(2) + " GB" : "0 GB";
@@ -148,7 +159,7 @@ const Tools = (() => {
   function render() {
     const d = T.data; if (!d) return;
     $("#toolsBody").className = "";
-    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro) + ccCard(d.cosmic_clarity) + gaiaCard(d.gaia);
+    $("#toolsBody").innerHTML = sirilCard(d.siril) + graxpertCard(d.graxpert) + starnetCard(d.starnet) + rcastroCard(d.rcastro) + ccCard(d.cosmic_clarity) + gaiaAstroCard(d.gaia_astro) + gaiaCard(d.gaia);
     $$("#toolsBody details.tool").forEach(el => el.ontoggle = () => el.open ? T.open.add(el.dataset.tool) : T.open.delete(el.dataset.tool));
     const code = $("#rcCode"); if (code) code.oninput = () => (T.code = code.value);
     const acc = $("#starnetAccept"); if (acc) acc.onchange = () => (T.starnetOk = acc.checked);
