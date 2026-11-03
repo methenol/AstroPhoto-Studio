@@ -109,7 +109,8 @@ STACK_DEFAULTS = {
     "imagemm_lower_bound": "local",  # latent >= the local background - 3 sigma (LBCA): no dark moat round stars; "global", False
     "imagemm_cosmetic": True,      # Siril find_cosme on every sub: warm / cold pixels (ImageMM has no rejection)
     "imagemm_latent_sigma": 1.0,   # g_sigma of the latent (Eq. 11; the paper's 1 px at r = 1, the script's 0.45)
-    "imagemm_bound_sigma": 1.0,    # lower bound's margin below the local background (latent sigma): 3 left rings, 0 a halo
+    "imagemm_bound_sigma": None,   # lower bound's margin below the local background (latent sigma); None = by what ImageMM restores:
+                                   # 3 for the objects only (the noise left alone), 1 for its stars (3 left rings, 0 a halo)
     "imagemm_saturated_points": False,  # saturated cores as point sources at iteration 10 (superseded by the photometry)
     "imagemm_saturated_photometry": True,  # saturated cores' colour from their unsaturated wings (PSF photometry), shape g_sigma
     "imagemm_psf_asymmetry": True,  # the optics' fixed one-sided wing (m = 1, 2) from the frames' mean, in every kernel
@@ -713,6 +714,21 @@ def _norm_autofinish(res) -> dict:
     return res.get("autofinish", res) if isinstance(res, dict) else {}
 
 
+def _failed_steps(s: Session, since: float) -> list[str]:
+    """The restoration steps that failed in this job (restore_meta.json written by it), each as "step (tool): why".
+
+    A failed tool used to leave the job "Finished": GraXpert died on a root-owned log file (2026-11-03) and three IC 434
+    exports went out without their gradient removal while every job read done - the failure was only in restore_meta."""
+    path = os.path.join(s.dir, "restore_meta.json")
+    try:
+        if os.path.getmtime(path) < since:
+            return []
+        steps = _read_json(path).get("steps") or []
+    except (OSError, AttributeError):
+        return []
+    return [f"{st.get('step')} ({st.get('tool')}): {(st.get('note') or 'failed')[:300]}" for st in steps if st.get("status") == "failed"]
+
+
 def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params: dict, export_opts: dict):
     """Map a job kind onto the Session methods (api-contract.md section 2)."""
     sp = {**STACK_DEFAULTS, **stack_params}
@@ -843,8 +859,10 @@ def _run_job(job_id: str):
                 # (made when a stage first reads them, deleted when the job ends)
                 with s.local_copy(progress):
                     job["result"] = _run_session_job(kind, s, progress, params, stack_params, export_opts)
+                job["warnings"] = _failed_steps(s, job["started"])
             job["progress"] = 1.0
-            job["message"] = "Finished"
+            job["message"] = (f"Finished with {len(job['warnings'])} failed step{'s' if len(job['warnings']) > 1 else ''}"
+                              if job.get("warnings") else "Finished")
             job["state"] = "done"               # last: a poller that sees "done" finds the result and the message too
         except Cancelled:
             job["message"] = "Cancelled"

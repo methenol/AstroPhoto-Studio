@@ -311,6 +311,7 @@ def run_study(study_dir: str, cancel: threading.Event | None = None, on_log=None
         study.set_metric_names([o["metric"] for o in objectives])
         if cfg.get("baseline", True) and not study.trials and name != "grid":
             base = {k: sp.get("value", pdefs[k]["default"]) for k, sp in space.items() if sp.get("tune") and k in pdefs}
+            base = {k: v for k, v in base.items() if v is not None}          # (an unset setting - "by the rule" - is sampled, not enqueued)
             if base:
                 study.enqueue_trial(base, user_attrs={"baseline": True})
                 # candidates the task proposes (Auto-finish's settings for the finish): trials of the experiment like any other

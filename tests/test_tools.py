@@ -523,3 +523,15 @@ def test_two_fetchers_of_one_catalogue_file_download_it_once(tmp_path, monkeypat
     for t in th:
         t.join()
     assert len(gets) == 1 and open(final, "rb").read() == b"catalogue" * 1000
+
+
+def test_graxpert_log_is_per_uid_when_home_is_not_ours(tmp_path, monkeypatch):
+    """A GraXpert run under another uid must not share the app's log: its rotation left a root-owned graxpert.log and
+    every later GraXpert call of the app died with PermissionError."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    own = tools.tool_env(kind="graxpert")
+    assert own.get("XDG_CACHE_HOME", os.path.join(str(tmp_path), ".cache")) == os.path.join(str(tmp_path), ".cache")
+    monkeypatch.setattr(tools.os, "getuid", lambda: os.stat(tmp_path).st_uid + 1)
+    other = tools.tool_env(kind="graxpert")
+    assert other["XDG_CACHE_HOME"] == os.path.join(str(tmp_path), f".cache-uid{os.stat(tmp_path).st_uid + 1}")

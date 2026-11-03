@@ -751,3 +751,14 @@ def test_raw_saturation_leaves_an_unsaturated_colour_alone(tmp_path):
     assert info["lattice_saturation"]["00"] is None and info["lattice_saturation"]["11"] is None
     rc = sat[0]
     assert not ((rc[:, 0] % 2) == (rc[:, 1] % 2)).any()
+
+
+def test_the_lower_bound_follows_what_imagemm_restores_unless_set():
+    """1 sigma was measured for ImageMM's own stars; with the stars from another tool the bound leaves the noise alone (3 sigma): on the
+    clipped sky NXT took 9-12 % of the stars' light (NGC 1499 2026-11-03).  A number set by the user is used as it is."""
+    objects = S.map_params({"deconv_method": "imagemm", "deconv_stars_method": "auto"})
+    both = S.map_params({"deconv_method": "imagemm", "deconv_stars_method": "imagemm"})
+    stars = S.map_params({"deconv_method": "bxt", "deconv_stars_method": "imagemm"})
+    assert objects["bound_sigma"] == S.OBJECTS_BOUND_SIGMA == 3.0 and objects["bound_sigma_rule"] == "objects only"
+    assert both["bound_sigma"] == 1.0 and stars["bound_sigma"] == 1.0
+    assert S.map_params({"deconv_method": "imagemm", "deconv_stars_method": "auto", "imagemm_bound_sigma": 1.5})["bound_sigma"] == 1.5

@@ -132,6 +132,16 @@ def tool_env(extra: dict | None = None, kind: str = "graxpert") -> dict:
     else:
         env.pop("LD_LIBRARY_PATH", None)
     os.makedirs(env["HOME"], exist_ok=True)
+    if kind == "graxpert":
+        # GraXpert's RotatingFileHandler opens $XDG_CACHE_HOME/GraXpert/log/graxpert.log before it does anything and exits
+        # when it cannot: a run under another uid (a root ``docker exec``) rotated the log into a root-owned file and every
+        # later GraXpert call of the app failed with PermissionError.  A uid that does not own HOME logs to its own cache.
+        try:
+            owner = os.stat(env["HOME"]).st_uid
+        except OSError:
+            owner = os.getuid()
+        if os.getuid() != owner:
+            env["XDG_CACHE_HOME"] = os.path.join(env["HOME"], f".cache-uid{os.getuid()}")
     return env
 
 

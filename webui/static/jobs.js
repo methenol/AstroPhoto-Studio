@@ -15,6 +15,8 @@ const Jobs = (() => {
       <table class="jobstages"><tbody>${j.stages.map(([k, t]) => `<tr><td>${esc(k)}</td><td class="num">${fmtDur(t)}</td></tr>`).join("")}</tbody></table></details>` : "";
     const err = j.state === "error" ? `<details class="small"><summary style="color:var(--bad)">${esc(j.message)}</summary>
       <pre class="log" style="max-height:300px;user-select:text">${esc((j.device_state ? j.device_state + "\n\n" : "") + (j.traceback || ""))}</pre></details>` : "";
+    const warn = (j.warnings || []).length ? `<details class="small" open><summary style="color:var(--warn,#d9a400)">${esc(j.message)}</summary>
+      <pre class="log" style="max-height:200px;user-select:text">${esc(j.warnings.join("\n"))}</pre></details>` : "";
     const bar = history ? "" : `<div class="progress"><div style="width:${(j.progress * 100).toFixed(1)}%;height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent))"></div></div>`;
     const times = history
       ? `${when(j.created)} · ${j.state === "done" ? "took " + fmtDur(j.active_seconds ?? j.active) : esc(j.message)}${j.paused_total ? ` (+${fmtDur(j.paused_total)} paused)` : ""}`
@@ -22,7 +24,7 @@ const Jobs = (() => {
     return `<div class="jobcard ${esc(j.state)}">
       <div class="jobhead"><b>${esc(j.label)}</b><span class="muted">${esc(j.dataset || "")}${j.n_subs ? ` · ${j.n_subs} subs` : ""}</span>
         <span class="state ${esc(j.state)}">${STATE[j.state] || esc(j.state)}</span><span class="jobctl">${ctl.join(" ")}</span></div>
-      ${bar}<div class="small jobmsg">${times}</div>${stages}${err}</div>`;
+      ${bar}<div class="small jobmsg">${times}</div>${warn}${stages}${err}</div>`;
   }
 
   async function refresh() {

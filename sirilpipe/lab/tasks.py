@@ -927,7 +927,7 @@ IMAGEMM_PARAMS = [
     _imm("imagemm_lower_bound", "lower bound", "categorical", "local", choices=["local", "global", False]),
     _imm("imagemm_cosmetic", "cosmetic correction of the subs", "bool", True),
     _imm("imagemm_latent_sigma", "latent sigma", "float", 1.0, low=0.3, high=2.0),
-    _imm("imagemm_bound_sigma", "lower bound's margin (latent sigma)", "float", 1.0, low=0.0, high=3.0),
+    _imm("imagemm_bound_sigma", "lower bound's margin (latent sigma; unset = 3 for the objects only, 1 for its stars)", "float", None, low=0.0, high=3.0),
     _imm("imagemm_halo", "halo", "bool", False),
     _imm("imagemm_saturated_points", "saturated cores as points", "bool", False),
     _imm("imagemm_saturated_photometry", "saturated cores' colour from their wings", "bool", True),

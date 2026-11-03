@@ -57,6 +57,7 @@ SAT_PLATEAU = 4              # raw pixels at the frame's maximum that make it a 
 FW_PILEUP = 3.0              # a lattice's top-value histogram peaks at >= this x its smooth tail: a full well (raw_saturation)
 FW_ONSET = 2.0               # the full well's level: where the pile-up falls back under this x the tail
 FW_MAX_SPREAD = 0.015        # a full well's frame maxima agree to this (robust relative spread); a peak's follow the seeing
+OBJECTS_BOUND_SIGMA = 3.0    # the lower bound's margin (latent sigma) when ImageMM restores the objects only: below the noise (map_params)
 # a registered pixel is touched by a saturated raw pixel within the debayer's reach (RCD, Siril's default: 3 px) plus
 # the Lanczos-4 kernel's (4 px)
 SAT_GROW = 7
@@ -147,6 +148,16 @@ def map_params(stack_params: dict | None) -> dict:
     kw["psf_wings"] = _flag(kw["psf_wings"])
     kw["psf_asymmetry"] = _flag(kw["psf_asymmetry"])
     kw["psf_radial_wings"] = _flag(kw["psf_radial_wings"])
+    if sp.get("imagemm_bound_sigma") in (None, "", "auto"):
+        # the lower bound's margin by what ImageMM restores: 1 sigma was measured for its own stars (3 left dark R / B rings round the
+        # bright ones), at the price of a clipped sky (the noise's low tail cut at -1.3 sigma, 0.2 % of the pixels below -1.5 sigma
+        # against the stack's 6 %); when the stars are another tool's (post.join_stars takes each whole from the stack) the bound goes
+        # back to OBJECTS_BOUND_SIGMA, where the noise is left alone - on the clipped sky NXT took 9-12 % of every star's light round
+        # it and the star gate halved the linear noise reduction (NGC 1499 2026-11-03: 0.913 -> 0.981 of the light kept at dn 0.8)
+        from .post import deconv_choice
+        obj, stars = deconv_choice(sp)
+        kw["bound_sigma"] = OBJECTS_BOUND_SIGMA if (obj == "imagemm" and stars != "imagemm") else float(DEFAULTS["bound_sigma"])
+        kw["bound_sigma_rule"] = "objects only" if (obj == "imagemm" and stars != "imagemm") else "stars restored"
     kw["bound_sigma"] = max(0.0, float(kw["bound_sigma"]))
     kw["bloom_grow"] = int(min(8, max(0, round(float(kw["bloom_grow"] or 0)))))
     kw["point_init"] = _flag(kw["point_init"])
@@ -1076,6 +1087,7 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
     kw = map_params(sp)
     r = kw.pop("r")
     formal = kw.pop("formal_mode")
+    bound_rule = kw.pop("bound_sigma_rule", "set")
     say = progress or (lambda i, n, m: None)
     say(0, 1, "ImageMM: loading the stack")
     stack, header = fitsio.read_rgb(os.path.join(session_dir, "stack.fits"))
@@ -1203,7 +1215,7 @@ def run(session_dir: str, stack_meta: dict, stack_params: dict, progress=None, c
                                               for c in range(kern[0].shape[0])] if kern else None,
                     # the restored stars' width (information: their equivalent Gaussian sigma)
                     "restored_sigma_px": restored_sigma(out, [(x_ * r, y_ * r) for x_, y_ in (store.stars[0] if len(store) else [])])},
-            "params": {**kw, "r": r, "formal_mode": formal},
+            "params": {**kw, "r": r, "formal_mode": formal, "bound_sigma_rule": bound_rule},
             "iterations": {"done": info.get("iters_done"), "max": info.get("iters_max"), "converged": info.get("converged"),
                            "mean_diff": info.get("mean_diff"), "mean_diff_history": info.get("mean_diff_history")},
             "stopping": f"Appendix C: mean |u_k / u_k-1 - 1| over the effective pixels (mu {kw['mu']:g}) < {kw['stop_epsilon']:g}",

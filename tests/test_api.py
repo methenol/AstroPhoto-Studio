@@ -1034,3 +1034,24 @@ def test_server_imports_without_tools():
             "t = s.tools_status(); assert isinstance(t, dict); print(sorted(t))")
     r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr[-2000:]
+
+
+def test_failed_restore_step_is_a_job_warning(env):
+    """GraXpert died on a root-owned log (2026-11-03): the gradient step failed, the job still read "Finished" and three
+    exports went out with the light-pollution gradient in them.  A failed step of this job's restoration is now on the job."""
+    orig = FakeSession.run_denoise
+
+    def failing(self, stack_params, progress, params=None):
+        self.calls.append("restore")
+        with open(os.path.join(self.dir, "restore_meta.json"), "w") as f:
+            json.dump({"steps": [{"step": "gradient", "tool": "graxpert", "status": "failed", "note": "PermissionError: graxpert.log"},
+                                 {"step": "deconvolution", "tool": "rc-astro bxt", "status": "unavailable"},
+                                 {"step": "denoise", "tool": "rc-astro nxt", "status": "done"}]}, f)
+        return {}
+    FakeSession.run_denoise = failing
+    try:
+        done = wait_state(env.client, submit(env, stack_params={"autofinish": False, "star_remover": False})["id"])
+    finally:
+        FakeSession.run_denoise = orig
+    assert done["state"] == "done" and done["message"] == "Finished with 1 failed step"
+    assert done["warnings"] == ["gradient (graxpert): PermissionError: graxpert.log"]
