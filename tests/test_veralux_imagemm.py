@@ -709,3 +709,78 @@ def test_the_core_rewrite_gives_back_the_light_the_restoration_had():
     pre = np.array(a["amps_pre_floor"], float)
     post = np.array(a["amps"], float)
     assert post / post[1] == pytest.approx(pre / pre[1], rel=1e-3)       # given back at the wings' colour, not level
+
+
+def _nucleus_store(tmp_path, n_frames=4, N=260):
+    """Frames of a galaxy whose nucleus is clipped in every frame (M 31 on a Seestar, 60 s gain 200), with stars for the PSF
+    (41 px cut-outs: 45 px from the edges, clear of the galaxy)."""
+    rng = np.random.default_rng(21)
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    gal = 3.0 * np.exp(-np.hypot(xx - 130, yy - 130) / 9.0)
+    stars = [(45.4, 45.2, 1.0), (215.6, 45.3, 1.0), (45.2, 214.7, 1.0), (214.3, 215.4, 1.0), (130.5, 45.6, 0.8), (45.3, 130.7, 0.9),
+             (215.6, 130.4, 0.9), (130.4, 215.6, 0.8), (88.7, 46.2, 0.9), (172.4, 214.4, 0.8)]
+    clip = 1.5
+    st = V.FrameStore(str(tmp_path / "f.npy"), (n_frames, 1, N, N))
+    for t in range(n_frames):
+        f = _field(N, stars, 0.2, 1.8, rng, 0.003) + cv2.GaussianBlur(gal, (0, 0), 1.8)
+        sat = f >= clip
+        f[sat] = clip
+        st.data[t, 0] = f
+        st.sat[t] = sat
+        st.stars[t] = [(x, y) for x, y, _ in stars]
+    return st, sat, clip
+
+
+def test_a_galaxy_nucleus_saturated_in_every_frame_is_censored_not_drained(tmp_path):
+    """Change 35: a nucleus clipped in every frame is told from a star by the light beyond its core in the rings that hold data (the
+    no-data zone round it is 0 in the initial guess and read as "no light beyond the core": a point of 9000 x the clip level), and
+    is censored data, at least the clip level, rather than missing data (the Seestar M 31's nucleus: a disc at the sky level,
+    red and black after finishing)."""
+    st, sat, clip = _nucleus_store(tmp_path)
+    eng = V.ImageMMEngine("cpu")
+    img = eng.run_imagemm(st, iterations=20, log=lambda m: None)[0]
+    assert sat.sum() > 50
+    core = float(np.median(img[sat]))
+    assert 0.9 * clip < core < 4.0 * clip, core                         # (the old classification made it a "star" at 9000 x the clip)
+    assert eng.last_run_info["censored_extended_px"] >= sat.sum()
+    assert float(img[sat].min()) >= 0.98 * clip, float(img[sat].min())    # censored: at least the clip level, everywhere in the core
+
+
+def test_a_channel_keeps_its_data_round_a_patch_only_another_channel_clipped():
+    """The Seestar M 31's nucleus clips in red to 14 px and never in green: green's measurements there are data."""
+    N = 200
+    yy, xx = np.mgrid[:N, :N]
+    sat = np.zeros((3, N, N), bool)
+    r = np.hypot(xx - 100, yy - 100)
+    sat[0, r <= 14.0] = True
+    sat[2, r <= 4.0] = True
+    z = V.ImageMMEngine._bloom_zone(sat, 4)
+    assert not z[1].any()
+    assert z[0][(r > 14.5) & (r <= 23.0)].all() and not z[0][r > 26].any()                     # 14 + 0.75 x 14
+    assert z[2][(r > 4.5) & (r <= 8.0)].all() and not z[2][r > 9.5].any()                      # blue: its own 4 px core
+
+
+def test_a_galaxy_nucleus_has_no_bloom_zone():
+    N = 200
+    yy, xx = np.mgrid[:N, :N]
+    sat = np.zeros((3, N, N), bool)
+    big = np.hypot(xx - 60, yy - 60) <= 12.0
+    sat[:, big] = True
+    small = np.hypot(xx - 150, yy - 150) <= 2.0
+    sat[1, small] = True
+    z = V.ImageMMEngine._bloom_zone(sat, 4, extended=big)
+    r_small = np.hypot(xx - 150, yy - 150)
+    assert not z[:, np.hypot(xx - 60, yy - 60) < 40].any()                                     # the nucleus: data to its edge
+    assert z[1][(r_small > 2.5) & (r_small <= 6.0)].all()                                       # a star keeps its zone
+
+
+def test_point_initial_tells_a_nucleus_from_a_star_without_moving_anything(tmp_path):
+    C, N = 1, 300
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    gal = 0.1 + 3.0 * np.exp(-np.hypot(xx - 150, yy - 150) / 9.0)
+    img = np.minimum(gal, 1.5)[None]
+    core = gal >= 1.5
+    x = torch.from_numpy(img.astype(np.float32))[None]
+    ext = np.zeros(core.shape, bool)
+    out, _ = V.ImageMMEngine._point_initial(x, core, 1.0, [1e-3] * C, extended=ext, move=False)
+    assert ext[core].all() and torch.equal(out, x)

@@ -102,6 +102,19 @@ switches (``run_imagemm`` arguments, ``imagemm_*`` settings), on by default.
    are sparse is its restored-image PSF at its wings' colour on a floor fitted 4-20 px outside; in the join the
    restoration's own structure (less its smooth part per ring) is kept, and the PSF's tail fades on beyond.  The
    lower bound takes the 5 x 5 minimum of the image everywhere (a dust lane under the bulge was held flat).
+35. A saturated patch that is not a star - a galaxy nucleus, by ``_point_initial``'s test (larger than ``MAX_SAT_CORE_PX``,
+    or more light beyond the core than ``ext_max`` x the core's) - is censored data (Whyte, Sivic & Zisserman 2014), not
+    missing data, and its bloom zone is the detector's ``bloom_grow`` px only.  Missing data left the restoration nothing
+    there: M 31's nucleus, saturated in green in every Seestar frame (60 s, gain 200), was drained by the update to the
+    lower bound - a disc at the sky level inside a 0.75 x r_eq "bloom" ring of no data, red and black after finishing
+    (2026-11-02).  Measured on that nucleus (crop [736, 1120, 640, 960]): red clips to 14 px, blue to 4 px, green nowhere,
+    and the bloom zone of the channels' union had dropped green's measurements to 24 px - green drained, red and blue ran
+    away to 13-330 x their clip.  So: the bloom zone is per channel, a nucleus has none (its neighbours are the galaxy,
+    measured; change 29's reasons are a star's light exceeding its PSF), the initial guess is rebuilt from the frames once
+    the nucleus is known, its saturated pixels are censored, where every frame is saturated the median of the frames' clipped
+    values on their common scale is the pixel's lower bound, and the saturated-core step keeps the nucleus as restored.  Result: the nucleus follows the stack to 0.5-2 % at 15 px in every channel.
+37. ``_point_initial``'s wing photometry is used only at a signal-to-noise of ``SAT_WING_SNR`` (its own sigma_F = 1.2533 sigma /
+    sqrt(sum n k^2)): with the dense rings where the kernel is ~0 it returned 1e17-1e20 x the clipped light (IC 434, 2026-11-02).
 34. The point a saturated star starts from is its PSF, not a delta (``point_kernel``): ``_point_initial`` deposits the light its wings' photometry
     measures through the frames' own mean kernel (``keff`` - the mean extended frame kernel convolved with g_sigma, the very basis the wing amplitude was
     least-squared on, support to 80 px) instead of through a 1 px Gaussian, because a star deposited as a delta has no halo for the restoration to
@@ -1583,8 +1596,11 @@ class ImageMMEngine:
     @staticmethod
     def _saturated_star_photometry(x, core, mean_img, kmean, grow: int = 2, ann: tuple = (4, 8), sky: tuple = (18, 26),
                                    sigma: float = 1.0, R_win: int = 104, bg_ring: tuple = (90, 104), ext_max: float = 0.1, valid_frac=None,
-                                   inner_px: float = 2.0, blend_px: float = SAT_BLEND, psi=None, catalog=None):
-        """PIPELINE (changes 25, 33): saturated stars as the restored image's PSF at their wings' colour; saturated galaxy
+                                   inner_px: float = 2.0, blend_px: float = SAT_BLEND, psi=None, catalog=None, censored=None):
+        """PIPELINE (changes 25, 33): ``censored`` (H, W; change 35): the galaxy cores restored as censored data - their channels are fitted
+        to the frames (unsaturated ones measured, saturated ones at least their clip) and are left as restored: green's shape at the wings'
+        colour, the rewrite below, put M 31's blue core at 0.78 x its clip level.
+        Saturated stars as the restored image's PSF at their wings' colour; saturated galaxy
         nuclei with their colour.
 
         Next to a saturated core the PSF model does not fit the data (M 31 2026-10-22: 2.3-3.8 x the PSF at 5-6 px against
@@ -1681,6 +1697,10 @@ class ImageMMEngine:
         vf = np.pad(valid_frac if valid_frac is not None else np.ones((C, H, W)), ((0, 0), (R, R), (R, R)), constant_values=0.0)
         for q in range(1, n + 1):
             ys, xs = np.nonzero(lab == q)
+            if censored is not None and censored[ys, xs].any():   # (change 35: restored as censored data, kept)
+                extended += 1
+                dbg.append((int(round(float(xs.mean()))), int(round(float(ys.mean()))), "extended (censored, kept)"))
+                continue
             if len(ys) > MAX_SAT_CORE_PX:                     # (a galaxy nucleus, not a star)
                 skipped += 1
                 continue
@@ -2002,8 +2022,11 @@ class ImageMMEngine:
 
     @staticmethod
     def _point_initial(x, core, sigma: float, noise, grow: int = 2, R: int = 104, bg_ring: tuple = (90, 104), ext_max: float = 0.5, valid=None,
-                       kmean=None, valid_frac=None, fit_w: int = 30, kernel: bool = False):
+                       kmean=None, valid_frac=None, fit_w: int = 30, kernel: bool = False, extended=None, move: bool = True):
         """PIPELINE (change 30): each saturated star in the initial guess as the point it is.
+
+    ``extended`` (change 35): an (H, W) bool array the cores left as they are - larger than ``MAX_SAT_CORE_PX`` or extended - are marked in
+    (grown by ``grow``); ``move`` False only classifies, ``x`` is returned unchanged.
 
     ``kernel`` (change 34) decides the *shape* the star's measured light is deposited with: a 1 px Gaussian (the latent's resolution element, as
     change 30 shipped it) or ``keff`` shifted to the star's centre and renormalised to unit sum - the frames' own seeing convolved with that resolution element,
@@ -2050,6 +2073,8 @@ class ImageMMEngine:
         for q in range(1, n + 1):
             ys, xs = np.nonzero(lab == q)
             if len(ys) > MAX_SAT_CORE_PX:
+                if extended is not None:
+                    extended[ys, xs] = True
                 continue
             iy, ix = int(round(float(ys.mean()))) + R, int(round(float(xs.mean()))) + R
             win = xp[:, iy - R:iy + R + 1, ix - R:ix + R + 1]
@@ -2097,8 +2122,33 @@ class ImageMMEngine:
             L_core = [float(np.clip(above[c][inside], 0, None).sum()) for c in range(C)]
             L_ext = [float((prof[c] * area)[ks > r_in].sum()) for c in range(C)]
             ratio = L_ext[g_] / max(L_core[g_], 1e-30)
+            # (change 35) the same measure on the rings' pixels that hold data: the zone round a core where no frame has data is 0 in
+            # the guess, and its rings' medians ended the profile there - M 31's nucleus (light beyond its core 2.9 x the core's)
+            # measured 0.0 and became a "star" of 32000 x the clip level in the synthetic test of the change
+            if valid is not None:
+                dat = (lw == 0) & have & vp[g_, iy - R:iy + R + 1, ix - R:ix + R + 1]
+                prof_d, area_d = np.zeros(nr + 1), np.zeros(nr + 1)
+                r_out_d, low = nr, 0
+                for k in range(nr + 1):
+                    sel = (rb == k) & dat
+                    area_d[k] = sel.sum()
+                    if area_d[k] == 0:
+                        continue
+                    prof_d[k] = np.median(above[g_][sel])
+                    if k >= r_in:
+                        low = low + 1 if prof_d[k] < 0.5 * 1.2533 * float(noise[g_]) / math.sqrt(area_d[k]) else 0
+                        if low == 3:
+                            r_out_d = k - 2
+                            break
+                taper_d = np.clip((r_out_d + 1.5 - ks) / 3.0, 0.0, 1.0)
+                L_ext_d = float((np.clip(prof_d, 0, None) * taper_d * area_d)[ks > r_in].sum())
+                ratio = max(ratio, L_ext_d / max(L_core[g_], 1e-30))
             if L_core[g_] <= 0 or ratio > ext_max:
                 info.append((ix - R, iy - R, round(r_out, 1), round(ratio, 3)))
+                if extended is not None:
+                    extended[ys, xs] = True
+                continue
+            if not move:
                 continue
             Mr = np.stack([np.interp(rr, ks, prof[c], right=0.0) for c in range(C)])
             S = np.exp(-(rr ** 2) / (2.0 * sigma * sigma))
@@ -2133,7 +2183,11 @@ class ImageMMEngine:
                         kk = float(np.median(Kc[sel]))
                         num += sel.sum() * float(np.median(above[c][sel])) * kk
                         den += sel.sum() * kk * kk
-                    if den > 0 and num > 0:
+                    # (change 37) used only where it is measured: the fit of ring medians (noise 1.2533 sigma / sqrt(n)) has
+                    # sigma_F = 1.2533 sigma / sqrt(den).  A core saturated in every channel puts the dense rings where the kernel
+                    # is ~0: den ~0 and F = num / den 1e17-1e20 x the clipped light (IC 434's brightest star, once the Seestar's
+                    # green full well was flagged) - a black-holed red disc after the restoration
+                    if den > 0 and num > 0 and (num / den) * math.sqrt(den) >= SAT_WING_SNR * 1.2533 * float(noise[c]):
                         Fw[c] = num / den
             Fs = [max(Ltot[c], Fw[c]) if Fw[c] is not None else Ltot[c] for c in range(C)]
             shapes = list(S for _ in range(C))
@@ -2211,26 +2265,33 @@ class ImageMMEngine:
         return out, {"cores": int(n), "made_points": done}
 
     @staticmethod
-    def _bloom_zone(sat, grow: int, scale: float = BLOOM_SCALE):
+    def _bloom_zone(sat, grow: int, scale: float = BLOOM_SCALE, extended=None):
         """PIPELINE (changes 29, 33): (C, H, W) the pixels next to a frame's saturated pixels ``sat`` (C, H, W) that are
         left out as data the linear model does not describe (the saturation / bleed masks of survey pipelines, grown):
-        per channel within ``grow`` px of its saturated pixels, and round a saturated patch (the channels' union) of
-        equivalent radius r_eq within ``scale`` x r_eq px of it where that is further.  The light next to a saturated
+        per channel within ``grow`` px of its saturated pixels, and round a channel's saturated patch of equivalent radius
+        r_eq within ``scale`` x r_eq px of it where that is further.  Per channel (change 35): the zone of the channels'
+        union took every channel's data out round a patch only one channel clipped - the Seestar's M 31 nucleus clips in
+        red to 14 px and never in green, and green's measurements to 24 px were dropped: no data, the update drained it
+        to 0 and the nucleus became a red disc in a black ring.  The light next to a saturated
         core exceeds the PSF's out to a distance that grows with the core: 2-5 px for cores of 2-8 px (M 31, against
         the restoration, by distance from the core), 8-9 px for the field's brightest star (r_eq ~11; per frame against
         its own wing fitted 10+ px out: G +0.33 / +0.14 / +0.04 at 5 / 7 / 9 px, B +0.54 / +0.21 / +0.07; at a fixed
         radius it falls with the distance from the saturated pixels).  With a fixed 4 px zone that light pulled the
         restoration's point to 0.77 of its wings' light and stayed as a ring at 12-16 px and a red-green halo to 40 px;
-        modelled as a feature of the PSF instead (fitted on that star's frames) the ring and halo stayed."""
+        modelled as a feature of the PSF instead (fitted on that star's frames) the ring and halo stayed.  A patch inside
+        ``extended`` (H, W; change 35: not a star - a galaxy nucleus) has no zone: the light next to it is the galaxy's, measured, and a ring
+        without data round a censored core left the core's light free to run away (M 31's nucleus: red and blue 13-330 x the clip level)."""
         from scipy.ndimage import label, find_objects
         k_ = 2 * int(grow) + 1
         se_ = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_, k_))
-        near = np.stack([cv2.dilate(sat[c].astype(np.uint8), se_) > 0 for c in range(sat.shape[0])])
-        anys = sat.any(0)
+        src = sat if extended is None else sat & ~extended[None]
+        near = np.stack([cv2.dilate(src[c].astype(np.uint8), se_) > 0 for c in range(sat.shape[0])])
         r_big = (grow + 1) / max(scale, 1e-6)
-        if anys.sum() > np.pi * r_big * r_big:
-            lab, n = label(anys)
-            H, W = anys.shape
+        H, W = sat.shape[1:]
+        for c in range(sat.shape[0]):
+            if src[c].sum() <= np.pi * r_big * r_big:
+                continue
+            lab, n = label(src[c])
             for q, sl in enumerate(find_objects(lab), start=1):
                 if sl is None:
                     continue
@@ -2241,8 +2302,7 @@ class ImageMMEngine:
                 y0, y1 = max(0, sl[0].start - g2), min(H, sl[0].stop + g2)
                 x0, x1 = max(0, sl[1].start - g2), min(W, sl[1].stop + g2)
                 se2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g2 + 1, 2 * g2 + 1))
-                z = cv2.dilate((lab[y0:y1, x0:x1] == q).astype(np.uint8), se2) > 0
-                near[:, y0:y1, x0:x1] |= z[None]
+                near[c, y0:y1, x0:x1] |= cv2.dilate((lab[y0:y1, x0:x1] == q).astype(np.uint8), se2) > 0
         return near & ~sat
 
     @staticmethod
@@ -2387,7 +2447,7 @@ class ImageMMEngine:
         yy, xx = np.mgrid[-Rw:Rw + 1, -Rw:Rw + 1].astype(np.float64)
         rr = np.hypot(yy, xx); rb = np.rint(rr).astype(int); th = np.arctan2(yy, xx)
         bgm = (rr >= bg_ring[0]) & (rr <= bg_ring[1])
-        ext = {(int(s_[0]), int(s_[1])) for s_ in (info.get("saturated_photometry") or {}).get("stars", []) if len(s_) > 2 and s_[2] == "extended"}
+        ext = {(int(s_[0]), int(s_[1])) for s_ in (info.get("saturated_photometry") or {}).get("stars", []) if len(s_) > 2 and str(s_[2]).startswith("extended")}
         ratios = [[] for _ in range(C)]
         used = 0
         for q in range(1, n + 1):
@@ -2480,6 +2540,7 @@ class ImageMMEngine:
             'mu': float(mu), 'kappa': float(kappa), 'data_mode': "MONO" if channels == 1 else "RGB", 'r': r,
             'mean_diff_history': [],
         }
+        self._ext_core = None                                # (change 35) the saturated patches that are not stars, once classified
 
         # 1. Analyze First Image & Init
         raw = store.frame(0)
@@ -2504,7 +2565,7 @@ class ImageMMEngine:
             with lock:
                 fa, fb = store.frame(i), store.saturated(i)
                 if bloom_grow and fb.any():
-                    fa = np.where(self._bloom_zone(fb, int(bloom_grow)), np.nan, fa).astype(np.float32)
+                    fa = np.where(self._bloom_zone(fb, int(bloom_grow), extended=self._ext_core), np.nan, fa).astype(np.float32)
                 a, b = torch.from_numpy(fa), torch.from_numpy(fb)
                 return (a.pin_memory(), b.pin_memory()) if dev.type == "cuda" else (a, b)
 
@@ -2807,19 +2868,65 @@ class ImageMMEngine:
         # (pixels without a valid sample in any frame - the core of a star saturated all night - start from the frames'
         # clipped values, the script's initial guess: a multiplicative update never grows a pixel that starts at 0)
         x_lr = torch.where(m_sum > 0, x_accum / torch.clamp(m_sum, min=1.0), all_accum / torch.clamp(all_sum, min=1.0))
+        core_i = ((sat_cnt >= 0.5 * torch.clamp(cov_cnt, min=1.0)) & (cov_cnt > 0)).cpu().numpy()
+        ext_core = np.zeros(core_i.shape, bool)
+        nz = km_i = None
+        if core_i.any():
+            hp_ = x_lr - F.avg_pool2d(F.pad(x_lr, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
+            nz = [float(1.4826 * torch.median(torch.abs(hp_[0, c] - torch.median(hp_[0, c])))) / math.sqrt(8.0 / 9.0) for c in range(channels)]
+            km_i = torch.stack([kernel_list_hr[i] for i in active]).mean(0).cpu().numpy()
+            # (change 35: the cores that are not stars, told apart before the stars are moved)
+            self._point_initial(x_lr, core_i, latent_sigma, nz, valid=(m_sum[0] > 0).cpu().numpy(), kmean=km_i,
+                                valid_frac=(m_sum[0] / float(max(1, len(active)))).cpu().numpy(), extended=ext_core, move=False)
+        self._ext_core = ext_core if ext_core.any() else None
+        cens_lb = None
+        if self._ext_core is not None:
+            # (change 35) the frames again, with the measurements next to the nucleus that the bloom zone had dropped: the
+            # initial guess held 0 there and the first iterations pumped the censored core to explain the ring.  Per channel,
+            # where every frame covering a nucleus pixel is saturated: each frame's censored value says the sky there is at
+            # least its clipped value on the frames' common scale, (clip - P_t) / s_t (Whyte, Sivic & Zisserman 2014), all
+            # of them at once.  Their median is the pixel's lower bound (the LBCA's b, Lanteri, Roche & Aime 2002): implied by
+            # the data whatever the frames' scale errors (x >= max >= median), where the largest follows the one frame whose
+            # transmission s_t was measured lowest (M 32's blue core 3 x its 3 px ring).  The censored term alone, bounded in
+            # influence by the Huber weight, left M 31's blue core at 0.74 x the stack's clip
+            x_accum.zero_(); m_sum.zero_(); all_accum.zero_(); all_sum.zero_()
+            ext_d = torch.from_numpy(self._ext_core).to(dev)[None, None]
+            e_idx = torch.from_numpy(np.flatnonzero(self._ext_core)).to(dev)
+            y_cens = []                                              # per frame (C, n): its clipped values in the nucleus, NaN elsewhere
+            n_sat = torch.zeros_like(x_accum)
+            for idx, d, sat in frames(list(active)):
+                check()
+                m, d_norm = self._mask_and_norm(d, norm_factor, sat_norm, sat, idx)
+                have = torch.isfinite(d).to(d_norm.dtype)
+                all_accum += d_norm * have
+                all_sum += have
+                m_sum += m
+                x_accum += d_norm * m
+                cs = sat & (have > 0) & ext_d
+                n_sat += cs.to(d_norm.dtype)
+                y_cens.append(torch.where(cs, d_norm, torch.full_like(d_norm, float('nan')))[0].reshape(channels, -1)[:, e_idx].cpu())
+                del m, d_norm, d
+                say(idx + 1, n_imgs, f"frames next to the nucleus {idx + 1}/{n_imgs}")
+            x_lr = torch.where(m_sum > 0, x_accum / torch.clamp(m_sum, min=1.0), all_accum / torch.clamp(all_sum, min=1.0))
+            full = (n_sat > 0) & (n_sat >= all_sum)
+            if bool(full.any()) and not censor_saturated:
+                med = torch.from_numpy(np.nan_to_num(np.nanmedian(torch.stack(y_cens).numpy(), 0), nan=0.0)).to(dev, x_accum.dtype)
+                y_med = torch.zeros_like(x_accum).reshape(1, channels, -1)
+                y_med[0][:, e_idx] = med
+                cens_lb = torch.where(full, y_med.reshape(x_accum.shape), torch.zeros_like(x_accum))
+                x_lr = torch.maximum(x_lr, cens_lb * 1.001)          # (the LBCA moves u = x - b: a pixel starting at b stays there)
+                self.last_run_info['censored_bound_px'] = [int(full[0, c].sum()) for c in range(channels)]
+            del y_cens, n_sat
         mean_norm = torch.where(all_sum > 0, all_accum / torch.clamp(all_sum, min=1.0), torch.full_like(all_sum, float('nan')))[0].cpu().numpy() if saturated_photometry else None
         del all_accum, all_sum
         del x_accum
         x = F.interpolate(x_lr, scale_factor=r, mode='nearest') if r > 1 else x_lr
-        if point_init and r == 1:
-            core_i = ((sat_cnt >= 0.5 * torch.clamp(cov_cnt, min=1.0)) & (cov_cnt > 0)).cpu().numpy()
-            if core_i.any():
-                hp_ = x_lr - F.avg_pool2d(F.pad(x_lr, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
-                nz = [float(1.4826 * torch.median(torch.abs(hp_[0, c] - torch.median(hp_[0, c])))) / math.sqrt(8.0 / 9.0) for c in range(channels)]
-                km_i = torch.stack([kernel_list_hr[i] for i in active]).mean(0).cpu().numpy()
-                x, pinfo = self._point_initial(x, core_i, latent_sigma, nz, valid=(m_sum[0] > 0).cpu().numpy(), kmean=km_i,
-                                               valid_frac=(m_sum[0] / float(max(1, len(active)))).cpu().numpy(), kernel=point_kernel)
-                self.last_run_info['point_initial'] = pinfo
+        if point_init and r == 1 and core_i.any():
+            x, pinfo = self._point_initial(x, core_i, latent_sigma, nz, valid=(m_sum[0] > 0).cpu().numpy(), kmean=km_i,
+                                           valid_frac=(m_sum[0] / float(max(1, len(active)))).cpu().numpy(), kernel=point_kernel)
+            self.last_run_info['point_initial'] = pinfo
+        ext_t = torch.from_numpy(ext_core).to(dev)[None, None] if (ext_core.any() and not censor_saturated) else None
+        self.last_run_info['censored_extended_px'] = int(ext_core.sum())
         # PIPELINE (change 11, lower_bound): the Lower Bound Constraint Algorithm (Lanteri, Roche & Aime 2002; Roche
         # et al. 2003, A&A 409, 1077): x = b + u, u >= 0, the multiplicative update applied to u.  Richardson-Lucy type
         # updates dig a moat round every star on a sky background (IC 1805: -1.4 % of the restored peak at 5-10 px,
@@ -2887,6 +2994,9 @@ class ImageMMEngine:
                         lb[0, c] = max(0.0, float(torch.quantile(v, 0.02)) - float(bound_sigma) * sig[c])
                 self.last_run_info['lower_bound'] = [float(v) * norm_factor for v in lb.flatten()]
 
+        if cens_lb is not None:
+            cens_lb = F.interpolate(cens_lb, scale_factor=r, mode='nearest') if r > 1 else cens_lb
+            lb = torch.maximum(lb, cens_lb)
         # Stop Criterion Mask: effective if present in > mu fraction of frames
         m_eff_lr = (m_sum / float(max(len(active), 1)) > float(mu)).to(x.dtype)
         vfrac = (m_sum[0] / float(max(1, len(active)))).cpu().numpy()
@@ -2930,6 +3040,11 @@ class ImageMMEngine:
                 # saturated in every frame has no data in its core and the update drained it to the sky.
                 if censor_saturated:
                     cens = sat & torch.isfinite(d) & (prediction_lr < y_batch)
+                    m_batch = torch.maximum(m_batch, cens.to(m_batch.dtype))
+                elif ext_t is not None:
+                    # (change 35) a saturated patch that is not a star - a galaxy nucleus - is censored data: as missing
+                    # data the update drained it to the lower bound
+                    cens = sat & ext_t & torch.isfinite(d) & (prediction_lr < y_batch)
                     m_batch = torch.maximum(m_batch, cens.to(m_batch.dtype))
                 v_src = torch.clamp(prediction_lr, min=0.0) if variance_from == "model" else y_batch
                 if ptc is not None:
@@ -3017,6 +3132,8 @@ class ImageMMEngine:
                 sig_now = torch.maximum(sig0, torch.tensor(sig_k, device=dev, dtype=x.dtype)[None, :, None, None])
                 self.last_run_info['bound_sigma'].append([round(float(v) * norm_factor, 8) for v in sig_now.flatten()])
                 lb = torch.clamp(bg_map - float(bound_sigma) * sig_now, min=0.0)
+                if cens_lb is not None:
+                    lb = torch.maximum(lb, cens_lb)
             # Apply
             x = lb + torch.clamp(x - lb, min=0.0) * ratio
             x = torch.nan_to_num(x, nan=EPSILON)
@@ -3038,7 +3155,7 @@ class ImageMMEngine:
             kmean = torch.stack([kernel_list_hr[i] for i in active]).mean(0).cpu().numpy()
             psi = self._restored_psf(x[0].detach().cpu().numpy().astype(np.float64), catalog, sat_core) if (catalog and r == 1) else None
             self.last_run_info['restored_psf_stars'] = None if psi is None else True
-            x, sinfo = self._saturated_star_photometry(x, sat_core, mean_norm, kmean, grow=int(bloom_grow) + 1 if not censor_saturated else 2, ann=(1, 5) if not censor_saturated else (1 + int(bloom_grow), 5 + int(bloom_grow)), sigma=latent_sigma, valid_frac=vfrac, inner_px=0.0 if not censor_saturated else 2.0, blend_px=2.0 if not censor_saturated else SAT_BLEND, psi=psi, catalog=catalog)
+            x, sinfo = self._saturated_star_photometry(x, sat_core, mean_norm, kmean, grow=int(bloom_grow) + 1 if not censor_saturated else 2, ann=(1, 5) if not censor_saturated else (1 + int(bloom_grow), 5 + int(bloom_grow)), sigma=latent_sigma, valid_frac=vfrac, inner_px=0.0 if not censor_saturated else 2.0, blend_px=2.0 if not censor_saturated else SAT_BLEND, psi=psi, catalog=catalog, censored=None if censor_saturated else self._ext_core)
             self.last_run_info['saturated_photometry'] = sinfo
         self._lb_used = torch.broadcast_to(lb, x.shape)[0].cpu().numpy() if lower_bound else None
         res_np = (x[0].cpu().numpy() * norm_factor).astype(np.float32)

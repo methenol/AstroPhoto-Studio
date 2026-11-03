@@ -13,10 +13,11 @@ is listed there).  This module does what the script's two tabs did by hand, head
    canvas.  The script registers with interpolation too; the stack's Bayer drizzle would leave 50-75 % of the R / B
    pixels of an unshifted frame empty, which ``seqsubsky`` then fills (its samples see the zeros: the reference
    frame of IC 1805 kept its sky while the others were levelled).
-2. Saturation (VeraLux's ``saturation_level``, which it reads from BITPIX - None for Siril's float frames): the
-   sensor ceiling is the highest raw value found as a plateau (>= 4 pixels at the maximum) over the frames' raw
-   files (frames.json ``path``); pixels at >= 0.995 x the ceiling (``SATURATION_FRAC``) that are still >= half the
-   ceiling in Siril's calibrated frame are saturated (the others are hot pixels, ~90 % on DWARF 3), grown by the
+2. Saturation (VeraLux's ``saturation_level``, which it reads from BITPIX - None for Siril's float frames): per CFA
+   lattice, the highest raw value found as a plateau (>= 4 pixels at the maximum) over the frames' raw files
+   (frames.json ``path``), or, for a lattice whose photosites reach full well below the ADC limit, the onset of the
+   pile-up of its top values (``raw_saturation``); pixels at >= 0.995 x a plateau / above the full-well onset that are
+   still >= half their lattice's level in Siril's calibrated frame are saturated (the others are hot pixels, ~90 % on DWARF 3), grown by the
    reach of the debayer and Lanczos-4 kernels (``SAT_GROW`` px) and registered by Siril with the frames' own
    transforms (``-interp=nearest``).  DWARF 3: a 12-bit sensor (ceiling 4095 in a 16-bit file).
 3. Star lists (the script's per-frame ``findstar`` loop): ``seqfindstar`` on the registered frames, default
@@ -49,10 +50,13 @@ STAGE = "imagemm"
 OUT_FITS = "imagemm.fits"
 OUT_META = "imagemm_meta.json"
 WORK = os.path.join("process", "imagemm")          # the frame store (deleted afterwards)
-PREP_VERSION = 8                                     # bump when the store's content changes (imagemm_keep_prepared)
+PREP_VERSION = 9                                     # bump when the store's content changes (imagemm_keep_prepared); 9: per-lattice saturation, full wells
 
 SATURATION_FRAC = 0.995      # VeraLux build_mask_and_variance(saturation_frac=0.995)
 SAT_PLATEAU = 4              # raw pixels at the frame's maximum that make it a saturation ceiling
+FW_PILEUP = 3.0              # a lattice's top-value histogram peaks at >= this x its smooth tail: a full well (raw_saturation)
+FW_ONSET = 2.0               # the full well's level: where the pile-up falls back under this x the tail
+FW_MAX_SPREAD = 0.015        # a full well's frame maxima agree to this (robust relative spread); a peak's follow the seeing
 # a registered pixel is touched by a saturated raw pixel within the debayer's reach (RCD, Siril's default: 3 px) plus
 # the Lanczos-4 kernel's (4 px)
 SAT_GROW = 7
@@ -458,11 +462,18 @@ def alignment_shift(ref: np.ndarray, frame: np.ndarray) -> list[float]:
 def raw_saturation(paths: dict[int, str], progress=None, checkpoint=None) -> tuple[float | None, dict[int, np.ndarray], dict]:
     """(sensor ceiling, {file number: (row, col) of the saturated raw pixels}, info) from the frames' raw FITS files.
 
-    The ceiling is the highest frame maximum that is a plateau (>= ``SAT_PLATEAU`` pixels at it: a saturated star
-    has many, an unsaturated peak one); a pixel is saturated at >= ``SATURATION_FRAC`` x the ceiling.  No plateau in
-    any frame: no saturation (None)."""
+    Per 2 x 2 CFA lattice, because the colours of one sensor need not saturate at one level.  The sensor's ceiling is
+    the highest frame maximum held by >= ``SAT_PLATEAU`` pixels (a saturated star has many, an unsaturated peak one);
+    a lattice that reaches it is ADC-clipped there, saturated at >= ``SATURATION_FRAC`` x the ceiling.  A lattice whose photosites reach full
+    well before the ADC limit has no plateau: its values pile up below their maximum, spread by the pixels' full-well
+    capacities (the Seestar S50 / IMX585's green, 60 s gain 200: a pile-up at 53 000-59 500 under red's and blue's
+    hard 65 535, one pixel at its maximum - never flagged, so saturated green entered ImageMM as data, a flat plateau
+    that the restoration fitted as the star).  Such a lattice is saturated from the onset of the pile-up in the
+    histogram of its top values pooled over the frames (``_full_well_level``), looked for only when the sensor clips
+    hard elsewhere (a frame with saturated stars) and below that ceiling.  No plateau in any frame: no saturation."""
     from astropy.io import fits
-    cand: dict[int, tuple[np.ndarray, np.ndarray]] = {}      # pixels >= 0.98 x the frame's maximum: (row, col), value
+    cand: dict[int, tuple[np.ndarray, np.ndarray]] = {}      # pixels >= 0.8 x their lattice's frame maximum: (row, col), value
+    lat_max: dict[tuple[int, int], list[tuple[float, int]]] = {(i, j): [] for i in (0, 1) for j in (0, 1)}
     maxima: list[tuple[float, int]] = []
     unreadable = 0
     n = len(paths)
@@ -479,22 +490,79 @@ def raw_saturation(paths: dict[int, str], progress=None, checkpoint=None) -> tup
         if a.ndim != 2:
             unreadable += 1
             continue
-        mx = float(a.max())
-        maxima.append((mx, int((a >= mx).sum())))
-        rc = np.argwhere(a >= 0.98 * mx).astype(np.int32)
+        mx_ = float(a.max())
+        maxima.append((mx_, int((a >= mx_).sum())))
+        keep = np.zeros(a.shape, bool)
+        for (i, j), lst in lat_max.items():
+            sub = a[i::2, j::2]
+            mx = float(sub.max())
+            lst.append((mx, int((sub >= mx).sum())))
+            keep[i::2, j::2] = sub >= 0.8 * mx
+        rc = np.argwhere(keep).astype(np.int32)
         cand[num] = (rc, a[rc[:, 0], rc[:, 1]])
         if progress and (k % 10 == 0 or k == n - 1):
             progress(k + 1, n, f"ImageMM: saturation of the raw frames {k + 1}/{n}")
+    frames = sum(1 for _ in cand)
+    info = {"raw_frames": frames, "unreadable": unreadable}
     plateaus = [m for m, c in maxima if c >= SAT_PLATEAU]
-    info = {"raw_frames": len(maxima), "unreadable": unreadable}
     if not plateaus:
         return None, {}, {**info, "ceiling": None}
     ceiling = max(plateaus)
-    # (a frame whose maximum is below 0.995 x the ceiling has no pixel there; one at the ceiling has them all in cand)
-    out = {num: rc[v >= SATURATION_FRAC * ceiling] for num, (rc, v) in cand.items()}
+    level: dict[tuple[int, int], float] = {}
+    how: dict[str, object] = {}
+    for lat in lat_max:
+        # (a lattice that reaches the ADC ceiling in some frame is clipped there, plateau of its own or not - a small saturated
+        # star holds under 4 pixels of one colour)
+        if any(m >= SATURATION_FRAC * ceiling for m, _ in lat_max[lat]):
+            level[lat] = SATURATION_FRAC * ceiling
+            how[f"{lat[0]}{lat[1]}"] = {"plateau": ceiling}
+            continue
+        vals = [v[(rc[:, 0] % 2 == lat[0]) & (rc[:, 1] % 2 == lat[1])] for rc, v in cand.values()]
+        fw = _full_well_level(np.concatenate(vals) if vals else np.zeros(0, np.float32),
+                              np.array([m for m, _ in lat_max[lat]], np.float64), ceiling, frames)
+        if fw is not None:
+            level[lat] = fw[0]
+            how[f"{lat[0]}{lat[1]}"] = {"full_well": round(fw[0], 1), **fw[1]}
+        else:
+            how[f"{lat[0]}{lat[1]}"] = None
+    out = {}
+    for num, (rc, v) in cand.items():
+        thr = np.array([level.get((int(a_), int(b_)), np.inf) for a_, b_ in zip(rc[:, 0] % 2, rc[:, 1] % 2)], np.float32)
+        out[num] = rc[v >= thr]
     counts = [len(v) for v in out.values()]
     return ceiling, out, {**info, "ceiling": ceiling, "frames_with_plateau": len(plateaus),
-                          "saturated_pixels_median": float(np.median(counts)) if counts else 0.0}
+                          "lattice_saturation": how, "saturated_pixels_median": float(np.median(counts)) if counts else 0.0}
+
+
+def _full_well_level(values: np.ndarray, maxima: np.ndarray, ceiling: float, frames: int) -> tuple[float, dict] | None:
+    """The level from which a lattice without a plateau is saturated: ``values`` its pixels >= 0.8 x each frame's lattice maximum
+    pooled over ``frames`` frames, ``maxima`` the lattice's maximum per frame (``top`` their median).  A full well caps every frame's
+    brightest pixel at one level - the Seestar's green maxima 59 059 / 59 457 / 59 685 / 59 398 (0.4 %) - while an unsaturated peak
+    follows each frame's seeing and transparency: the maxima's robust spread must be under ``FW_MAX_SPREAD`` (with the histogram alone,
+    a peak identical in every frame read as a full well).  Histogram in bins of 0.5 % of ``top`` over 0.8-1.02 x top: the
+    smooth tail's level is the median count over 0.80-0.88 x top; a full well is a pile-up above it - its highest bin over
+    ``FW_PILEUP`` x that level (and over ``SAT_PLATEAU`` pixels a frame) - and the level is where the counts, followed down from
+    that bin, fall back under ``FW_ONSET`` x the tail's.  None: no pile-up (an unsaturated lattice's top values thin out
+    smoothly), or ``top`` at the hard ceiling (that is a plateau's business)."""
+    top = float(np.median(maxima)) if maxima.size else 0.0
+    if values.size == 0 or top <= 0 or top >= SATURATION_FRAC * ceiling:
+        return None
+    spread = 1.4826 * float(np.median(np.abs(maxima - top))) / top
+    if spread > FW_MAX_SPREAD:
+        return None
+    edges = np.arange(0.8, 1.02 + 1e-9, 0.005) * top
+    cnt, _ = np.histogram(values, bins=edges)
+    lo = edges[:-1] < 0.88 * top
+    base = max(float(np.median(cnt[lo])), 1.0)
+    hi = np.flatnonzero(~lo)
+    pk = int(hi[np.argmax(cnt[hi])])
+    if cnt[pk] < FW_PILEUP * base or cnt[pk] < SAT_PLATEAU * max(frames, 1):
+        return None
+    b = pk
+    while b > 0 and cnt[b - 1] >= FW_ONSET * base:
+        b -= 1
+    return float(edges[b]), {"tail_per_bin": round(base, 1), "peak_per_bin": int(cnt[pk]), "top": round(top, 1), "maxima_spread": round(spread, 4),
+                             "fraction_of_top": round(float(edges[b] / top), 4)}
 
 
 def confirm_on_calibrated(sat: dict[int, np.ndarray], calibrated: dict[int, str], ceiling: float) -> tuple[dict[int, np.ndarray], bool | None, dict]:
@@ -962,7 +1030,7 @@ def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> 
 
 
 STAR_REPORT = ("saturated_cores", "bloom_grow", "point_initial", "saturated_photometry", "saturated_point_sources",
-               "restored_psf_stars")
+               "restored_psf_stars", "censored_extended_px", "censored_bound_px")
 # Every star, not the first two dozen: the star verdicts are per star, and a field of a few hundred saturated cores is
 # ~50 KB of meta -- cheaper than the one defect a truncated list hides. (C 49 measured 43; only 24 were ever visible.)
 STAR_LIST_CAP = 400

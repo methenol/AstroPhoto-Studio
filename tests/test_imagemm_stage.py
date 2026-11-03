@@ -704,3 +704,50 @@ def test_saturation_masks_added_after_the_frames_match_masks_read_with_them(tmp_
     assert st1["saturated_fraction"] == st2["saturated_fraction"]
     assert np.allclose(st1["invalid_fraction"], st2["invalid_fraction"])
     assert not any(os.path.exists(proc / f"r_immsat_{k:05d}.fit") for k in nums)
+
+
+def test_raw_saturation_finds_a_colour_that_reaches_full_well_below_the_adc_ceiling(tmp_path):
+    """Seestar S50 (IMX585, 60 s gain 200): red and blue clip at 65 535, green's photosites fill at ~53 000-59 500, each at its
+    own capacity - no plateau, one pixel at the maximum.  Never flagged, saturated green entered ImageMM as data."""
+    rng = np.random.default_rng(3)
+    paths = {}
+    for k in range(6):
+        a = (300 + rng.normal(0, 5, (200, 200))).clip(0).astype(np.float32)
+        yy, xx = np.mgrid[:200, :200]
+        for cx, cy in ((60, 60), (140, 120), (90, 160)):
+            r = np.hypot(xx - cx, yy - cy)
+            a += 120000.0 * np.exp(-r ** 2 / (2 * 6.0 ** 2))              # bright stars: well over every ceiling at the core
+        a += rng.uniform(0, 45000, a.shape) * (rng.random(a.shape) < 0.002)   # faint stars' peaks: a smooth tail
+        fw = rng.uniform(53000, 59500, a.shape)                           # each green photosite's own full well
+        g = np.zeros(a.shape, bool); g[0::2, 0::2] = True; g[1::2, 1::2] = True
+        a = np.where(g, np.minimum(a, fw), np.minimum(a, 65535))
+        p = str(tmp_path / f"s{k}.fits")
+        fits.PrimaryHDU(a.astype(np.uint16)).writeto(p, overwrite=True)
+        paths[k] = p
+    ceiling, sat, info = S.raw_saturation(paths)
+    assert ceiling == 65535
+    lat = info["lattice_saturation"]
+    assert lat["01"] == {"plateau": 65535} and lat["10"] == {"plateau": 65535}
+    assert lat["00"] and 50000 < lat["00"]["full_well"] < 54000, lat["00"]
+    rc = sat[0]
+    green = (rc[:, 0] % 2) == (rc[:, 1] % 2)
+    r = np.min([np.hypot(rc[:, 1] - cx, rc[:, 0] - cy) for cx, cy in ((60, 60), (140, 120), (90, 160))], 0)
+    assert green.sum() > 50 and r[green].max() < 15                       # the star cores' green, not the sky's
+
+
+def test_raw_saturation_leaves_an_unsaturated_colour_alone(tmp_path):
+    rng = np.random.default_rng(4)
+    paths = {}
+    for k in range(4):
+        a = (300 + rng.normal(0, 5, (200, 200))).clip(0)
+        yy, xx = np.mgrid[:200, :200]
+        a += 120000.0 * (1.0 + 0.06 * rng.normal()) * np.exp(-np.hypot(xx - 60, yy - 60) ** 2 / (2 * 6.0 ** 2))   # transparency
+        g = np.zeros(a.shape, bool); g[0::2, 0::2] = True; g[1::2, 1::2] = True
+        a = np.where(g, a * 0.3, np.minimum(a, 65535))                    # green far below any ceiling: a smooth peak
+        p = str(tmp_path / f"u{k}.fits")
+        fits.PrimaryHDU(a.astype(np.uint16)).writeto(p, overwrite=True)
+        paths[k] = p
+    _, sat, info = S.raw_saturation(paths)
+    assert info["lattice_saturation"]["00"] is None and info["lattice_saturation"]["11"] is None
+    rc = sat[0]
+    assert not ((rc[:, 0] % 2) == (rc[:, 1] % 2)).any()

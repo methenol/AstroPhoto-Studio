@@ -491,7 +491,7 @@ def star_footprint_mask(work: str, steps: _Steps, arr: np.ndarray, header) -> tu
     g = arr[1 if arr.shape[0] > 1 else 0].astype(np.float32)
     sigma = finish.mad_sigma((g - cv2.GaussianBlur(g, (0, 0), 5.0))[::2, ::2]) / float(np.sqrt(1.0 - 3.0 / (4.0 * np.pi * 25.0)))
     mask = np.zeros((H, W), np.uint8)
-    fwhms, radii = [], []
+    fwhms, radii, centres = [], [], []
     for st in rows:
         fwhm = max(st["FWHMx"], st["FWHMy"])
         beta = max(st["beta"], 1.0 + 1e-3)
@@ -505,13 +505,140 @@ def star_footprint_mask(work: str, steps: _Steps, arr: np.ndarray, header) -> tu
         cv2.circle(mask, (int(round(c * 16)), int(round(y * 16))), int(round(r * 16)), 1, -1, lineType=cv2.LINE_8, shift=4)
         fwhms.append(fwhm)
         radii.append(r)
+        centres.append((c, y))
     m = mask.astype(np.float32)
     if fwhms:
         m = np.clip(cv2.GaussianBlur(m, (0, 0), float(np.median(fwhms)) / 2.3548), 0.0, 1.0)
     info = {"stars": len(fwhms), "sky_sigma": round(float(sigma), 7), "k": STAR_MASK_K, "coverage": round(float(m.mean()), 4),
             "fwhm_median": round(float(np.median(fwhms)), 2) if fwhms else None,
-            "radius_median": round(float(np.median(radii)), 2) if radii else None, "radius_max": round(float(max(radii)), 1) if radii else None}
+            "radius_median": round(float(np.median(radii)), 2) if radii else None, "radius_max": round(float(max(radii)), 1) if radii else None,
+            "_stars": [(float(c), float(y), float(r)) for (c, y), r in zip(centres, radii)], "_disc": mask.astype(bool),
+            "_smooth": float(np.median(fwhms)) / 2.3548 if fwhms else 0.0}
     return m, info
+
+
+JOIN_SE = 3.0             # a star's region ends where the two images' band median agrees within this many standard errors ...
+JOIN_RINGS = 3            # ... over a band of this many 1 px rings at least,
+JOIN_BAND = 0.25          # ... or this fraction of the radius (a wing's deficit is coherent over the annulus: 1 px rings each under
+                          # 3 standard errors left a -0.1 to -0.17 sky-sigma ring that the stretch shows)
+JOIN_MAX_R = 120          # px: the furthest a star's region is followed (the PSF's measured wing reaches 80 px, its halo 110)
+
+
+JOIN_BG_BLOCK = 64        # px: the cells the two images' background difference is measured in (sky pixels only)
+JOIN_FINE_SIGMA = 5.0     # inside a star's region, a fine-scale difference beyond this x its own noise is data the base image lost
+
+
+def background_difference(d: np.ndarray, sources: np.ndarray, block: int = JOIN_BG_BLOCK) -> np.ndarray:
+    """(C, H, W) the smooth background difference of two renditions, ``d`` = one - the other: per ``block`` px cell and channel the median
+    of ``d`` over the cell's pixels outside ``sources`` (cells without enough such pixels take their neighbours'), bilinear between the
+    cells' centres.  ImageMM's sky and the stack's differ by a smooth offset after the photometric match (NGC 1499: +0.17 / +0.05 /
+    +0.24 x 1e-3 in R / G / B, 0.3 sky sigma) - stars taken from the stack sat on the stack's sky, tinted discs after the stretch."""
+    C, H, W = d.shape
+    gy, gx = max(1, H // block), max(1, W // block)
+    out = np.zeros((C, gy, gx), np.float32)
+    ok = np.zeros((gy, gx), bool)
+    for i in range(gy):
+        for j in range(gx):
+            ys, xs = slice(i * H // gy, (i + 1) * H // gy), slice(j * W // gx, (j + 1) * W // gx)
+            free = ~sources[ys, xs]
+            if free.sum() >= 0.1 * free.size:
+                ok[i, j] = True
+                for c in range(C):
+                    out[c, i, j] = float(np.median(d[c, ys, xs][free]))
+    if not ok.any():
+        return np.zeros_like(d)
+    if not ok.all():
+        from scipy.ndimage import distance_transform_edt
+        idx = distance_transform_edt(~ok, return_distances=False, return_indices=True)
+        out = out[:, idx[0], idx[1]]
+    return np.stack([cv2.resize(out[c], (W, H), interpolation=cv2.INTER_LINEAR) for c in range(C)])
+
+
+def join_stars(base: np.ndarray, other: np.ndarray, footprint: np.ndarray, stars: list, disc: np.ndarray,
+               smooth: float) -> tuple[np.ndarray, np.ndarray, dict]:
+    """``base`` (C, H, W) with the stars of ``other`` - two renditions of one image, one deconvolved and one not: (the joined image, the
+    stars' full-weight mask, the record).
+
+    A deconvolution moves each star's blurred wing into its core, out to the PSF's reach.  Joined at the stars' footprints alone
+    (``star_footprint_mask``: where the Moffat fitted to the stack falls to the sky noise) the core came from one image and the wing's
+    light was missing from the other - a blurred disc in a dark annulus round every star after the stretch, deepest round the
+    brightest (NGC 1499 2026-11-03, ImageMM's objects with the stack's stars: (ImageMM - stack) at the footprint's edge -0.43 / -0.70 /
+    -0.94 sky sigma for footprints of 3-5 / 5-8 / 8-15 px, still -0.1 sigma at 2.5 x; xi Per a step from the stack's halo to ImageMM's at
+    38 px: a ring of lumps after the star removal and the stretch).  Taken whole out to the wing's reach, the other image's sky came with
+    the star - its noise (the stack's 1.5-2 x ImageMM's in R and B) and its level - purple discs round the stars.  So, with
+    d = other - base - B (B: ``background_difference``, the two images' smooth sky offset):
+
+    * inside each footprint (the star dominates) the other image whole: base + d;
+    * beyond it, out to where the images agree about the star (``JOIN_SE`` standard errors of the channels' summed d over a band of
+      rings ``JOIN_BAND`` x the radius wide, ``JOIN_RINGS`` px at least - a wing's deficit is coherent round the annulus, which 1 px
+      rings each under 3 standard errors missed at -0.1 sky sigma; at most ``JOIN_MAX_R``), only the star's smooth wing: d low-passed
+      over the median star's sigma x 2, normalised over the pixels outside the footprints (a core's light must not be smeared out), so
+      the base image's own sky texture and fine structure stay;
+    * there, where the two differ at a fine scale by more than ``JOIN_FINE_SIGMA`` x that difference's noise (the base image lost data:
+      a neighbour swallowed by a saturated star's no-data zone in ImageMM, a dark gap between the two after the smooth wing), the other
+      image whole, 2 px round."""
+    C, H, W = base.shape
+    d0 = (other - base).astype(np.float32)
+    # (the background is measured clear of the stars' wings: 3 x each footprint's radius - cells holding a bright star's halo took
+    # its wing into the "background" and the join subtracted it again, xi Per 0.0003-0.0005 under the stack throughout)
+    halo = disc.astype(np.uint8).copy()
+    for cx, cy, r0 in stars:
+        cv2.circle(halo, (int(round(cx)), int(round(cy))), int(round(min(JOIN_MAX_R, 3.0 * r0))), 1, -1)
+    B = background_difference(d0, halo > 0)
+    d = d0 - B
+    ds = d.sum(0)
+    sky_ = halo == 0
+    dv = ds[sky_][:: max(1, int(sky_.sum()) // 2_000_000)]
+    sd = 1.4826 * float(np.median(np.abs(dv - np.median(dv)))) if dv.size else 0.0
+    out = disc.astype(np.uint8).copy()
+    ext = []
+    for cx, cy, r0 in sorted(stars, key=lambda t: -t[2]):
+        h = int(min(JOIN_MAX_R, max(4.0 * r0 + 8.0, r0 + 12.0)))
+        x0, x1, y0, y1 = max(0, int(cx) - h), min(W, int(cx) + h + 1), max(0, int(cy) - h), min(H, int(cy) + h + 1)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        rb = np.rint(np.hypot(xx - cx, yy - cy)).astype(int)
+        use = ~(disc[y0:y1, x0:x1] & ~(rb <= r0 + 1.0))
+        dw = ds[y0:y1, x0:x1]
+        r_end = None
+        for k in range(int(np.ceil(r0)) + 1, h + 1):
+            wb = max(JOIN_RINGS, int(round(JOIN_BAND * k)))
+            sel = (rb >= k) & (rb < k + wb) & use
+            n = int(sel.sum())
+            if n < 8 * wb:
+                continue
+            if abs(float(np.median(dw[sel]))) <= JOIN_SE * 1.2533 * sd / np.sqrt(n):
+                r_end = k
+                break
+        r_end = float(h) if r_end is None else max(float(r_end), r0)
+        if r_end > r0:
+            cv2.circle(out, (int(round(cx * 16)), int(round(cy * 16))), int(round(r_end * 16)), 1, -1, lineType=cv2.LINE_8, shift=4)
+        ext.append(r_end / max(r0, 1e-6))
+    wing = out.astype(np.float32)
+    if smooth > 0:
+        wing = np.clip(cv2.GaussianBlur(wing, (0, 0), smooth), 0.0, 1.0)
+    lp = max(2.0 * smooth, 1.0)
+    keep = (~disc).astype(np.float32)
+    nrm = np.maximum(cv2.GaussianBlur(keep, (0, 0), lp), 1e-6)
+    low = np.stack([cv2.GaussianBlur(d[c] * keep, (0, 0), lp) / nrm for c in range(C)])
+    # (where the two differ at a fine scale beyond the noise inside a star's region, the base image lost data there - a neighbour swallowed
+    # by a saturated star's no-data zone, the zone's clipped specks - which a smooth wing cannot carry: a dark gap between a bright
+    # star and its neighbour.  There the other image whole too; elsewhere the base image's texture and sharpening stay)
+    fine = (d - np.stack([cv2.GaussianBlur(d[c], (0, 0), lp) for c in range(C)])).sum(0)
+    fv = fine[sky_][:: max(1, int(sky_.sum()) // 2_000_000)]
+    fs = 1.4826 * float(np.median(np.abs(fv - np.median(fv)))) if fv.size else 0.0
+    lost = (np.abs(fine) > JOIN_FINE_SIGMA * fs) & (wing > 0) if fs > 0 else np.zeros_like(disc)
+    lost = cv2.dilate(lost.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
+    if smooth > 0:
+        lost = np.clip(cv2.GaussianBlur(lost, (0, 0), smooth), 0.0, 1.0)
+    f = np.maximum(np.clip(footprint, 0.0, 1.0), lost * wing)[None]
+    joined = base + f * d + (1.0 - f) * wing[None] * low
+    info = {"join": "footprint whole, smooth wing to where the images agree, on the base image's sky",
+            "difference_sky_sigma": round(sd, 7), "wing_coverage": round(float(wing.mean()), 4),
+            "background_offset_median": [round(float(np.median(B[c])), 7) for c in range(C)],
+            "extension_median": round(float(np.median(ext)), 2) if ext else None, "extension_max": round(float(max(ext)), 2) if ext else None,
+            "se": JOIN_SE, "band": JOIN_BAND, "lowpass_sigma": round(lp, 2), "lost_px": int((lost > 0.5).sum())}
+    return joined.astype(np.float32), np.maximum(f[0], wing), info
+
 
 # The star pass' photometric gate.  A deconvolution may move a star's light inward -- that is its whole job -- but it
 # may not delete it; a denoiser has no business with it at all.  Each star's light is its aperture sum above its own
@@ -676,10 +803,17 @@ class Restorer:
             raise RuntimeError(f"ImageMM ({region} only): stack.fits window {win.shape} does not match imagemm.fits {self.arr.shape}")
         img = np.nan_to_num(self.arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         m, info = star_footprint_mask(self.work, s, np.clip(win / max(float(win.max()), 1.0), 0.0, 1.0), self.header)
-        self._mask = m
+        stars_, disc_, smooth_ = info.pop("_stars", None), info.pop("_disc", None), info.pop("_smooth", 0.0)
         self._psf_image = win                                        # the other region's tool deconvolves the stack's blur
-        w = m if region == "stars" else 1.0 - m                      # where ImageMM's pixels are kept
-        self.arr = (win + w[None] * (img - win)).astype(np.float32)
+        if stars_ is not None and disc_ is not None:
+            # each star with its whole wing, on the objects' image's sky (join_stars)
+            base, other = (win, img) if region == "stars" else (img, win)
+            self.arr, m, info["join"] = join_stars(base, other, m, stars_, disc_, smooth_)
+            self._mask = m
+        else:
+            self._mask = m
+            w = m if region == "stars" else 1.0 - m                  # where ImageMM's pixels are kept
+            self.arr = (win + w[None] * (img - win)).astype(np.float32)
         s.add("deconvolution", "imagemm", seconds=time.time() - t0, region=region,
               note=f"ImageMM's {region}; the {'objects' if region == 'stars' else 'stars'} from stack.fits through the star mask", star_mask=info)
 
@@ -688,6 +822,8 @@ class Restorer:
         if self._mask is None:
             t0 = time.time()
             self._mask, info = star_footprint_mask(self.work, self.steps, self.arr, self.header)
+            for k in ("_stars", "_disc", "_smooth"):
+                info.pop(k, None)
             self.steps.add("deconvolution", "siril findstar (star mask)", seconds=time.time() - t0, **info)
         return self._mask
 
@@ -1722,11 +1858,15 @@ _PREVIEW_CACHE_LOCK = threading.Lock()                    # previews of two data
 
 
 
-def preview_jpeg(session_dir: str, stack_meta: dict, params: dict, max_side: int = 1600) -> bytes:
+def preview_jpeg(session_dir: str, stack_meta: dict, params: dict, max_side: int = 1600, checkpoint=None) -> bytes:
     """The preview of the best state on disk (starless + stars, else linear, else the stack) as JPEG bytes: the SAME finishing chain as the export (``pro.Finisher``, the
     professional workflow of research/pro-workflow.md: Siril ``ght`` two-pass stretch, palette, ``clahe`` under a mask, ``satu``, Seti Star Stretch as ``mtf``, screen
     recombination) on the same data with the same parameters, at the export's resolution (reduced to ``max_side`` only at the end).  Only the external AI steps are left
-    out: the preview is "without the AI noise reduction of the stretched image (NoiseXTerminator / GraXpert)", which the export runs at step 3."""
+    out: the preview is "without the AI noise reduction of the stretched image (NoiseXTerminator / GraXpert)", which the export runs at step 3.
+
+    The loaded layers keep a ``pro.StepMemo``: a step whose input and settings are those of an earlier preview is taken from it, so moving one
+    slider re-runs the chain from the first step that setting reaches.  ``checkpoint``: called between and during the steps; it raises to abandon
+    the render (a newer preview was asked for)."""
     p = {**DEFAULTS, **(params or {})}
     key = (session_dir, p["star_separation"]) + tuple(
         os.path.getmtime(_p(session_dir, f)) if os.path.exists(_p(session_dir, f)) else 0
@@ -1735,23 +1875,26 @@ def preview_jpeg(session_dir: str, stack_meta: dict, params: dict, max_side: int
         layers = _PREVIEW_CACHE.get(key)
     if layers is None:
         layers = _Layers(session_dir, p, None)           # full resolution: the noise statistics and the colour resolution are those of the export
+        layers.memo = pro.StepMemo()
         with _PREVIEW_CACHE_LOCK:
             _PREVIEW_CACHE.clear()                         # one dataset's layers at a time (memory)
             _PREVIEW_CACHE[key] = layers
     work = _p(session_dir, "process", "preview")
     os.makedirs(work, exist_ok=True)
-    img, _ = _render(layers, p, _dual_band(stack_meta or {}, layers.header), external=False, work=work)
+    img, _ = _render(layers, p, _dual_band(stack_meta or {}, layers.header), external=False, work=work, checkpoint=checkpoint,
+                     memo=layers.memo, measure_steps=False)
     return export_mod.jpeg_bytes(export_mod.display_image(img, export_mod.bottom_up(layers.header)), 88, max_side)
 
 
 def _render(layers: _Layers, p: dict, dual: bool, external: bool, work: str, sp: dict | None = None, steps: _Steps | None = None,
-            tick=None, pictures: bool = False) -> tuple[np.ndarray, dict]:
-    """The finishing chain on the loaded layers: ``pro.Finisher`` (``external``: with the AI noise reduction of the stretched image)."""
+            tick=None, pictures: bool = False, checkpoint=None, memo=None, measure_steps: bool = True) -> tuple[np.ndarray, dict]:
+    """The finishing chain on the loaded layers: ``pro.Finisher`` (``external``: with the AI noise reduction of the stretched image; ``checkpoint``
+    without ``steps``, ``memo`` / ``measure_steps``: see ``pro.Finisher``)."""
     base, stars = layers.base, layers.stars
     if str(p.get("stretch_method")) in ("mtf", "asinh", "log"):      # the old numpy statistical stretches are gone: the default recipe runs
         p = {**p, "stretch_method": "statstretch"}
-    fin = pro.Finisher(work, layers.header, p, dual, external=external, progress=(steps.sub if steps else None), checkpoint=(steps.checkpoint if steps else None), tick=tick,
-                       device=_device_gpu(sp), steps=steps, keep_pictures=pictures, coverage=layers.coverage)
+    fin = pro.Finisher(work, layers.header, p, dual, external=external, progress=(steps.sub if steps else None), checkpoint=(steps.checkpoint if steps else checkpoint), tick=tick,
+                       device=_device_gpu(sp), steps=steps, keep_pictures=pictures, coverage=layers.coverage, memo=memo, measure_steps=measure_steps)
     img, info = fin.run(base, stars)
     info["star_layer"] = "separate" if stars is not None else "none"
     info["palette"] = fin.palette_name() if dual else "natural"

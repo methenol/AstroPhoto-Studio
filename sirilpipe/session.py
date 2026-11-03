@@ -40,8 +40,9 @@ STAGES = ["Scanning frames", "Calibrating", "Registering (pass 1/2)", "Registeri
           "Applying registration", "Stacking", "Cropping", "Plate solving"]
 
 
-class PreviewSuperseded(Exception):
-    """A newer preview of the dataset was requested while this one waited for the render lock."""
+class PreviewSuperseded(Cancelled):
+    """A newer preview of the dataset was requested while this one waited for the render lock or rendered (a ``Cancelled``, so the steps
+    that re-raise a cancel stop for it too)."""
 
 
 def local_copy_enabled() -> bool:
@@ -1276,13 +1277,17 @@ class Session:
     def preview_jpeg(self, params: dict | None = None, max_side: int = 1600, superseded=None) -> bytes:
         """One render at a time per dataset: every render works in ``process/preview`` with the same file names, and two at once (a slider
         moved while the last preview still rendered) overwrote each other's Siril inputs - a failure at whatever stage met the other render's
-        files ("Local contrast", "stretch-fit0_p3", ...).  ``superseded``: called once the lock is held; True = a newer preview was asked for
-        meanwhile, this one is not rendered (PreviewSuperseded)."""
+        files ("Local contrast", "stretch-fit0_p3", ...).  ``superseded``: called once the lock is held and then by the chain's checkpoints while it
+        renders (Siril polls them twice a second); True = a newer preview was asked for meanwhile, this one stops (PreviewSuperseded) and the
+        steps it finished stay in the step memo for the newer one."""
         from sirilpipe import post
-        with self.preview_lock:
+
+        def checkpoint():
             if superseded is not None and superseded():
                 raise PreviewSuperseded()
-            return post.preview_jpeg(self.dir, self.meta, params or {}, max_side=max_side)
+        with self.preview_lock:
+            checkpoint()
+            return post.preview_jpeg(self.dir, self.meta, params or {}, max_side=max_side, checkpoint=checkpoint)
 
     def run_all(self, stack_params: dict | None = None, params: dict | None = None, export_opts: dict | None = None,
                 progress=None) -> dict:

@@ -275,7 +275,7 @@ def test_post_stages_are_delegated_lazily(session, monkeypatch):
     fake.remove_stars = lambda *a: calls.append("stars") or {"tool": "x"}
     fake.autofinish = lambda *a: calls.append("auto") or {"params": {"stretch": 0.2}, "report": {}}
     fake.export = lambda d, meta, params, opts, p, c: calls.append(("export", opts)) or {"jpg": "a.jpg", "size": [1, 1]}
-    fake.preview_jpeg = lambda d, meta, params, max_side=1600: b"jpeg"
+    fake.preview_jpeg = lambda d, meta, params, max_side=1600, checkpoint=None: b"jpeg"
     monkeypatch.setitem(sys.modules, "sirilpipe.post", fake)
     monkeypatch.setattr("sirilpipe.post", fake, raising=False)
     session.run_denoise({}, None, {})
@@ -421,7 +421,7 @@ def test_previews_of_a_dataset_never_overlap_and_a_superseded_one_is_skipped(ses
     from sirilpipe import post
     active, overlap = [0], [False]
 
-    def fake_preview(d, meta, params, max_side=1600):
+    def fake_preview(d, meta, params, max_side=1600, checkpoint=None):
         active[0] += 1
         overlap[0] |= active[0] > 1
         _time.sleep(0.05)
@@ -435,3 +435,21 @@ def test_previews_of_a_dataset_never_overlap_and_a_superseded_one_is_skipped(ses
     with pytest.raises(sess.PreviewSuperseded):
         session.preview_jpeg({}, superseded=lambda: True)
     assert session.preview_jpeg({}, superseded=lambda: False) == b"jpeg"
+
+
+def test_a_preview_that_is_rendering_stops_when_a_newer_one_is_asked_for(session, monkeypatch):
+    """The render polls ``superseded`` through the chain's checkpoints: a slider moved while a 40 s render runs starts the new render at once."""
+    from sirilpipe import post
+    polls = []
+
+    def fake_preview(d, meta, params, max_side=1600, checkpoint=None):
+        for _ in range(5):
+            checkpoint()
+            polls.append(1)
+        return b"jpeg"
+    monkeypatch.setattr(post, "preview_jpeg", fake_preview)
+    newer = iter([False, False, False, True])
+    with pytest.raises(sess.PreviewSuperseded):
+        session.preview_jpeg({}, superseded=lambda: next(newer))
+    assert len(polls) == 2
+    assert issubclass(sess.PreviewSuperseded, sess.Cancelled)

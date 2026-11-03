@@ -36,10 +36,13 @@ The preview runs this class without the external AI steps (``external=False``: s
 """
 from __future__ import annotations
 
+import collections
+import hashlib
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 import cv2
@@ -329,11 +332,163 @@ def _chroma_ray(lum: np.ndarray, off: np.ndarray) -> np.ndarray:
     return lum + a * off
 
 
+_ALL = object()                    # a step iterated the whole parameter dict: every parameter is one of its inputs
+_MISSING = object()
+
+
+class _ReadLog(dict):
+    """The finishing parameters, noting which keys a step reads (``reads``: None = not recording) and whether it wrote any (``wrote``).
+
+    Reads through ``[]`` / ``get`` / ``in`` record the key; iterating, copying or comparing the dict records every key (``_ALL``), so
+    ``{**p}`` / ``dict(p)`` / ``json.dumps(p)`` inside a step make the whole dict its input rather than escaping the log."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.reads: set | None = None
+        self.wrote = False
+
+    def _note(self, key) -> None:
+        if self.reads is not None:
+            self.reads.add(key)
+
+    def __getitem__(self, key):
+        self._note(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._note(key)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        self._note(key)
+        return super().__contains__(key)
+
+    def __iter__(self):
+        self._note(_ALL)
+        return super().__iter__()
+
+    def keys(self):
+        self._note(_ALL)
+        return super().keys()
+
+    def items(self):
+        self._note(_ALL)
+        return super().items()
+
+    def values(self):
+        self._note(_ALL)
+        return super().values()
+
+    def __len__(self):
+        self._note(_ALL)
+        return super().__len__()
+
+    def copy(self):
+        self._note(_ALL)
+        return dict(super().items())
+
+    def __eq__(self, other):
+        self._note(_ALL)
+        return super().__eq__(other)
+
+    __hash__ = None
+
+    def _write(self):
+        self.wrote = True
+
+    def __setitem__(self, key, value):
+        self._write()
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._write()
+        super().__delitem__(key)
+
+    def update(self, *a, **k):
+        self._write()
+        super().update(*a, **k)
+
+    def pop(self, *a):
+        self._write()
+        return super().pop(*a)
+
+    def setdefault(self, key, default=None):
+        self._write()
+        return super().setdefault(key, default)
+
+
+def _copy_value(v):
+    if isinstance(v, np.ndarray):
+        return v.copy()
+    if isinstance(v, tuple):
+        return tuple(_copy_value(x) for x in v)
+    return v
+
+
+def _nbytes(v) -> int:
+    if isinstance(v, np.ndarray):
+        return int(v.nbytes)
+    if isinstance(v, tuple):
+        return sum(_nbytes(x) for x in v)
+    return 0
+
+
+class StepMemo:
+    """The outputs of the finishing chain's steps for one set of loaded layers, so a preview re-runs only the steps a changed setting reaches.
+
+    A step's entry is keyed by the key of its input (the chain of steps and settings that produced it) and holds the parameter values the step
+    read while it ran (``_ReadLog``), its output, the records it appended and the attributes and ``info`` entries it set.  A later render takes
+    the entry only when every parameter the step read has the same value now, so the picture is the one the full chain would give: the steps
+    are deterministic functions of their input array and those parameters.  Bounded by bytes (least recently used dropped first):
+    ``ASTROPHOTO_PREVIEW_MEMO_MB``, default 3072."""
+
+    def __init__(self, limit_bytes: int | None = None):
+        if limit_bytes is None:
+            limit_bytes = int(float(os.environ.get("ASTROPHOTO_PREVIEW_MEMO_MB", 3072) or 0) * 2**20)
+        self.limit = limit_bytes
+        self.entries: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+        self.size = 0
+        self.lock = threading.Lock()
+        self.hits = self.misses = 0
+
+    def find(self, key: str, name: str, p: dict) -> dict | None:
+        with self.lock:
+            for k in [k for k, e in self.entries.items() if e["in"] == key and e["name"] == name]:
+                e = self.entries[k]
+                if all(dict.get(p, r, _MISSING) == v for r, v in e["reads"].items()):
+                    self.entries.move_to_end(k)
+                    self.hits += 1
+                    return e
+            self.misses += 1
+            return None
+
+    def store(self, entry: dict) -> None:
+        n = _nbytes(entry["value"])
+        if n > self.limit:
+            return
+        with self.lock:
+            old = self.entries.pop(entry["out"], None)
+            if old is not None:
+                self.size -= old["bytes"]
+            entry["bytes"] = n
+            self.entries[entry["out"]] = entry
+            self.size += n
+            while self.size > self.limit and self.entries:
+                _, e = self.entries.popitem(last=False)
+                self.size -= e["bytes"]
+
+
 class Finisher:
-    """One run of the chain.  ``external`` = the AI steps (NoiseXTerminator / GraXpert on the stretched image) run; the preview passes False."""
+    """One run of the chain.  ``external`` = the AI steps (NoiseXTerminator / GraXpert on the stretched image) run; the preview passes False.
+    ``memo``: a ``StepMemo`` the steps' outputs are taken from and kept in (the preview); ``measure_steps`` False leaves the levels out of the
+    chain records (nothing but the export's sidecar reads them)."""
 
     def __init__(self, work: str, header, p: dict, dual: bool, *, external: bool = True, progress=None, checkpoint=None, tick=None, device: str = "auto",
-                 steps=None, keep_pictures: bool = True, coverage: np.ndarray | None = None):
+                 steps=None, keep_pictures: bool = True, coverage: np.ndarray | None = None, memo: StepMemo | None = None, measure_steps: bool = True):
+        self.memo = memo if steps is None else None             # the export's _Steps log every step as it runs: never replayed
+        self.measure_steps = measure_steps
+        if self.memo is not None:
+            p = _ReadLog(p)
         self.work, self.header, self.p, self.dual, self.external = work, header, p, dual, external
         self.progress, self.checkpoint, self.tick, self.device, self.steps = progress, checkpoint, tick, device, steps
         self.coverage = coverage                            # the stacking coverage map (frames per pixel), or None
@@ -424,7 +579,8 @@ class Finisher:
             rec["source"] = source
         if arr is not None and status == "done":
             rec["picture"] = self.picture(re.sub(r"[^a-z0-9]+", "_", step.lower()).strip("_"), arr, linear)
-            rec["levels"] = level_stats(arr)
+            if self.measure_steps:
+                rec["levels"] = level_stats(arr)
         self.records.append(rec)
         if self.steps is not None:
             self.steps.add(step, tool, status, seconds, note=note, commands=rec["commands"], **(params or {}))
@@ -523,8 +679,10 @@ class Finisher:
         return float(nebula_mask(lum, _hist_stats(lum)["mode"])[1]["coverage"])
 
     def stretch(self, base: np.ndarray) -> np.ndarray:
-        method = str(self.p.get("stretch_method", "ghs2"))
-        method = "ghs2" if method == "ghs" else method
+        return self.stretch_prepared(self.prepare_linear(base))
+
+    def prepare_linear(self, base: np.ndarray) -> np.ndarray:
+        """The linear steps before the stretch: colour gradient, background neutralisation, banding (none of them reads a stretch setting)."""
         self._say("Stretching")
         cov = self.subject_coverage(base)
         self.info["subject_coverage"] = round(cov, 3)
@@ -533,7 +691,11 @@ class Finisher:
         else:
             self.record("colour gradient (linear)", "none", None, status="skipped", note="background = off")
         base = self.neutralise(base)
-        base = self.banding(base, "linear starless", True)
+        return self.banding(base, "linear starless", True)
+
+    def stretch_prepared(self, base: np.ndarray) -> np.ndarray:
+        method = str(self.p.get("stretch_method", "ghs2"))
+        method = "ghs2" if method == "ghs" else method
         if method == "statstretch":
             return self._stretch_stat(base)
         if method in ALT_METHODS:
@@ -734,6 +896,9 @@ class Finisher:
         t0 = time.time()
         out = compose(starless)
         limit = float(gates.LIMITS["sky_pixel_noise"])
+        if not self.external and not self.measure_steps:
+            self.record("noise reduction (sky gate)", "none", out, status="skipped", note="preview: no AI steps")
+            return starless, out
         noise = self._sky_noise_of(out, starless)
         if not self.external or self.denoiser is None:
             why = "preview: no AI steps" if not self.external else "nothing was available to ask"
@@ -1436,26 +1601,63 @@ class Finisher:
         return out
 
     # ---- the whole chain -----------------------------------------------------------------------------------------------------
+    _STATE_SKIP = ("records", "info", "n", "p", "memo")
+
+    def _step(self, name: str, fn, arg, key):
+        """``fn(arg)`` through the step memo: ``(output, key of the output)``.  ``key`` names the input (None = no memo for this run).  On a hit the
+        step's records, ``info`` entries and attributes are replayed and a copy of its output returned (later steps may work in place)."""
+        p = self.p
+        if self.memo is None or key is None or not isinstance(p, _ReadLog) or p.wrote:
+            return fn(arg), None
+        hit = self.memo.find(key, name, p)
+        if hit is not None:
+            for r in hit["records"]:
+                self.n += 1
+                self.records.append({**r, "n": self.n})
+            self.info.update(hit["info"])
+            vars(self).update(hit["attrs"])
+            return _copy_value(hit["value"]), hit["out"]
+        before, info0, nrec = dict(vars(self)), dict(self.info), len(self.records)
+        p.reads = set()
+        try:
+            value = fn(arg)
+            reads = p.reads
+        finally:
+            p.reads = None
+        if p.wrote:
+            return value, None
+        reads = dict(dict.items(p)) if _ALL in reads else {r: dict.get(p, r, _MISSING) for r in reads}
+        out = hashlib.sha1(repr((key, name, sorted((repr(k), repr(v)) for k, v in reads.items()))).encode()).hexdigest()
+        self.memo.store({"in": key, "name": name, "out": out, "reads": reads, "value": _copy_value(value),
+                         "records": [dict(r) for r in self.records[nrec:]],
+                         "info": {k: v for k, v in self.info.items() if k not in info0 or info0[k] is not v},
+                         "attrs": {k: v for k, v in vars(self).items() if k not in self._STATE_SKIP and (k not in before or before[k] is not v)}})
+        return value, out
+
     def run(self, base: np.ndarray, stars: np.ndarray | None) -> tuple[np.ndarray, dict]:
         self.n = 0
         self.record("starless, linear", "input (post.restore -> post.remove_stars)", base, linear=True, params={"stars_layer": stars is not None},
                     note="shown through a linked autostretch")
-        s = self.stretch(base)
-        s = self.highlights(s)
+        k = repr(("starless", self.dual)) if self.memo is not None else None
+        s, k = self._step("linear", self.prepare_linear, base, k)
+        s, k = self._step("stretch", self.stretch_prepared, s, k)
+        s, k = self._step("highlights", self.highlights, s, k)
         pre = s
-        s = self.denoise(s)
-        s = self.banding(s, "stretched starless", False, noise_from=pre)
-        s = self.colour(s)
+        s, k = self._step("denoise", self.denoise, s, k)
+        s, k = self._step("banding", lambda a: self.banding(a, "stretched starless", False, noise_from=pre), s, k)
+        s, k = self._step("colour", self.colour, s, k)
         self._pre_local_contrast = s
-        s = self.local_contrast(s)
-        s = self.sharpen(s)
+        s, k = self._step("local contrast", self.local_contrast, s, k)
+        s, k = self._step("sharpen", self.sharpen, s, k)
         self._pre_saturation = s
-        s = self.saturation(s)
-        t = None
+        s, k = self._step("saturation", self.saturation, s, k)
+        t, kt = None, "no stars"
         if stars is not None and float(self.p.get("star_reduction", 0.4)) < 1.0:
-            t = self.stars(stars)
-        s, out = self._close_sky_noise(s, lambda sl: self._compose(sl, t))   # the gate measures the delivered picture, so the loop runs after the
-        out = self._close_clipping(s, t, out)                                # composition and recomposes every candidate it tries
+            t, kt = self._step("stars", self.stars, stars, repr(("stars", self.dual)) if self.memo is not None else None)
+        # the gate measures the delivered picture, so the loop runs after the composition and recomposes every candidate it tries
+        (s, out), _ = self._step("sky noise", lambda sl: self._close_sky_noise(sl, lambda x: self._compose(x, t)), s,
+                                 None if k is None or kt is None else repr((k, kt)))
+        out = self._close_clipping(s, t, out)
         self.info.update(chain=self.records, starless=s, starless_delivered=self.delivered_starless(s))
         return out, self.info
 
@@ -1473,8 +1675,10 @@ class Finisher:
             st = level_stats(img)
             return st["clipped"] > lim_c or st["white"] > lim_w, {"clipped": st["clipped"], "white": st["white"]}
 
+        if not self.external:
+            return out
         bad, st0 = fails(out)
-        if not bad or not self.external:
+        if not bad:
             return out
         base_failed = set(self._failed_of(out, starless)) - {"clipped", "white"}
         new_fails = lambda img, sl: sorted(set(self._failed_of(img, sl)) - {"clipped", "white"} - base_failed)   # noqa: E731  a gate passing now must keep passing

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
+import cv2
 import numpy as np
 import pytest
 
@@ -372,3 +373,33 @@ def test_a_denoiser_that_eats_the_stars_is_asked_again_weaker(tmp_path, monkeypa
     assert all(abs(a - w) <= 0.05 * w for a, w in zip(after, want)), (gate, after, want)
 
 
+
+
+def test_join_stars_takes_the_whole_star_and_keeps_the_base_images_sky():
+    """NGC 1499 2026-11-03: ImageMM's objects joined to the stack's stars at the stars' footprints left a blurred disc in a dark
+    annulus round every star (the deconvolution had moved the wing into a core that was discarded) and, taken whole to the wing's
+    reach, the stack's noisier sky came with it.  The join: the other image's star whole inside the footprint, its smooth wing out
+    to where the images agree, on the base image's sky (its background offset removed)."""
+    rng = np.random.default_rng(7)
+    C, N = 3, 241
+    yy, xx = np.mgrid[:N, :N].astype(np.float64)
+    r = np.hypot(xx - 120, yy - 120)
+    wide = 0.5 * (1 + (r / 3.0) ** 2) ** -1.6                          # the stack's star: a Moffat with a long wing
+    narrow = np.exp(-r ** 2 / (2 * 0.8 ** 2)) * float(wide.sum()) / (2 * np.pi * 0.8 ** 2)
+    base = (0.10 + 0.0004 + narrow + rng.normal(0, 0.0005, (C, N, N))).astype(np.float32)   # deconvolved, quieter, sky 4e-4 higher
+    other = (0.10 + wide + rng.normal(0, 0.0010, (C, N, N))).astype(np.float32)
+    disc = r <= 12.0
+    footprint = np.clip(cv2.GaussianBlur(disc.astype(np.float32), (0, 0), 1.0), 0, 1)
+    joined, mask, info = post.join_stars(base, other, footprint, [(120.0, 120.0, 12.0)], disc, 1.0)
+    sky_b = float(np.median(base[1][r > 100]))
+    for r0 in (14, 20, 30, 45):
+        ring = (r >= r0) & (r < r0 + 2)
+        got = float(np.median(joined[1][ring])) - sky_b
+        want = float(np.median(wide[ring]))
+        assert abs(got - want) < 0.15 * want + 0.0002, (r0, got, want)       # the stack's wing, on the base image's sky
+    far = r > 100
+    assert abs(float(np.median(joined[1][far])) - sky_b) < 1e-4                # the base image's sky level
+    ann = (r > 20) & (r < 40)
+    hp = joined[1] - cv2.GaussianBlur(joined[1], (0, 0), 3)
+    assert 1.4826 * float(np.median(np.abs(hp[ann]))) < 1.4 * 1.4826 * float(np.median(np.abs((base[1] - cv2.GaussianBlur(base[1], (0, 0), 3))[ann])))
+    assert info["extension_max"] > 1.5                                          # followed past the footprint

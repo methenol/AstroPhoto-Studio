@@ -617,3 +617,103 @@ def test_the_star_gates_compare_the_picture_with_its_starless_in_the_same_levels
     x = (0.2 - 0.05) / 0.95
     want = (0.4 - 1.0) * x / ((2 * 0.4 - 1.0) * x - 0.4)
     assert np.allclose(fin.delivered_starless(sl), want, atol=1e-6)
+
+
+def test_the_preview_step_memo_reuses_a_step_only_while_the_settings_it_read_are_unchanged(tmp_path):
+    """A step is taken from the memo only when every parameter it read has the value it had; its records, info and attributes are replayed and
+    its output handed out as a copy (a later step may work in place)."""
+    memo = pro.StepMemo()
+    calls = []
+
+    def step(fin):
+        def fn(a):
+            calls.append(1)
+            fin.info["seen"] = fin.p.get("saturation")
+            fin.final_levels = (0.0, 0.5)
+            fin.record("step", "test", None, status="skipped")
+            return a * float(fin.p["saturation"])
+        return fn
+
+    base = np.ones((3, 4, 4), np.float32)
+    f1 = pro.Finisher(str(tmp_path), {}, {"saturation": 2.0, "contrast": 4}, False, external=False, keep_pictures=False, memo=memo)
+    out1, k1 = f1._step("s", step(f1), base, "in")
+    f2 = pro.Finisher(str(tmp_path), {}, {"saturation": 2.0, "contrast": 9}, False, external=False, keep_pictures=False, memo=memo)
+    f2.record("first", "test", None, status="skipped")
+    out2, k2 = f2._step("s", step(f2), base, "in")
+    assert len(calls) == 1 and k1 == k2 and np.array_equal(out1, out2) and out1 is not out2      # contrast was not read: a hit
+    assert f2.info["seen"] == 2.0 and f2.final_levels == (0.0, 0.5) and [r["n"] for r in f2.records] == [1, 2]
+    out2 *= 0
+    f3 = pro.Finisher(str(tmp_path), {}, {"saturation": 2.0}, False, external=False, keep_pictures=False, memo=memo)
+    assert np.array_equal(f3._step("s", step(f3), base, "in")[0], out1)                         # the cached copy was not touched
+    f4 = pro.Finisher(str(tmp_path), {}, {"saturation": 3.0}, False, external=False, keep_pictures=False, memo=memo)
+    out4, k4 = f4._step("s", step(f4), base, "in")
+    assert len(calls) == 2 and k4 != k1 and np.allclose(out4, 3.0)
+    f5 = pro.Finisher(str(tmp_path), {}, {"saturation": 2.0}, False, external=False, keep_pictures=False, memo=memo)
+    f5._step("s", step(f5), base, "other input")
+    assert len(calls) == 3
+
+
+def test_a_step_that_iterates_the_settings_depends_on_all_of_them(tmp_path):
+    memo = pro.StepMemo()
+    calls = []
+
+    def fn_of(fin):
+        def fn(a):
+            calls.append(1)
+            return a + len({**fin.p})
+        return fn
+
+    base = np.zeros((3, 2, 2), np.float32)
+    for p in ({"a": 1, "b": 2}, {"a": 1, "b": 2}, {"a": 1, "b": 3}):
+        fin = pro.Finisher(str(tmp_path), {}, p, False, external=False, keep_pictures=False, memo=memo)
+        fin._step("s", fn_of(fin), base, "in")
+    assert len(calls) == 2
+
+
+def test_the_step_memo_is_bounded_by_bytes():
+    memo = pro.StepMemo(limit_bytes=2 * 48)
+    for i in range(3):
+        memo.store({"in": "x", "name": str(i), "out": str(i), "reads": {}, "value": np.zeros(12, np.float32), "records": [], "info": {}, "attrs": {}})
+    assert list(memo.entries) == ["1", "2"] and memo.size == 96
+
+
+def test_a_memoised_preview_chain_renders_what_the_full_chain_renders(tmp_path, monkeypatch):
+    """Moving one setting re-runs the chain from the first step that reads it; the picture equals the one rendered without the memo."""
+    ran = []
+
+    def stage(name, key, k):
+        def f(self, a, *rest, **kw):
+            ran.append(name)
+            return (a * k + float(self.p.get(key, 0.0))).astype(np.float32)
+        return f
+
+    for i, (name, key) in enumerate((("prepare_linear", "background"), ("stretch_prepared", "stretch"), ("highlights", "hdr"), ("denoise", "luminance_denoise"), ("banding", "none"),
+                                     ("colour", "palette_amount"), ("local_contrast", "local_contrast"), ("sharpen", "sharpen"),
+                                     ("saturation", "saturation"), ("stars", "star_intensity"))):
+        monkeypatch.setattr(pro.Finisher, name, stage(name, key, 0.9 + 0.01 * i))
+
+    def close(self, sl, compose):
+        ran.append("sky noise")
+        return sl, compose(sl)
+    monkeypatch.setattr(pro.Finisher, "_close_sky_noise", close)
+    monkeypatch.setattr(pro.Finisher, "_compose", lambda self, sl, st: sl + (0 if st is None else st))
+    base, stars = RNG.random((3, 6, 6)).astype(np.float32), RNG.random((3, 6, 6)).astype(np.float32)
+    memo = pro.StepMemo()
+    p0 = {"stretch": 0.1, "saturation": 1.2, "local_contrast": 0.5, "star_intensity": 1.0, "star_reduction": 0.4}
+
+    def render(p, m):
+        return pro.Finisher(str(tmp_path), {}, p, False, external=False, keep_pictures=False, memo=m, measure_steps=False).run(base, stars)[0]
+
+    a = render(p0, memo)
+    assert len(ran) == 11
+    for change, rerun in (({}, []), ({"saturation": 1.5}, ["saturation", "sky noise"]), ({"star_intensity": 1.3}, ["stars", "sky noise"]),
+                          ({"local_contrast": 0.7}, ["local_contrast", "sharpen", "saturation", "sky noise"]),
+                          ({"stretch": 0.12}, ["stretch_prepared", "highlights", "denoise", "banding", "colour", "local_contrast", "sharpen",
+                                               "saturation", "sky noise"])):
+        ran.clear()
+        p = {**p0, **change}
+        got = render(p, memo)
+        assert ran == rerun, change
+        ran.clear()
+        assert np.array_equal(got, render(p, None))
+    assert np.array_equal(a, render(p0, None))
