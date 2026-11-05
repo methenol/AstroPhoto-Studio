@@ -1046,12 +1046,16 @@ def test_failed_restore_step_is_a_job_warning(env):
         with open(os.path.join(self.dir, "restore_meta.json"), "w") as f:
             json.dump({"steps": [{"step": "gradient", "tool": "graxpert", "status": "failed", "note": "PermissionError: graxpert.log"},
                                  {"step": "deconvolution", "tool": "rc-astro bxt", "status": "unavailable"},
-                                 {"step": "denoise", "tool": "rc-astro nxt", "status": "done"}]}, f)
+                                 {"step": "denoise", "tool": "rc-astro nxt", "status": "done"},
+                                 {"step": "deconvolution", "tool": "graxpert deconvolution (stars)", "status": "done"}],
+                       "star_photometry": {"deconvolution": {"mode": "population", "median": 0.58, "p10": 0.39, "tolerance": 0.1},
+                                           "denoise": {"median": 0.99}}}, f)
         return {}
     FakeSession.run_denoise = failing
     try:
         done = wait_state(env.client, submit(env, stack_params={"autofinish": False, "star_remover": False})["id"])
     finally:
         FakeSession.run_denoise = orig
-    assert done["state"] == "done" and done["message"] == "Finished with 1 failed step"
-    assert done["warnings"] == ["gradient (graxpert): PermissionError: graxpert.log"]
+    assert done["state"] == "done" and done["message"] == "Finished with 2 failed steps"
+    assert done["warnings"][0] == "gradient (graxpert): PermissionError: graxpert.log"
+    assert done["warnings"][1].startswith("star photometry (graxpert deconvolution (stars)): the stars kept 0.58")

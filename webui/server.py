@@ -723,10 +723,20 @@ def _failed_steps(s: Session, since: float) -> list[str]:
     try:
         if os.path.getmtime(path) < since:
             return []
-        steps = _read_json(path).get("steps") or []
+        meta = _read_json(path)
+        steps = meta.get("steps") or []
     except (OSError, AttributeError):
         return []
-    return [f"{st.get('step')} ({st.get('tool')}): {(st.get('note') or 'failed')[:300]}" for st in steps if st.get("status") == "failed"]
+    out = [f"{st.get('step')} ({st.get('tool')}): {(st.get('note') or 'failed')[:300]}" for st in steps if st.get("status") == "failed"]
+    # a tool that moved every star's light (star_flux_guard "population") delivered a damaged picture although it "ran":
+    # GraXpert's stellar model kept 0.58 of the stars' light on IC 434's stack (BXT 1.01), recorded and never shown
+    tools_by_stage = {"deconvolution": [st.get("tool") for st in steps if st.get("step") == "deconvolution" and st.get("status") == "done"]}
+    for stage, v in (meta.get("star_photometry") or {}).items():
+        if isinstance(v, dict) and v.get("mode") == "population":
+            who = ", ".join(t for t in tools_by_stage.get(stage, []) if t) or stage
+            out.append(f"star photometry ({who}): the stars kept {v.get('median')} of their light (p10 {v.get('p10')}, "
+                       f"tolerance ±{v.get('tolerance')}) - every star changed")
+    return out
 
 
 def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params: dict, export_opts: dict):

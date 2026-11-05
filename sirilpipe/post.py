@@ -733,6 +733,195 @@ def star_flux_guard(arr: np.ndarray, ref: np.ndarray, tol: float = GUARD_TOL, ns
     return arr, info
 
 
+CONSERVE_NSIG = 5.0      # a star: a peak this many sky sigmas above its own sky on the reference
+CONSERVE_EDGE = 1.0      # its region ends where its mean radial profile on the reference falls to this many sigmas ...
+CONSERVE_MIN_R = 3.0     # ... and no nearer than this many FWHM (GUARD_APER_FWHM: the aperture that holds a star's whole light)
+CONSERVE_MAX_R = 60      # ... and no further than this (px)
+CONSERVE_CORE = 3.0      # the common star profile fades in from this many sigmas of the 1 px-smoothed luminance's noise ...
+CONSERVE_FULL = 12.0     # ... to all of the pixel here (below, GraXpert's own pixel and the sky's colour noise stay)
+CONSERVE_CORE_FWHM = 1.5  # the sharp (pixel-scale) correction: this many FWHM beyond a saturated plateau, fading over as many again
+CONSERVE_SATURATED = 0.95  # a reference pixel this bright is the star's saturated plateau
+
+
+def _place_star_light(base: np.ndarray, so: np.ndarray, light: np.ndarray, p_g: np.ndarray, p_r: np.ndarray,
+                      m: np.ndarray) -> tuple[np.ndarray, float]:
+    """``conserve_star_light``: every channel's ``light`` (above its sky ``so``) put onto one profile in ``base`` over the
+    star's pixels ``m``; returns (image, t).
+
+    One profile for every channel: a star is a point source with one spectrum and the optics' PSF is the same in the
+    three channels, but GraXpert sharpens each channel on its own (IC 434: blue pulled into the core 4.40 -> 5.76 inside
+    2 px and 5.26 -> 1.25 at 2-4 px, green far less - a blue core in a green halo).  The profile is GraXpert's
+    (``p_g``), blended towards the reference's own star (``p_r``) by the least ``t`` that carries every channel's light
+    below saturation (a sharpened core that would have to exceed 1.0 clips one channel before another).  Water-filling:
+    a pixel stops at the data's saturation, 1.0, the same in every channel (GraXpert clipped its cores there, RC-Astro
+    rescales an image above it; a per-channel cap spilled one channel's light outward and coloured the halo again) or,
+    taking light away, at the sky - what it cannot take spills to the next pixels of the profile."""
+    C = base.shape[0]
+    need = np.array([light[c] - float((base[c][m] - so[c]).sum()) for c in range(C)])
+    top = float(base.max())
+    peak = lambda t: float(np.max(need)) * float(((1 - t) * p_g + t * p_r).max()) + top
+    t = 0.0
+    if peak(0.0) > 1.0:
+        if peak(1.0) < 1.0:
+            lo, hi = 0.0, 1.0
+            for _ in range(20):
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if peak(mid) > 1.0 else (lo, mid)
+            t = hi
+        else:
+            t = 1.0
+    p = (1 - t) * p_g + t * p_r
+    out = base.copy()
+    for c in range(C):
+        left, live = float(need[c]), m & (p > 0)
+        for _ in range(12):
+            if abs(left) <= 1e-9 or not live.any():
+                break
+            w = np.where(live, p, 0.0)
+            new = out[c][live] + left * w[live] / w.sum()
+            lim = np.minimum(new, 1.0) if left > 0 else np.maximum(new, so[c])
+            left = float((new - lim).sum())
+            out[c][live] = lim
+            live &= (out[c] < 1.0) if left > 0 else (out[c] > so[c])
+    return out, t
+
+
+def conserve_star_light(out: np.ndarray, ref: np.ndarray, fwhm: float) -> tuple[np.ndarray, dict]:
+    """GraXpert's stellar deconvolution projected onto two constraints every deconvolution with a normalised PSF obeys: a
+    star's light is conserved, and nothing around a star falls below its sky.  Returns (image, record).
+
+    GraXpert runs its network on ``log(tile - min + 1e-5)`` and subtracts the network's residual there
+    (graxpert/deconvolution.py), so a star's light changes by whatever the residual does in log space and the undershoot
+    comes back through ``exp`` as a dip below the sky.  On IC 434 (2026-11-03) the stars kept 0.58 of their light on the
+    stack (p10 0.39) and 0.90 (p10 0.54) on ImageMM's join, BXT on the same input 1.01; even at ``-strength 0`` faint stars
+    gained 13 % and bright ones lost up to 70 %, per channel differently (green stars), with dark notches beside them.
+
+    Per star (peaks of the reference over CONSERVE_NSIG; each pixel belongs to its nearest star within that star's
+    radius, where its mean radial profile on the reference falls to CONSERVE_EDGE sigma, at least CONSERVE_MIN_R FWHM):
+      * a coherent dip below the star's sky (1 px Gaussian, the reference's own dip allowed) is lifted back to it;
+      * per channel, the light the star lost (or gained) - aperture sums above each image's own sky - goes back onto
+        GraXpert's own star profile above CONSERVE_CORE sigma, so the sharpened shape stays and the noise is not
+        scaled; a star GraXpert erased (no such pixel left) takes the reference's profile instead."""
+    from scipy import ndimage as ndi
+
+    C, H, W = out.shape
+    o = np.asarray(out, np.float32).copy()
+    r_ = np.asarray(ref, np.float32)
+    lum = finish.luminance(r_)
+    bg = ndi.median_filter(lum[::8, ::8], size=9)
+    bg = cv2.resize(bg, (W, H), interpolation=cv2.INTER_LINEAR)
+    res = lum - bg
+    sigma = max(finish.lower_half_sigma(finish.sample(res)), 1e-9)
+    sm = cv2.GaussianBlur(res, (0, 0), 1.0)
+    win = max(3, int(round(2 * fwhm)) | 1)
+    peaks = (sm == ndi.maximum_filter(sm, size=win)) & (sm > CONSERVE_NSIG * sigma)
+    pys, pxs = np.nonzero(peaks)
+    info: dict = {"constraint": "star light conserved per channel; no dip below the star's sky", "stars": int(len(pys))}
+    if not len(pys):
+        return o, info
+    # each star's radius from its mean radial profile on the reference
+    radii = np.empty(len(pys), np.float32)
+    rr = np.arange(CONSERVE_MAX_R + 1)
+    for i, (y, x) in enumerate(zip(pys, pxs)):
+        y0, y1, x0, x1 = max(0, y - CONSERVE_MAX_R), min(H, y + CONSERVE_MAX_R + 1), max(0, x - CONSERVE_MAX_R), min(W, x + CONSERVE_MAX_R + 1)
+        w = res[y0:y1, x0:x1]
+        d = np.hypot(*np.mgrid[y0 - y:y1 - y, x0 - x:x1 - x]).astype(np.int32).ravel()
+        prof = np.bincount(d, w.ravel(), minlength=len(rr) + 2)[:len(rr)] / np.maximum(np.bincount(d, minlength=len(rr) + 2)[:len(rr)], 1)
+        below = np.nonzero(prof < CONSERVE_EDGE * sigma)[0]
+        radii[i] = float(np.clip(below[0] if len(below) else CONSERVE_MAX_R, CONSERVE_MIN_R * fwhm, CONSERVE_MAX_R))
+    # nearest star per pixel (Voronoi), within that star's radius
+    seed = np.ones((H, W), bool)
+    seed[pys, pxs] = False
+    dist, (iy, ix) = ndi.distance_transform_edt(seed, return_indices=True)
+    lab = np.full((H, W), -1, np.int32)
+    idx = np.full((H, W), -1, np.int32)
+    idx[pys, pxs] = np.arange(len(pys))
+    own = idx[iy, ix]
+    inside = dist <= radii[own]
+    lab[inside] = own[inside]
+    o_s = np.stack([cv2.GaussianBlur(o[c], (0, 0), 1.0) for c in range(C)])
+    r_s = np.stack([cv2.GaussianBlur(r_[c], (0, 0), 1.0) for c in range(C)])
+    lifted = moved = lost = blended = 0
+    ratios = []
+    for i, (y, x) in enumerate(zip(pys, pxs)):
+        R = int(np.ceil(radii[i])) + 10
+        y0, y1, x0, x1 = max(0, y - R), min(H, y + R + 1), max(0, x - R), min(W, x + R + 1)
+        m = lab[y0:y1, x0:x1] == i
+        d = np.hypot(*np.mgrid[y0 - y:y1 - y, x0 - x:x1 - x])
+        ann = (d > radii[i] + 2) & (d <= radii[i] + 8) & (lab[y0:y1, x0:x1] < 0)
+        if ann.sum() < 12:
+            ann = (d > radii[i] + 2) & (d <= radii[i] + 8)
+        oc, rc = o[:, y0:y1, x0:x1], r_[:, y0:y1, x0:x1]
+        so = np.array([np.median(oc[c][ann]) for c in range(C)], np.float32)
+        sr = np.array([np.median(rc[c][ann]) for c in range(C)], np.float32)
+        # 1. no coherent dip below the sky that the reference does not have itself
+        floor = np.minimum(so[:, None, None], r_s[:, y0:y1, x0:x1] - sr[:, None, None] + so[:, None, None])
+        lift = np.maximum(floor - o_s[:, y0:y1, x0:x1], 0.0) * m
+        if lift.any():
+            lifted += int((lift.max(0) > 0).sum())
+            oc += lift
+        # 2. the light the star had, per channel, back on its own profile
+        f_r = np.array([(rc[c][m] - sr[c]).sum() for c in range(C)])
+        f_o = np.array([(oc[c][m] - so[c]).sum() for c in range(C)])
+        if f_r.sum() <= 0:
+            continue
+        ratios.append(float(f_o.sum() / f_r.sum()))
+        # where the star dominates: its significance on the 1 px Gaussian (noise / 2 sqrt(pi)), on either image (a star
+        # GraXpert erased is still the reference's).  Weight 0 below CONSERVE_CORE, 1 from CONSERVE_FULL: the rebuild
+        # fades in, so the sky's own noise and colour noise stay wherever the star is weak (a hard support left a grey,
+        # colour-noise-free patch round Alnitak that the finishing turned into a speckled disc)
+        sig_s = sigma / (2.0 * np.sqrt(np.pi))
+        prof = finish.luminance(oc) - float(finish.luminance(so[:, None, None]).ravel()[0])
+        pr = finish.luminance(rc) - float(finish.luminance(sr[:, None, None]).ravel()[0])
+        q = np.maximum(cv2.GaussianBlur(prof, (0, 0), 1.0), cv2.GaussianBlur(pr, (0, 0), 1.0)) / sig_s
+        wt = np.clip((q - CONSERVE_CORE) / (CONSERVE_FULL - CONSERVE_CORE), 0.0, 1.0) * m
+        if not wt.any():
+            continue
+        if not (m & (cv2.GaussianBlur(prof, (0, 0), 1.0) > CONSERVE_CORE * sig_s)).any():
+            lost += 1
+        # one profile for every channel: a star is a point source with one spectrum and the optics' PSF is the same in the
+        # three channels, but GraXpert sharpens each channel on its own (IC 434: blue pulled into the core 4.40 -> 5.76
+        # inside 2 px and 5.26 -> 1.25 at 2-4 px, green far less - a blue core in a green halo).  The shape is GraXpert's
+        # luminance profile, blended towards the reference's own star only as far as needed to carry every channel's
+        # light below saturation (a sharpened core that would have to exceed 1.0 clips one channel before another)
+        orig = oc.copy()
+        # two targets, one per scale: the sharp one from the pixels as they are, for where the star's own fine structure
+        # stands out of the noise (its core); the smooth one from 2 px Gaussians of the profile and of every channel, for
+        # its smooth halo - GraXpert's colour change is smooth there, and each channel's own fine-scale noise stays
+        # untouched (rebuilt from the pixels, Alnitak's halo lost its colour noise: 27.5 -> 3.9 at 25-40 px)
+        targets = []
+        for sm in (False, True):
+            g = (lambda a: cv2.GaussianBlur(a, (0, 0), 2.0)) if sm else (lambda a: a)
+            pg = np.where(wt > 0, np.maximum(g(prof), 0.0), 0.0) * wt
+            pr_ = np.where(wt > 0, np.maximum(g(pr), 0.0), 0.0) * wt
+            if pg.sum() <= 0:
+                pg = pr_
+            if pg.sum() <= 0:
+                targets = None
+                break
+            pg, pr_ = pg / pg.sum(), (pr_ / pr_.sum() if pr_.sum() > 0 else pg / pg.sum())
+            base = np.stack([orig[c] - wt * g(orig[c] - so[c]) for c in range(C)])     # the star's light taken out
+            targets.append(_place_star_light(base, so, f_r, pg, pr_, m))
+        if targets is None:
+            continue
+        (sharp, t_s), (smooth, _) = targets
+        blended += t_s > 0
+        # the sharp target where the deconvolution reshapes the star - its PSF core, out from a saturated plateau - and
+        # the smooth one beyond, by distance: judged by significance, a bright halo's own photon noise (several times the
+        # sky's) passed for structure and the halo lost its colour noise
+        sat = m & (rc.max(0) >= CONSERVE_SATURATED)
+        r_core = (float(d[sat].max()) if sat.any() else 0.0) + CONSERVE_CORE_FWHM * fwhm
+        w_hf = np.clip((r_core + CONSERVE_CORE_FWHM * fwhm - d) / (CONSERVE_CORE_FWHM * fwhm), 0.0, 1.0)
+        oc[...] = np.minimum(w_hf * sharp + (1.0 - w_hf) * smooth, 1.0)
+        moved += 1
+    info.update(radius_median=round(float(np.median(radii)), 1), radius_max=round(float(radii.max()), 1), sky_sigma=float(f"{sigma:.3g}"),
+                light_before_median=round(float(np.median(ratios)), 4) if ratios else None,
+                light_before_p10=round(float(np.percentile(ratios, 10)), 4) if ratios else None,
+                stars_corrected=moved, stars_restored_from_input=lost, dip_px_lifted=lifted,
+                stars_widened_below_saturation=int(blended))
+    return o, info
+
+
 class Restorer:
     """The linear post-processing chain on ``stack.fits`` -> ``linear.fits`` (DESIGN section 4 "Restore")."""
 
@@ -1342,9 +1531,12 @@ class Restorer:
             try:
                 src, dst = self._file(self.arr, f"gxdc_{kind}_in.fits"), self._out(f"gxdc_{kind}_out.fits")
                 meta = tools.graxpert.deconvolve(src, dst, kind=kind, strength=d, psfsize=fwhm, gpu=self.gpu, progress=s.sub, checkpoint=s.checkpoint)
-                self.arr = _sanitize(fitsio.read_rgb(dst)[0])
+                before, self.arr = self.arr, _sanitize(fitsio.read_rgb(dst)[0])
+                extra = {}
+                if kind == "stellar":                                  # its log-space residual does not conserve a star's light (conserve_star_light)
+                    self.arr, extra["star_light"] = conserve_star_light(self.arr, before, fwhm)
                 s.add("deconvolution", f"graxpert deconvolution ({'objects' if kind == 'obj' else 'stars'})", seconds=time.time() - t0, region=region, strength=round(d, 3),
-                      psfsize=round(fwhm, 2), model=meta.get("model"), providers=meta.get("providers"))
+                      psfsize=round(fwhm, 2), model=meta.get("model"), providers=meta.get("providers"), **extra)
             except Cancelled:
                 raise
             except (ToolUnavailable, ToolError) as e:

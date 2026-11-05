@@ -403,3 +403,61 @@ def test_join_stars_takes_the_whole_star_and_keeps_the_base_images_sky():
     hp = joined[1] - cv2.GaussianBlur(joined[1], (0, 0), 3)
     assert 1.4826 * float(np.median(np.abs(hp[ann]))) < 1.4 * 1.4826 * float(np.median(np.abs((base[1] - cv2.GaussianBlur(base[1], (0, 0), 3))[ann])))
     assert info["extension_max"] > 1.5                                          # followed past the footprint
+
+
+def test_conserve_star_light_restores_graxperts_lost_light_and_lifts_its_dips():
+    """GraXpert's stellar network works on log intensities (IC 434 2026-11-03: stars kept 0.58 of their light, per channel
+    differently - green stars - with dark notches beside them).  The projection gives every star its light back per
+    channel on GraXpert's own sharper profile, lifts the dip, and leaves the sky and its noise alone."""
+    rng = np.random.default_rng(3)
+    H = W = 300
+    yy, xx = np.mgrid[:H, :W]
+    sky, noise = 0.03, 4e-4
+    stars = [(60, 60, 0.05), (60, 200, 0.2), (150, 120, 0.8), (230, 70, 0.02), (240, 230, 0.4)]
+    ref = np.full((3, H, W), sky, np.float32)
+    out = np.full((3, H, W), sky, np.float32)
+    colour = np.array([0.7, 1.0, 0.9], np.float32)
+    lost = np.array([0.6, 0.75, 0.5], np.float32)                      # GraXpert: a different loss per channel
+    for y, x, a in stars:
+        r2 = (yy - y) ** 2 + (xx - x) ** 2
+        g_ref = np.exp(-r2 / (2 * 1.8 ** 2))
+        dip = -0.3 * a * np.exp(-((np.sqrt(r2) - 4.0) ** 2) / 2) * (yy > y)  # a notch on one side
+        for c, s_out in enumerate((1.3, 1.4, 0.9)):                       # sharper, each channel differently (blue core, green halo)
+            g_out = np.exp(-r2 / (2 * s_out ** 2)) * (1.8 / s_out) ** 2
+            ref[c] += a * colour[c] * g_ref
+            out[c] += a * colour[c] * lost[c] * g_out + 0.02 * dip
+    n = rng.normal(0, noise, (3, H, W)).astype(np.float32)
+    ref += n
+    out += n
+    fixed, info = post.conserve_star_light(out, ref, fwhm=1.8 * 2.355)
+    assert info["stars"] == len(stars) and info["stars_corrected"] == len(stars)
+    assert fixed.max() <= max(ref.max(), out.max(), 0) + 1e-6 and fixed.max() <= 1.0   # no core pushed past the data's range (RC-Astro rescales it)
+
+    def flux(img, y, x):
+        r = np.hypot(yy - y, xx - x)
+        return np.array([(img[c][r <= 12] - np.median(img[c][(r > 20) & (r < 30)])).sum() for c in range(3)])
+
+    for y, x, a in stars:
+        k = flux(fixed, y, x) / flux(ref, y, x)
+        assert np.all(np.abs(k - 1) < 0.03), (y, x, k)                       # the light, per channel (the colour)
+        assert flux(out, y, x)[2] / flux(ref, y, x)[2] < 0.6                 # (what GraXpert delivered)
+        assert fixed[1, y, x] > ref[1, y, x]                                 # GraXpert's sharper core stays sharper
+        r = np.hypot(yy - y, xx - x)
+        if a >= 0.2:                                                          # one colour across the star: core and wing alike
+            gb = [(fixed[1][z] - sky).sum() / (fixed[2][z] - sky).sum() for z in ((r <= 1.5), (r > 1.5) & (r <= 4))]
+            assert abs(gb[0] / gb[1] - 1) < 0.05, (y, x, gb)
+        r = np.hypot(yy - y, xx - x)
+        ring = (r > 3) & (r < 5) & (yy > y)
+        below = cv2.GaussianBlur(fixed[1], (0, 0), 1.0)[ring].min() - sky
+        assert below > -3 * noise, (y, x, below / noise)                    # no notch below the sky
+    far = np.ones((H, W), bool)
+    for y, x, _ in stars:
+        far &= np.hypot(yy - y, xx - x) > 30
+    assert abs(float(np.median(fixed[1][far]) - np.median(ref[1][far]))) < 0.1 * noise
+    assert np.std(fixed[1][far] - out[1][far]) < 0.05 * noise              # the sky's noise untouched
+    # the colour noise of a bright star's halo stays (rebuilt from the luminance, Alnitak's halo lost it - a grey disc)
+    r = np.hypot(yy - 150, xx - 120)
+    halo = (r > 8) & (r < 14)
+    hp = lambda img: img - np.stack([cv2.GaussianBlur(img[c], (0, 0), 2.0) for c in range(3)])
+    cn_fixed, cn_ref = (hp(fixed)[1] - hp(fixed)[2])[halo].std(), (hp(ref)[1] - hp(ref)[2])[halo].std()
+    assert abs(cn_fixed / cn_ref - 1) < 0.15, (cn_fixed, cn_ref)
