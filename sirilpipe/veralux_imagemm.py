@@ -2843,6 +2843,10 @@ class ImageMMEngine:
                 active.remove(idx)
                 del m, d_norm, d
                 continue
+            # (a channel without a measured far wing keeps the short support: zero-padded, centred, to the longest -
+            # torch.stack refused the mix, 161 and 81 px, on an M 42 crop where one channel had no wing)
+            n_k = max(int(k_.shape[-1]) for k_ in ks)
+            ks = [k_ if k_.shape[-1] == n_k else torch.nn.functional.pad(k_, [(n_k - k_.shape[-1]) // 2] * 4) for k_ in ks]
             kernel_list_hr[idx] = torch.stack(ks).contiguous()           # (C or 1, k, k): broadcasts over channels
             have = torch.isfinite(d).to(d_norm.dtype)
             all_accum += d_norm * have

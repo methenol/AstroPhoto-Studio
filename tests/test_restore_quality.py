@@ -461,3 +461,28 @@ def test_conserve_star_light_restores_graxperts_lost_light_and_lifts_its_dips():
     hp = lambda img: img - np.stack([cv2.GaussianBlur(img[c], (0, 0), 2.0) for c in range(3)])
     cn_fixed, cn_ref = (hp(fixed)[1] - hp(fixed)[2])[halo].std(), (hp(ref)[1] - hp(ref)[2])[halo].std()
     assert abs(cn_fixed / cn_ref - 1) < 0.15, (cn_fixed, cn_ref)
+
+
+def test_keep_trail_repairs_keeps_trails_and_refuses_filled_filaments():
+    """Cosmic Clarity's satellite remover filled M 42's filaments with a flat sky level (2026-11-04: black streaks in every
+    finish).  A trail only adds light: its repair comes down to its surroundings, a false one goes below them."""
+    rng = np.random.default_rng(5)
+    H, W = 200, 200
+    yy, xx = np.mgrid[:H, :W]
+    noise = 3e-4
+    nebula = 0.004 + 0.006 * np.exp(-((xx - 140) ** 2) / (2 * 30 ** 2))          # smooth nebula on the right
+    filament = 0.004 * np.exp(-((xx - 0.5 * yy - 100) ** 2) / (2 * 2.0 ** 2)) * (yy > 40) * (yy < 160)
+    base = np.stack([nebula + filament] * 3).astype(np.float32) + rng.normal(0, noise, (3, H, W)).astype(np.float32)
+    trail = (np.abs(yy - 0.3 * xx - 20) < 1.5) & (xx < 90)                        # a real trail across the sky on the left
+    before = base.copy()
+    before[:, trail] += 0.01
+    after = before.copy()
+    after[:, trail] = base[:, trail]                                              # the trail repaired to its surroundings
+    fil = filament > 0.002
+    after[:, fil] = 0.004                                                         # the filament "repaired" to the sky level
+    out, info = post.keep_trail_repairs(before, after)
+    assert info["refused"] == 1 and info["kept"] >= 1, info
+    assert np.allclose(out[:, fil], before[:, fil], atol=1e-6)                    # the filament is back
+    assert np.allclose(out[:, trail], base[:, trail], atol=1e-6)                  # the trail stays removed
+    nothing, info0 = post.keep_trail_repairs(before, before)
+    assert info0["regions"] == 0 and np.array_equal(nothing, before)

@@ -733,6 +733,63 @@ def star_flux_guard(arr: np.ndarray, ref: np.ndarray, tol: float = GUARD_TOL, ns
     return arr, info
 
 
+TRAIL_CHANGED = 3.0      # a satellite repair: where the remover moved the luminance by more than this many sky sigmas ...
+TRAIL_RING = (2, 8)      # ... judged against the original's pixels this far around it (px) ...
+TRAIL_FLOOR_PCT = 10     # ... whose lower decile (less TRAIL_CHANGED standard errors of the repair's median) a trail's repair cannot go under
+
+
+def keep_trail_repairs(before: np.ndarray, after: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Cosmic Clarity's satellite repairs, kept where they are trails.  Returns (image, record).
+
+    A satellite trail only adds light, so its repair brings the pixels down to their surroundings, never below them.
+    On M 42 (2026-11-04, ``--sat-mode full --sensitivity 0.1``) the remover took the nebula's long filaments for trails
+    and filled them with a flat 0.0036 - 0.39 of the nebula around them - and every finish carried black streaks.  Each
+    connected region the remover changed is compared with the original's ring around it: a repair whose median falls
+    under the ring's lower decile by more than TRAIL_CHANGED standard errors removed structure, not a trail, and the
+    original's pixels come back there (with a 1 px feathered edge)."""
+    from scipy import ndimage as ndi
+
+    b = np.asarray(before, np.float32)
+    a = np.asarray(after, np.float32)
+    lb, la = finish.luminance(b), finish.luminance(a)
+    sigma = max(finish.lower_half_sigma(finish.sample(lb)), 1e-9)
+    moved = np.abs(la - lb) > TRAIL_CHANGED * sigma
+    lab, n = ndi.label(ndi.binary_dilation(moved, iterations=2))
+    info: dict = {"regions": int(n), "kept": 0, "refused": 0, "refused_px": 0}
+    if not n:
+        return a, info
+    refuse = np.zeros(lb.shape, bool)
+    worst = []
+    for i, sl in enumerate(ndi.find_objects(lab), start=1):
+        y0, y1 = max(0, sl[0].start - TRAIL_RING[1]), min(lb.shape[0], sl[0].stop + TRAIL_RING[1])
+        x0, x1 = max(0, sl[1].start - TRAIL_RING[1]), min(lb.shape[1], sl[1].stop + TRAIL_RING[1])
+        comp = lab[y0:y1, x0:x1] == i
+        core = comp & moved[y0:y1, x0:x1]                     # the pixels the remover moved (the region is dilated by 2 px)
+        ring = ndi.binary_dilation(comp, iterations=TRAIL_RING[1]) & ~ndi.binary_dilation(comp, iterations=TRAIL_RING[0])
+        ring &= lab[y0:y1, x0:x1] == 0
+        if ring.sum() < 8:
+            info["kept"] += 1
+            continue
+        # the repair's median against the ring's lower decile, within three standard errors of that median
+        # (1.2533 sigma / sqrt(n)): a single pixel's 3 sigma let small false repairs through (26 px halved to 0.0063
+        # in a 0.0087..0.0122 nebula)
+        floor = float(np.percentile(lb[y0:y1, x0:x1][ring], TRAIL_FLOOR_PCT)) - TRAIL_CHANGED * 1.2533 * sigma / np.sqrt(core.sum())
+        level = float(np.median(la[y0:y1, x0:x1][core]))
+        if level < floor:
+            refuse[y0:y1, x0:x1] |= comp
+            info["refused"] += 1
+            worst.append((round(float((level - floor) / sigma), 1), sl[0].start, sl[1].start, int(core.sum())))
+        else:
+            info["kept"] += 1
+    if refuse.any():
+        w = cv2.GaussianBlur(ndi.binary_dilation(refuse, iterations=1).astype(np.float32), (0, 0), 1.0)
+        w = np.clip(w * 2.0, 0.0, 1.0)[None]
+        a = (a * (1.0 - w) + b * w).astype(np.float32)
+        info["refused_px"] = int(refuse.sum())
+        info["refused_worst"] = [list(v) for v in sorted(worst)[:5]]            # (sigmas under the floor, y, x, px)
+    return a, info
+
+
 CONSERVE_NSIG = 5.0      # a star: a peak this many sky sigmas above its own sky on the reference
 CONSERVE_EDGE = 1.0      # its region ends where its mean radial profile on the reference falls to this many sigmas ...
 CONSERVE_MIN_R = 3.0     # ... and no nearer than this many FWHM (GUARD_APER_FWHM: the aperture that holds a star's whole light)
@@ -1061,9 +1118,11 @@ class Restorer:
         t0 = time.time()
         cli = ["--sat-mode", "full", "--sensitivity", "0.1"]
         try:
-            self.arr, meta = self._cc("satellite", self.arr, cli)
+            before = self.arr
+            fixed, meta = self._cc("satellite", self.arr, cli)
+            self.arr, check = keep_trail_repairs(before, fixed)
             s.add("satellite", "cosmic clarity satellite", seconds=time.time() - t0, command=meta["command"], trails_detected=meta.get("trails_detected"),
-                  backend=meta.get("backend"), device=meta.get("device"))
+                  backend=meta.get("backend"), device=meta.get("device"), repairs=check)
         except Cancelled:
             raise
         except (ToolUnavailable, ToolError) as e:

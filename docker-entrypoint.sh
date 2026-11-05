@@ -14,15 +14,21 @@ export USER="${USER:-astrophoto}" LOGNAME="${LOGNAME:-astrophoto}"
 # Siril keeps every frame of a sequence open (2000+ subs): raise the open-files limit as far as allowed
 ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
-# per-user directories of the tools (HOME is on the output volume): Siril, GraXpert, RC-Astro, StarNet
-prepare_home() {
+# per-user directories of the tools (HOME is on the output volume): Siril, GraXpert, RC-Astro, StarNet.
+# siril-scripts / siril-spcc-database must sit at their XDG location (canonical clones from the image).  A copy that is
+# not the image's (its .image-version: upstream commit + the patches) is replaced: copied once and never again, the
+# volume kept the 2026-10-14 scripts through every rebuild, and patched scripts never reached Siril.  One definition,
+# run by both start paths (the user's own and root dropping to the user).
+PREPARE_HOME='
     mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/tools"
-    # siril-scripts / siril-spcc-database must sit at their XDG location (canonical clones from the image)
     for d in /opt/siril-data/*; do
         [ -d "$d" ] || continue
-        [ -e "$HOME/.local/share/$(basename "$d")" ] || cp -a "$d" "$HOME/.local/share/"
-    done
-}
+        t="$HOME/.local/share/$(basename "$d")"
+        if [ ! -e "$t" ] || [ "$(cat "$d/.image-version" 2>/dev/null)" != "$(cat "$t/.image-version" 2>/dev/null)" ]; then
+            rm -rf "$t.new" && cp -a "$d" "$t.new" && rm -rf "$t" && mv "$t.new" "$t"
+        fi
+    done'
+prepare_home() { sh -c "$PREPARE_HOME"; }
 
 # one line per tool in the container log (no licence is touched: read-only queries)
 report_tools() {
@@ -81,11 +87,6 @@ if ! as_user sh -c "test -w '$OUT' && mkdir -p '$HOME'"; then
 fi
 
 # prepare the tool directories as the user (so everything is owned by it), then report and start
-as_user sh -c '
-    mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/tools"
-    for d in /opt/siril-data/*; do
-        [ -d "$d" ] || continue
-        [ -e "$HOME/.local/share/$(basename "$d")" ] || cp -a "$d" "$HOME/.local/share/"
-    done' || true
+as_user sh -c "$PREPARE_HOME" || true
 report_tools
 exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"

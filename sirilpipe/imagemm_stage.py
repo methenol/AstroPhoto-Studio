@@ -1041,7 +1041,7 @@ def _signature(keys, crop, region, scale, flip, cosmetic=True, subsky=False) -> 
 
 
 STAR_REPORT = ("saturated_cores", "bloom_grow", "point_initial", "saturated_photometry", "saturated_point_sources",
-               "restored_psf_stars", "censored_extended_px", "censored_bound_px")
+               "restored_psf_stars", "censored_extended_px", "censored_bound_px", "psf_radial_wings", "psf_wing_chroma")
 # Every star, not the first two dozen: the star verdicts are per star, and a field of a few hundred saturated cores is
 # ~50 KB of meta -- cheaper than the one defect a truncated list hides. (C 49 measured 43; only 24 were ever visible.)
 STAR_LIST_CAP = 400

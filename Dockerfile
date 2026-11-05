@@ -32,6 +32,12 @@ RUN curl -fsSL -o Siril.AppImage "https://free-astro.org/download/Siril-${SIRIL_
 RUN mkdir -p /opt/siril-data \
  && git clone --depth 1 https://gitlab.com/free-astro/siril-scripts.git      /opt/siril-data/siril-scripts \
  && git clone --depth 1 https://gitlab.com/free-astro/siril-spcc-database.git /opt/siril-data/siril-spcc-database
+# fixes to the published scripts (patches/siril-scripts/*.patch, each says why): applied with git apply, so a
+# changed upstream fails the build instead of shipping unfixed
+COPY patches/siril-scripts /tmp/patches/siril-scripts
+RUN cd /opt/siril-data/siril-scripts \
+ && for p in /tmp/patches/siril-scripts/*.patch; do git apply --whitespace=nowarn "$p" || exit 1; done \
+ && { git rev-parse HEAD; cat /tmp/patches/siril-scripts/*.patch | sha1sum; } > .image-version
 
 # ---------------------------------------------------------------- GraXpert venv (own numpy / onnxruntime)
 FROM python:3.12-slim AS graxpert-build
