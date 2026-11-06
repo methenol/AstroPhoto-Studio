@@ -458,15 +458,25 @@ def stack_is_flipped(ref: np.ndarray, frame: np.ndarray) -> tuple[bool, dict]:
 
 
 def alignment_shift(ref: np.ndarray, frame: np.ndarray) -> list[float]:
-    """(dx, dy) of a frame against stack.fits (phase correlation of the smoothed g channels, 4x down-sampled
-    and scaled back): the frames must sit on the stack's pixels."""
+    """(dx, dy) of a frame against stack.fits: the frames must sit on the stack's pixels.  Cross-correlation of the
+    smoothed g channels, its peak located to 0.01 px by the upsampled DFT (Guizar-Sicairos, Thurman & Fienup 2008:
+    scikit-image ``phase_cross_correlation``, unnormalised).
+
+    OpenCV's ``phaseCorrelate`` read 0.5 px between two IDENTICAL images at some sizes (it pads to its DFT size and
+    the sub-pixel centroid of a peak at zero shift then wraps: 1928 x 3620 -> x 0.5, 1804 x 960 -> y 0.5, 1680 x 852 ->
+    0) and 2.82 px for an exact 2 px shift: ImageMM refused C 9 and B 33 (2026-11-05) - frames that sat on the stack's
+    pixels - as "0.53 / 0.55 px off"."""
+    from skimage.registration import phase_cross_correlation
     have = frame[..., 1] != 0
     a = np.where(have, frame[..., 1], np.median(frame[..., 1][have]) if have.any() else 0).astype(np.float32)
     b = np.ascontiguousarray(ref[..., 1], np.float32)
-    a = cv2.GaussianBlur(a, (0, 0), 2.0)
-    b = cv2.GaussianBlur(b, (0, 0), 2.0)
-    (dx, dy), _ = cv2.phaseCorrelate(b.astype(np.float64), a.astype(np.float64))
-    return [round(float(dx), 3), round(float(dy), 3)]
+    # the structure (2 px Gaussian less a 15 px one: stars, not levels) where the frame has data: an unnormalised
+    # correlation of the levels followed the edge of a frame's coverage (0.13-0.27 px on frames that sat on the grid)
+    hp = lambda x: cv2.GaussianBlur(x, (0, 0), 2.0) - cv2.GaussianBlur(x, (0, 0), 15.0)            # noqa: E731
+    inside = cv2.erode(have.astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
+    a, b = np.where(inside, hp(a), 0.0), np.where(inside, hp(b), 0.0)
+    sh, _, _ = phase_cross_correlation(b, a, upsample_factor=100, normalization=None)   # the move that registers a onto b
+    return [round(float(-sh[1]), 3), round(float(-sh[0]), 3)]
 
 
 # --------------------------------------------------------------------------- saturation (raw frames)

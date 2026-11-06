@@ -163,7 +163,7 @@ def _job(job_id: str) -> dict:
 
 
 def _profiles() -> dict:
-    PROFILES, STACK_DEFAULTS = srv.PROFILES, srv.STACK_DEFAULTS
+    PROFILES, STACK_DEFAULTS = srv.PROFILES, srv.stack_defaults()
     return {name: {"label": p.get("label", name), "stack_params": p.get("stack_params", {}),
                    "params": p.get("params", {}),
                    "effective": {k: {**STACK_DEFAULTS, **p.get("stack_params", {})}[k]
@@ -182,7 +182,7 @@ def health():
 
 @router.get("")
 def info():
-    STACK_DEFAULTS = srv.STACK_DEFAULTS
+    STACK_DEFAULTS = srv.stack_defaults()
     dev = srv.device_info()
     srv._load_jobs()
     return srv.clean_json({

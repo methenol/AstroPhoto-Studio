@@ -227,10 +227,10 @@ def test_run_stack_writes_stack_and_meta(session):
     assert r["ok"] is True and session.meta["wcs"] is True and r["pixel_scale"] == pytest.approx(2.52, abs=0.01)
 
 
-def test_two_x_request_falls_back_with_reason(session):
+def test_two_x_request_is_stacked_at_two_x(session):
     session.run_analysis(1.0)
     meta = session.run_stack({"scale": 2})
-    assert meta["scale"] == 1.0 and "requested 2x drizzle, using 1x" in meta["resampling_reason"]
+    assert meta["scale"] == 2.0 and "2x drizzle as requested" in meta["resampling_reason"]
 
 
 def test_new_stack_invalidates_later_products(session):

@@ -322,11 +322,11 @@ def test_profiles(env):
     assert list(r["profiles"]) == ["default", "imagemm", "n2n-imagemm", "n2n-network", "n2n-rl"]
     p = r["profiles"]["n2n-network"]
     assert p["label"].startswith("Fast restoration: BlurXTerminator")
-    assert p["stack_params"] == {"deconv_method": "auto", "ai_deconvolution": True, "scale": 2.0}
+    assert p["stack_params"] == {"deconv_method": "auto", "ai_deconvolution": True, "autofinish": False, "scale": 2.0}
     assert p["effective"] == {"deconv_method": "auto", "ai_deconvolution": True, "imagemm_n2n": True,
                               "star_remover": True, "scale": 2.0}
     d = r["profiles"]["default"]["effective"]
-    assert d == {"deconv_method": "auto", "ai_deconvolution": True, "imagemm_n2n": True, "star_remover": True, "scale": 1.0}
+    assert d == {"deconv_method": "auto", "ai_deconvolution": True, "imagemm_n2n": True, "star_remover": True, "scale": 2.0}
     assert r["profiles"]["n2n-rl"]["effective"]["ai_deconvolution"] is False
     assert r["profiles"]["n2n-rl"]["effective"]["deconv_method"] == "rl"
 
@@ -1059,3 +1059,32 @@ def test_failed_restore_step_is_a_job_warning(env):
     assert done["state"] == "done" and done["message"] == "Finished with 2 failed steps"
     assert done["warnings"][0] == "gradient (graxpert): PermissionError: graxpert.log"
     assert done["warnings"][1].startswith("star photometry (graxpert deconvolution (stars)): the stars kept 0.58")
+
+
+def test_a_stack_below_the_requested_scale_is_a_job_warning(env):
+    """2x requested with drizzle, the drizzle rule stacked at 1x and nothing upscaled (Seestar, 2026-11-05): the job says so."""
+    orig = FakeSession.run_stack
+
+    def stack(self, sp, progress):
+        r = orig(self, sp, progress)
+        with open(os.path.join(self.dir, "stack_meta.json"), "w") as f:
+            json.dump({"scale": 1.0, "params": {"scale": 2.0, "superres_method": "drizzle"},
+                       "resampling_reason": "requested 2x drizzle, using 1x: median FWHM 2.96 px is not < 2.0 px"}, f)
+        return r
+    FakeSession.run_stack = stack
+    try:
+        done = wait_state(env.client, submit(env, stack_params={"autofinish": False, "star_remover": False})["id"])
+    finally:
+        FakeSession.run_stack = orig
+    assert done["state"] == "done" and done["message"] == "Finished with 1 failed step"
+    assert done["warnings"][0].startswith("super-resolution: 2x requested, the stack is 1x")
+
+
+def test_defaults_without_cosmic_clarity_are_2x_drizzle_and_no_autofinish(env):
+    """The default and n2n-network profiles: no auto-finish, 2x super-resolution - Cosmic Clarity when its model is
+    installed (with its Sharpen, both), else drizzle (the test environment has no Cosmic Clarity)."""
+    import webui.server as srv
+    d = srv.stack_defaults()
+    assert d["autofinish"] is False and d["scale"] == 2.0 and d["superres_method"] == "drizzle"
+    for name in ("default", "n2n-network"):
+        assert {**d, **srv.PROFILES[name]["stack_params"]}["autofinish"] is False

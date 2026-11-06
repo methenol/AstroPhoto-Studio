@@ -158,3 +158,17 @@ def test_dualband_names():
         assert dataset.is_dualband(f), f
     for f in ("", "Astro", "UV/IR Block", "L", "Optolong L-Pro"):
         assert not dataset.is_dualband(f), f
+
+
+def test_binned_and_unbinned_subs_of_one_sensor_are_one_set():
+    """The Seestar S50 Pro bins 2 x 2 in one session and not in the next (IC 434: 1080 x 1920 / 2160 x 3840): grouped by
+    the file's size the 4K session was left out unseen; by the sensor's size both stack, on the finest frames' grid."""
+    def fr(name, w, h, b, t):
+        return dataset.Frame(path=f"/x/{name}", name=name, folder="/x", object="IC 434", filter="LP", exptime=60.0, gain=200.0,
+                             temp=None, date_obs="", timestamp=t, bayer="GRBG", width=w, height=h, binning=b,
+                             focallen=250.0, pixsize=2.9 * b)
+    a, b_ = fr("a", 2160, 3840, 1, 1.0), fr("b", 1080, 1920, 2, 2.0)
+    assert a.group_key == b_.group_key
+    fs = dataset.FrameSet(folders=["/x"], frames=[b_, a])
+    assert fs.mixed_binning and fs.finest_binning == 1
+    assert abs(fs.pixel_scale - 206.265 * 2.9 / 250.0) < 1e-9          # the full-resolution grid's, not the first frame's

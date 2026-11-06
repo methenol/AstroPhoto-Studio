@@ -7,6 +7,8 @@ pillow>=10.0
 tifffile>=2024.1
 # astrophoto/ (ImageMM stage only): sep
 sep>=1.4
+# ImageMM's frame-to-stack alignment check (upsampled cross-correlation); astroalign needs it too
+scikit-image>=0.22
 astroalign>=2.5
 pyvo>=1.5
 # Experiments tab (Optuna studies)

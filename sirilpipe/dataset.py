@@ -87,8 +87,12 @@ class Frame:
 
     @property
     def group_key(self) -> tuple:
+        # the sensor's own size (frame size x binning): a camera that bins 2 x 2 in one session and not in the next (the
+        # Seestar S50 Pro: 1080 x 1920 binned / 2160 x 3840) records the same target - the registration measures the 2x and
+        # the stack takes the finest frames' grid.  Grouped by the file's size, the 4K session was left out unseen (IC 434,
+        # 2026-11-05: 38 full-resolution subs dropped, the stack 864 x 1732 of the binned ones)
         return (_norm(self.object), _norm(self.filter), round(self.exptime, 2), round(self.gain, 1),
-                self.width, self.height, self.bayer.upper())
+                self.width * self.binning, self.height * self.binning, self.bayer.upper())
 
 
 @dataclass
@@ -162,9 +166,18 @@ class FrameSet:
         return sum(f.exptime for f in self.frames)
 
     @property
+    def finest_binning(self) -> int:
+        """The smallest binning among the frames: the grid the stack takes (``mixed_binning``: frames of more than one)."""
+        return min((f.binning for f in self.frames), default=1)
+
+    @property
+    def mixed_binning(self) -> bool:
+        return len({f.binning for f in self.frames}) > 1
+
+    @property
     def pixel_scale(self) -> float | None:
-        """Arcsec per pixel from XPIXSZ / FOCALLEN (None when either is unknown)."""
-        f = self.first
+        """Arcsec per pixel from XPIXSZ / FOCALLEN of a frame at the finest binning (None when either is unknown)."""
+        f = next((f for f in self.frames if f.binning == self.finest_binning), self.first)
         if f.pixsize and f.focallen:
             return 206.265 * f.pixsize / f.focallen
         return None

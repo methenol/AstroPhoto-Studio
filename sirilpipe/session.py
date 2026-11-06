@@ -550,8 +550,13 @@ class Session:
                 self._frame_bkg_unit(u, seq, pat, progress)
             self._time("frame_background", time.time() - t0)
         if len(units) > 1:
-            runner.run(workflow.merge_script(units, self.process, seq), "merge", expect=[f"{seq}_.seq"],
-                       label="Calibrating (merging nights)")
+            if len({(u.frames[0].width, u.frames[0].height) for u in units if u.frames}) > 1:
+                # nights of different frame sizes (one binned 2 x 2): one sequence of mixed sizes, which merge refuses
+                runner.run(workflow.link_units(units, self.process, seq), "merge", expect=[f"{seq}_.seq"],
+                           label="Calibrating (joining nights of different binning)")
+            else:
+                runner.run(workflow.merge_script(units, self.process, seq), "merge", expect=[f"{seq}_.seq"],
+                           label="Calibrating (merging nights)")
         t0 = time.time()
         runner.run(workflow.register_script(self.process, seq, n), "register", expect=[f"{seq}_.seq"],
                    label="Registering (pass 1/2)", markers=[(r"Trial #|choosing image|Matching stars", "Registering (pass 2/2)")])
@@ -581,10 +586,15 @@ class Session:
                           "nbstars": sf.nbstars, "roundness": sf.roundness, "wfwhm": sf.wfwhm, "fwhm": sf.fwhm,
                           "bkg": sf.background, "quality": sf.quality, "H": sf.H})
         rows = []
+        # FWHM on one grid: Siril measures each frame in its own pixels, and a 2 x 2-binned frame's stars are half as many
+        # pixels wide - the selection would have taken a full-resolution session for blurred (mixed binning, ``dataset.Frame.group_key``)
+        fine = min((f.binning for f in frames), default=1)
         for i, (f, s) in enumerate(zip(frames, stats)):
+            k = (f.binning or 1) / max(fine, 1)
             rows.append({"idx": i, "group": groups[i], "name": f.name, "path": f.path, "folder": f.folder, "time": f.date_obs, "date": f.date_obs,
-                         "exptime": f.exptime, "gain": f.gain, "temp": f.temp,
-                         "registered": s["registered"], "fwhm": s["fwhm"], "wfwhm": s["wfwhm"],
+                         "exptime": f.exptime, "gain": f.gain, "temp": f.temp, "binning": f.binning,
+                         "registered": s["registered"], "fwhm": s["fwhm"] * k if s["fwhm"] else s["fwhm"],
+                         "wfwhm": s["wfwhm"] * k if s["wfwhm"] else s["wfwhm"],
                          "roundness": s["roundness"], "elongation": (1.0 / s["roundness"]) if s["roundness"] else None,
                          "bkg": s["bkg"], "background": s["bkg"], "nbstars": s["nbstars"], "n_stars": s["nbstars"],
                          "quality": s["quality"], "H": s["H"], "is_reference": i == max(seqd.reference, 0),
@@ -604,8 +614,11 @@ class Session:
     def _apply_selection(self, sensitivity: float) -> None:
         rows = self._rows or []
         reasons: list[list[str]] = [[] for _ in rows]
-        for g in sorted({r.get("group", 0) for r in rows}):         # wFWHM ranks are only comparable within an exposure
-            idx = [i for i, r in enumerate(rows) if r.get("group", 0) == g]
+        # wFWHM ranks are only comparable within an exposure - and within a binning: Siril weights the FWHM by the stars it
+        # detects, and a 2 x 2-binned frame detects twice as many (IC 434 2026-11-05: the full-resolution night, sharper at
+        # 4.2 px against 5.8, lost 25 of its 37 frames to the binned night's cut)
+        for g in sorted({(r.get("group", 0), r.get("binning") or 1) for r in rows}):
+            idx = [i for i, r in enumerate(rows) if (r.get("group", 0), r.get("binning") or 1) == g]
             for i, why in zip(idx, workflow.select_frames([rows[i] for i in idx], sensitivity)):
                 reasons[i] = why
         wmin = min([r["wfwhm"] for r in rows if r.get("wfwhm")] or [1.0])
@@ -759,7 +772,13 @@ class Session:
             runner = self._runner(progress)
             workflow.clean_registered(self.process)
             t0 = time.time()
-            runner.run(workflow.apply_script(self.process, seq, n, excluded, rs), "apply_registration",
+            # mixed binning: the output takes the grid of the best frame at the finest binning (``-2pass`` picks its reference by
+            # quality, a binned one as often as not, and every full-resolution frame was then binned onto its grid)
+            fine = min((rows[i].get("binning") or 1 for i in inc), default=1)
+            ref_fine = None
+            if any((rows[i].get("binning") or 1) != fine for i in inc):
+                ref_fine = max((i for i in inc if (rows[i].get("binning") or 1) == fine), key=lambda i: rows[i].get("weight") or 0.0)
+            runner.run(workflow.apply_script(self.process, seq, n, excluded, rs, reference=ref_fine), "apply_registration",
                        expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc),
                        label="Applying registration")
             if workflow.unstackable_max_framing(os.path.join(self.process, f"r_{seq}_.seq")):
@@ -768,7 +787,7 @@ class Session:
                 log.info("registered frames all at offset 0 with differing sizes: applying again with -framing=current")
                 rs = {**rs, "framing": "current"}
                 workflow.clean_registered(self.process)
-                runner.run(workflow.apply_script(self.process, seq, n, excluded, rs), "apply_registration",
+                runner.run(workflow.apply_script(self.process, seq, n, excluded, rs, reference=ref_fine), "apply_registration",
                            expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc),
                            label="Applying registration")
             self._time("apply_registration", time.time() - t0)

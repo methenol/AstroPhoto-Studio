@@ -38,15 +38,12 @@ REGISTER_ARGS = "-2pass -transf=homography -minpairs=10 -maxstars=2000"
 ROUNDNESS_K = 2.5
 # Bayer drizzle: Siril docs / OSC_Preprocessing_BayerDrizzle.ssf: scale 1, pixfrac 1, square kernel for OSC
 DRIZZLE_1X = {"scale": 1.0, "pixfrac": 1.0, "kernel": "square"}
-# 2x drizzle only with plenty of data and undersampled stars: PixInsight DrizzleIntegration guidance quoted in
-# workflows.md section 10 (FWHM < ~2 px) and the community minimum of 100 subs (lancepickens: 50+; DESIGN: 100)
-DRIZZLE_2X = {"scale": 2.0, "pixfrac": 0.5, "kernel": "square"}   # pixfrac ~ 1/scale (Siril drizzle docs)
+# a scale above 1: the scale asked for, pixfrac ~ 1/scale (Siril drizzle docs)
+DRIZZLE_2X = {"scale": 2.0, "pixfrac": 0.5, "kernel": "square"}
 DRIZZLE_KERNELS = ("square", "point", "turbo", "gaussian", "lanczos2", "lanczos3")   # seqapplyreg -kernel= (Siril 1.4 drizzle)
 # stack rej: Siril's letters; GESDT ("g") is left out (bug #1993, fixed only in 1.4.5); percentile clipping takes fractions, not sigmas
 REJECTIONS = {"winsorized": "w", "sigma": "s", "mad": "a", "linear": "l", "median": "m", "none": "n"}
 WEIGHTINGS = ("wfwhm", "nbstars", "noise", "nbstack", "none")                       # stack -weight= (Siril 1.4); none = no weighting
-DRIZZLE2_MIN_FRAMES = 100
-DRIZZLE2_MAX_FWHM = 2.0
 # Banding (CMOS row noise): Siril's own tool, run on the calibrated CFA subs BEFORE registration, where the pattern still lies along the sensor rows
 # (after the 0-2 degree field rotation of an alt-az mount and the drizzle it is smeared into the stack and cannot be removed any more).  Siril docs
 # (https://siril.readthedocs.io/en/stable/Commands.html#fixbanding): "amount defines the amount of correction, between 0 and 4. sigma defines the
@@ -136,20 +133,15 @@ def _decide_resampling(params: dict, n_included: int, median_fwhm: float | None,
                    reason="demosaic + Lanczos4 registration" if cfa else "not a Bayer mosaic")
         return out
     if want > 1.0:
-        if mode == "drizzle":                          # the user chose Bayer drizzle at this scale explicitly: honoured (Siril drizzle docs: pixfrac ~ 1 / scale)
-            out.update(scale=float(want), pixfrac=round(1.0 / float(want), 3), kernel="square")
-            out["reason"] = f"{want:g}x drizzle requested explicitly (pixfrac {1.0 / want:.2f})"
-            return out
-        ok = n_included >= DRIZZLE2_MIN_FRAMES and median_fwhm is not None and median_fwhm < DRIZZLE2_MAX_FWHM
-        if ok:
-            out.update(DRIZZLE_2X)
-            out["reason"] = f"2x drizzle: {n_included} frames, median FWHM {median_fwhm:.2f} px"
-            return out
-        why = (f"only {n_included} frames (< {DRIZZLE2_MIN_FRAMES})" if n_included < DRIZZLE2_MIN_FRAMES
-               else f"median FWHM {median_fwhm:.2f} px is not < {DRIZZLE2_MAX_FWHM} px"
-               if median_fwhm is not None else "no FWHM measurement")
-        out.update(DRIZZLE_1X)
-        out["reason"] = f"requested {want:g}x drizzle, using 1x: {why}"
+        # the scale asked for is the scale delivered (Siril drizzle docs: pixfrac ~ 1 / scale).  Auto used to refuse it below
+        # 100 frames or at a FWHM of 2 px or more and stack at 1x with nothing else upscaling: every Seestar session
+        # (2 x 2-binned subs, ~3 px FWHM) came out at the stack's 864 x 1732 although 2x was requested (2026-11-05).
+        # The sampling is recorded, as information, not as a veto.
+        out.update(scale=float(want), pixfrac=round(1.0 / float(want), 3), kernel="square")
+        sampling = (f"{n_included} frames, median FWHM {median_fwhm:.2f} px" if median_fwhm is not None
+                    else f"{n_included} frames, no FWHM measurement")
+        out["reason"] = (f"{want:g}x drizzle requested explicitly (pixfrac {1.0 / want:.2f})" if mode == "drizzle"
+                         else f"{want:g}x drizzle as requested (pixfrac {1.0 / want:.2f}); {sampling}")
         return out
     out.update(DRIZZLE_1X)
     out["reason"] = "Bayer drizzle 1x (scale 1, pixfrac 1)"
@@ -269,7 +261,7 @@ def clean_process_dir(d: str, keep_logs: bool = True) -> None:
         if name in ("logs", "scripts") and keep_logs:
             continue
         if os.path.isdir(p) and not os.path.islink(p):
-            if name.startswith(("src", "drizztmp", "cache", "u")) or name == "src":
+            if name.startswith(("src", "drizztmp", "cache", "u", "_link")) or name == "src":
                 shutil.rmtree(p, ignore_errors=True)
             continue
         if name.endswith((".fit", ".fits", ".seq", ".lst", ".txt", ".csv")) or os.path.islink(p):
@@ -502,6 +494,23 @@ def banding_install(unit_dir: str, seq: str, prefix: str = "mCFA_unband_CFA0_") 
 def seq_name(units: list[Unit], debayer: bool) -> str:
     """Name of the (merged) calibrated sequence the registration works on."""
     return "pp_light" if (debayer or any(u.calibrated for u in units)) else "light"
+
+
+def link_units(units: list[Unit], process_dir: str, seq: str) -> str:
+    """The units' calibrated sequences as ONE sequence of frames of different sizes, for Siril ``link`` - ``merge`` refuses
+    them ("All sequences must be the same format for merging": IC 434 2026-11-05, a 2 x 2-binned night and a full-resolution
+    one, ``dataset.Frame.group_key``).  The frames are linked, in ``merge``'s order (unit by unit, frame by frame), as
+    ``<process_dir>/_link/<seq>_NNNNN.fit``; the script links them into ``<process_dir>`` with their ``.seq``.  Returns it."""
+    stage = os.path.join(process_dir, "_link")
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    k = 0
+    for u in units:
+        for i in range(1, len(u.frames) + 1):
+            k += 1
+            os.symlink(os.path.join(u.dir, f"{seq}_{i:05d}.fit"), os.path.join(stage, f"{seq}_{k:05d}.fit"))
+    # (``link`` writes the frames only: the .seq is written when a command first opens the sequence)
+    return f"cd {quote(stage)}\nlink {seq} -out={quote(process_dir)}\ncd {quote(process_dir)}\nselect {seq} 1 {k}\n"
 
 
 def merge_script(units: list[Unit], process_dir: str, seq: str) -> str:

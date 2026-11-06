@@ -47,6 +47,7 @@ async function init() {
   buildParamUI();
   buildPresets();
   bindUI();
+  resetStackParams(true);       // the served defaults (Cosmic Clarity super-resolution when installed), not the page's own
   loadExperimentChoices();
   const adv = $(".sidebar details.adv"); if (adv) adv.addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
   Tools.init();
@@ -355,7 +356,7 @@ function renderHypertune(rep) {
   $$("#afReport [data-study]").forEach(a => a.onclick = e => { e.preventDefault(); switchTab("lab"); if (typeof Lab !== "undefined" && Lab.open) Lab.open(a.dataset.study); });
 }
 
-function resetStackParams() {
+function resetStackParams(quiet = false) {
   // every option back to the pipeline's STACK_DEFAULTS (served by /api/system)
   const D = S.system.stack_defaults;
   for (const [k, v] of Object.entries(D)) {
@@ -366,7 +367,7 @@ function resetStackParams() {
     if (el.type === "range" && el.nextElementSibling?.tagName === "OUTPUT") el.nextElementSibling.textContent = (+v).toFixed(1);
   }
   syncHypertune();
-  toast("Integration & compute options reset to defaults");
+  if (!quiet) toast("Integration & compute options reset to defaults");
 }
 
 /* ------------------------------------------------------------ settings from an experiment */
@@ -793,7 +794,7 @@ function bindUI() {
   const q = $("#ex-quality"); q.oninput = () => (q.nextElementSibling.textContent = q.value);
   bindViewer();
   $("#logsRefresh").onclick = loadLogs;
-  $("#spReset").onclick = resetStackParams;
+  $("#spReset").onclick = () => resetStackParams();
 }
 
 init().catch(e => toast(e.message, true));

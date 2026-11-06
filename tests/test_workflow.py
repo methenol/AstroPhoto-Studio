@@ -66,14 +66,14 @@ def test_decide_resampling_default_is_bayer_drizzle_1x():
     assert (r["mode"], r["scale"], r["pixfrac"], r["kernel"]) == ("drizzle", 1.0, 1.0, "square")
 
 
-def test_two_x_drizzle_only_when_rule_allows():
-    ok = w.decide_resampling({"scale": 2}, 300, 1.7)
-    assert ok["scale"] == 2.0 and ok["pixfrac"] == 0.5
-    few = w.decide_resampling({"scale": 2}, 99, 1.7)
-    assert few["scale"] == 1.0 and "only 99 frames" in few["reason"]
-    soft = w.decide_resampling({"scale": 2.0}, 300, 3.1)
-    assert soft["scale"] == 1.0 and "3.10 px" in soft["reason"]
-    assert w.decide_resampling({"scale": 2}, 300, None)["scale"] == 1.0
+def test_the_requested_drizzle_scale_is_delivered():
+    """2x asked for is 2x stacked, whatever the frame count or FWHM (the Seestar's ~3 px subs were refused and the exports
+    came out at 1x with nothing else upscaling); the sampling is recorded as information."""
+    for n, fwhm in ((300, 1.7), (99, 1.7), (300, 3.1), (25, 2.96), (300, None)):
+        r = w.decide_resampling({"scale": 2}, n, fwhm)
+        assert (r["mode"], r["scale"], r["pixfrac"]) == ("drizzle", 2.0, 0.5), (n, fwhm, r)
+        assert "as requested" in r["reason"] and f"{n} frames" in r["reason"]
+    assert w.decide_resampling({"scale": 3}, 25, 3.0)["pixfrac"] == round(1 / 3, 3)
 
 
 def test_demosaic_mode():

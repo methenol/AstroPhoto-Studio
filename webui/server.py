@@ -69,8 +69,9 @@ CONTROL: dict[str, threading.Event] = {}   # job id -> "pause requested" (the se
 
 STACK_DEFAULTS = {
     "mode": "auto",          # auto | drizzle | demosaic
-    "scale": 1.0,            # output up-sampling (1, 1.5, 2; 3, 4 with Cosmic Clarity)
-    "superres_method": "drizzle",   # drizzle = Siril Bayer drizzle at `scale`; cosmic_clarity = stack at 1x, Cosmic Clarity Super-Resolution 2/3/4x on the finished image
+    "scale": 2.0,            # output up-sampling (1, 1.5, 2; 3, 4 with Cosmic Clarity)
+    "superres_method": "drizzle",   # drizzle = Siril Bayer drizzle at `scale`; cosmic_clarity = stack at 1x, Cosmic Clarity Super-Resolution 2/3/4x on the
+                                    # finished image.  The served default is Cosmic Clarity when its super-resolution model is installed (sr_defaults)
     "sigma_low": 4.0,
     "sigma_high": 3.0,
     "local_norm": True,
@@ -125,13 +126,31 @@ STACK_DEFAULTS = {
     "n2n_loss": "asinh_mse",
     "star_remover": True,
     "star_remover_iters": 3000,
-    "autofinish": True,
+    "autofinish": False,
     "deconv_target_fwhm": 0.0,
     "deconv_iters": 6000,
     "deconv_sources": 1.0,
     "network_groups": 0,
     "device": "auto",
 }
+
+
+def sr_defaults() -> tuple[dict, dict]:
+    """(stack_params, params) the defaults take for the super-resolution: 2x by Cosmic Clarity Super-Resolution when its
+    model is installed - with Cosmic Clarity Sharpen (both) on the finished image - else 2x Bayer drizzle.  Read at every
+    use, so a model downloaded in the Tools panel changes the defaults without a restart."""
+    try:
+        ready = bool(tools_mod.cosmic_clarity.ready("superres"))
+    except Exception:                                              # noqa: BLE001  (not installed / no tools: drizzle)
+        ready = False
+    if ready:
+        return {"scale": 2.0, "superres_method": "cosmic_clarity"}, {"cc_sharpen": "both"}
+    return {"scale": 2.0, "superres_method": "drizzle"}, {}
+
+
+def stack_defaults() -> dict:
+    """STACK_DEFAULTS with the super-resolution of ``sr_defaults``: the defaults the web UI, the profiles and the jobs use."""
+    return {**STACK_DEFAULTS, **sr_defaults()[0]}
 
 
 def default_scale(deconv_method: str) -> float:
@@ -152,15 +171,16 @@ def default_scale(deconv_method: str) -> float:
 #                  stars follow it (_run_session_job)
 # ai_deconvolution and imagemm_n2n (the 1.x ImageMM's Noise2Noise pass) are accepted for compatibility and have no effect.
 PROFILES = {
-    "default": {"label": "Pipeline defaults (STACK_DEFAULTS)", "stack_params": {}},
+    "default": {"label": "Pipeline defaults (STACK_DEFAULTS; 2x super-resolution by Cosmic Clarity when installed, else drizzle; no auto-finish)",
+                "stack_params": {"autofinish": False}},
     "imagemm": {"label": "ImageMM: multi-frame restoration of every registered sub (slow, GPU)",
                 "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-imagemm": {"label": "ImageMM multi-frame restoration (same as imagemm with this backend)",
                     "stack_params": {"deconv_method": "imagemm", "imagemm_n2n": True}},
     "n2n-network": {"label": "Fast restoration: BlurXTerminator + NoiseXTerminator when licensed, else GraXpert "
-                             "deconvolution + denoise (Siril RL without GraXpert); 2x drizzle when the data supports it "
-                             "(was: Noise2Noise + deconvolution network)",
-                    "stack_params": {"deconv_method": "auto", "ai_deconvolution": True,
+                             "deconvolution + denoise (Siril RL without GraXpert); 2x super-resolution by Cosmic Clarity when "
+                             "installed, else drizzle; no auto-finish (was: Noise2Noise + deconvolution network)",
+                    "stack_params": {"deconv_method": "auto", "ai_deconvolution": True, "autofinish": False,
                                      "scale": default_scale("auto")}},
     "n2n-rl": {"label": "Siril Richardson-Lucy (TV) deconvolution, no AI restoration "
                         "(was: Noise2Noise denoiser + Richardson-Lucy)",
@@ -281,8 +301,8 @@ def index():
 
 @app.get("/api/system")
 def system():
-    return clean_json({"version": __version__, "backend": "siril", "devices": device_info(), "defaults": {**DEFAULTS, **EXTRA_DEFAULTS},
-                       "stack_defaults": STACK_DEFAULTS, "param_spec": list(PARAM_SPEC), "presets": PRESETS,
+    return clean_json({"version": __version__, "backend": "siril", "devices": device_info(), "defaults": {**DEFAULTS, **EXTRA_DEFAULTS, **sr_defaults()[1]},
+                       "stack_defaults": stack_defaults(), "param_spec": list(PARAM_SPEC), "presets": PRESETS,
                        "images_root": CONFIG["images"], "tools": tools_status(), "job_kinds": JOB_KINDS})
 
 
@@ -714,20 +734,44 @@ def _norm_autofinish(res) -> dict:
     return res.get("autofinish", res) if isinstance(res, dict) else {}
 
 
+def _scale_not_met(s: Session, since: float) -> list[str]:
+    """A stack this job integrated at a smaller scale than the one asked for, as "super-resolution: why".
+
+    ``scale`` 2 with ``superres_method`` drizzle under ``mode`` auto stacks at 1x when the drizzle rule refuses (frames
+    not undersampled: the Seestar's 2 x 2-binned subs measure ~3 px FWHM, never < 2) and nothing else upscales: the
+    exports came out at the stack's 864 x 1732 / 836 x 1736 with the reason only in stack_meta.json (2026-11-05)."""
+    path = os.path.join(s.dir, "stack_meta.json")
+    try:
+        if os.path.getmtime(path) < since:
+            return []
+        meta = _read_json(path) or {}
+        want = float((meta.get("params") or {}).get("scale") or 1.0)
+        got = float(meta.get("scale") or 1.0)
+        method = str((meta.get("params") or {}).get("superres_method") or "drizzle")
+    except (OSError, AttributeError, TypeError, ValueError):
+        return []
+    if want > got + 1e-6 and method != "cosmic_clarity":
+        return [f"super-resolution: {want:g}x requested, the stack is {got:g}x and nothing else upscales - "
+                f"{meta.get('resampling_reason') or 'the drizzle rule refused it'} "
+                f"(Cosmic Clarity Super-Resolution or drizzle mode 'drizzle' deliver the {want:g}x)"]
+    return []
+
+
 def _failed_steps(s: Session, since: float) -> list[str]:
     """The restoration steps that failed in this job (restore_meta.json written by it), each as "step (tool): why".
 
     A failed tool used to leave the job "Finished": GraXpert died on a root-owned log file (2026-11-03) and three IC 434
     exports went out without their gradient removal while every job read done - the failure was only in restore_meta."""
+    out = _scale_not_met(s, since)
     path = os.path.join(s.dir, "restore_meta.json")
     try:
         if os.path.getmtime(path) < since:
-            return []
+            return out
         meta = _read_json(path)
         steps = meta.get("steps") or []
     except (OSError, AttributeError):
-        return []
-    out = [f"{st.get('step')} ({st.get('tool')}): {(st.get('note') or 'failed')[:300]}" for st in steps if st.get("status") == "failed"]
+        return out
+    out += [f"{st.get('step')} ({st.get('tool')}): {(st.get('note') or 'failed')[:300]}" for st in steps if st.get("status") == "failed"]
     # a tool that moved every star's light (star_flux_guard "population") delivered a damaged picture although it "ran":
     # GraXpert's stellar model kept 0.58 of the stars' light on IC 434's stack (BXT 1.01), recorded and never shown
     tools_by_stage = {"deconvolution": [st.get("tool") for st in steps if st.get("step") == "deconvolution" and st.get("status") == "done"]}
@@ -741,7 +785,9 @@ def _failed_steps(s: Session, since: float) -> list[str]:
 
 def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params: dict, export_opts: dict):
     """Map a job kind onto the Session methods (api-contract.md section 2)."""
-    sp = {**STACK_DEFAULTS, **stack_params}
+    sp = {**stack_defaults(), **stack_params}
+    if "cc_sharpen" not in params and str(sp.get("superres_method")) == "cosmic_clarity":
+        params = {**params, "cc_sharpen": "both"}           # Cosmic Clarity in use: its Sharpen (both) by default
     if "deconv_method" in stack_params and "deconv_stars_method" not in stack_params:
         sp["deconv_stars_method"] = ""           # one deconvolution named (an API client, a 1.x profile): the stars follow it (post.deconv_choice)
     # the auto-crop is decided at stack time, so the two processing settings that control it travel

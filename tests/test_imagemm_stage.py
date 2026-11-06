@@ -762,3 +762,21 @@ def test_the_lower_bound_follows_what_imagemm_restores_unless_set():
     assert objects["bound_sigma"] == S.OBJECTS_BOUND_SIGMA == 3.0 and objects["bound_sigma_rule"] == "objects only"
     assert both["bound_sigma"] == 1.0 and stars["bound_sigma"] == 1.0
     assert S.map_params({"deconv_method": "imagemm", "deconv_stars_method": "auto", "imagemm_bound_sigma": 1.5})["bound_sigma"] == 1.5
+
+
+def test_alignment_shift_reads_zero_for_identical_images_and_true_subpixel_shifts():
+    """cv2.phaseCorrelate read 0.5 px between identical images of some sizes (C 9 1804 x 960, B 33 1928 x 3620) and the
+    stage refused frames that sat on the stack's pixels."""
+    import cv2
+    rng = np.random.default_rng(1)
+    for shape in ((1928, 3620), (1804, 960), (500, 501)):
+        big = cv2.GaussianBlur(rng.random((shape[0] + 20, shape[1] + 20)).astype(np.float32), (0, 0), 2)
+        ref = np.repeat(big[10:10 + shape[0], 10:10 + shape[1], None], 3, 2)
+        assert np.allclose(S.alignment_shift(ref, ref), [0.0, 0.0], atol=0.02), shape
+        if shape == (500, 501):
+            for s in (0.5, 1.0):
+                m = np.float32([[1, 0, s], [0, 1, 0]])
+                moved = cv2.warpAffine(big, m, (big.shape[1], big.shape[0]), flags=cv2.INTER_CUBIC)[10:10 + shape[0], 10:10 + shape[1]]
+                fr = np.repeat(moved[..., None], 3, 2)
+                dx, dy = S.alignment_shift(ref, fr)
+                assert abs(abs(dx) - s) < 0.05 and abs(dy) < 0.05, (s, dx, dy)
