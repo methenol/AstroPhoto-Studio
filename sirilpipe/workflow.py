@@ -621,6 +621,30 @@ def group_stack_script(process_dir: str, seq: str, n_reg: int, others: list[int]
     return "\n".join(lines) + "\n"
 
 
+def mosaic_panels_script(process_dir: str, seq: str, feather: int, n: int, catalog_lines: list[str] | None = None) -> str:
+    """Panels already stacked and plate-solved, linked as ``_link/<seq>_NNNNN.fit``: the solutions become the registration, every panel is
+    projected on one canvas (``-framing=max``), and the mean of each pixel's panels is the mosaic (the recipe of Siril's mosaic tutorial:
+    additive-with-scaling normalisation, no rejection and no weights; feathered seams, normalised on the overlaps).  Without ``-force`` the
+    panels' own solutions are kept, but Siril 1.4.4 still prepares a catalogue first: no reachable catalogue fails the command, hence ``catalog_lines``."""
+    catalog = "".join(f"{ln}\n" for ln in catalog_lines or [])
+    return (f"cd {quote(os.path.join(process_dir, '_link'))}\nlink {seq} -out={quote(process_dir)}\ncd {quote(process_dir)}\n{catalog}"
+            f"select {seq} 1 {n}\nseqplatesolve {seq}{' -catalog=localgaia' if catalog_lines else ''}\nseqapplyreg {seq} -framing=max\n"
+            f"stack r_{seq} rej n 3 3 -norm=addscale -output_norm -rgb_equal -maximize -overlap_norm -feather={feather} -32b -out=mosaic_raw\n")
+
+
+def mosaic_subs_script(process_dir: str, seq: str, feather: int, frame: Frame | None, catalog_lines: list[str] | None = None) -> str:
+    """A native smart-telescope mosaic: calibrated subs whose field changes.  Star matching cannot chain them, so each sub is plate-solved and
+    the solutions register the sequence on one canvas; a rejected, feathered integration of the lot."""
+    solve = [f"seqplatesolve {seq} -force" + (" -catalog=localgaia" if catalog_lines else "")]
+    if frame is not None and frame.focallen:
+        solve.append(f"-focal={frame.focallen:g}")
+    if frame is not None and frame.pixsize:
+        solve.append(f"-pixelsize={frame.pixsize:g}")
+    lines = [f"cd {quote(process_dir)}", *(catalog_lines or []), " ".join(solve), f"seqapplyreg {seq} -framing=max",
+             f"stack r_{seq} rej w 3 3 -norm=addscale -output_norm -rgb_equal -maximize -overlap_norm -feather={feather} -32b -out=mosaic_raw"]
+    return "\n".join(lines) + "\n"
+
+
 def platesolve_script(session_dir: str, stack: str, frame: Frame | None, force: bool = True,
                       solved: str = "stack_solved", catalog_lines: list[str] | None = None) -> str:
     """Plate-solve the stack with Siril (online catalogues: NOMAD/Gaia via VizieR).

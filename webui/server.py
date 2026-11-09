@@ -84,6 +84,7 @@ STACK_DEFAULTS = {
     "deconv_stars_method": "auto",  # deconvolution of the stars, the same choices (post.deconv_choice; a request naming only deconv_method: the stars follow it)
     "denoise_method": "auto",  # linear noise reduction: auto = NXT when licensed, else GraXpert / Siril; nxt | graxpert | siril (that tool only); none.  CC Denoise: cc_denoise
     "rejection": "auto",       # stack rejection: auto = winsorized (MAD for drizzle > 1x); winsorized | sigma | mad | linear | median | none (workflow.REJECTIONS)
+    "roi_crop_percent": 0.0,   # region of interest: keep this percentage of the frame's width and height around its centre, cut after the restoration; 0 = the whole frame
     "stack_weighting": "wfwhm",  # stack -weight=: wfwhm | nbstars | noise | nbstack | none
     "drizzle_pixfrac": 0.0,    # drizzle drop size; 0 = the rule's (1 / scale)
     "drizzle_kernel": "square",  # drizzle kernel: square | point | turbo | gaussian | lanczos2 | lanczos3
@@ -587,7 +588,7 @@ def thumb(folder: str, name: str, size: int = 360):
 
 JOB_KINDS = {"calibrate": "Calibrate", "analyse": "Analyse frames", "stack": "Register & integrate", "denoise": "Restore",
              "starnet": "Train star remover", "autofinish": "Auto-finish", "all": "Run everything & export",
-             "export": "Export", "tools": "Tools"}
+             "mosaic": "Assemble mosaic", "export": "Export", "tools": "Tools"}
 
 ACTIVE = ("running", "paused", "queued")
 QUEUE: list[str] = []                     # queued job ids, first to run first
@@ -813,6 +814,24 @@ def _run_session_job(kind: str, s: Session, progress, params: dict, stack_params
         return {"autofinish": _norm_autofinish(s.autofinish(params, progress))}
     if kind == "export":
         return s.export(params, progress=progress, **export_opts)
+    if kind == "mosaic":
+        # the panels stacked (only those with new data), assembled on one canvas; the finished image comes from the usual chain
+        from sirilpipe import mosaic as mosaic_mod
+        report = mosaic_mod.assemble(s, sp, progress)
+        sp = mosaic_mod.finishing_params(sp)
+        _call(s.run_denoise, sp, progress, params=params)
+        if sp["star_remover"]:
+            s.train_star_remover(params, sp, progress)
+        fin = None
+        if sp["autofinish"]:
+            fin = _norm_autofinish(s.autofinish(params, progress))
+            params = fin["params"]
+        result = dict(s.export(params, progress=progress, **export_opts))
+        if fin:
+            result["autofinish"] = fin
+        report["output"] = {k: result.get(k) for k in ("jpg", "tif")}
+        result["mosaic"] = report
+        return result
     if kind == "all" and sp.get("hypertune"):
         # Hyper-tune each stage: an experiment-lab study of every stage before it runs (sirilpipe.hypertune); the studies appear in the Experiments tab
         from sirilpipe import hypertune

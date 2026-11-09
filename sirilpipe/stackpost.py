@@ -11,6 +11,21 @@ import cv2
 import numpy as np
 
 
+# ======================================================================= region of interest
+ROI_MIN_SIDE = 256                # px: never crop an image smaller than this on either side
+
+
+def roi_box(width: int, height: int, percent: float) -> tuple[int, int, int, int]:
+    """The centred crop (x, y, w, h) keeping ``percent`` of the frame's width and of its height (linear: 50 keeps a
+    quarter of the area), on even sizes, and never narrower than ``ROI_MIN_SIDE`` (or the frame)."""
+    if not 0 < percent <= 100:
+        raise ValueError(f"the ROI crop is a percentage of the frame in (0, 100], got {percent}")
+    def side(full: int) -> int:
+        return min(full, max(ROI_MIN_SIDE, 2 * int(round(full * percent / 200.0))))
+    w, h = side(width), side(height)
+    return (width - w) // 2, (height - h) // 2, w, h
+
+
 # ======================================================================= coverage / crop
 CONVENTIONS = ("FHF", "inv", "H", "FinvF")      # tried in this order; the best IoU against the data wins
 

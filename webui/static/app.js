@@ -418,6 +418,7 @@ function stackParams() {
     deconv_method: g("deconv_method").value, deconv_stars_method: g("deconv_stars_method").value, ai_deconvolution: on,
     denoise_method: g("denoise_method").value, superres_method: g("superres_method").value, satellite_removal: g("satellite_removal").checked,
     graxpert_psfsize: parseFloat(g("graxpert_psfsize").value) || 0,
+    roi_crop_percent: Math.max(0, Math.min(100, parseFloat(g("roi_crop_percent").value) || 0)),
     star_remover: g("star_remover").checked,
     autofinish: g("autofinish").checked,
     hypertune: g("hypertune").checked,

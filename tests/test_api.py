@@ -1088,3 +1088,59 @@ def test_defaults_without_cosmic_clarity_are_2x_drizzle_and_no_autofinish(env):
     assert d["autofinish"] is False and d["scale"] == 2.0 and d["superres_method"] == "drizzle"
     for name in ("default", "n2n-network"):
         assert {**d, **srv.PROFILES[name]["stack_params"]}["autofinish"] is False
+
+
+# --------------------------------------------------------------------------- region of interest and mosaics
+
+def test_roi_crop_percent_reaches_the_job(env):
+    j = submit(env, roi_crop_percent=22.5)
+    assert server.JOBS[j["id"]]["stack_params"]["roi_crop_percent"] == 22.5
+    wait_state(env.client, j["id"])
+
+
+def test_no_roi_is_the_default(env):
+    j = submit(env)
+    assert "roi_crop_percent" not in server.JOBS[j["id"]]["stack_params"]
+    wait_state(env.client, j["id"])
+
+
+@pytest.mark.parametrize("bad", [-5, 100, 140, "lots"])
+def test_bad_roi_crop_percent_is_refused(env, bad):
+    r = env.client.post("/api/v1/jobs", json={"path": "M 42/night1", "roi_crop_percent": bad})
+    assert r.status_code == 400 and "roi_crop_percent" in r.json()["detail"]
+
+
+MOSAIC = {"project_id": "m42-mosaic", "target": "M 42", "execution": "panels", "overlap": 0.25,
+          "footprint": {"ra_deg": 83.8, "dec_deg": -5.4, "width_arcmin": 200, "height_arcmin": 90},
+          "panels": [{"id": "P1", "ra_deg": 83.0, "dec_deg": -5.4, "path": "M 42/night1"}, {"id": "P2", "ra_deg": 84.6, "dec_deg": -5.4, "path": "M 42/night2"},
+                     {"id": "P3", "ra_deg": 85.4, "dec_deg": -5.4}]}
+
+
+def test_mosaic_job_reports_panels_and_coverage(env, monkeypatch):
+    from sirilpipe import mosaic
+    report = {"project_id": "m42-mosaic", "status": "assembled", "panels": [{"id": "P1", "accepted_sec": 30.0}], "coverage": {"percent": 80.0, "revisit": ["P3"]}, "canvas": {"width": 10, "height": 8}}
+    seen = {}
+
+    def assemble(s, sp, progress):
+        seen.update(sp["mosaic"])
+        return dict(report)
+    monkeypatch.setattr(mosaic, "assemble", assemble)
+    r = env.client.post("/api/v1/mosaics", json={**MOSAIC, "client_ref": "mos-1"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["kind"] == "mosaic" and j["duplicate"] is False and "(mosaic, 2 panels)" in j["dataset"] and "stack_params" not in j
+    done = wait_state(env.client, j["id"])
+    assert done["state"] == "done", done.get("traceback")
+    assert [p["id"] for p in seen["panels"]] == ["P1", "P2", "P3"] and seen["panels"][2]["folders"] == []
+    st = env.client.get("/api/v1/mosaics/m42-mosaic").json()
+    assert st["state"] == "done" and st["job"] == j["id"] and st["coverage"]["revisit"] == ["P3"] and st["panels"][0]["accepted_sec"] == 30.0 and st["outputs"]
+    assert env.client.post("/api/v1/mosaics", json={**MOSAIC, "client_ref": "mos-1"}).json()["duplicate"] is True
+
+
+def test_mosaic_refusals(env):
+    assert env.client.get("/api/v1/mosaics/none").status_code == 404
+    one = {**MOSAIC, "panels": MOSAIC["panels"][:1] + [{"id": "P2", "ra_deg": 1, "dec_deg": 1}]}
+    assert env.client.post("/api/v1/mosaics", json=one).status_code == 422
+    assert env.client.post("/api/v1/mosaics", json={**MOSAIC, "execution": "x"}).status_code == 400
+    gone = {**MOSAIC, "panels": [{"id": "P1", "ra_deg": 1, "dec_deg": 1, "path": "nope"}, MOSAIC["panels"][1]]}
+    assert env.client.post("/api/v1/mosaics", json=gone).status_code == 404

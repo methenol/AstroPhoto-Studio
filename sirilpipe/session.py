@@ -1186,7 +1186,43 @@ class Session:
                 out = post.restore(self.dir, self.meta, sp, params or {}, self._cb(progress), self.checkpoint)
             if info is not None:
                 out = self._record_imagemm(out, used, info, post.deconv_choice(sp))
+            self._apply_roi(sp, progress)
             return out
+
+    def _apply_roi(self, sp: dict, progress=None) -> dict | None:
+        """The region of interest: ``roi_crop_percent`` of the frame's width and height, around its centre, cut from the restored
+        ``linear.fits``.  After the restoration on purpose: the gradient model and the colour calibration need the sky and the stars of
+        the whole frame, and a tight crop around a nebula has neither.  ``stack.fits`` stays whole, so restoring again (with another
+        percentage) starts from the full frame; every later product (star removal, auto-finish, export) is made from the crop."""
+        meta = self.meta
+        try:
+            pct = float(sp.get("roi_crop_percent") or 0.0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        if not 0 < pct < 100:
+            if meta.pop("roi", None) is not None:
+                write_json(self._p("stack_meta.json"), meta)
+            return None
+        cb = self._cb(progress)
+        cb(0, 1, "Cropping to the region of interest")
+        path = self._p("linear.fits")
+        arr, hdr = fitsio.read_rgb(path)
+        H, W = arr.shape[1:]
+        x, y, w, h = stackpost.roi_box(W, H, pct)
+        info = {"percent": pct, "box": [x, y, w, h], "frame": [W, H]}
+        if (w, h) != (W, H):
+            hdr = hdr.copy()
+            for key, off in (("CRPIX1", x), ("CRPIX2", y)):          # the plate solution follows the crop (SIP terms are relative to CRPIX)
+                if key in hdr:
+                    hdr[key] = float(hdr[key]) - off
+            fitsio.write_rgb(path, np.ascontiguousarray(arr[:, y:y + h, x:x + w]), hdr)
+            for name in ("starless.fits", "stars.fits", "starnet_meta.json", "autofinish.json"):   # made from the whole frame
+                if os.path.exists(self._p(name)):
+                    os.remove(self._p(name))
+        meta["roi"] = info
+        write_json(self._p("stack_meta.json"), meta)
+        cb(1, 1, "Cropping to the region of interest")
+        return info
 
     def _imagemm_stage(self, sp: dict, progress) -> tuple[bool, dict]:
         """Run the ImageMM stage.  Returns (imagemm.fits is usable, record for restore_meta.json)."""

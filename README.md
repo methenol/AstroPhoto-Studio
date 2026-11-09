@@ -555,3 +555,10 @@ network. The results and the arXiv papers behind each choice are in
 - For very short sessions (fewer than about 15 subs) the stacker switches from
   drizzle to demosaic automatically. The denoiser still works, but has less to learn from.
 - Export writes a JSON sidecar with every parameter, so a result can be reproduced.
+
+## Mosaics and region-of-interest crops
+
+**Region of interest.** `roi_crop_percent` (a stack parameter, the *ROI crop* option in the web UI, or a field of `POST /api/v1/jobs`) keeps that percentage of the frame's width and height around its centre. The crop is cut after the restoration, from `linear.fits`: the gradient model and the colour calibration still see the whole frame, and `stack.fits` stays whole, so restoring again can use another percentage. The crop and its plate solution are recorded in `stack_meta.json` (`roi`).
+
+**Mosaics.** `POST /api/v1/mosaics` queues a mosaic project: its footprint and, per panel, where it was aimed and which session folders hold its subs. `GET /api/v1/mosaics/{project_id}` returns the latest job with per-panel accepted integration, the measured sky coverage and the panels to shoot again. Panels are stacked and plate-solved separately in `<session>/panels/<id>/` and kept, so a night added to one panel leaves the others alone; the linear panels are then assembled by Siril (`seqplatesolve`, `seqapplyreg -framing=max`, `stack -maximize -overlap_norm -feather`) and finished as one image. `execution: native` is the path for a scope's own mosaic: one set of subs, each plate-solved, integrated on one canvas. Siril's 32 768 px limit is checked before the assembly.
+

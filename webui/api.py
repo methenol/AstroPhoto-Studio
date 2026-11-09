@@ -14,6 +14,8 @@ up in its Jobs panel.  No authentication: it is meant for a private network (Tai
     POST   /api/v1/jobs                     queue a job (idempotent per client_ref)
     GET    /api/v1/jobs?state=&client_ref=  jobs, newest first
     GET    /api/v1/jobs/{id}                one job: state, stage, progress, ETAs, outputs
+    POST   /api/v1/mosaics                  queue a mosaic project: panels' sessions -> one image (idempotent per client_ref)
+    GET    /api/v1/mosaics/{project_id}     the project's latest job: status, per-panel accepted integration, sky coverage, output
     POST   /api/v1/jobs/{id}/cancel         cancel (queued: removed; running: at the next checkpoint)
     GET    /api/v1/jobs/{id}/files/{name}   download an output (jpg / tif / json)
     GET    /api/v1/queue                    running + queued jobs in order, with positions and ETAs
@@ -129,6 +131,20 @@ def _dataset(body: dict) -> list[str]:
     for p in paths:
         folders += _light_folders(_resolve(p, body.get("source")))
     return sorted(set(folders))
+
+
+def _roi_percent(body: dict) -> float | None:
+    """A request's ``roi_crop_percent``: a percentage of the frame in (0, 100); absent or 0: no crop."""
+    v = body.get("roi_crop_percent")
+    if v in (None, 0, 0.0):
+        return None
+    try:
+        pct = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"roi_crop_percent must be a number, not {v!r}")
+    if not 0 < pct < 100:
+        raise HTTPException(400, f"roi_crop_percent must be between 0 and 100 (the percentage of the frame kept), not {pct:g}")
+    return pct
 
 
 def _outputs(j: dict) -> list[dict]:
@@ -259,7 +275,8 @@ def submit(body: dict = Body(...)):
     as they are; stack_params.hypertune = true runs an experiment of every stage first, hypertune_trials
     trials each, and each stage with its best trial: hours), profile (a name from /profiles), stack_params / params (override the
     profile and the defaults), preset (a processing preset of the web UI), export (quality,
-    upscale, tiff), client_ref (the client's id for this job: submitting it again returns the job
+    upscale, tiff), roi_crop_percent (keep this percentage of the frame's width and height around its centre, cut after the
+    restoration; omitted or 0: the whole frame), client_ref (the client's id for this job: submitting it again returns the job
     already queued or done instead of a second one), label (shown in the Jobs panel)."""
     PROFILES = srv.PROFILES
     srv._load_jobs()
@@ -287,9 +304,10 @@ def submit(body: dict = Body(...)):
     if not seen["n_fits"]:
         raise HTTPException(422, f"no FITS subs in {', '.join(folders)}")
     prof = PROFILES[profile]
+    roi = _roi_percent(body)
     job = srv.start_job({
         "kind": kind, "folder": os.pathsep.join(folders),
-        "stack_params": {**prof.get("stack_params", {}), **(body.get("stack_params") or {})},
+        "stack_params": {**prof.get("stack_params", {}), **(body.get("stack_params") or {}), **({"roi_crop_percent": roi} if roi else {})},
         "params": {**srv.PRESETS.get(preset or "", {}), **prof.get("params", {}), **(body.get("params") or {})},
         "export": body.get("export") or {},
         "origin": body.get("origin") or "api", "profile": profile, "client_ref": ref,
@@ -301,6 +319,76 @@ def submit(body: dict = Body(...)):
         j["dataset"] = seen["object"] + (f" ({len(folders)} sessions)" if len(folders) > 1 else "")
         srv._save_jobs(force=True)
     return JSONResponse(_view(j) | {"duplicate": False, "dataset_info": srv.clean_json(seen)})
+
+
+@router.post("/mosaics")
+def submit_mosaic(body: dict = Body(...)):
+    """Queue the processing of a mosaic project.
+
+    body: project_id, target, execution (panels | native), overlap (0-1), footprint {ra_deg, dec_deg, width_arcmin, height_arcmin, angle_deg},
+    panels [{id, ra_deg, dec_deg, path | paths}], source (images | uploads), and as for /jobs: profile, stack_params, params, preset, export,
+    client_ref, label.  Panels without data yet are left out and show as holes in the coverage."""
+    from sirilpipe import mosaic as mosaic_mod
+    srv._load_jobs()
+    ref = body.get("client_ref")
+    if ref:
+        prior = [j for j in srv.JOBS.values() if j.get("client_ref") == ref and j["state"] not in ("cancelled", "error", "interrupted")]
+        if prior:
+            return JSONResponse(_view(max(prior, key=lambda j: j.get("created") or 0)) | {"duplicate": True})
+    panels, all_folders = [], []
+    for p in body.get("panels") or []:
+        folders: list[str] = []
+        for q in (p.get("paths") or ([p["path"]] if p.get("path") else [])):
+            folders += _light_folders(_resolve(q, body.get("source")))
+        folders = sorted(set(folders))
+        missing = [f for f in folders if not os.path.isdir(f)]
+        if missing:
+            raise HTTPException(404, f"panel {p.get('id')}: folder not found on the server: {', '.join(missing)}")
+        panels.append({**p, "folders": folders})
+        all_folders += folders
+    try:
+        manifest = mosaic_mod.normalise_manifest({**body, "panels": panels})
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(400, f"bad mosaic manifest: {e}")
+    with_data = [p for p in manifest["panels"] if p["folders"]]
+    if len(with_data) < (1 if manifest["execution"] == "native" else 2):
+        raise HTTPException(422, "a mosaic needs subs for at least two panels (one set of subs for a native mosaic)")
+    seen = _describe(sorted(set(all_folders)))
+    if not seen["n_fits"]:
+        raise HTTPException(422, "no FITS subs in the mosaic's folders")
+    profile = body.get("profile") or "default"
+    if profile not in srv.PROFILES:
+        raise HTTPException(400, f"unknown profile {profile!r}; one of {list(srv.PROFILES)}")
+    preset = body.get("preset")
+    if preset and preset not in srv.PRESETS:
+        raise HTTPException(400, f"unknown preset {preset!r}; one of {list(srv.PRESETS)}")
+    prof = srv.PROFILES[profile]
+    job = srv.start_job({
+        "kind": "mosaic", "folder": os.pathsep.join(sorted(set(all_folders))),
+        "stack_params": {**prof.get("stack_params", {}), **(body.get("stack_params") or {}), "mosaic": manifest},
+        "params": {**srv.PRESETS.get(preset or "", {}), **prof.get("params", {}), **(body.get("params") or {})},
+        "export": body.get("export") or {},
+        "origin": body.get("origin") or "api", "profile": profile, "client_ref": ref, "label": body.get("label") or manifest["target"]})
+    import json as _json
+    j = srv.JOBS[_json.loads(job.body)["id"]]
+    j["dataset"] = f"{manifest['target']} (mosaic, {len(with_data)} panels)"
+    j["mosaic_project"] = manifest["project_id"]
+    srv._save_jobs(force=True)
+    return JSONResponse(_view(j) | {"duplicate": False, "dataset_info": srv.clean_json(seen)})
+
+
+@router.get("/mosaics/{project_id}")
+def mosaic_status(project_id: str):
+    """The latest job of a mosaic project and what it measured."""
+    srv._load_jobs()
+    runs = [j for j in srv.JOBS.values() if j.get("mosaic_project") == project_id]
+    if not runs:
+        raise HTTPException(404, f"no mosaic project {project_id}")
+    j = max(runs, key=lambda x: x.get("created") or 0)
+    res = j.get("result") if isinstance(j.get("result"), dict) else {}
+    report = res.get("mosaic") or {}
+    return srv.clean_json({"project_id": project_id, "job": j["id"], "state": j["state"], "message": j.get("message"), "panels": report.get("panels"),
+                           "coverage": report.get("coverage"), "canvas": report.get("canvas"), "outputs": _outputs(j)})
 
 
 @router.get("/jobs")
