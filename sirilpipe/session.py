@@ -778,6 +778,8 @@ class Session:
             ref_fine = None
             if any((rows[i].get("binning") or 1) != fine for i in inc):
                 ref_fine = max((i for i in inc if (rows[i].get("binning") or 1) == fine), key=lambda i: rows[i].get("weight") or 0.0)
+            if ref_fine is None:
+                ref_fine = self._applied_reference(seq, rows, inc)
             runner.run(workflow.apply_script(self.process, seq, n, excluded, rs, reference=ref_fine), "apply_registration",
                        expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc),
                        label="Applying registration")
@@ -811,15 +813,35 @@ class Session:
             self._invalidate_after_stack()
             return clean_json(meta)
 
-    def _reference_name(self, seq: str, rows: list[dict]) -> str | None:
-        """The file name of the frame the registration made its reference (its homography the identity)."""
+    def _reference_index(self, seq: str, rows: list[dict]) -> int | None:
+        """The row index of the frame the registration made its reference (its homography the identity)."""
         try:
             for fr in parse_seq(os.path.join(self.process, f"{seq}_.seq")).frames:
                 if fr.H and len(fr.H) == 9 and max(abs(a - b) for a, b in zip(fr.H, (1, 0, 0, 0, 1, 0, 0, 0, 1))) < 1e-9 and fr.index < len(rows):
-                    return rows[fr.index].get("name")
+                    return fr.index
         except (OSError, ValueError):
             pass
         return None
+
+    def _reference_name(self, seq: str, rows: list[dict]) -> str | None:
+        """The file name of the frame the registration made its reference (its homography the identity)."""
+        i = self._reference_index(seq, rows)
+        return rows[i].get("name") if i is not None else None
+
+    def _applied_reference(self, seq: str, rows: list[dict], applied: list[int] | set[int]) -> int | None:
+        """The ``setref`` frame for ``seqapplyreg`` of ``applied`` (row indices), or None to keep the registration's own reference.
+        Siril aborts the apply when its reference frame is not among the frames applied ("The reference image has a null matrix and
+        was not previously aligned"): the registration picks its reference before the frame selection runs, and the selection may
+        then reject it (Ced 19l 2026-11-10: the reference frame's roundness 0.71 < 0.79).  The output then takes the grid of the
+        best applied frame (highest selection weight, as Siril's own reference choice is its best frame)."""
+        applied = set(applied)
+        ref = self._reference_index(seq, rows)
+        if ref is None or ref in applied or not applied:
+            return None
+        best = max(applied, key=lambda i: (rows[i].get("weight") or 0.0, -(rows[i].get("fwhm") or 1e9)))
+        log.info("registration reference %s is not among the frames applied (excluded by selection); applying relative to %s",
+                 rows[ref].get("name"), rows[best].get("name"))
+        return best
 
     def stack_subsets(self, subsets: dict, progress=None, stack_params: dict | None = None, place: bool = True, ref_frame: str | None = None) -> dict:
         """Stacks of subsets of the stacked frames, on ``stack.fits``'s pixel grid: {name: [row indices]} -> {name: (3, h, w) array}.
@@ -858,6 +880,8 @@ class Session:
             # stack came out 0.2 degrees rotated against the held-out stack).  It is applied even when no subset stacks it.
             ref_idx = next((i for i, r in enumerate(rows) if ref_frame and r.get("name") == ref_frame and r.get("registered")), None)
             applied = set(inc) | ({ref_idx} if ref_idx is not None else set())
+            if ref_idx is None:
+                ref_idx = self._applied_reference(seq, rows, applied)
             self.last_reference = rows[ref_idx]["name"] if ref_idx is not None else self._reference_name(seq, rows)
             runner.run(workflow.apply_script(self.process, seq, n, [i for i in range(len(rows)) if i not in applied], rs, reference=ref_idx), "apply_registration",
                        expect=[f"r_{seq}_.seq"], count_glob=f"r_{seq}_[0-9]*.fit", total=len(inc), label="Applying registration (frame subsets)")

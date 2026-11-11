@@ -366,6 +366,25 @@ def test_a_dead_jobs_copy_is_reaped_and_a_live_jobs_is_not(session, monkeypatch,
     assert not root.exists()
 
 
+def test_a_reference_frame_left_out_by_the_selection_is_replaced_for_the_apply(session):
+    """Ced 19l (2026-11-10): the registration's reference frame (identity homography) was rejected by the frame selection;
+    seqapplyreg of the other frames aborted ("The reference image has a null matrix and was not previously aligned").
+    The apply then sets the best included frame as its reference."""
+    session.run_analysis(1.0)
+    name = session.frames_table()[0]["name"]                    # frame 1: the fixture registration's reference
+    session.set_override(name, False)
+    session.run_stack({})
+    apply = dict(FakeRunner.log)["apply_registration"]
+    rows = session.frames_table()
+    ref = next(int(l.split()[-1]) for l in apply.splitlines() if l.startswith("setref light "))
+    assert "unselect light 1 1" in apply and ref != 1 and rows[ref - 1]["included"]
+    assert apply.index("setref") < apply.index("unselect")
+    session.set_override(name, None)                           # reference included again: no setref
+    FakeRunner.log = []
+    session.run_stack({})
+    assert "setref" not in dict(FakeRunner.log)["apply_registration"]
+
+
 def test_local_copy_off_and_unsafe_dir(session, monkeypatch, tmp_path):
     monkeypatch.delenv("ASTROPHOTO_LOCAL_COPY", raising=False)
     with session.local_copy() as s:
