@@ -28,6 +28,9 @@ RUN curl -fsSL -o Siril.AppImage "https://free-astro.org/download/Siril-${SIRIL_
  && chmod +x Siril.AppImage && ./Siril.AppImage --appimage-extract >/dev/null \
  && mv squashfs-root /opt/siril \
  && rm -rf /opt/siril/usr/share/icons /opt/siril/usr/share/locale
+# fixes to the Siril binaries (patches/siril/README.md): multi_save's list walk hangs seqsplit_cfa (1.4.0-1.4.5)
+COPY patches/siril /tmp/patches/siril
+RUN python /tmp/patches/siril/multi_save_list_walk.py /opt/siril/usr/bin/siril-cli /opt/siril/usr/bin/siril
 # Siril insists on the canonical remotes
 RUN mkdir -p /opt/siril-data \
  && git clone --depth 1 https://gitlab.com/free-astro/siril-scripts.git      /opt/siril-data/siril-scripts \
